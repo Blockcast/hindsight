@@ -4,6 +4,8 @@ Persistent long-term memory for [Vapi](https://vapi.ai) voice AI calls via [Hind
 
 ## Quick Start
 
+> ✨ **Recommended:** [Hindsight Cloud](https://ui.hindsight.vectorize.io/signup) — sign up free, get an API key, and skip the self-hosting setup entirely.
+
 ```bash
 pip install hindsight-vapi
 ```
@@ -15,7 +17,8 @@ from hindsight_vapi import HindsightVapiWebhook
 app = FastAPI()
 memory = HindsightVapiWebhook(
     bank_id="user-123",
-    hindsight_api_url="http://localhost:8888",
+    hindsight_api_url="https://api.hindsight.vectorize.io",
+    api_key="hsk_your_token_here",
 )
 
 @app.post("/webhook")
@@ -27,15 +30,7 @@ async def vapi_webhook(request: Request):
 
 Point Vapi's Server URL at this endpoint and memory is active.
 
-Or with [Hindsight Cloud](https://ui.hindsight.vectorize.io/signup):
-
-```python
-memory = HindsightVapiWebhook(
-    bank_id="user-123",
-    hindsight_api_url="https://api.hindsight.vectorize.io",
-    api_key="hsk_your_token_here",
-)
-```
+**Self-hosting alternative:** replace the URL with `http://localhost:8888` and omit the `api_key`.
 
 ## How It Works
 
