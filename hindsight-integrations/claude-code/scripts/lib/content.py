@@ -49,6 +49,82 @@ def strip_memory_tags(content: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Retain filtering (low-value retry/quota loops)
+# ---------------------------------------------------------------------------
+
+_LIMIT_CHURN_PATTERN = re.compile(
+    r"(?:you(?:'|\u2019)?ve hit (?:your )?(?:usage )?limit|"
+    r"you(?:'|\u2019)?re out of extra usage|"
+    r"out of (?:extra )?usage|"
+    r"usage limit|"
+    r"try again at|"
+    r"resets? [0-9:]+)",
+    re.IGNORECASE,
+)
+_CONTINUE_CHURN_PATTERN = re.compile(
+    r"(?:continue from where you left off\.?|no response requested\.?)",
+    re.IGNORECASE,
+)
+_RETRY_WAKE_PATTERN = re.compile(
+    r"wake reason:\s*(?:"
+    r"transient_failure_retry|"
+    r"issue_continuation_needed|"
+    r"process_lost_retry|"
+    r"missing_issue_comment|"
+    r"issue_blockers_resolved_sweep"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def should_skip_retry_limit_churn(messages: list, transcript: str) -> bool:
+    """Return True for Stop-hook transcripts dominated by retry/quota churn.
+
+    Full-session retention re-sends the whole conversation on every Stop. When
+    a session is only bouncing through quota-limit messages and automated
+    "continue" wakeups, retaining it again burns extraction quota without
+    adding durable memory.
+    """
+    if not isinstance(messages, list) or not transcript:
+        return False
+
+    assistant_text = "\n".join(
+        _extract_text_content(message.get("content", ""), role="assistant")
+        for message in messages
+        if message.get("role") == "assistant"
+    )
+    user_text = "\n".join(
+        _extract_text_content(message.get("content", ""), role="user")
+        for message in messages
+        if message.get("role") == "user"
+    )
+
+    limit_hits = len(_LIMIT_CHURN_PATTERN.findall(assistant_text))
+    if limit_hits == 0:
+        return False
+
+    churn_hits = len(_CONTINUE_CHURN_PATTERN.findall(user_text + "\n" + assistant_text))
+    churn_hits += len(_RETRY_WAKE_PATTERN.findall(user_text))
+    if churn_hits == 0:
+        return False
+
+    cleaned_assistant = _LIMIT_CHURN_PATTERN.sub(" ", assistant_text)
+    cleaned_assistant = _CONTINUE_CHURN_PATTERN.sub(" ", cleaned_assistant)
+    cleaned_assistant = re.sub(
+        r"[\s\u00b7:;,.()0-9a-z]*utc[\s\u00b7:;,.()0-9a-z]*",
+        " ",
+        cleaned_assistant,
+        flags=re.IGNORECASE,
+    )
+    if len(cleaned_assistant.strip()) <= 400:
+        return True
+
+    # In full-session mode, repeated quota/continue markers mean the useful
+    # earlier content was already retained by a prior Stop.
+    return limit_hits >= 2 and churn_hits >= 2 and len(transcript) > 10000
+
+
+# ---------------------------------------------------------------------------
 # Recall: query composition and truncation
 # ---------------------------------------------------------------------------
 

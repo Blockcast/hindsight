@@ -29,6 +29,7 @@ from lib.client import HindsightClient
 from lib.config import debug_log, load_config
 from lib.content import (
     prepare_retention_transcript,
+    should_skip_retry_limit_churn,
     slice_last_turns_by_user_boundary,
 )
 from lib.daemon import get_api_url
@@ -127,6 +128,10 @@ def run_retain(hook_input: dict, force: bool = False) -> None:
 
     if not transcript:
         debug_log(config, "Empty transcript after formatting, skipping retain")
+        return
+
+    if should_skip_retry_limit_churn(messages_to_retain, transcript):
+        debug_log(config, "Retry/limit/continue churn detected, skipping retain")
         return
 
     # Resolve API URL

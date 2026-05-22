@@ -8,6 +8,7 @@ from lib.content import (
     compose_recall_query,
     format_memories,
     prepare_retention_transcript,
+    should_skip_retry_limit_churn,
     slice_last_turns_by_user_boundary,
     strip_channel_envelope,
     strip_memory_tags,
@@ -469,3 +470,28 @@ class TestPrepareRetentionTranscript:
         transcript, _ = prepare_retention_transcript(msgs, retain_full_window=True, include_tool_calls=False)
         assert "[role: user]" in transcript
         assert "[user:end]" in transcript
+
+
+# ---------------------------------------------------------------------------
+# should_skip_retry_limit_churn
+# ---------------------------------------------------------------------------
+
+
+class TestShouldSkipRetryLimitChurn:
+    def test_skips_quota_continue_loop(self):
+        msgs = _msgs(
+            ("user", "Continue from where you left off."),
+            ("assistant", "You've hit your usage limit. Try again at May 26, 2026 11:57 AM."),
+            ("user", "Wake reason: transient_failure_retry\nContinue from where you left off."),
+            ("assistant", "No response requested."),
+        )
+        transcript, _ = prepare_retention_transcript(msgs, retain_full_window=True)
+        assert should_skip_retry_limit_churn(msgs, transcript) is True
+
+    def test_does_not_skip_real_work_that_mentions_limits(self):
+        msgs = _msgs(
+            ("user", "Please debug why a usage limit was reached."),
+            ("assistant", "The queue is over-producing work; reduce duplicate retain jobs and inspect worker fanout."),
+        )
+        transcript, _ = prepare_retention_transcript(msgs, retain_full_window=True)
+        assert should_skip_retry_limit_churn(msgs, transcript) is False
