@@ -61,6 +61,19 @@ const manifest: PaperclipPluginManifestV1 = {
         description: "Automatically retain agent run output to Hindsight when a run completes.",
         default: true,
       },
+      seedBankEnabled: {
+        type: "boolean",
+        title: "Seed Bank Lifecycle Hook",
+        description:
+          "Create/touch each new agent's canonical bank and optionally queue seed-bank work when an agent is created.",
+        default: true,
+      },
+      seedBankWebhookUrl: {
+        type: "string",
+        title: "Seed Bank Webhook URL",
+        description:
+          "Optional operator-provided queue endpoint. When set, agent.created posts one seed job with the canonical bank id and deterministic query plan.",
+      },
     },
   },
   tools: [

@@ -47,7 +47,9 @@ export class HindsightClient {
         throw new Error(`HTTP ${resp.status} from ${path}: ${text}`);
       }
 
-      return (await resp.json()) as T;
+      const text = await resp.text();
+      if (!text.trim()) return undefined as T;
+      return JSON.parse(text) as T;
     } finally {
       clearTimeout(timer);
     }
@@ -76,6 +78,11 @@ export class HindsightClient {
     if (documentId) item["document_id"] = documentId;
     if (metadata) item["metadata"] = metadata;
     await this.request("POST", path, { items: [item], async: true });
+  }
+
+  async touchBank(bankId: string): Promise<void> {
+    const path = `/v1/default/banks/${encodeURIComponent(bankId)}`;
+    await this.request("PUT", path, {});
   }
 
   async health(): Promise<boolean> {

@@ -4,6 +4,8 @@
  * Gives Paperclip agents persistent long-term memory via Hindsight.
  *
  * Lifecycle:
+ *   agent.created          → create/touch the agent's canonical bank and queue
+ *                            an optional seed-bank job.
  *   agent.run.started      → fetch the run's issue, recall relevant memories,
  *                            cache them in plugin state for the run.
  *   issue.comment.created  → retain the full comment body to Hindsight (this is
@@ -18,7 +20,7 @@
  */
 
 import { definePlugin, runWorker } from "@paperclipai/plugin-sdk";
-import type { ToolRunContext } from "@paperclipai/plugin-sdk";
+import type { Agent, ToolRunContext } from "@paperclipai/plugin-sdk";
 import { HindsightClient, formatMemories } from "./client.js";
 import { deriveBankId } from "./bank.js";
 
@@ -28,6 +30,13 @@ interface PluginConfig {
   bankGranularity?: Array<"company" | "agent">;
   recallBudget?: "low" | "mid" | "high";
   autoRetain?: boolean;
+  seedBankEnabled?: boolean;
+  seedBankWebhookUrl?: string;
+}
+
+interface AgentCreatedPayload {
+  agentId?: string;
+  agent?: Agent;
 }
 
 interface RunStartedPayload {
@@ -48,6 +57,94 @@ interface CommentCreatedPayload {
   runId?: string | null;
 }
 
+class SeedBankQueueError extends Error {
+  readonly status?: number;
+
+  constructor(message: string, status?: number) {
+    super(message);
+    this.name = "SeedBankQueueError";
+    this.status = status;
+  }
+}
+
+function readStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => {
+      if (typeof item === "string") return item;
+      if (item && typeof item === "object") {
+        const record = item as Record<string, unknown>;
+        const candidate = record.slug ?? record.id ?? record.name;
+        if (typeof candidate === "string") return candidate;
+      }
+      return "";
+    })
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function desiredSkillSlugs(agent: Agent): string[] {
+  const metadata = agent.metadata ?? {};
+  return [
+    ...readStringArray(metadata.desiredSkills),
+    ...readStringArray(metadata.desiredSkillSlugs),
+    ...readStringArray(metadata.skills),
+  ];
+}
+
+function uniqueNonEmpty(items: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const item of items) {
+    const normalized = item.trim().replace(/\s+/g, " ");
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    out.push(normalized);
+  }
+  return out;
+}
+
+function deriveSeedBankQueries(agent: Agent, reportingParent?: Agent | null): string[] {
+  return uniqueNonEmpty([
+    agent.capabilities ?? "",
+    ...desiredSkillSlugs(agent).map((slug) => `Skill: ${slug}`),
+    reportingParent?.capabilities
+      ? `Reporting parent capabilities: ${reportingParent.capabilities}`
+      : "",
+  ]);
+}
+
+async function queueSeedBankJob(
+  webhookUrl: string,
+  payload: {
+    agentId: string;
+    companyId: string;
+    bankId: string;
+    mode: "seed";
+    queries: string[];
+  }
+): Promise<void> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15_000);
+  try {
+    const response = await fetch(webhookUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      throw new SeedBankQueueError(
+        `HTTP ${response.status} from seed-bank webhook: ${text}`,
+        response.status
+      );
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function getConfig(ctx: {
   config: { get(): Promise<Record<string, unknown>> };
 }): Promise<PluginConfig> {
@@ -66,6 +163,64 @@ async function resolveApiKey(
 const plugin = definePlugin({
   async setup(ctx) {
     ctx.logger.info("Hindsight memory plugin starting");
+
+    // ---------------------------------------------------------------------------
+    // agent.created — create/touch bank and optionally queue deterministic seeding
+    // ---------------------------------------------------------------------------
+    ctx.events.on("agent.created", async (event) => {
+      const config = await getConfig(ctx);
+      if (config.seedBankEnabled === false) return;
+
+      const companyId = event.companyId;
+      const payload = (event.payload ?? {}) as AgentCreatedPayload;
+      const payloadAgent = payload.agent;
+      const agentId = payload.agentId ?? payloadAgent?.id;
+      if (!companyId || !agentId) return;
+
+      const bankId = deriveBankId({ companyId, agentId }, config);
+      try {
+        const agent = payloadAgent ?? (await ctx.agents.get(agentId, companyId));
+        if (!agent) return;
+
+        const reportingParent = agent.reportsTo
+          ? await ctx.agents.get(agent.reportsTo, companyId).catch(() => null)
+          : null;
+        const apiKey = await resolveApiKey(ctx, config);
+        const client = new HindsightClient(config.hindsightApiUrl, apiKey);
+        await client.touchBank(bankId);
+
+        const webhookUrl = config.seedBankWebhookUrl?.trim();
+        if (webhookUrl) {
+          await queueSeedBankJob(webhookUrl, {
+            agentId,
+            companyId,
+            bankId,
+            mode: "seed",
+            queries: deriveSeedBankQueries(agent, reportingParent),
+          });
+        }
+
+        ctx.logger.info("Seed bank lifecycle hook completed", { agentId, bankId });
+      } catch (err) {
+        const status = err instanceof SeedBankQueueError ? err.status : undefined;
+        await ctx.state.set(
+          { scopeKind: "agent", scopeId: agentId, stateKey: "seed-bank-failure" },
+          {
+            retryable: true,
+            status,
+            bankId,
+            error: String(err),
+            failedAt: new Date().toISOString(),
+          }
+        );
+        ctx.logger.warn("Failed to run seed bank lifecycle hook", {
+          agentId,
+          bankId,
+          status,
+          error: String(err),
+        });
+      }
+    });
 
     // ---------------------------------------------------------------------------
     // agent.run.started — recall memories using the issue's title + description
