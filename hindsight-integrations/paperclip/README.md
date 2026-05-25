@@ -6,6 +6,7 @@ Install once. Every agent in your Paperclip instance gets memory that persists a
 
 ## What It Does
 
+- **When an agent is created** — creates/touches the agent's canonical bank and can queue deterministic seed-bank work
 - **Before each run** — fetches the run's issue and recalls relevant memories on its title + description, caches them for the agent
 - **After each comment** — retains the full comment body to Hindsight (durable record of both user and agent output)
 - **Agent tools** — `hindsight_recall` and `hindsight_retain` tools for agents to query and store memory mid-run
@@ -40,6 +41,8 @@ Or [Hindsight Cloud](https://ui.hindsight.vectorize.io/signup) — no self-hosti
 | `bankGranularity`    | `["company", "agent"]`  | Memory isolation: per company+agent, per company, or per agent |
 | `recallBudget`       | `mid`                   | `low` = fastest, `mid` = balanced, `high` = most thorough      |
 | `autoRetain`         | `true`                  | Automatically retain run output after every run                |
+| `seedBankEnabled`    | `true`                  | Create/touch new-agent banks and enable optional seeding hook  |
+| `seedBankWebhookUrl` | —                       | Optional queue endpoint for one seed job on `agent.created`    |
 
 ## Bank ID Format
 
@@ -60,6 +63,11 @@ Agents can call these tools directly during a run:
 ## How It Works
 
 ```
+agent.created
+  └─ create/touch paperclip::{companyId}::{agentId}
+       └─ optional seedBankWebhookUrl POST
+            └─ { agentId, companyId, bankId, mode: "seed", queries }
+
 agent.run.started
   └─ fetch issue via ctx.issues.get
        └─ recall(issueTitle + description) → cached in plugin state for the run
@@ -75,6 +83,8 @@ issue.comment.created
 agent.run.finished
   └─ no-op (subscription kept for future use when payload carries output)
 ```
+
+The seed-bank query plan is deterministic: agent capabilities first, then desired skill slugs from agent metadata, then reporting-parent capabilities when available. Bank-create or queue failures are logged and written to agent-scoped plugin state at `seed-bank-failure` with `retryable: true`; they do not abort the `agent.created` lifecycle event.
 
 The bundled plugin manifest declares the `issues.read` and `issue.comments.read` capabilities needed by the new SDK calls, so Paperclip may prompt for these on first install or upgrade.
 

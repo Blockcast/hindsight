@@ -3,7 +3,7 @@ import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
 const manifest: PaperclipPluginManifestV1 = {
   id: "paperclip-plugin-hindsight",
   apiVersion: 1,
-  version: "0.2.0",
+  version: "0.2.2",
   displayName: "Hindsight Memory",
   author: "Vectorize <support@vectorize.io>",
   description:
@@ -60,6 +60,19 @@ const manifest: PaperclipPluginManifestV1 = {
         title: "Auto-retain on Run Finished",
         description: "Automatically retain agent run output to Hindsight when a run completes.",
         default: true,
+      },
+      seedBankEnabled: {
+        type: "boolean",
+        title: "Seed Bank Lifecycle Hook",
+        description:
+          "Create/touch each new agent's canonical bank and optionally queue seed-bank work when an agent is created.",
+        default: true,
+      },
+      seedBankWebhookUrl: {
+        type: "string",
+        title: "Seed Bank Webhook URL",
+        description:
+          "Optional operator-provided queue endpoint. When set, agent.created posts one seed job with the canonical bank id and deterministic query plan.",
       },
     },
   },

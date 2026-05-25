@@ -9,6 +9,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createTestHarness } from "@paperclipai/plugin-sdk";
+import type { Agent } from "@paperclipai/plugin-sdk";
 import manifest from "../src/manifest.js";
 import plugin from "../src/worker.js";
 
@@ -40,6 +41,38 @@ const DEFAULT_CONFIG = {
   recallBudget: "mid",
   autoRetain: true,
 };
+
+function seedAgent(harness: ReturnType<typeof buildHarness>, agent: Partial<Agent> & { id: string }) {
+  const now = new Date("2026-01-01T00:00:00.000Z");
+  harness.seed({
+    agents: [
+      {
+        id: agent.id,
+        companyId: agent.companyId ?? "co-1",
+        name: agent.name ?? agent.id,
+        urlKey: agent.urlKey ?? agent.id,
+        role: agent.role ?? "general",
+        title: agent.title ?? null,
+        icon: agent.icon ?? null,
+        status: agent.status ?? "idle",
+        reportsTo: agent.reportsTo ?? null,
+        capabilities: agent.capabilities ?? null,
+        adapterType: agent.adapterType ?? "process",
+        adapterConfig: agent.adapterConfig ?? {},
+        runtimeConfig: agent.runtimeConfig ?? {},
+        budgetMonthlyCents: agent.budgetMonthlyCents ?? 0,
+        spentMonthlyCents: agent.spentMonthlyCents ?? 0,
+        pauseReason: agent.pauseReason ?? null,
+        pausedAt: agent.pausedAt ?? null,
+        permissions: agent.permissions ?? { canCreateAgents: false },
+        lastHeartbeatAt: agent.lastHeartbeatAt ?? null,
+        metadata: agent.metadata ?? null,
+        createdAt: agent.createdAt ?? now,
+        updatedAt: agent.updatedAt ?? now,
+      },
+    ],
+  });
+}
 
 function buildHarness(config: Record<string, unknown> = DEFAULT_CONFIG) {
   return createTestHarness({
@@ -187,6 +220,130 @@ describe("agent.run.started", () => {
         { companyId: "co-1" }
       )
     ).resolves.not.toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// agent.created — seed-bank lifecycle hook
+// ---------------------------------------------------------------------------
+
+describe("agent.created", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("touches the canonical bank and queues one deterministic seed-bank job", async () => {
+    const fetchMock = mockFetch([
+      { url: /\/v1\/default\/banks\//, body: { success: true } },
+      { url: "https://seed.example/jobs", body: { queued: true } },
+    ]);
+    vi.stubGlobal("fetch", fetchMock);
+    const harness = buildHarness({
+      ...DEFAULT_CONFIG,
+      seedBankWebhookUrl: "https://seed.example/jobs",
+    });
+    seedAgent(harness, {
+      id: "parent-1",
+      companyId: "co-1",
+      capabilities: "Reviews production database migrations and checks rollback risk.",
+    });
+    seedAgent(harness, {
+      id: "ag-1",
+      companyId: "co-1",
+      capabilities: "Writes TypeScript services and React UI tests.",
+      reportsTo: "parent-1",
+      metadata: { desiredSkills: ["vercel-labs/browser", "github/pr-review"] },
+    });
+    await setupPlugin(harness);
+
+    await harness.emit("agent.created", { agentId: "ag-1" }, { companyId: "co-1" });
+
+    const bankCall = fetchMock.mock.calls.find(([url, init]: [string, RequestInit]) =>
+      url.includes("/v1/default/banks/") && init.method === "PUT"
+    );
+    expect(bankCall).toBeDefined();
+    expect(bankCall?.[0]).toContain("paperclip%3A%3Aco-1%3A%3Aag-1");
+
+    const queueCalls = fetchMock.mock.calls.filter(([url]: [string]) =>
+      url.includes("https://seed.example/jobs")
+    );
+    expect(queueCalls).toHaveLength(1);
+    const payload = JSON.parse(queueCalls[0]?.[1]?.body as string) as {
+      agentId: string;
+      companyId: string;
+      bankId: string;
+      mode: string;
+      queries: string[];
+    };
+    expect(payload).toEqual(
+      expect.objectContaining({
+        agentId: "ag-1",
+        companyId: "co-1",
+        bankId: "paperclip::co-1::ag-1",
+        mode: "seed",
+      })
+    );
+    expect(payload.queries).toEqual([
+      "Writes TypeScript services and React UI tests.",
+      "Skill: vercel-labs/browser",
+      "Skill: github/pr-review",
+      "Reporting parent capabilities: Reviews production database migrations and checks rollback risk.",
+    ]);
+  });
+
+  it("records retryable state and resolves when seed queue returns 503", async () => {
+    const fetchMock = mockFetch([
+      { url: /\/v1\/default\/banks\//, body: { success: true } },
+      { url: "https://seed.example/jobs", body: { error: "unavailable" }, status: 503 },
+    ]);
+    vi.stubGlobal("fetch", fetchMock);
+    const harness = buildHarness({
+      ...DEFAULT_CONFIG,
+      seedBankWebhookUrl: "https://seed.example/jobs",
+    });
+    seedAgent(harness, {
+      id: "ag-1",
+      companyId: "co-1",
+      capabilities: "Writes TypeScript services.",
+    });
+    await setupPlugin(harness);
+
+    await expect(
+      harness.emit("agent.created", { agentId: "ag-1" }, { companyId: "co-1" })
+    ).resolves.not.toThrow();
+
+    const failure = harness.getState({
+      scopeKind: "agent",
+      scopeId: "ag-1",
+      stateKey: "seed-bank-failure",
+    }) as { retryable?: boolean; status?: number; bankId?: string };
+    expect(failure).toEqual(
+      expect.objectContaining({
+        retryable: true,
+        status: 503,
+        bankId: "paperclip::co-1::ag-1",
+      })
+    );
+  });
+
+  it("skips the seed-bank hook when disabled", async () => {
+    const fetchMock = mockFetch([{ url: /\/v1\/default\/banks\//, body: { success: true } }]);
+    vi.stubGlobal("fetch", fetchMock);
+    const harness = buildHarness({
+      ...DEFAULT_CONFIG,
+      seedBankEnabled: false,
+      seedBankWebhookUrl: "https://seed.example/jobs",
+    });
+    seedAgent(harness, {
+      id: "ag-1",
+      companyId: "co-1",
+      capabilities: "Writes TypeScript services.",
+    });
+    await setupPlugin(harness);
+
+    await harness.emit("agent.created", { agentId: "ag-1" }, { companyId: "co-1" });
+
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });
 
