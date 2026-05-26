@@ -11,7 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createTestHarness } from "@paperclipai/plugin-sdk";
 import type { Agent } from "@paperclipai/plugin-sdk";
 import manifest from "../src/manifest.js";
-import plugin from "../src/worker.js";
+import plugin, { buildRecallQuery, DEFAULT_MAX_RECALL_QUERY_BYTES } from "../src/worker.js";
 
 // ---------------------------------------------------------------------------
 // Fetch mock helpers
@@ -42,7 +42,10 @@ const DEFAULT_CONFIG = {
   autoRetain: true,
 };
 
-function seedAgent(harness: ReturnType<typeof buildHarness>, agent: Partial<Agent> & { id: string }) {
+function seedAgent(
+  harness: ReturnType<typeof buildHarness>,
+  agent: Partial<Agent> & { id: string }
+) {
   const now = new Date("2026-01-01T00:00:00.000Z");
   harness.seed({
     agents: [
@@ -177,6 +180,40 @@ describe("agent.run.started", () => {
     expect(state).toContain("TypeScript");
   });
 
+  it("bounds the run-start recall query before calling Hindsight", async () => {
+    const harness = buildHarness();
+    await setupPlugin(harness);
+    const issue = await seedIssue(harness, {
+      companyId: "co-1",
+      title: "Investigate preview deployment failures",
+      description: "Long issue body. ".repeat(500),
+    });
+
+    await harness.emit(
+      "agent.run.started",
+      { agentId: "ag-1", runId: "run-long", issueId: issue.id },
+      { companyId: "co-1" }
+    );
+
+    const recallCall = fetchMock.mock.calls.find(([url]: [string]) => url.includes("recall"));
+    expect(recallCall).toBeDefined();
+    const recallBody = JSON.parse(recallCall?.[1]?.body as string) as { query: string };
+    expect(Buffer.byteLength(recallBody.query, "utf8")).toBeLessThanOrEqual(
+      DEFAULT_MAX_RECALL_QUERY_BYTES
+    );
+    expect(recallBody.query).toContain("Investigate preview deployment failures");
+  });
+
+  it("builds a compact recall query from long issue text", () => {
+    const query = buildRecallQuery({
+      title: "Fix stuck reviewer runs",
+      description: "Detailed reproduction with logs and stack traces. ".repeat(500),
+    });
+
+    expect(Buffer.byteLength(query, "utf8")).toBeLessThanOrEqual(DEFAULT_MAX_RECALL_QUERY_BYTES);
+    expect(query).toContain("Fix stuck reviewer runs");
+  });
+
   it("skips recall when no issueId is provided", async () => {
     const harness = buildHarness();
     await setupPlugin(harness);
@@ -258,8 +295,9 @@ describe("agent.created", () => {
 
     await harness.emit("agent.created", { agentId: "ag-1" }, { companyId: "co-1" });
 
-    const bankCall = fetchMock.mock.calls.find(([url, init]: [string, RequestInit]) =>
-      url.includes("/v1/default/banks/") && init.method === "PUT"
+    const bankCall = fetchMock.mock.calls.find(
+      ([url, init]: [string, RequestInit]) =>
+        url.includes("/v1/default/banks/") && init.method === "PUT"
     );
     expect(bankCall).toBeDefined();
     expect(bankCall?.[0]).toContain("paperclip%3A%3Aco-1%3A%3Aag-1");
