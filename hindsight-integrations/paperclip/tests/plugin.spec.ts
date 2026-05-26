@@ -42,7 +42,10 @@ const DEFAULT_CONFIG = {
   autoRetain: true,
 };
 
-function seedAgent(harness: ReturnType<typeof buildHarness>, agent: Partial<Agent> & { id: string }) {
+function seedAgent(
+  harness: ReturnType<typeof buildHarness>,
+  agent: Partial<Agent> & { id: string }
+) {
   const now = new Date("2026-01-01T00:00:00.000Z");
   harness.seed({
     agents: [
@@ -207,9 +210,7 @@ describe("agent.run.started", () => {
       description: "Detailed reproduction with logs and stack traces. ".repeat(500),
     });
 
-    expect(Buffer.byteLength(query, "utf8")).toBeLessThanOrEqual(
-      DEFAULT_MAX_RECALL_QUERY_BYTES
-    );
+    expect(Buffer.byteLength(query, "utf8")).toBeLessThanOrEqual(DEFAULT_MAX_RECALL_QUERY_BYTES);
     expect(query).toContain("Fix stuck reviewer runs");
   });
 
@@ -294,8 +295,9 @@ describe("agent.created", () => {
 
     await harness.emit("agent.created", { agentId: "ag-1" }, { companyId: "co-1" });
 
-    const bankCall = fetchMock.mock.calls.find(([url, init]: [string, RequestInit]) =>
-      url.includes("/v1/default/banks/") && init.method === "PUT"
+    const bankCall = fetchMock.mock.calls.find(
+      ([url, init]: [string, RequestInit]) =>
+        url.includes("/v1/default/banks/") && init.method === "PUT"
     );
     expect(bankCall).toBeDefined();
     expect(bankCall?.[0]).toContain("paperclip%3A%3Aco-1%3A%3Aag-1");
