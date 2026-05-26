@@ -4,6 +4,10 @@
 
 ### Added
 
+- `retainMaxChars` config (env: `HINDSIGHT_RETAIN_MAX_CHARS`) to bound
+  Stop-hook retain payloads before they reach Hindsight extraction. Oversized
+  transcripts keep the session head and latest tail with an explicit truncation
+  marker.
 - `{user_id}` template variable for `retainTags` and `retainMetadata`, resolved
   from the `HINDSIGHT_USER_ID` env var (empty string if unset). Enables
   machine-independent per-user memory scoping without hardcoding user ids in
