@@ -2108,7 +2108,12 @@ class MemoryEngine(MemoryEngineInterface):
                 _check_database(),
                 timeout=self.HEALTH_CHECK_DATABASE_TIMEOUT_SECONDS,
             )
-        except TimeoutError:
+        except asyncio.TimeoutError:
+            # asyncio.TimeoutError is an alias of builtin TimeoutError on Python
+            # >=3.11 and the distinct class actually raised by wait_for on <3.11.
+            # The deploy image's Python base is upstream-controlled and unpinned
+            # here, so catching the asyncio alias keeps this degraded-but-healthy
+            # path intact even if that base changes.
             # Liveness must describe the process, not wait behind a saturated DB
             # pool. Surface DB degradation but keep probes responsive so backlog
             # pressure does not trigger restart loops.
