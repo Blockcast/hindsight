@@ -1,9 +1,13 @@
 import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
 
+// Injected by esbuild `define` from package.json at build time — keep in lockstep
+// with the published package version instead of hand-editing this constant.
+declare const __PLUGIN_VERSION__: string;
+
 const manifest: PaperclipPluginManifestV1 = {
   id: "paperclip-plugin-hindsight",
   apiVersion: 1,
-  version: "0.2.3",
+  version: __PLUGIN_VERSION__,
   displayName: "Hindsight Memory",
   author: "Vectorize <support@vectorize.io>",
   description:
