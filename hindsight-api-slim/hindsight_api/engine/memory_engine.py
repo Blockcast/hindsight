@@ -374,6 +374,8 @@ class MemoryEngine(MemoryEngineInterface):
     - bank profile and disposition management
     """
 
+    HEALTH_CHECK_DATABASE_TIMEOUT_SECONDS = 1.0
+
     def __init__(
         self,
         db_url: str | None = None,
@@ -2093,14 +2095,34 @@ class MemoryEngine(MemoryEngineInterface):
         if not self._initialized:
             return {"status": "unhealthy", "reason": "not_initialized"}
 
-        try:
+        async def _check_database() -> dict:
             backend = await self._get_backend()
             async with backend.acquire() as conn:
                 result = await conn.fetchval("SELECT 1")
                 if result == 1:
                     return {"status": "healthy", "database": "connected"}
-                else:
-                    return {"status": "unhealthy", "database": "unexpected response"}
+                return {"status": "unhealthy", "database": "unexpected response"}
+
+        try:
+            return await asyncio.wait_for(
+                _check_database(),
+                timeout=self.HEALTH_CHECK_DATABASE_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            # asyncio.TimeoutError is an alias of builtin TimeoutError on Python
+            # >=3.11 and the distinct class actually raised by wait_for on <3.11.
+            # The deploy image's Python base is upstream-controlled and unpinned
+            # here, so catching the asyncio alias keeps this degraded-but-healthy
+            # path intact even if that base changes.
+            # Liveness must describe the process, not wait behind a saturated DB
+            # pool. Surface DB degradation but keep probes responsive so backlog
+            # pressure does not trigger restart loops.
+            return {
+                "status": "healthy",
+                "database": "timeout",
+                "degraded": True,
+                "reason": "database_health_check_timeout",
+            }
         except Exception as e:
             return {"status": "unhealthy", "database": "error", "error": str(e)}
 

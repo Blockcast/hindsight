@@ -27,6 +27,9 @@ from .entity_labels import (
 )
 
 
+MAX_RETAIN_CONTEXT_CHARS = 12_000
+
+
 def _extract_map_entities(
     entity_obj: dict,
     fields: dict[str, MapField],
@@ -998,6 +1001,12 @@ def _build_user_message(
 
     sanitized_chunk = _sanitize_text(chunk)
     sanitized_context = _sanitize_text(context) if context else "none"
+    if sanitized_context and len(sanitized_context) > MAX_RETAIN_CONTEXT_CHARS:
+        original_context_chars = len(sanitized_context)
+        sanitized_context = (
+            sanitized_context[:MAX_RETAIN_CONTEXT_CHARS]
+            + f"\n[truncated context: {original_context_chars - MAX_RETAIN_CONTEXT_CHARS} chars omitted]"
+        )
 
     if event_date is not None:
         event_date = parse_datetime_flexible(event_date)

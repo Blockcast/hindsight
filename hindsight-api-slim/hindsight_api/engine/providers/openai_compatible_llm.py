@@ -26,6 +26,7 @@ import logging
 import os
 import re
 import time
+from email.utils import parsedate_to_datetime
 from typing import Any
 from urllib.parse import parse_qs, urlparse, urlunparse
 
@@ -221,6 +222,27 @@ def _summarize_status_error(e: APIStatusError, body_max: int = 400) -> str:
     if len(body_str) > body_max:
         body_str = body_str[:body_max] + "...TRUNCATED"
     return f"HTTP {e.status_code}: {body_str or '<no body>'}"
+
+
+def _retry_after_seconds(e: APIStatusError, *, max_backoff: float) -> float | None:
+    """Parse Retry-After for provider cooldowns, capped by max_backoff."""
+    response = getattr(e, "response", None)
+    headers = getattr(response, "headers", None)
+    if not headers:
+        return None
+    retry_after = headers.get("retry-after") or headers.get("Retry-After")
+    if not retry_after:
+        return None
+    try:
+        seconds = float(retry_after)
+    except ValueError:
+        try:
+            seconds = parsedate_to_datetime(retry_after).timestamp() - time.time()
+        except (TypeError, ValueError, OverflowError):
+            return None
+    if seconds <= 0:
+        return None
+    return min(seconds, max_backoff)
 
 
 class OpenAICompatibleLLM(LLMInterface):
@@ -763,9 +785,18 @@ class OpenAICompatibleLLM(LLMInterface):
                         f"APIStatusError ({self.provider}/{self.model}, scope={scope}, "
                         f"attempt {attempt + 1}/{max_retries + 1}): {_summarize_status_error(e)}"
                     )
-                    backoff = min(initial_backoff * (2**attempt), max_backoff)
-                    jitter = backoff * 0.2 * (2 * (time.time() % 1) - 1)
-                    sleep_time = backoff + jitter
+                    retry_after = _retry_after_seconds(e, max_backoff=max_backoff)
+                    if retry_after is not None:
+                        sleep_time = retry_after
+                    else:
+                        backoff = min(initial_backoff * (2**attempt), max_backoff)
+                        jitter = backoff * 0.2 * (2 * (time.time() % 1) - 1)
+                        sleep_time = max(0.0, backoff + jitter)
+                    if e.status_code == 429:
+                        logger.warning(
+                            f"Rate limited ({self.provider}/{self.model}, scope={scope}); "
+                            f"cooling down for {sleep_time:.2f}s before retry"
+                        )
                     await asyncio.sleep(sleep_time)
                 else:
                     logger.error(
