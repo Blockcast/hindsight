@@ -62,11 +62,21 @@ jobs:
       integrations-roo-code: ${{ steps.filter.outputs.integrations-roo-code }}
       dev: ${{ steps.filter.outputs.dev }}
       ci: ${{ steps.filter.outputs.ci }}
-      # Secrets are available for internal PRs and workflow_dispatch.
-      # Fork PRs via pull_request event do NOT have access to secrets.
-      has_secrets: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+      # Secrets are "present" only when the CI repo actually has the cloud
+      # provider keys configured (probed below via COHERE_API_KEY). Upstream
+      # sets them; a fork/mirror that runs hindsight with self-hosted (local)
+      # embeddings won't have them, so secret-dependent jobs skip cleanly
+      # instead of failing on empty keys. (Was: same-repo-PR heuristic, which
+      # wrongly assumed same-repo ⇒ secrets exist.)
+      has_secrets: ${{ steps.secrets.outputs.has }}
     steps:
     - uses: actions/checkout@v6
+
+    - id: secrets
+      env:
+        PROBE: ${{ secrets.COHERE_API_KEY }}
+      run: |
+        if [ -n "$PROBE" ]; then echo "has=true" >> "$GITHUB_OUTPUT"; else echo "has=false" >> "$GITHUB_OUTPUT"; fi
 
     - uses: dorny/paths-filter@v4
       id: filter
@@ -1179,14 +1189,14 @@ jobs:
     # Only test slim variants to save disk space (they're much smaller)
     # Slim variants require external embedding providers
     - name: Setup GCP credentials for smoke test
-      if: matrix.variant == 'slim'
+      if: matrix.variant == 'slim' && needs.detect-changes.outputs.has_secrets == 'true'
       run: |
         printf '%s' '${{ secrets.GCP_VERTEXAI_CREDENTIALS }}' > /tmp/gcp-credentials.json
         PROJECT_ID=$(jq -r '.project_id' /tmp/gcp-credentials.json)
         echo "HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$PROJECT_ID" >> $GITHUB_ENV
 
     - name: Smoke test - verify container starts
-      if: matrix.variant == 'slim'
+      if: matrix.variant == 'slim' && needs.detect-changes.outputs.has_secrets == 'true'
       env:
         HINDSIGHT_API_LLM_PROVIDER: vertexai
         HINDSIGHT_API_LLM_MODEL: google/gemini-2.5-flash-lite

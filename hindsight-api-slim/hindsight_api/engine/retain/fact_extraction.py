@@ -26,7 +26,6 @@ from .entity_labels import (
     parse_entity_labels,
 )
 
-
 MAX_RETAIN_CONTEXT_CHARS = 12_000
 
 
