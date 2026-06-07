@@ -53,6 +53,37 @@ def _count_delta_content_tokens(delta_contents: list["RetainContent"]) -> int:
     return total
 
 
+# Fixed namespace for deriving deterministic document IDs from content. NEVER
+# change this value: it would change the derived IDs of every content-addressed
+# document and break idempotent re-ingest against already-stored rows.
+_DOCUMENT_ID_NAMESPACE = uuid.UUID("a3f2e1d0-7c4b-5a69-b8e2-1f0c9d6a4b73")
+
+
+def _derive_document_id(contents_dicts: list["RetainContentDict"]) -> str:
+    """Deterministic document_id derived from batch content + context namespace.
+
+    Fallback used when a caller supplies no explicit document_id. Making the id a
+    content hash (rather than a random uuid4) means re-ingesting identical
+    content+context upserts the same ``documents (id, bank_id)`` row via the
+    existing ON CONFLICT path instead of creating a duplicate — the random-uuid4
+    fallback was the source of the exact-duplicate documents found in the
+    BLO-9319 bank dedup.
+
+    Namespacing the hash by ``context`` keeps two intentionally-distinct
+    documents that happen to share identical content separate; only same-content
+    AND same-context re-ingests collapse. Returned as a uuid5 string so the id
+    keeps the 36-char shape of the historical uuid4 ids (document_id is never
+    parsed as a UUID downstream, but chunk ids concatenate it and the UI renders
+    it). Content is sanitized with the same helper used for ``content_hash`` so
+    whitespace/encoding noise does not perturb the id.
+    """
+    combined_content = "\n".join(item.get("content", "") or "" for item in contents_dicts)
+    combined_context = "\n".join(item.get("context", "") or "" for item in contents_dicts)
+    sanitized_content = fact_extraction._sanitize_text(combined_content) or ""
+    sanitized_context = fact_extraction._sanitize_text(combined_context) or ""
+    return str(uuid.uuid5(_DOCUMENT_ID_NAMESPACE, f"{sanitized_context}|{sanitized_content}"))
+
+
 def parse_datetime_flexible(value: Any) -> datetime:
     """
     Parse a datetime value that could be either a datetime object or an ISO string.
@@ -478,7 +509,7 @@ async def retain_batch(
             groups: dict[str, tuple[list[RetainContentDict], list[RetainContent]]] = {}
             original_indices: dict[str, list[int]] = {}
             for idx, (cd, c) in enumerate(zip(contents_dicts, contents)):
-                doc_key = cd.get("document_id") or str(uuid.uuid4())
+                doc_key = cd.get("document_id") or _derive_document_id([cd])
                 if doc_key not in groups:
                     groups[doc_key] = ([], [])
                     original_indices[doc_key] = []
@@ -550,7 +581,9 @@ async def retain_batch(
         except Exception:
             pass
     if not effective_doc_id:
-        effective_doc_id = str(uuid.uuid4())
+        # Content-derived (deterministic) id so re-ingesting identical
+        # content+context upserts the same document instead of duplicating it.
+        effective_doc_id = _derive_document_id(contents_dicts)
 
     # Record effective_doc_id on the operation (idempotent set-append). Captures
     # both user-provided and generated ids so the operation shows every document
