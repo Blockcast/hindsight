@@ -10,18 +10,89 @@ set -e
 # loss scenarios where a container restart caused the data directory to be
 # wiped despite a volume mount being present.
 # =============================================================================
-PG0_DATA_DIR="${HOME}/.pg0"
-if [ -d "$PG0_DATA_DIR" ]; then
+pg0_has_pg_version() {
+    local pg0_data_dir="$1"
+
+    # pg0 has used more than one on-disk layout. Newer standalone images keep
+    # PostgreSQL data under instances/<name>/data, while older volumes may have
+    # placed PG_VERSION at or one level below the mount.
+    [ -f "$pg0_data_dir/PG_VERSION" ] && return 0
+    compgen -G "$pg0_data_dir"/*/PG_VERSION > /dev/null 2>&1 && return 0
+    compgen -G "$pg0_data_dir"/instances/*/data/PG_VERSION > /dev/null 2>&1 && return 0
+
+    return 1
+}
+
+check_pg0_data_integrity() {
+    local pg0_data_dir="$1"
+
+    if [ ! -d "$pg0_data_dir" ]; then
+        return 0
+    fi
+
     # Look for actual PostgreSQL data directories (pg0 creates subdirs per instance)
-    if compgen -G "$PG0_DATA_DIR"/*/PG_VERSION > /dev/null 2>&1; then
-        echo "✅ Existing pg0 data directory detected at $PG0_DATA_DIR"
-    elif [ "$(ls -A "$PG0_DATA_DIR" 2>/dev/null)" ]; then
-        echo "⚠️  WARNING: pg0 data directory exists at $PG0_DATA_DIR but no PG_VERSION found."
+    if pg0_has_pg_version "$pg0_data_dir"; then
+        echo "✅ Existing pg0 data directory detected at $pg0_data_dir"
+    elif [ "$(ls -A "$pg0_data_dir" 2>/dev/null)" ]; then
+        echo "⚠️  WARNING: pg0 data directory exists at $pg0_data_dir but no PG_VERSION found."
         echo "   This may indicate data corruption or an incomplete previous shutdown."
         echo "   If you see all migrations running from scratch after this, your data may have been lost."
         echo "   See: https://github.com/vectorize-io/hindsight/issues/675"
     fi
+
+    return 0
+}
+
+# =============================================================================
+# Embedded pg0 writability pre-check (#1483)
+#
+# The container runs as the unprivileged `hindsight` user (UID 1000). When the
+# pg0 data directory is a host bind mount (e.g. `-v $HOME/dir:/home/hindsight/.pg0`)
+# that is not owned by UID 1000 — the default on macOS Docker Desktop and most
+# non-1000 Linux hosts — pg0 fails with the opaque "Permission denied (os error
+# 13)". We cannot chown it ourselves without root (and the image is deliberately
+# rootless), so we surface an actionable message up front instead.
+#
+# Docker *named* volumes are seeded with the image directory's ownership (UID
+# 1000) on first use, so they avoid this entirely — hence the named-volume
+# recommendation below and in the README.
+# =============================================================================
+check_pg0_writable() {
+    local pg0_data_dir="$1"
+
+    # Only relevant for embedded pg0; an external database doesn't use this dir.
+    if [ -n "${HINDSIGHT_API_DATABASE_URL:-}" ]; then
+        return 0
+    fi
+
+    mkdir -p "$pg0_data_dir" 2>/dev/null || true
+    if touch "$pg0_data_dir/.hindsight-write-test" 2>/dev/null; then
+        rm -f "$pg0_data_dir/.hindsight-write-test" 2>/dev/null || true
+        return 0
+    fi
+
+    echo "❌ The embedded database directory $pg0_data_dir is not writable by this container (UID $(id -u))."
+    echo ""
+    echo "   A host directory was bind-mounted but is not owned by the container user (UID 1000)."
+    echo "   Hindsight runs rootless and cannot fix this for you. Choose one:"
+    echo ""
+    echo "   • Recommended — use a Docker named volume (auto-owned by the container):"
+    echo "       -v hindsight-data:/home/hindsight/.pg0"
+    echo ""
+    echo "   • Or keep the host path and run as your host user, chowning it to match:"
+    echo "       sudo chown -R \$(id -u):\$(id -g) <host-directory>"
+    echo "       docker run --user \$(id -u):\$(id -g) -e HOME=/home/hindsight ..."
+    echo ""
+    echo "   See https://github.com/vectorize-io/hindsight/issues/1483"
+    return 1
+}
+
+if [ "${HINDSIGHT_START_ALL_SOURCE_ONLY:-false}" = "true" ]; then
+    return 0 2>/dev/null || exit 0
 fi
+
+check_pg0_data_integrity "${HOME}/.pg0"
+check_pg0_writable "${HOME}/.pg0" || exit 1
 
 # Service flags (default to true if not set)
 ENABLE_API="${HINDSIGHT_ENABLE_API:-true}"
@@ -156,7 +227,7 @@ PIDS=()
 # Start API if enabled
 if [ "$ENABLE_API" = "true" ]; then
     cd /app/api
-    API_HEALTH_URL="${HINDSIGHT_API_HEALTH_URL:-http://localhost:8888/health}"
+    API_HEALTH_URL="${HINDSIGHT_API_HEALTH_URL:-http://localhost:${HINDSIGHT_API_PORT:-8888}/health}"
     API_STARTUP_WAIT_SECONDS="${HINDSIGHT_API_STARTUP_WAIT_SECONDS:-300}"
 
     # Run API directly - Python's PYTHONUNBUFFERED=1 handles output buffering

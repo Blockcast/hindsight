@@ -15,23 +15,37 @@ NOTE: Observations are distinct from mental models (pinned reflections).
 - Mental models: user-defined queries stored in the mental_models table, refreshed on demand via reflect
 """
 
+import asyncio
 import json
 import logging
 import time
 import uuid
-from dataclasses import dataclass, field
+from collections import defaultdict
+from contextlib import AsyncExitStack
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from itertools import combinations
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, field_validator
 
 from ...config import get_config
+from ...worker.stage import set_stage
 from ..db_utils import acquire_with_retry
+from ..llm_trace import (
+    record_created_memory_ids,
+    record_source_memory_ids,
+    reset_trace_context,
+    set_trace_context,
+    trace_context_of,
+)
 from ..llm_wrapper import sanitize_llm_output
 from ..memory_engine import Budget, fq_table
 from ..retain import embedding_utils
-from .prompts import build_batch_consolidation_prompt
+from .prompts import (
+    build_consolidation_input,
+    build_consolidation_system_prompt,
+)
 
 if TYPE_CHECKING:
     from asyncpg import Connection
@@ -41,6 +55,339 @@ if TYPE_CHECKING:
     from ..response_models import MemoryFact, RecallResult
 
 logger = logging.getLogger(__name__)
+
+
+def _norm_obs_text(text: str) -> str:
+    """Whitespace-normalised observation text for exact-duplicate matching.
+
+    Collapses runs of whitespace only; case is preserved. The reconciliation guard
+    drops a CREATE on the premise that an exact-text match loses no information — but
+    case-folding would also drop a create differing only in case (e.g. "TLS" vs "tls"),
+    which *does* lose information, so we match case-sensitively.
+    """
+    return " ".join((text or "").split()).strip()
+
+
+def _duplicate_create_target(
+    create_text: str,
+    shown_obs_by_text: "dict[str, MemoryFact]",
+    update_texts: set[str],
+) -> str | None:
+    """Return a human label for what ``create_text`` duplicates, or None if novel.
+
+    A CREATE is a duplicate when its normalised text matches an observation that was
+    already shown to the LLM, or the text of an UPDATE issued in the same response
+    (the model occasionally UPDATEs the twin to text X and also CREATEs X). Exact-text
+    match means no information is lost by dropping the CREATE.
+    """
+    norm = _norm_obs_text(create_text)
+    matched = shown_obs_by_text.get(norm)
+    if matched is not None:
+        return f"shown observation {str(matched.id)[:8]}"
+    if norm in update_texts:
+        return "an UPDATE in this response"
+    return None
+
+
+# Top-K existing observations probed (by the new observation's own embedding) when
+# semantic dedup is enabled. Small: we only need the nearest few candidates.
+_DEDUP_TOP_K = 5
+
+
+class _DedupDecision(BaseModel):
+    """Focused 1-by-1 verdict for whether a new observation duplicates an existing one."""
+
+    action: Literal["merge", "keep"]
+    text: str = ""  # the synthesized merged observation (when action == "merge")
+    reason: str = ""
+
+
+_DEDUP_PROMPT = """You reconcile long-term memory observations. A NEW observation is about to be \
+stored, and it is highly similar to an EXISTING one:
+
+[NEW] {new}
+[EXISTING] {existing}
+
+If they assert the SAME fact (wording aside), respond action="merge" and provide `text`: a single \
+observation that preserves EVERY detail from both. If they differ in ANY important detail — a \
+number/quantity, a named entity or language, a negation, or a condition — respond action="keep"."""
+
+
+def _dedup_active(config: Any) -> bool:
+    """Whether create/update semantic dedup runs for this consolidation.
+
+    Enabled when the resolved threshold is < 1.0, EXCEPT on Oracle: the merge path uses
+    Postgres-only SQL (``unnest``/``array_agg``, ``UPDATE ... FROM``), so on Oracle dedup is
+    skipped — it behaves exactly as it did before this feature, regardless of the configured
+    threshold. This is why the feature can ship enabled-by-default without breaking Oracle.
+    """
+    if config is None or getattr(config, "consolidation_dedup_threshold", 1.0) >= 1.0:
+        return False
+    return get_config().database_backend != "oracle"
+
+
+@dataclass
+class _DedupOutcome:
+    """Result of probing one observation against its in-scope neighbours.
+
+    ``best_id`` is the nearest observation at/above the threshold (None if none),
+    ``merged_text`` is the LLM-synthesized union text (set only when ``should_merge``).
+    """
+
+    best_id: str | None
+    merged_text: str
+    should_merge: bool
+
+
+async def _dedup_adjudicate(
+    conn: "Connection",
+    memory_engine: "MemoryEngine",
+    bank_id: str,
+    config: Any,
+    dedup_llm_config: Any,
+    anchor_text: str,
+    anchor_emb_str: str | None,
+    tags: list[str] | None,
+    exclude_id: str | None,
+) -> _DedupOutcome:
+    """Probe one observation's embedding against in-scope observations and adjudicate a merge.
+
+    Anchored on the observation text — the correct obs<->obs comparison, unlike consolidation
+    recall which is anchored on the raw fact. Returns the nearest observation at/above
+    ``consolidation_dedup_threshold`` and, when found, the LLM's focused 1-by-1 merge-or-keep
+    verdict (scope ``consolidation_dedup``): the LLM reads both texts, so a word-level difference
+    (number / negation / entity) is respected. ``exclude_id`` skips the anchor observation itself
+    (used by the UPDATE path, where the anchor row already exists and would self-match at 1.0).
+    ``anchor_emb_str`` reuses an already-computed embedding (the UPDATE path just embedded it);
+    pass None to embed ``anchor_text`` here (the CREATE path).
+    """
+    from ..search.retrieval import retrieve_semantic_bm25_combined
+
+    threshold = config.consolidation_dedup_threshold
+    if anchor_emb_str is None:
+        embs = await embedding_utils.generate_embeddings_batch(memory_engine.embeddings, [anchor_text])
+        if not embs:
+            return _DedupOutcome(best_id=None, merged_text="", should_merge=False)
+        anchor_emb_str = str(embs[0])
+    tags_match = "all_strict" if tags else "any"
+    grouped = await retrieve_semantic_bm25_combined(
+        conn, anchor_emb_str, anchor_text, bank_id, ["observation"], _DEDUP_TOP_K, tags=tags, tags_match=tags_match
+    )
+    results = grouped.get("observation", ([], []))[0]
+    best_id: str | None = None
+    best_text = ""
+    best_sim = threshold  # only candidates at/above the threshold are considered
+    for r in results:
+        rid = str(r.id)
+        if exclude_id is not None and rid == exclude_id:
+            continue  # never match the anchor observation against itself
+        sim = r.similarity or 0.0
+        if sim >= best_sim:
+            best_id, best_text, best_sim = rid, r.text, sim
+
+    if best_id is None:
+        return _DedupOutcome(best_id=None, merged_text="", should_merge=False)
+
+    decision: _DedupDecision = await dedup_llm_config.call(
+        messages=[{"role": "user", "content": _DEDUP_PROMPT.format(new=anchor_text, existing=best_text)}],
+        response_format=_DedupDecision,
+        scope="consolidation_dedup",
+    )
+    if decision.action != "merge":
+        return _DedupOutcome(best_id=best_id, merged_text="", should_merge=False)
+    return _DedupOutcome(best_id=best_id, merged_text=decision.text.strip() or best_text, should_merge=True)
+
+
+async def _dedup_reconcile_create(
+    conn: "Connection",
+    memory_engine: "MemoryEngine",
+    bank_id: str,
+    config: Any,
+    dedup_llm_config: Any,
+    create_text: str,
+    create_source_ids: list[uuid.UUID],
+    tags: list[str] | None,
+) -> str | None:
+    """Semantic dedup for a single CREATE (create-time, focused 1-by-1).
+
+    On "merge", folds the new source facts + the synthesized text into the existing
+    observation and returns its id (caller skips the CREATE). Returns None when there is
+    no near twin or the LLM keeps them distinct.
+    """
+    outcome = await _dedup_adjudicate(
+        conn, memory_engine, bank_id, config, dedup_llm_config, create_text, None, tags, exclude_id=None
+    )
+    if not outcome.should_merge or outcome.best_id is None:
+        return None
+
+    # Fold the new source facts into the twin and persist the merged text. We keep the twin's
+    # existing embedding: the merged text is >= threshold similar, so the stored vector stays
+    # representative and we avoid a re-embed + a dialect-specific vector UPDATE.
+    await conn.execute(
+        f"""
+        UPDATE {fq_table("memory_units")}
+        SET text = $1,
+            source_memory_ids = (SELECT array_agg(DISTINCT e) FROM unnest(source_memory_ids || $2::uuid[]) e),
+            proof_count = (SELECT count(DISTINCT e) FROM unnest(source_memory_ids || $2::uuid[]) e),
+            updated_at = now()
+        WHERE id = $3::uuid
+        """,
+        outcome.merged_text,
+        create_source_ids,
+        uuid.UUID(outcome.best_id),
+    )
+    return outcome.best_id
+
+
+async def _dedup_reconcile_update(
+    conn: "Connection",
+    memory_engine: "MemoryEngine",
+    bank_id: str,
+    config: Any,
+    dedup_llm_config: Any,
+    updated_id: str,
+    updated_text: str,
+    updated_emb_str: str | None,
+    tags: list[str] | None,
+) -> None:
+    """Semantic dedup for an UPDATE (after the observation was rewritten + re-embedded).
+
+    An UPDATE rewrites an observation's text and re-embeds it, so its vector can drift to
+    within threshold of a DIFFERENT existing observation. The create-time guard never sees
+    this (it only runs on CREATE), so without this the two persist as a near-duplicate pair —
+    the measured residual-duplicate source. Probe the updated observation's new embedding
+    against the others (excluding itself); on "merge", fold the just-updated observation's
+    sources into the twin, persist the merged text, and DELETE the updated row. Unlike the
+    CREATE path the row already exists, so reconciliation is a fold-and-delete, not a skip.
+    """
+    outcome = await _dedup_adjudicate(
+        conn,
+        memory_engine,
+        bank_id,
+        config,
+        dedup_llm_config,
+        updated_text,
+        updated_emb_str,
+        tags,
+        exclude_id=updated_id,
+    )
+    if not outcome.should_merge or outcome.best_id is None:
+        return
+
+    # Fold the updated observation's sources into the twin (keeping the twin's embedding, as in
+    # the create path) then delete the now-redundant updated row. The all_strict/any tag match
+    # guarantees twin and updated share scope, so dropping the updated row's tags loses no
+    # visibility. Temporal fields follow the surviving twin (minimal scope; matches create).
+    await conn.execute(
+        f"""
+        UPDATE {fq_table("memory_units")} t
+        SET text = $1,
+            source_memory_ids = (
+                SELECT array_agg(DISTINCT e) FROM unnest(t.source_memory_ids || u.source_memory_ids) e
+            ),
+            proof_count = (
+                SELECT count(DISTINCT e) FROM unnest(t.source_memory_ids || u.source_memory_ids) e
+            ),
+            updated_at = now()
+        FROM {fq_table("memory_units")} u
+        WHERE t.id = $2::uuid AND u.id = $3::uuid
+        """,
+        outcome.merged_text,
+        uuid.UUID(outcome.best_id),
+        uuid.UUID(updated_id),
+    )
+    await _execute_delete_action(conn, bank_id, updated_id)
+    logger.info(
+        "[CONSOLIDATION] dedup-merged updated observation %s into %s (cosine>=%.2f)",
+        updated_id[:8],
+        outcome.best_id[:8],
+        config.consolidation_dedup_threshold,
+    )
+
+
+@dataclass
+class _BatchDeltas:
+    """Per-LLM-batch deltas, merged into the job's running stats after dispatch.
+
+    Returned by value rather than mutated into the outer ``stats`` /
+    ``consolidated_tags`` so parallel batches cannot race on those shared
+    structures (the merge happens once, serially, after dispatch completes).
+    """
+
+    stats: dict[str, int]
+    tags: set[str]
+    cancelled: bool
+
+
+def _parse_observation_scopes(memory: dict[str, Any]) -> Any:
+    """Parse the per-memory ``observation_scopes`` column from a DB row.
+
+    asyncpg may return JSONB as a raw JSON string depending on driver settings;
+    accept both that and a pre-parsed value.
+    """
+    raw = memory.get("observation_scopes")
+    return json.loads(raw) if isinstance(raw, str) else raw
+
+
+def _resolve_obs_tags_list(memory: dict[str, Any]) -> list[list[str]] | None:
+    """Resolve a memory's ``observation_scopes`` spec into concrete scope tags.
+
+    Returns ``None`` for the default ``combined``-mode single pass (caller uses
+    the memory's own tags). Returns a list[list[str]] when the memory requested
+    multi-pass scoping (``per_tag``, ``all_combinations``, or an explicit list).
+    """
+    parsed = _parse_observation_scopes(memory)
+    tags = list(memory.get("tags") or [])
+
+    if parsed == "per_tag":
+        return [[t] for t in tags] if tags else None
+    if parsed == "all_combinations":
+        if not tags:
+            return None
+        return [list(c) for r in range(1, len(tags) + 1) for c in combinations(tags, r)]
+    if parsed == "combined" or parsed is None:
+        return None
+    return parsed  # explicit list[list[str]]
+
+
+def _resolve_write_scopes(memory: dict[str, Any]) -> list[frozenset[str]]:
+    """Return the observation scopes a memory will write to, as frozensets.
+
+    Used by the parallel dispatcher to acquire one lock per scope before
+    processing a tag group, so that two groups whose write-scope sets overlap
+    serialise on the overlapping scopes rather than racing on the same
+    observation row. The mapping mirrors ``_resolve_obs_tags_list`` exactly:
+
+    - ``combined`` / ``None``    -> ``[frozenset(memory.tags)]``
+    - ``per_tag``                -> ``[frozenset({t}) for t in memory.tags]``
+    - ``all_combinations``       -> one frozenset per nonempty subset of tags
+    - explicit ``list[list[str]]`` -> one frozenset per declared scope
+
+    Empty-tag memories collapse to a single ``frozenset()`` in all modes so they
+    still take exactly one lock and serialise against other untagged work.
+    """
+    parsed = _parse_observation_scopes(memory)
+    tags = list(memory.get("tags") or [])
+
+    if parsed == "per_tag":
+        return [frozenset([t]) for t in tags] if tags else [frozenset()]
+    if parsed == "all_combinations":
+        if not tags:
+            return [frozenset()]
+        return [frozenset(c) for r in range(1, len(tags) + 1) for c in combinations(tags, r)]
+    if parsed == "combined" or parsed is None:
+        return [frozenset(tags)]
+    return [frozenset(s) for s in parsed]  # explicit list[list[str]]
+
+
+def _scope_sort_key(scope: frozenset[str]) -> tuple[str, ...]:
+    """Total ordering on scope frozensets for deadlock-free lock acquisition.
+
+    Every parallel group acquires its scope locks in this same order, so two
+    groups that share any subset of scopes cannot acquire them in opposite
+    orders and deadlock.
+    """
+    return tuple(sorted(scope))
 
 
 async def _filter_live_source_memories(
@@ -79,6 +426,9 @@ async def _filter_live_source_memories(
 class _CreateAction(BaseModel):
     text: str
     source_fact_ids: list[str]  # memory UUIDs from the NEW FACTS list
+    # One-sentence justification from the LLM (why CREATE vs UPDATE). Diagnostic
+    # only — surfaced in the consolidation trace to explain duplicate creates.
+    reason: str = ""
 
     @field_validator("text", mode="before")
     @classmethod
@@ -90,6 +440,7 @@ class _UpdateAction(BaseModel):
     text: str
     observation_id: str  # UUID of the existing observation to update
     source_fact_ids: list[str]  # memory UUIDs from the NEW FACTS list
+    reason: str = ""  # LLM's one-sentence justification (diagnostic only)
 
     @field_validator("text", mode="before")
     @classmethod
@@ -99,6 +450,7 @@ class _UpdateAction(BaseModel):
 
 class _DeleteAction(BaseModel):
     observation_id: str  # UUID of the observation to remove
+    reason: str = ""  # LLM's one-sentence justification (diagnostic only)
 
 
 class _ConsolidationBatchResponse(BaseModel):
@@ -215,6 +567,25 @@ class ConsolidationPerfLog:
         self.total_obs_in_context += obs_count
         self.total_prompt_chars += prompt_chars
 
+    def merge_from(self, other: "ConsolidationPerfLog") -> None:
+        """Merge a per-batch perf log into this (job-level) one.
+
+        Used by the parallel dispatcher: each in-flight batch records into its
+        own ``ConsolidationPerfLog`` so the per-batch log line shows only that
+        batch's timings (no cross-batch interleaving). After the batch finishes
+        we fold the local counters into the job-level perf, which then drives
+        the final ``flush()`` summary.
+
+        ``lines`` is intentionally NOT merged — log lines are emitted directly
+        in ``logger.info`` calls by the dispatcher; the perf object's ``lines``
+        buffer is only used by the top-level job summary.
+        """
+        for key, value in other.timings.items():
+            self.timings[key] = self.timings.get(key, 0.0) + value
+        self.llm_calls += other.llm_calls
+        self.total_obs_in_context += other.total_obs_in_context
+        self.total_prompt_chars += other.total_prompt_chars
+
     def flush(self) -> None:
         """Flush all log lines to the logger."""
         total_time = time.time() - self.start_time
@@ -230,6 +601,7 @@ async def run_consolidation_job(
     bank_id: str,
     request_context: "RequestContext",
     operation_id: str | None = None,
+    observation_scopes: list[list[str]] | None = None,
 ) -> dict[str, Any]:
     """
     Run consolidation job for a bank.
@@ -240,6 +612,10 @@ async def run_consolidation_job(
         memory_engine: MemoryEngine instance
         bank_id: Bank identifier
         request_context: Request context for authentication
+        operation_id: Optional operation ID for tracking
+        observation_scopes: Optional list of tag scopes. When provided, only
+            unconsolidated memories whose tags contain all tags in at least one
+            scope are processed.
 
     Returns:
         Dict with consolidation results
@@ -249,8 +625,36 @@ async def run_consolidation_job(
 
     # Build a configured LLM wrapper that applies per-bank settings (e.g. safety settings)
     # to every call without leaking across operations.
-    llm_config = memory_engine._consolidation_llm_config.with_config(config)
+    llm_config = memory_engine._consolidation_llm_config.with_config(config, bank_id=bank_id, operation="consolidation")
 
+    # Bind the operation trace context for the whole run so the create/update DB
+    # sites (deep inside _process_memory_batch) can accumulate the observations
+    # this consolidation produced and the source memories it consumed onto the
+    # trace — flushed onto every trace row on exit by attach_memory_ids.
+    trace_ctx = trace_context_of(llm_config)
+    trace_token = set_trace_context(trace_ctx) if trace_ctx is not None else None
+    try:
+        return await _run_consolidation_job(
+            memory_engine, bank_id, request_context, config, llm_config, operation_id, observation_scopes
+        )
+    finally:
+        if trace_token is not None:
+            reset_trace_context(trace_token)
+            # Fire-and-forget: patched on a background task, off the consolidation
+            # critical path.
+            memory_engine._llm_recorder.attach_memory_ids(trace_ctx)
+
+
+async def _run_consolidation_job(
+    memory_engine: "MemoryEngine",
+    bank_id: str,
+    request_context: "RequestContext",
+    config: Any,
+    llm_config: Any,
+    operation_id: str | None = None,
+    observation_scopes: list[list[str]] | None = None,
+) -> dict[str, Any]:
+    """Core consolidation flow. See ``run_consolidation_job`` for the public entrypoint."""
     perf = ConsolidationPerfLog(bank_id)
     max_memories_per_batch = config.consolidation_batch_size
     max_memories_per_round = config.consolidation_max_memories_per_round
@@ -281,6 +685,18 @@ async def run_consolidation_job(
 
         perf.record_timing("fetch_bank", time.time() - t0)
 
+        # Build optional scope filter clause.  When observation_scopes is provided,
+        # only process memories whose tags contain all tags in at least one scope.
+        scope_clause = ""
+        scope_params: list[Any] = [bank_id]
+        if observation_scopes:
+            or_parts: list[str] = []
+            for scope_tags in observation_scopes:
+                idx = len(scope_params) + 1
+                or_parts.append(f"tags @> ${idx}::varchar[]")
+                scope_params.append(scope_tags)
+            scope_clause = " AND (" + " OR ".join(or_parts) + ")"
+
         # Count total unconsolidated memories for progress logging
         total_count = await conn.fetchval(
             f"""
@@ -290,8 +706,9 @@ async def run_consolidation_job(
               AND consolidated_at IS NULL
               AND consolidation_failed_at IS NULL
               AND fact_type IN ('experience', 'world')
+              {scope_clause}
             """,
-            bank_id,
+            *scope_params,
         )
 
     if total_count == 0:
@@ -300,6 +717,44 @@ async def run_consolidation_job(
 
     logger.info(f"[CONSOLIDATION] bank={bank_id} total_unconsolidated={total_count}")
     perf.log(f"[1] Found {total_count} pending memories to consolidate")
+
+    # Initial durable progress snapshot so an operator polling the operation status
+    # API sees the job has started and how much work it found, before the first batch
+    # of LLM work completes (which can take minutes on a dense bank). Uses the same
+    # "consolidating" stage as the per-batch heartbeat so the operator sees a single
+    # phase advancing 0/N -> N/N rather than an opaque "scanning" -> "processing" hop.
+    set_stage("consolidation.consolidating")
+    await memory_engine._write_operation_progress(operation_id, stage="consolidating", processed=0, total=total_count)
+
+    async def _count_unconsolidated() -> int:
+        """Re-count memories still pending consolidation in this job's scope.
+
+        ``total_count`` is a point-in-time estimate from job start; memories retained
+        while consolidation runs get picked up by later fetches, so processed can pass
+        it. When that happens we re-count to report a real total (processed + remaining)
+        instead of pinning the bar at 100%."""
+        async with acquire_with_retry(pool) as count_conn:
+            pending = await count_conn.fetchval(
+                f"""
+                SELECT COUNT(*)
+                FROM {fq_table("memory_units")}
+                WHERE bank_id = $1
+                  AND consolidated_at IS NULL
+                  AND consolidation_failed_at IS NULL
+                  AND fact_type IN ('experience', 'world')
+                  {scope_clause}
+                """,
+                *scope_params,
+            )
+        return pending or 0
+
+    async def _progress_total(processed: int) -> int:
+        # Cheap path: while we're still within the start-of-job estimate it's exact, so
+        # no extra query. Only re-count once the estimate is exhausted (≈the final batch
+        # normally, or repeatedly only if memories keep arriving mid-run).
+        if processed < total_count:
+            return total_count
+        return processed + await _count_unconsolidated()
 
     # Process each memory with individual commits for crash recovery
     stats: dict[str, int] = {
@@ -321,6 +776,18 @@ async def run_consolidation_job(
     hit_round_limit = False
 
     llm_batch_num = 0
+    # Cumulative counters across the whole job, shared by the per-batch log and the
+    # durable progress snapshot so both report processed/total (and observation
+    # tallies) under parallelism. Mutable container so the inner closure can update
+    # without a `nonlocal`.
+    cumulative_progress = {
+        "processed": 0,
+        "observations_created": 0,
+        "observations_updated": 0,
+        "observations_merged": 0,
+        "observations_deleted": 0,
+        "memories_failed": 0,
+    }
     while True:
         # Cap fetch size by remaining round budget
         fetch_limit = (
@@ -330,6 +797,9 @@ async def run_consolidation_job(
         # Fetch next batch of unconsolidated memories
         async with acquire_with_retry(pool) as conn:
             t0 = time.time()
+            # scope_params[0] is bank_id; append fetch_limit after scope params
+            fetch_params = list(scope_params) + [fetch_limit]
+            limit_idx = len(fetch_params)
             memories = await conn.fetch(
                 f"""
                 SELECT id, text, fact_type, occurred_start, occurred_end, event_date, tags, mentioned_at,
@@ -339,11 +809,11 @@ async def run_consolidation_job(
                   AND consolidated_at IS NULL
                   AND consolidation_failed_at IS NULL
                   AND fact_type IN ('experience', 'world')
+                  {scope_clause}
                 ORDER BY created_at ASC
-                LIMIT $2
+                LIMIT ${limit_idx}
                 """,
-                bank_id,
-                fetch_limit,
+                *fetch_params,
             )
             perf.record_timing("fetch_memories", time.time() - t0)
 
@@ -357,73 +827,63 @@ async def run_consolidation_job(
             tag_key = tuple(sorted(m.get("tags") or []))
             tag_groups.setdefault(tag_key, []).append(dict(m))
 
-        # Flatten into LLM batches respecting both tag groups and llm_batch_size
-        llm_batches: list[list[dict[str, Any]]] = []
+        # Split each tag group into LLM batches respecting llm_batch_size, keeping
+        # the group boundary intact so the dispatcher can parallelise across
+        # distinct groups while running each group's batches serially.
+        grouped_batches: list[list[list[dict[str, Any]]]] = []
         for group in tag_groups.values():
-            for i in range(0, len(group), llm_batch_size):
-                llm_batches.append(group[i : i + llm_batch_size])
+            grouped_batches.append([group[i : i + llm_batch_size] for i in range(0, len(group), llm_batch_size)])
 
-        for llm_batch in llm_batches:
-            llm_batch_num += 1
+        # Compute each group's union write-scope set. Used below to acquire
+        # per-scope locks: any two groups whose write-scope sets share a scope S
+        # will serialise on the lock for S, leaving truly disjoint groups to run
+        # concurrently. We union over every memory because per-memory
+        # observation_scopes can differ within a group.
+        group_scopes: list[list[frozenset[str]]] = []
+        for batches in grouped_batches:
+            scopes: set[frozenset[str]] = set()
+            for batch in batches:
+                for memory in batch:
+                    scopes.update(_resolve_write_scopes(memory))
+            group_scopes.append(sorted(scopes, key=_scope_sort_key))
+
+        async def _process_one_llm_batch(llm_batch_local: list[dict[str, Any]], batch_num_local: int) -> _BatchDeltas:
+            """Process one LLM batch independently. Returns local deltas + cancelled flag.
+
+            Each batch records timings/llm-call counters into its OWN
+            ``ConsolidationPerfLog`` so the per-batch log line reflects only
+            this batch's work — not interleaved timings from concurrent batches
+            sharing the global ``perf``. The local perf is merged into the
+            job-level ``perf`` once at the end so the final summary still totals
+            everything.
+            """
             llm_batch_start = time.time()
+            batch_perf = ConsolidationPerfLog(bank_id)
 
-            # Snapshot perf and stats before this LLM batch
-            snap_timings = perf.timings.copy()
-            snap_llm_calls = perf.llm_calls
-            snap_total_chars = perf.total_prompt_chars
-            snap_stats = stats.copy()
-
-            # Track tags for mental model refresh filtering
-            for memory in llm_batch:
+            local_tags: set[str] = set()
+            for memory in llm_batch_local:
                 memory_tags = memory.get("tags") or []
                 if memory_tags:
-                    consolidated_tags.update(memory_tags)
+                    local_tags.update(memory_tags)
 
-            # Process llm_batch with adaptive splitting: on LLM failure, halve the sub-batch
-            # and retry, down to batch_size=1. Only if a single-memory batch still fails is
-            # the memory marked with consolidation_failed_at and excluded from future runs
-            # until explicitly retried via the API.
+            # Adaptive splitting: on LLM failure, halve the sub-batch and retry,
+            # down to batch_size=1. Only if a single-memory batch still fails is
+            # the memory marked with consolidation_failed_at.
             all_results: list[dict[str, Any]] = []
             all_deleted = 0
             succeeded_ids: list[Any] = []
             failed_ids: list[Any] = []
 
-            pending: list[list[dict[str, Any]]] = [llm_batch]
+            pending: list[list[dict[str, Any]]] = [llm_batch_local]
             while pending:
                 sub_batch = pending.pop(0)
 
                 async with acquire_with_retry(pool) as conn:
-                    # Determine observation_scopes for this sub-batch. All memories share
-                    # the same tags (enforced by tag_groups), so we only check the first memory.
-                    # asyncpg returns JSONB columns as raw JSON strings, so parse if needed.
-                    _obs_raw = sub_batch[0].get("observation_scopes") if sub_batch else None
-                    _obs_parsed = json.loads(_obs_raw) if isinstance(_obs_raw, str) else _obs_raw
-
-                    # Resolve the scope spec into a concrete list[list[str]] (or None for combined).
-                    if _obs_parsed == "per_tag":
-                        _memory_tags = sub_batch[0].get("tags") or []
-                        obs_tags_list = [[tag] for tag in _memory_tags] if _memory_tags else None
-                    elif _obs_parsed == "all_combinations":
-                        _memory_tags = sub_batch[0].get("tags") or []
-                        obs_tags_list = (
-                            [
-                                list(combo)
-                                for r in range(1, len(_memory_tags) + 1)
-                                for combo in combinations(_memory_tags, r)
-                            ]
-                            if _memory_tags
-                            else None
-                        )
-                    elif _obs_parsed == "combined" or _obs_parsed is None:
-                        obs_tags_list = None  # single combined pass (default behaviour)
-                    else:
-                        # explicit list[list[str]]
-                        obs_tags_list = _obs_parsed
+                    obs_tags_list = _resolve_obs_tags_list(sub_batch[0]) if sub_batch else None
 
                     sub_deleted: int = 0
                     sub_llm_failed = False
                     if obs_tags_list:
-                        # Multi-pass: run one observation consolidation pass per tag set
                         sub_results: list[dict[str, Any]] = []
                         for obs_tags in obs_tags_list:
                             pass_results, pass_deleted, pass_failed = await _process_memory_batch(
@@ -433,13 +893,12 @@ async def run_consolidation_job(
                                 bank_id=bank_id,
                                 memories=sub_batch,
                                 request_context=request_context,
-                                perf=perf,
+                                perf=batch_perf,
                                 config=config,
                                 obs_tags_override=obs_tags,
                             )
                             sub_deleted += pass_deleted
                             sub_llm_failed = sub_llm_failed or pass_failed
-                            # Merge results: prefer non-skipped actions
                             if not sub_results:
                                 sub_results = pass_results
                             else:
@@ -447,7 +906,6 @@ async def run_consolidation_job(
                                     if existing.get("action") == "skipped" and new.get("action") != "skipped":
                                         sub_results[i] = new
                                     elif existing.get("action") != "skipped" and new.get("action") != "skipped":
-                                        # Both did something — combine into "multiple"
                                         existing_created = existing.get(
                                             "created", 1 if existing.get("action") == "created" else 0
                                         )
@@ -465,7 +923,6 @@ async def run_consolidation_job(
                                             "total_actions": total,
                                         }
                     else:
-                        # Normal single pass using the memory's own tags
                         sub_results, sub_deleted, sub_llm_failed = await _process_memory_batch(
                             conn=conn,
                             memory_engine=memory_engine,
@@ -473,14 +930,13 @@ async def run_consolidation_job(
                             bank_id=bank_id,
                             memories=sub_batch,
                             request_context=request_context,
-                            perf=perf,
+                            perf=batch_perf,
                             config=config,
                         )
 
                 all_deleted += sub_deleted
 
                 if sub_llm_failed and len(sub_batch) > 1:
-                    # Split and retry with smaller batches
                     mid = len(sub_batch) // 2
                     logger.warning(
                         f"[CONSOLIDATION] bank={bank_id} LLM failed for sub-batch of {len(sub_batch)},"
@@ -488,7 +944,6 @@ async def run_consolidation_job(
                     )
                     pending[0:0] = [sub_batch[:mid], sub_batch[mid:]]
                 elif sub_llm_failed:
-                    # batch_size=1 and still failing — mark as permanently failed for now
                     failed_ids.append(sub_batch[0]["id"])
                     all_results.append({"action": "failed"})
                     logger.warning(
@@ -499,7 +954,6 @@ async def run_consolidation_job(
                     succeeded_ids.extend(m["id"] for m in sub_batch)
                     all_results.extend(sub_results)
 
-            # Commit consolidated_at / consolidation_failed_at in a single DB round-trip
             async with acquire_with_retry(pool) as conn:
                 if succeeded_ids:
                     await conn.executemany(
@@ -512,61 +966,185 @@ async def run_consolidation_job(
                         [(mem_id,) for mem_id in failed_ids],
                     )
 
-            stats["observations_deleted"] += all_deleted
-            results = all_results
-
-            # Checkpoint: abort if the operation (and thus the bank) was deleted mid-run.
+            cancelled_local = False
             if operation_id and not await memory_engine._check_op_alive(operation_id):
                 logger.info(
                     f"[CONSOLIDATION] bank={bank_id} operation {operation_id} cancelled (bank deleted), stopping early"
                 )
-                return {"status": "cancelled", "bank_id": bank_id, **stats}
+                cancelled_local = True
 
-            for result in results:
-                stats["memories_processed"] += 1
+            # Per-batch local stats; merged into outer state once, serially,
+            # after dispatch completes.
+            local_stats: dict[str, int] = {
+                "memories_processed": 0,
+                "observations_created": 0,
+                "observations_updated": 0,
+                "observations_merged": 0,
+                "observations_deleted": all_deleted,
+                "actions_executed": 0,
+                "skipped": 0,
+                "memories_failed": 0,
+            }
+            for result in all_results:
+                local_stats["memories_processed"] += 1
                 action = result.get("action")
                 if action == "created":
-                    stats["observations_created"] += 1
-                    stats["actions_executed"] += 1
+                    local_stats["observations_created"] += 1
+                    local_stats["actions_executed"] += 1
                 elif action == "updated":
-                    stats["observations_updated"] += 1
-                    stats["actions_executed"] += 1
+                    local_stats["observations_updated"] += 1
+                    local_stats["actions_executed"] += 1
                 elif action == "merged":
-                    stats["observations_merged"] += 1
-                    stats["actions_executed"] += 1
+                    local_stats["observations_merged"] += 1
+                    local_stats["actions_executed"] += 1
                 elif action == "multiple":
-                    stats["observations_created"] += result.get("created", 0)
-                    stats["observations_updated"] += result.get("updated", 0)
-                    stats["observations_merged"] += result.get("merged", 0)
-                    stats["actions_executed"] += result.get("total_actions", 0)
+                    local_stats["observations_created"] += result.get("created", 0)
+                    local_stats["observations_updated"] += result.get("updated", 0)
+                    local_stats["observations_merged"] += result.get("merged", 0)
+                    local_stats["actions_executed"] += result.get("total_actions", 0)
                 elif action == "skipped":
-                    stats["skipped"] += 1
+                    local_stats["skipped"] += 1
                 elif action == "failed":
-                    stats["memories_failed"] += 1
+                    local_stats["memories_failed"] += 1
 
-            # Per-LLM-batch log
+            # Maintain the cumulative-progress indicator under parallelism:
+            # increment shared counters and snapshot under the same statements so
+            # the snapshot includes this batch. No await between the reads and
+            # writes, so single-threaded asyncio gives us atomicity for free —
+            # no lock needed.
+            cumulative_progress["processed"] += local_stats["memories_processed"]
+            cumulative_progress["observations_created"] += local_stats["observations_created"]
+            cumulative_progress["observations_updated"] += local_stats["observations_updated"]
+            cumulative_progress["observations_merged"] += local_stats["observations_merged"]
+            cumulative_progress["observations_deleted"] += local_stats["observations_deleted"]
+            cumulative_progress["memories_failed"] += local_stats["memories_failed"]
+            cum_processed = cumulative_progress["processed"]
+            cum_snapshot = dict(cumulative_progress)
+
+            # Per-batch log uses batch_perf so timings/llm-calls/tokens reflect
+            # only this batch's own work, even when other batches are running
+            # concurrently under parallelism > 1. ``processed=`` is the
+            # cumulative count across all batches that have finished so far in
+            # this job (monotonic, may be reported out of strict batch-number
+            # order under parallelism).
             llm_batch_time = time.time() - llm_batch_start
-            timing_parts = []
-            for key in ["recall", "llm", "embedding", "db_write"]:
-                if key in perf.timings:
-                    delta = perf.timings[key] - snap_timings.get(key, 0)
-                    timing_parts.append(f"{key}={delta:.3f}s")
-            input_tokens = int((perf.total_prompt_chars - snap_total_chars) / 4)
-            batch_created = stats["observations_created"] - snap_stats["observations_created"]
-            batch_updated = stats["observations_updated"] - snap_stats["observations_updated"]
-            batch_skipped = stats["skipped"] - snap_stats["skipped"]
-            batch_failed = stats["memories_failed"] - snap_stats["memories_failed"]
-            llm_calls_made = perf.llm_calls - snap_llm_calls
+            timing_parts = [
+                f"{key}={batch_perf.timings[key]:.3f}s"
+                for key in ("recall", "llm", "embedding", "db_write")
+                if key in batch_perf.timings
+            ]
+            input_tokens = int(batch_perf.total_prompt_chars / 4)
             logger.info(
-                f"[CONSOLIDATION] bank={bank_id} llm_batch #{llm_batch_num}"
-                f" ({len(llm_batch)} memories, {llm_calls_made} llm calls)"
-                f" | {stats['memories_processed']}/{total_count} processed"
+                f"[CONSOLIDATION] bank={bank_id} llm_batch #{batch_num_local}"
+                f" ({len(llm_batch_local)} memories, {batch_perf.llm_calls} llm calls)"
+                f" | processed={cum_processed}/{total_count}"
                 f" | {', '.join(timing_parts)}"
-                f" | created={batch_created} updated={batch_updated} skipped={batch_skipped}"
-                + (f" failed={batch_failed}" if batch_failed else "")
+                f" | created={local_stats['observations_created']}"
+                f" updated={local_stats['observations_updated']}"
+                f" skipped={local_stats['skipped']}"
+                + (f" failed={local_stats['memories_failed']}" if local_stats["memories_failed"] else "")
                 + f" | input_tokens=~{input_tokens}"
-                f" | avg={llm_batch_time / len(llm_batch):.3f}s/memory"
+                f" | avg={llm_batch_time / max(1, len(llm_batch_local)):.3f}s/memory"
             )
+
+            # Durable progress snapshot per LLM batch — this is the heartbeat an
+            # operator polls. The whole fetched batch is processed inside one outer
+            # round, so a round-boundary write would sit at the pre-round count for
+            # the entire (often minutes-long) LLM phase; writing here advances
+            # processed/total as each batch commits. set_stage mirrors it for the
+            # live worker log.
+            set_stage(f"consolidation.llm_batch.{batch_num_local}")
+            await memory_engine._write_operation_progress(
+                operation_id,
+                stage="consolidating",
+                processed=cum_processed,
+                total=await _progress_total(cum_processed),
+                detail={
+                    "observations_created": cum_snapshot["observations_created"],
+                    "observations_updated": cum_snapshot["observations_updated"],
+                    "observations_merged": cum_snapshot["observations_merged"],
+                    "observations_deleted": cum_snapshot["observations_deleted"],
+                    "memories_failed": cum_snapshot["memories_failed"],
+                },
+            )
+
+            # Fold batch counters into the job-level perf so the final summary
+            # (perf.flush) totals every batch correctly. Safe without a lock —
+            # ConsolidationPerfLog.merge_from is a series of += on Python ints
+            # and floats with no intervening awaits, so single-threaded asyncio
+            # gives us atomicity.
+            perf.merge_from(batch_perf)
+
+            return _BatchDeltas(stats=local_stats, tags=local_tags, cancelled=cancelled_local)
+
+        # Number every batch up front so log line numbering is deterministic
+        # regardless of dispatch order under parallelism. Each group keeps its own
+        # (batch, number) list so it can be processed as one serial unit.
+        numbered_groups: list[list[tuple[list[dict[str, Any]], int]]] = []
+        for batches in grouped_batches:
+            numbered: list[tuple[list[dict[str, Any]], int]] = []
+            for b in batches:
+                llm_batch_num += 1
+                numbered.append((b, llm_batch_num))
+            numbered_groups.append(numbered)
+
+        async def _process_tag_group(
+            group_batches: list[tuple[list[dict[str, Any]], int]],
+        ) -> list[_BatchDeltas]:
+            # Batches within a group share a tag set and observation scope, so
+            # they MUST run serially. Stop early if the op was cancelled mid-group.
+            deltas: list[_BatchDeltas] = []
+            for b, n in group_batches:
+                d = await _process_one_llm_batch(b, n)
+                deltas.append(d)
+                if d.cancelled:
+                    break
+            return deltas
+
+        llm_parallelism = max(1, config.consolidation_llm_parallelism)
+
+        if llm_parallelism > 1 and len(numbered_groups) > 1:
+            sem = asyncio.Semaphore(llm_parallelism)
+            # Per-scope async locks shared across all parallel groups in this
+            # fetch iteration. Each group acquires locks for every scope it will
+            # write to, in _scope_sort_key order (deadlock-free). Groups with
+            # disjoint scope sets never contend; any overlap serialises on the
+            # overlapping scopes — covering combined / per_tag / all_combinations
+            # / explicit-list modes uniformly without operator opt-in.
+            scope_locks: defaultdict[frozenset[str], asyncio.Lock] = defaultdict(asyncio.Lock)
+
+            async def _run_group(
+                group_batches: list[tuple[list[dict[str, Any]], int]],
+                scopes: list[frozenset[str]],
+            ) -> list[_BatchDeltas]:
+                async with sem:
+                    async with AsyncExitStack() as stack:
+                        for s in scopes:
+                            await stack.enter_async_context(scope_locks[s])
+                        return await _process_tag_group(group_batches)
+
+            group_results = await asyncio.gather(*(_run_group(g, s) for g, s in zip(numbered_groups, group_scopes)))
+            batch_results: list[_BatchDeltas] = [d for gd in group_results for d in gd]
+            any_cancelled = any(d.cancelled for d in batch_results)
+        else:
+            batch_results = []
+            any_cancelled = False
+            for g in numbered_groups:
+                group_deltas = await _process_tag_group(g)
+                batch_results.extend(group_deltas)
+                if any(d.cancelled for d in group_deltas):
+                    any_cancelled = True
+                    break
+
+        # Merge per-batch deltas into outer state — serial, post-dispatch, so
+        # concurrent batches cannot race on the shared counters / tag set.
+        for d in batch_results:
+            for k, v in d.stats.items():
+                stats[k] = stats.get(k, 0) + v
+            consolidated_tags.update(d.tags)
+
+        if any_cancelled:
+            return {"status": "cancelled", "bank_id": bank_id, **stats}
 
         # Update round budget after processing this DB fetch batch
         if round_limit_enabled:
@@ -575,17 +1153,24 @@ async def run_consolidation_job(
                 hit_round_limit = True
                 break
 
-    # Re-submit consolidation if we hit the round limit and there's likely more work
+    # Re-submit consolidation if we hit the round limit and there's likely more work.
+    # Any failure here must propagate: swallowing it (the prior behavior) leaves the
+    # bank with backlog and no queued work — silently stuck — because the outer op
+    # gets marked completed in the success path. Letting the exception bubble up to
+    # execute_task's retry handler means the op is retried with backoff; on retry the
+    # consolidator skips already-consolidated rows via the consolidated_at filter and
+    # picks up the remainder. Issue #1842.
     if hit_round_limit:
         remaining = total_count - stats["memories_processed"]
         logger.info(
             f"[CONSOLIDATION] bank={bank_id} hit round limit of {max_memories_per_round} memories,"
             f" ~{remaining} remaining. Re-queuing consolidation."
         )
-        try:
-            await memory_engine.submit_async_consolidation(bank_id=bank_id, request_context=request_context)
-        except Exception as e:
-            logger.warning(f"[CONSOLIDATION] bank={bank_id} failed to re-queue consolidation: {e}")
+        await memory_engine.submit_async_consolidation(
+            bank_id=bank_id,
+            request_context=request_context,
+            observation_scopes=observation_scopes,
+        )
 
     # Build summary
     perf.log(
@@ -621,6 +1206,13 @@ async def run_consolidation_job(
         stats["mental_models_refreshed"] = 0
         logger.info(f"[CONSOLIDATION] bank={bank_id} skipping mental model refresh (round limit hit, re-queued)")
     else:
+        set_stage("consolidation.refreshing_mental_models")
+        await memory_engine._write_operation_progress(
+            operation_id,
+            stage="refreshing_mental_models",
+            processed=stats["memories_processed"],
+            total=await _progress_total(stats["memories_processed"]),
+        )
         # SECURITY: Only refresh mental models with matching tags (or all if no tags were consolidated)
         mental_models_refreshed = await _trigger_mental_model_refreshes(
             memory_engine=memory_engine,
@@ -764,6 +1356,9 @@ async def _process_memory_batch(
     """
     import asyncio
 
+    # Map the source memories this batch consumes onto the consolidation trace.
+    record_source_memory_ids([str(m["id"]) for m in memories])
+
     # 1. Parallel recalls — one per fact
     # When obs_tags_override is set, use it as the observation scope for all facts.
     t0 = time.time()
@@ -843,6 +1438,20 @@ async def _process_memory_batch(
 
     mem_by_id = {str(m["id"]): m for m in memories}
 
+    # Semantic dedup: when enabled, an observation that is >= the threshold cosine to a DIFFERENT
+    # existing observation is reconciled by a focused 1-by-1 LLM merge (anchored on the observation
+    # text, not the source fact). It runs on both CREATE (a near-dup emitted despite the twin being
+    # in context — weak-model failure mode) and UPDATE (a rewrite+re-embed that drifts an existing
+    # observation into a twin — the create-time guard can't see this). The trace operation/scope is
+    # "consolidation_dedup" (routes through the consolidation concurrency bucket via llm_wrapper's
+    # "consolidation" prefix; recorded distinctly in llm_requests).
+    dedup_enabled = _dedup_active(config)
+    dedup_llm_config = (
+        memory_engine._consolidation_llm_config.with_config(config, bank_id=bank_id, operation="consolidation_dedup")
+        if dedup_enabled
+        else None
+    )
+
     # Execute deletes first to free observation slots before creates consume them
     deleted_count = 0
     for delete in llm_result.deletes:
@@ -867,7 +1476,7 @@ async def _process_memory_batch(
             )
             continue
         agg = _aggregate_source_fields(source_mems, tags=fact_tags)
-        await _execute_update_action(
+        updated_emb_str = await _execute_update_action(
             conn=conn,
             memory_engine=memory_engine,
             bank_id=bank_id,
@@ -883,17 +1492,76 @@ async def _process_memory_batch(
         )
         for m in source_mems:
             per_memory_updated.add(str(m["id"]))
+        # Reconcile the rewritten observation against its neighbours: the re-embed may have
+        # drifted it into a near-twin of another existing observation (the residual-duplicate
+        # source). updated_emb_str is None when the update was skipped — nothing to reconcile.
+        if dedup_enabled and updated_emb_str is not None:
+            await _dedup_reconcile_update(
+                conn,
+                memory_engine,
+                bank_id,
+                config,
+                dedup_llm_config,
+                update.observation_id,
+                update.text,
+                updated_emb_str,
+                agg.tags,
+            )
+
+    # Deterministic dedup guard: map the observations the LLM was SHOWN by their
+    # normalised text. The model intermittently emits a CREATE whose text is identical
+    # to an observation already in its context (over-aggregation / incoherence — it even
+    # UPDATEs the twin and creates a sibling). When that happens we drop the duplicate
+    # CREATE instead of inserting a redundant row. No extra LLM/embedding cost — the
+    # match is exact text against the in-memory set.
+    shown_obs_by_text = {_norm_obs_text(o.text): o for o in union_observations}
+    # Also collapse a CREATE that reproduces the text of an UPDATE issued in the SAME
+    # response (the model occasionally UPDATEs the twin to text X and also CREATEs X).
+    update_texts = {_norm_obs_text(u.text) for u in llm_result.updates if u.text}
 
     for create in llm_result.creates:
         source_mems = [mem_by_id[fid] for fid in create.source_fact_ids if fid in mem_by_id]
         if not source_mems:
             continue
         agg = _aggregate_source_fields(source_mems, tags=fact_tags)
+        create_source_ids = [m["id"] for m in source_mems]
+
+        # Reconcile against observations shown to the LLM: an exact-text match means
+        # this CREATE reproduces verbatim an observation the model already had in context.
+        # Since that observation already carries this exact text, drop the duplicate CREATE
+        # — no row is inserted, nothing is lost. We deliberately do NOT also UPDATE the twin
+        # here: the LLM frequently UPDATEd it earlier in this same batch, and a second update
+        # would run off the pre-LLM snapshot and clobber that change (see _dedupe_updates).
+        duplicate_of = _duplicate_create_target(create.text, shown_obs_by_text, update_texts)
+        if duplicate_of is not None:
+            logger.warning(
+                "[CONSOLIDATION] dropped duplicate observation CREATE — verbatim match of %s; llm_reason=%r",
+                duplicate_of,
+                create.reason or "(none given)",
+            )
+            continue
+
+        # Semantic near-duplicate reconciliation: merge this CREATE into an existing
+        # near-identical observation (LLM-adjudicated, 1-by-1) instead of inserting a dup.
+        if dedup_enabled:
+            merged_into = await _dedup_reconcile_create(
+                conn, memory_engine, bank_id, config, dedup_llm_config, create.text, create_source_ids, agg.tags
+            )
+            if merged_into is not None:
+                logger.info(
+                    "[CONSOLIDATION] dedup-merged observation CREATE into %s (cosine>=%.2f)",
+                    merged_into[:8],
+                    config.consolidation_dedup_threshold,
+                )
+                for m in source_mems:
+                    per_memory_created.add(str(m["id"]))
+                continue
+
         await _execute_create_action(
             conn=conn,
             memory_engine=memory_engine,
             bank_id=bank_id,
-            source_memory_ids=[m["id"] for m in source_mems],
+            source_memory_ids=create_source_ids,
             text=create.text,
             source_fact_tags=agg.tags,
             event_date=agg.event_date,
@@ -933,6 +1601,64 @@ def _max_date(dates: "Any") -> "datetime | None":
     return max((d for d in dates if d is not None), default=None)
 
 
+@dataclass(frozen=True)
+class _ObservationHistorySnapshot:
+    """Pre-update state of an observation, persisted as the ``content`` JSON blob
+    of one observation_history row.
+
+    Temporal fields are the ISO strings carried on MemoryFact; new_source_memory_ids
+    are the ids added by the update.
+    """
+
+    previous_text: str | None
+    previous_tags: list[str]
+    previous_occurred_start: str | None
+    previous_occurred_end: str | None
+    previous_mentioned_at: str | None
+    new_source_memory_ids: list[str]
+
+
+async def _append_observation_history(
+    conn: "Connection",
+    bank_id: str,
+    observation_id: str,
+    snapshot: _ObservationHistorySnapshot,
+    max_entries: int,
+) -> None:
+    """Insert one pre-update snapshot into ``observation_history``, then delete the
+    oldest rows beyond ``max_entries`` for this observation.
+
+    The snapshot is stored as a single JSONB ``content`` blob (per-row, so it stays
+    small). Bounding by row count keeps a frequently-reinforced observation's
+    history from growing without bound.
+    """
+    obs_uuid = uuid.UUID(observation_id)
+    await conn.execute(
+        f"""
+        INSERT INTO {fq_table("observation_history")} (observation_id, bank_id, content, changed_at)
+        VALUES ($1, $2, $3::jsonb, now())
+        """,
+        obs_uuid,
+        bank_id,
+        json.dumps(asdict(snapshot)),
+    )
+    if max_entries and max_entries > 0:
+        await conn.execute(
+            f"""
+            DELETE FROM {fq_table("observation_history")}
+            WHERE observation_id = $1
+              AND id NOT IN (
+                  SELECT id FROM {fq_table("observation_history")}
+                  WHERE observation_id = $1
+                  ORDER BY changed_at DESC, id DESC
+                  LIMIT $2
+              )
+            """,
+            obs_uuid,
+            max_entries,
+        )
+
+
 async def _execute_update_action(
     conn: "Connection",
     memory_engine: "MemoryEngine",
@@ -946,12 +1672,15 @@ async def _execute_update_action(
     source_occurred_end: datetime | None = None,
     source_mentioned_at: datetime | None = None,
     perf: ConsolidationPerfLog | None = None,
-) -> None:
+) -> str | None:
     """
     Update an existing observation.
 
     Extends source_memory_ids with all contributing memories, updates temporal fields
     (LEAST for occurred_start, GREATEST for occurred_end / mentioned_at), and merges tags.
+
+    Returns the observation's freshly-computed embedding (pgvector literal) so the caller can
+    run UPDATE-path dedup without re-embedding, or None when the update was skipped.
     """
     model = next((m for m in observations if str(m.id) == observation_id), None)
     if not model:
@@ -969,15 +1698,14 @@ async def _execute_update_action(
 
     from ...config import get_config
 
-    history_entry = {
-        "previous_text": model.text,
-        "previous_tags": list(model.tags or []),
-        "previous_occurred_start": model.occurred_start,
-        "previous_occurred_end": model.occurred_end,
-        "previous_mentioned_at": model.mentioned_at,
-        "changed_at": datetime.now(timezone.utc).isoformat(),
-        "new_source_memory_ids": [str(mid) for mid in source_memory_ids],
-    }
+    history_entry = _ObservationHistorySnapshot(
+        previous_text=model.text,
+        previous_tags=list(model.tags or []),
+        previous_occurred_start=model.occurred_start,
+        previous_occurred_end=model.occurred_end,
+        previous_mentioned_at=model.mentioned_at,
+        new_source_memory_ids=[str(mid) for mid in source_memory_ids],
+    )
 
     source_ids = list(model.source_fact_ids or []) + source_memory_ids
 
@@ -993,9 +1721,6 @@ async def _execute_update_action(
         perf.record_timing("embedding", time.time() - t0)
 
     config = get_config()
-    history_clause = (
-        "history = COALESCE(history, '[]'::jsonb) || $3::jsonb," if config.enable_observation_history else ""
-    )
 
     t0 = time.time()
     await conn.execute(
@@ -1003,19 +1728,17 @@ async def _execute_update_action(
         UPDATE {fq_table("memory_units")}
         SET text = $1,
             embedding = $2::vector,
-            {history_clause}
-            source_memory_ids = $4,
-            proof_count = $5,
-            tags = $10,
+            source_memory_ids = $3,
+            proof_count = $4,
+            tags = $9,
             updated_at = now(),
-            occurred_start = LEAST(occurred_start, COALESCE($7, occurred_start)),
-            occurred_end = GREATEST(occurred_end, COALESCE($8, occurred_end)),
-            mentioned_at = GREATEST(mentioned_at, COALESCE($9, mentioned_at))
-        WHERE id = $6
+            occurred_start = LEAST(occurred_start, COALESCE($6, occurred_start)),
+            occurred_end = GREATEST(occurred_end, COALESCE($7, occurred_end)),
+            mentioned_at = GREATEST(mentioned_at, COALESCE($8, mentioned_at))
+        WHERE id = $5
         """,
         new_text,
         embedding_str,
-        json.dumps([history_entry]),
         source_ids,
         len(source_ids),
         uuid.UUID(observation_id),
@@ -1024,6 +1747,15 @@ async def _execute_update_action(
         source_mentioned_at,
         merged_tags,
     )
+
+    # Record the pre-update snapshot in the dedicated observation_history table
+    # (one row per change), then trim to the configured cap. History lived in a
+    # single unbounded JSONB column before; an often-reinforced observation grew
+    # it until it crossed Postgres's 256MB jsonb limit and got stuck.
+    if config.enable_observation_history:
+        await _append_observation_history(
+            conn, bank_id, observation_id, history_entry, config.observation_history_max_entries
+        )
 
     # Sync observation_sources junction table (Oracle only — PG uses native array ops).
     if memory_engine._backend.ops.uses_observation_sources_table:
@@ -1045,7 +1777,10 @@ async def _execute_update_action(
     if perf:
         perf.record_timing("db_write", time.time() - t0)
 
+    # Map the updated observation onto the consolidation trace as a produced memory.
+    record_created_memory_ids([observation_id])
     logger.debug(f"Updated observation {observation_id} from {len(source_memory_ids)} source memories")
+    return embedding_str
 
 
 async def _execute_create_action(
@@ -1067,7 +1802,7 @@ async def _execute_create_action(
     Tags are inherited from the source facts (determined algorithmically, not by LLM)
     to maintain visibility scope.
     """
-    await _create_observation_directly(
+    created = await _create_observation_directly(
         conn=conn,
         memory_engine=memory_engine,
         bank_id=bank_id,
@@ -1080,6 +1815,10 @@ async def _execute_create_action(
         mentioned_at=mentioned_at,
         perf=perf,
     )
+    # Map the new observation onto the consolidation trace as a produced memory.
+    new_id = created.get("observation_id")
+    if new_id:
+        record_created_memory_ids([new_id])
     logger.debug(f"Created observation from {len(source_memory_ids)} source memories")
 
 
@@ -1178,6 +1917,13 @@ async def _find_related_observations(
             include_source_facts=True,  # Embed source facts so we avoid a separate DB fetch
             max_source_facts_tokens=config.consolidation_source_facts_max_tokens,
             max_source_facts_tokens_per_observation=config.consolidation_source_facts_max_tokens_per_observation,
+            # Round-robin interleave fusion (no cross-encoder): consolidation is looking
+            # for an existing near-identical observation to merge into. Both the
+            # cross-encoder (semantic #1 -> reranked #37) and RRF (semantic #1 -> outside
+            # the 512-token budget) were measured to bury that twin; interleave guarantees
+            # each retrieval arm's top hits a slot, so the semantic-#1 twin is always shown
+            # to the LLM, which then UPDATEs instead of creating a duplicate.
+            reranking="interleave",
             _quiet=True,  # Suppress logging
         )
     finally:
@@ -1224,6 +1970,44 @@ def _build_observations_for_llm(
             obs_data["source_memories"] = source_memories
         obs_list.append(obs_data)
     return obs_list
+
+
+def _dedupe_updates(updates: list[_UpdateAction], *, batch_label: str) -> list[_UpdateAction]:
+    """Collapse `updates` that target the same `observation_id`.
+
+    LLMs occasionally emit several update entries for one observation in a
+    single response (one per facet drawn from the same fact). Without
+    deduplication the downstream loop would issue separate DB writes for each
+    and the last write would silently overwrite the earlier ones. We keep the
+    last text (the LLM's most recent attempt) and union all contributing
+    `source_fact_ids`, then warn so the misbehavior is visible in logs.
+    """
+    if len(updates) < 2:
+        return list(updates)
+
+    by_id: dict[str, _UpdateAction] = {}
+    collisions = 0
+    for upd in updates:
+        existing = by_id.get(upd.observation_id)
+        if existing is None:
+            by_id[upd.observation_id] = upd
+            continue
+        collisions += 1
+        merged_ids = list(dict.fromkeys([*existing.source_fact_ids, *upd.source_fact_ids]))
+        by_id[upd.observation_id] = _UpdateAction(
+            text=upd.text,
+            observation_id=upd.observation_id,
+            source_fact_ids=merged_ids,
+        )
+
+    if collisions:
+        logger.warning(
+            f"[CONSOLIDATION] {batch_label}: LLM emitted {collisions} duplicate update(s) targeting "
+            f"the same observation_id ({len(updates)} updates -> {len(by_id)} after dedup). "
+            "Kept the last text and unioned source_fact_ids."
+        )
+
+    return list(by_id.values())
 
 
 async def _consolidate_batch_with_llm(
@@ -1274,11 +2058,37 @@ async def _consolidate_batch_with_llm(
                 f"(out of {max_observations_per_scope}). Prefer UPDATE over CREATE when possible."
             )
 
-    prompt_template = build_batch_consolidation_prompt(config.observations_mission, observation_capacity_note)
-    prompt = prompt_template.format(
+    # Split the prompt: a bank-agnostic system instruction (rules + input format +
+    # decision guide + output format) that is byte-identical across batches AND
+    # across banks, and a per-batch user message (mission + capacity note + facts +
+    # existing observations). The split lets the system prefix be served from a
+    # single Gemini context cache shared by every bank — the bank mission, capacity
+    # note, and response_schema (all bank/batch-variable) are kept OUT of the
+    # cached prefix so one cache serves all and it never busts within a run.
+    system_prompt = build_consolidation_system_prompt(
+        llm_output_language=getattr(config, "llm_output_language", None),
+    )
+    user_content = build_consolidation_input(
         facts_text=facts_lines,
         observations_text=observations_text,
+        observations_mission=config.observations_mission,
+        observation_capacity_note=observation_capacity_note,
     )
+
+    # Opt into context caching of the stable system prefix when the provider
+    # supports it (gemini/vertexai with the flag on). response_schema is NOT
+    # passed to the fingerprint: it varies per batch (max_creates) but is not
+    # part of the cached prefix, so keying on it would needlessly bust the cache.
+    cached_prefix_name: str | None = None
+    provider_impl = getattr(llm_config, "_provider_impl", None)
+    if provider_impl is not None and provider_impl.supports_prompt_caching():
+        try:
+            cached_prefix_name = await provider_impl.get_or_create_cached_prefix(
+                system_instruction=system_prompt,
+            )
+        except Exception:
+            logger.exception("Consolidation cache prefix lookup failed; falling back to uncached call")
+            cached_prefix_name = None
 
     # Use a constrained response model when observation limit is active
     response_model = _build_response_model(max_creates=remaining_observation_slots)
@@ -1299,12 +2109,17 @@ async def _consolidate_batch_with_llm(
     for attempt in range(1, max_attempts + 1):
         try:
             call_kwargs: dict[str, Any] = {
-                "messages": [{"role": "user", "content": prompt}],
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_content},
+                ],
                 "response_format": response_model,
                 "scope": "consolidation",
             }
             if inner_max_retries is not None:
                 call_kwargs["max_retries"] = inner_max_retries
+            if cached_prefix_name is not None:
+                call_kwargs["cached_prefix"] = cached_prefix_name
             response: _ConsolidationBatchResponse = await llm_config.call(**call_kwargs)
             # Defensive truncation: some LLM providers may not enforce JSON schema max_length
             creates = response.creates
@@ -1315,12 +2130,13 @@ async def _consolidate_batch_with_llm(
                         f"(max_observations_per_scope={max_observations_per_scope})"
                     )
                     creates = creates[:remaining_observation_slots]
+            updates = _dedupe_updates(response.updates, batch_label=batch_label)
             return _BatchLLMResult(
                 creates=creates,
-                updates=response.updates,
+                updates=updates,
                 deletes=response.deletes,
                 obs_count=len(union_observations),
-                prompt_chars=len(prompt),
+                prompt_chars=len(system_prompt) + len(user_content),
             )
         except Exception as exc:
             last_exc = exc
@@ -1332,7 +2148,9 @@ async def _consolidate_batch_with_llm(
         f"[CONSOLIDATION] LLM batch call failed after {max_attempts} attempts for {batch_label}, "
         f"skipping batch. Last error: {last_exc}"
     )
-    return _BatchLLMResult(obs_count=len(union_observations), prompt_chars=len(prompt), failed=True)
+    return _BatchLLMResult(
+        obs_count=len(union_observations), prompt_chars=len(system_prompt) + len(user_content), failed=True
+    )
 
 
 async def _create_observation_directly(
@@ -1379,22 +2197,29 @@ async def _create_observation_directly(
         # VectorChord: manually tokenize and insert search_vector
         query = f"""
             INSERT INTO {fq_table("memory_units")} (
-                id, bank_id, text, fact_type, embedding, proof_count, source_memory_ids, history,
+                id, bank_id, text, fact_type, embedding, proof_count, source_memory_ids,
                 tags, event_date, occurred_start, occurred_end, mentioned_at, search_vector
             )
-            VALUES ($1, $2, $3, 'observation', $4::vector, 1, $5, '[]'::jsonb, $6, $7, $8, $9, $10,
+            VALUES ($1, $2, $3, 'observation', $4::vector, 1, $5, $6, $7, $8, $9, $10,
                     tokenize($3, 'llmlingua2')::bm25_catalog.bm25vector)
             RETURNING id
         """
-    else:  # native or pg_textsearch
-        # Native PostgreSQL: search_vector is GENERATED ALWAYS, don't include it
-        # pg_textsearch: indexes operate on base columns directly, don't populate search_vector
+    else:  # native, pg_textsearch, pgroonga, or pg_search
+        # pg_textsearch / pgroonga / pg_search: indexes operate on base text
+        # columns directly, so the dummy search_vector column is left NULL.
+        # Native: the migration p4q5r6s7t8u9 dropped the GENERATED expression on
+        # search_vector to allow per-deployment language configuration; the
+        # batch insert path in ops_postgresql.insert_facts_batch now populates
+        # it via to_tsvector($lang, ...). This single-observation INSERT does
+        # not, so observations under the native backend currently land with
+        # NULL search_vector and are not BM25-searchable until reflected/
+        # re-ingested. Tracking a separate fix for that gap.
         query = f"""
             INSERT INTO {fq_table("memory_units")} (
-                id, bank_id, text, fact_type, embedding, proof_count, source_memory_ids, history,
+                id, bank_id, text, fact_type, embedding, proof_count, source_memory_ids,
                 tags, event_date, occurred_start, occurred_end, mentioned_at
             )
-            VALUES ($1, $2, $3, 'observation', $4::vector, 1, $5, '[]'::jsonb, $6, $7, $8, $9, $10)
+            VALUES ($1, $2, $3, 'observation', $4::vector, 1, $5, $6, $7, $8, $9, $10)
             RETURNING id
         """
 

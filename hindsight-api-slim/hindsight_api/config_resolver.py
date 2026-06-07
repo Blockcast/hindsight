@@ -172,8 +172,9 @@ class ConfigResolver:
                     # Normalize keys (handle both env var format and Python field format)
                     normalized = normalize_config_dict(config_data)
 
-                    # Only return overrides for configurable fields
-                    return {k: v for k, v in normalized.items() if k in self._configurable_fields}
+                    # Only return active overrides for configurable fields. JSON null is a tombstone
+                    # for "Server Default" in the bank-config UI and should not override defaults.
+                    return {k: v for k, v in normalized.items() if k in self._configurable_fields and v is not None}
         except Exception as e:
             logger.error(f"Failed to load bank config for {bank_id}: {e}")
 
@@ -265,12 +266,20 @@ class ConfigResolver:
         # Validate recall budget fields
         _validate_recall_budget_updates(normalized_updates)
 
-        # Merge with existing config (JSONB || operator)
+        # Persist the override. Banks are created lazily (on first retain), so a
+        # PATCH that precedes any ingestion would otherwise UPDATE zero rows and
+        # silently no-op while returning 200. Ensure the bank row exists first
+        # (this also creates its per-bank vector indexes), then merge defensively:
+        # COALESCE guards against a NULL config column (NULL || jsonb is NULL),
+        # which would drop the override even when a row is updated.
+        from .engine.retain.fact_storage import ensure_bank_exists
+
         async with self._backend.acquire() as conn:
+            await ensure_bank_exists(conn, bank_id, ops=self._backend.ops)
             await conn.execute(
                 f"""
                 UPDATE {fq_table("banks")}
-                SET config = config || $1::jsonb,
+                SET config = COALESCE(config, '{{}}'::jsonb) || $1::jsonb,
                     updated_at = now()
                 WHERE bank_id = $2
                 """,

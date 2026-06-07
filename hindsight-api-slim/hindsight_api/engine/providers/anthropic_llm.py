@@ -38,6 +38,7 @@ class AnthropicLLM(LLMInterface):
         reasoning_effort: str = "low",
         timeout: float = 300.0,
         default_headers: dict[str, str] | None = None,
+        extra_body: dict[str, Any] | None = None,
         **kwargs: Any,
     ):
         """
@@ -54,12 +55,19 @@ class AnthropicLLM(LLMInterface):
                 the Anthropic SDK client. Used by operators routing through proxies
                 or request-tracing middleware. Sourced from ``llm_default_headers`` in
                 ``HindsightConfig`` (env: ``HINDSIGHT_API_LLM_DEFAULT_HEADERS``).
+            extra_body: Extra request-body params (e.g. ``{"temperature": 0.2,
+                "top_p": 0.9, "top_k": 40}``) passed via the Anthropic SDK's
+                ``extra_body`` so they merge into the JSON sent to the Messages API.
+                Sourced from ``llm_extra_body`` (env: ``HINDSIGHT_API_LLM_EXTRA_BODY``).
             **kwargs: Additional provider-specific parameters.
         """
         super().__init__(provider, api_key, base_url, model, reasoning_effort, **kwargs)
 
         if not self.api_key:
             raise ValueError("API key is required for Anthropic provider")
+
+        # User-configured extra body params (merged into every Messages API call)
+        self._extra_body = extra_body or {}
 
         # Import and initialize Anthropic client
         try:
@@ -93,7 +101,6 @@ class AnthropicLLM(LLMInterface):
             await self.call(
                 messages=test_messages,
                 max_completion_tokens=10,
-                temperature=0.0,
                 scope="verification",
                 max_retries=0,
             )
@@ -179,8 +186,8 @@ class AnthropicLLM(LLMInterface):
         if system_prompt:
             call_params["system"] = system_prompt
 
-        if temperature is not None:
-            call_params["temperature"] = temperature
+        if self._extra_body:
+            call_params["extra_body"] = self._extra_body
 
         last_exception = None
 
@@ -220,6 +227,7 @@ class AnthropicLLM(LLMInterface):
                 input_tokens = response.usage.input_tokens or 0 if response.usage else 0
                 output_tokens = response.usage.output_tokens or 0 if response.usage else 0
                 total_tokens = input_tokens + output_tokens
+                cached_tokens = getattr(response.usage, "cache_read_input_tokens", 0) or 0 if response.usage else 0
 
                 # Record LLM metrics
                 metrics = get_metrics_collector()
@@ -249,6 +257,7 @@ class AnthropicLLM(LLMInterface):
                     duration=duration,
                     finish_reason=finish_reason,
                     error=None,
+                    cached_tokens=cached_tokens,
                 )
 
                 # Log slow calls
@@ -264,6 +273,7 @@ class AnthropicLLM(LLMInterface):
                         input_tokens=input_tokens,
                         output_tokens=output_tokens,
                         total_tokens=total_tokens,
+                        cached_tokens=cached_tokens,
                     )
                     return result, token_usage
                 return result
@@ -398,8 +408,8 @@ class AnthropicLLM(LLMInterface):
         if system_prompt:
             call_params["system"] = system_prompt
 
-        if temperature is not None:
-            call_params["temperature"] = temperature
+        if self._extra_body:
+            call_params["extra_body"] = self._extra_body
 
         last_exception = None
         for attempt in range(max_retries + 1):
