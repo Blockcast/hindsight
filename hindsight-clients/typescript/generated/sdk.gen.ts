@@ -23,6 +23,9 @@ import type {
   ClearMemoryObservationsData,
   ClearMemoryObservationsErrors,
   ClearMemoryObservationsResponses,
+  ClearMentalModelData,
+  ClearMentalModelErrors,
+  ClearMentalModelResponses,
   ClearObservationsData,
   ClearObservationsErrors,
   ClearObservationsResponses,
@@ -56,6 +59,9 @@ import type {
   ExportBankTemplateData,
   ExportBankTemplateErrors,
   ExportBankTemplateResponses,
+  ExportDocumentsData,
+  ExportDocumentsErrors,
+  ExportDocumentsResponses,
   FileRetainData,
   FileRetainErrors,
   FileRetainResponses,
@@ -113,6 +119,9 @@ import type {
   ImportBankTemplateData,
   ImportBankTemplateErrors,
   ImportBankTemplateResponses,
+  ImportDocumentsData,
+  ImportDocumentsErrors,
+  ImportDocumentsResponses,
   ListAuditLogsData,
   ListAuditLogsErrors,
   ListAuditLogsResponses,
@@ -131,6 +140,9 @@ import type {
   ListEntitiesData,
   ListEntitiesErrors,
   ListEntitiesResponses,
+  ListLlmRequestsData,
+  ListLlmRequestsErrors,
+  ListLlmRequestsResponses,
   ListMemoriesData,
   ListMemoriesErrors,
   ListMemoriesResponses,
@@ -149,6 +161,9 @@ import type {
   ListWebhooksData,
   ListWebhooksErrors,
   ListWebhooksResponses,
+  LlmRequestStatsData,
+  LlmRequestStatsErrors,
+  LlmRequestStatsResponses,
   MetricsEndpointMetricsGetData,
   MetricsEndpointMetricsGetResponses,
   RecallMemoriesData,
@@ -564,6 +579,19 @@ export const refreshMentalModel = <ThrowOnError extends boolean = false>(
   >({ url: "/v1/default/banks/{bank_id}/mental-models/{mental_model_id}/refresh", ...options });
 
 /**
+ * Clear mental model content
+ *
+ * Clear a mental model's content so the next refresh performs a full re-synthesis. This is useful for delta-mode models that have accumulated drift over many incremental refreshes. After clearing, call the /refresh endpoint to trigger a clean full rebuild.
+ */
+export const clearMentalModel = <ThrowOnError extends boolean = false>(
+  options: Options<ClearMentalModelData, ThrowOnError>
+) =>
+  (options.client ?? client).post<ClearMentalModelResponses, ClearMentalModelErrors, ThrowOnError>({
+    url: "/v1/default/banks/{bank_id}/mental-models/{mental_model_id}/clear",
+    ...options,
+  });
+
+/**
  * List directives
  *
  * List hard rules that are injected into prompts.
@@ -951,6 +979,37 @@ export const exportBankTemplate = <ThrowOnError extends boolean = false>(
   >({ url: "/v1/default/banks/{bank_id}/export", ...options });
 
 /**
+ * Export documents
+ *
+ * Export documents (extracted facts, entity names, causal links, chunks) from a bank as a transfer ZIP archive. Embeddings and database ids are not included — importing re-embeds with the target bank's model and re-resolves entities. Consolidated observations are excluded unless include_observations=true. Pass document_id query params to export specific documents, or omit to export the whole bank.
+ */
+export const exportDocuments = <ThrowOnError extends boolean = false>(
+  options: Options<ExportDocumentsData, ThrowOnError>
+) =>
+  (options.client ?? client).get<ExportDocumentsResponses, ExportDocumentsErrors, ThrowOnError>({
+    url: "/v1/default/banks/{bank_id}/document-transfer",
+    ...options,
+  });
+
+/**
+ * Import documents (async)
+ *
+ * Submit a transfer archive (produced by the export endpoint) for import into a bank. Runs as a background operation: facts are re-embedded with the target bank's embedding model and entities are re-resolved — no LLM extraction. Returns an operation_id; poll GET /v1/default/banks/{bank_id}/operations/{operation_id} for status and the imported/skipped counts in result_metadata. Use on_conflict to control existing document ids: skip (default), replace, or new-id.
+ */
+export const importDocuments = <ThrowOnError extends boolean = false>(
+  options: Options<ImportDocumentsData, ThrowOnError>
+) =>
+  (options.client ?? client).post<ImportDocumentsResponses, ImportDocumentsErrors, ThrowOnError>({
+    ...formDataBodySerializer,
+    url: "/v1/default/banks/{bank_id}/document-transfer",
+    ...options,
+    headers: {
+      "Content-Type": null,
+      ...options.headers,
+    },
+  });
+
+/**
  * Get bank template JSON Schema
  *
  * Returns the JSON Schema for the bank template manifest format. Use this to validate template manifests before importing.
@@ -1062,7 +1121,14 @@ export const triggerConsolidation = <ThrowOnError extends boolean = false>(
     TriggerConsolidationResponses,
     TriggerConsolidationErrors,
     ThrowOnError
-  >({ url: "/v1/default/banks/{bank_id}/consolidate", ...options });
+  >({
+    url: "/v1/default/banks/{bank_id}/consolidate",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
 
 /**
  * List webhooks
@@ -1261,5 +1327,31 @@ export const auditLogStats = <ThrowOnError extends boolean = false>(
 ) =>
   (options.client ?? client).get<AuditLogStatsResponses, AuditLogStatsErrors, ThrowOnError>({
     url: "/v1/default/banks/{bank_id}/audit-logs/stats",
+    ...options,
+  });
+
+/**
+ * List LLM request traces
+ *
+ * List traced LLM requests for a bank, ordered by most recent first. Requires LLM request tracing to be enabled (HINDSIGHT_API_LLM_TRACE_ENABLED).
+ */
+export const listLlmRequests = <ThrowOnError extends boolean = false>(
+  options: Options<ListLlmRequestsData, ThrowOnError>
+) =>
+  (options.client ?? client).get<ListLlmRequestsResponses, ListLlmRequestsErrors, ThrowOnError>({
+    url: "/v1/default/banks/{bank_id}/llm-requests",
+    ...options,
+  });
+
+/**
+ * LLM request statistics
+ *
+ * Get LLM request counts grouped by time bucket and status for charting.
+ */
+export const llmRequestStats = <ThrowOnError extends boolean = false>(
+  options: Options<LlmRequestStatsData, ThrowOnError>
+) =>
+  (options.client ?? client).get<LlmRequestStatsResponses, LlmRequestStatsErrors, ThrowOnError>({
+    url: "/v1/default/banks/{bank_id}/llm-requests/stats",
     ...options,
   });

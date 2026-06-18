@@ -14,6 +14,7 @@ Supports multi-tenant schema isolation via ALTER SESSION SET CURRENT_SCHEMA.
 """
 
 import datetime
+import inspect
 import json
 import logging
 import re
@@ -72,6 +73,9 @@ _RETURNING_RE = re.compile(r"\bRETURNING\s+(.+)", re.IGNORECASE | re.DOTALL)
 
 _ANY_RE = re.compile(r"=\s*ANY\s*\(\s*:(\d+)\s*\)", re.IGNORECASE)
 _NOT_ALL_RE = re.compile(r"!=\s*ALL\s*\(\s*:(\d+)\s*\)", re.IGNORECASE)
+# LIKE ANY / NOT LIKE ALL — capture the column name before the operator
+_LIKE_ANY_RE = re.compile(r"(\w+)\s+LIKE\s+ANY\s*\(\s*:(\d+)\s*\)", re.IGNORECASE)
+_NOT_LIKE_ALL_RE = re.compile(r"(\w+)\s+NOT\s+LIKE\s+ALL\s*\(\s*:(\d+)\s*\)", re.IGNORECASE)
 
 _JSON_ARROW_TEXT_RE = re.compile(r'("?\w+"?)\s*->>\s*\'(\w+)\'')  # handles both col and "col"
 _JSON_HAS_KEY_RE = re.compile(r"(\w+)\s*\?\s*'(\w+)'")
@@ -151,6 +155,23 @@ _JSON_COL_NAMES = {
     "result_metadata",
     "task_payload",
     "history",
+}
+# NOTE: the history tables' JSON payload column is named ``content`` — deliberately
+# NOT added here, because ``mental_models.content`` is plain text (adding "content"
+# would corrupt those reads). The history read paths json.loads ``content`` directly.
+
+# Columns backed by CLOB in Oracle (large text or JSON). When such a column is
+# returned via a ``RETURNING`` clause it must be bound as DB_TYPE_CLOB; binding
+# it as VARCHAR raises ORA-22835 ("buffer too small for CLOB to CHAR") once the
+# value exceeds 4000 bytes. Union of the JSON-CLOB columns above and the
+# large-text CLOB columns.
+_CLOB_RETURNING_COLS = _JSON_COL_NAMES | {
+    "content",
+    "text",
+    "context",
+    "structured_content",
+    "text_signals",
+    "search_vector",
 }
 
 
@@ -349,6 +370,10 @@ def _rewrite_pg_to_oracle(query: str) -> RewriteResult:
     # Boolean literals: Oracle uses NUMBER(1) for booleans
     query = re.sub(r"\b=\s*TRUE\b", "= 1", query, flags=re.IGNORECASE)
     query = re.sub(r"\b=\s*FALSE\b", "= 0", query, flags=re.IGNORECASE)
+    # FOR NO KEY UPDATE → FOR UPDATE (Oracle has only FOR UPDATE; it does not block
+    # indexed-FK child inserts the way PG's FOR UPDATE would, so plain FOR UPDATE is
+    # the correct equivalent). Must run before the FOR SHARE rule below.
+    query = re.sub(r"\bFOR\s+NO\s+KEY\s+UPDATE\b", "FOR UPDATE", query, flags=re.IGNORECASE)
     # FOR SHARE → FOR UPDATE (Oracle doesn't support FOR SHARE)
     query = re.sub(r"\bFOR\s+SHARE\b", "FOR UPDATE", query, flags=re.IGNORECASE)
 
@@ -535,6 +560,12 @@ def _rewrite_pg_to_oracle(query: str) -> RewriteResult:
     # != ALL(:N) → NOT IN (expanded list) — the negative counterpart of = ANY
     query = _NOT_ALL_RE.sub(r"NOT IN (/*EXPAND:\1*/)", query)
 
+    # col LIKE ANY(:N) → (col LIKE :p0 OR col LIKE :p1 OR ...)
+    query = _LIKE_ANY_RE.sub(r"\1 /*LIKE_ANY:\2:\1*/", query)
+
+    # col NOT LIKE ALL(:N) → (col NOT LIKE :p0 AND col NOT LIKE :p1 AND ...)
+    query = _NOT_LIKE_ALL_RE.sub(r"\1 /*NOT_LIKE_ALL:\2:\1*/", query)
+
     # CTE AS MATERIALIZED (...) → AS (...) — Oracle doesn't support MATERIALIZED CTE hint
     query = re.sub(r"\bAS\s+MATERIALIZED\s*\(", "AS (", query, flags=re.IGNORECASE)
 
@@ -672,6 +703,11 @@ class OracleConnection(DatabaseConnection):
                     params[f"ret_{i}"] = cursor.var(oracledb.DB_TYPE_TIMESTAMP_TZ, arraysize=1)
                 elif clean in _NUMERIC_COLS:
                     params[f"ret_{i}"] = cursor.var(oracledb.DB_TYPE_NUMBER, arraysize=1)
+                elif clean in _CLOB_RETURNING_COLS:
+                    # CLOB-backed column: a VARCHAR out-bind caps at 4000 bytes and
+                    # raises ORA-22835 for larger values. Read back as a LOB in
+                    # _read_returning_values.
+                    params[f"ret_{i}"] = cursor.var(oracledb.DB_TYPE_CLOB, arraysize=1)
                 else:
                     params[f"ret_{i}"] = cursor.var(oracledb.DB_TYPE_VARCHAR, arraysize=1)
 
@@ -725,16 +761,37 @@ class OracleConnection(DatabaseConnection):
     _expand_counter = 0
 
     @staticmethod
+    def _resolve_list_param(params: dict[str, Any], key: str) -> list | None:
+        """Resolve a parameter that may be a list or a JSON-encoded list string."""
+        val = params.get(key)
+        if isinstance(val, str):
+            try:
+                parsed = json.loads(val)
+                if isinstance(parsed, list):
+                    return parsed
+            except (json.JSONDecodeError, TypeError):
+                pass
+        if isinstance(val, (list, tuple)):
+            return list(val)
+        return None
+
+    @staticmethod
     def _expand_any_lists(query: str, params: dict[str, Any] | None) -> tuple[str, dict[str, Any] | None]:
-        """Expand /*EXPAND:N*/ markers into individual bind vars for IN clauses.
+        """Expand /*EXPAND:N*/, /*LIKE_ANY:N:col*/, /*NOT_LIKE_ALL:N:col*/ markers.
 
         Converts: IN (/*EXPAND:1*/) with params["1"] = [a, b, c]
         Into:     IN (:any_0, :any_1, :any_2) with params["any_0"]=a, etc.
 
+        Converts: col /*LIKE_ANY:1:col*/ with params["1"] = [a, b]
+        Into:     (col LIKE :lk_0 OR col LIKE :lk_1)
+
+        Converts: col /*NOT_LIKE_ALL:1:col*/ with params["1"] = [a, b]
+        Into:     (col NOT LIKE :nlk_0 AND col NOT LIKE :nlk_1)
+
         Uses a unique prefix to avoid name collisions with other bind vars.
         The original param is kept (for other references to :N in the query).
         """
-        if params is None or "/*EXPAND:" not in query:
+        if params is None or "/*" not in query:
             return query, params
 
         expand_re = re.compile(r"/\*EXPAND:(\d+)\*/")
@@ -775,6 +832,50 @@ class OracleConnection(DatabaseConnection):
 
         query = expand_re.sub(_replace, query)
 
+        # Expand LIKE ANY: col /*LIKE_ANY:N:col*/ → (col LIKE :p0 OR col LIKE :p1 ...)
+        like_any_re = re.compile(r"(\w+)\s*/\*LIKE_ANY:(\d+):(\w+)\*/")
+
+        def _replace_like_any(m):
+            _col = m.group(1)  # redundant column ref before marker
+            param_key = m.group(2)
+            col = m.group(3)
+            val = OracleConnection._resolve_list_param(params, param_key)
+            if val is None or len(val) == 0:
+                return "1=0"  # no patterns → no match
+            OracleConnection._expand_counter += 1
+            prefix = f"lk{OracleConnection._expand_counter}"
+            clauses = []
+            for i, item in enumerate(val):
+                k = f"{prefix}_{i}"
+                params[k] = item
+                clauses.append(f"{col} LIKE :{k}")
+            keys_to_remove.add(param_key)
+            return f"({' OR '.join(clauses)})"
+
+        query = like_any_re.sub(_replace_like_any, query)
+
+        # Expand NOT LIKE ALL: col /*NOT_LIKE_ALL:N:col*/ → (col NOT LIKE :p0 AND ...)
+        not_like_all_re = re.compile(r"(\w+)\s*/\*NOT_LIKE_ALL:(\d+):(\w+)\*/")
+
+        def _replace_not_like_all(m):
+            _col = m.group(1)
+            param_key = m.group(2)
+            col = m.group(3)
+            val = OracleConnection._resolve_list_param(params, param_key)
+            if val is None or len(val) == 0:
+                return "1=1"  # no patterns → everything matches
+            OracleConnection._expand_counter += 1
+            prefix = f"nlk{OracleConnection._expand_counter}"
+            clauses = []
+            for i, item in enumerate(val):
+                k = f"{prefix}_{i}"
+                params[k] = item
+                clauses.append(f"{col} NOT LIKE :{k}")
+            keys_to_remove.add(param_key)
+            return f"({' AND '.join(clauses)})"
+
+        query = not_like_all_re.sub(_replace_not_like_all, query)
+
         # Remove original list params that were expanded — their placeholder
         # (:N) no longer exists in the query, and leaving them causes DPY-4008.
         # Only remove if the key's placeholder is truly gone from the query.
@@ -784,7 +885,7 @@ class OracleConnection(DatabaseConnection):
 
         return query, params
 
-    def _read_returning_values(self, returning_cols: list[str], params: dict[str, Any]) -> dict[str, Any] | None:
+    async def _read_returning_values(self, returning_cols: list[str], params: dict[str, Any]) -> dict[str, Any] | None:
         """Read values from RETURNING INTO output variables after execute."""
         row: dict[str, Any] = {}
         for i, col in enumerate(returning_cols):
@@ -793,6 +894,14 @@ class OracleConnection(DatabaseConnection):
             if not values:
                 return None
             val = values[0] if isinstance(values, list) else values
+
+            # CLOB-bound columns return a LOB handle; read it to a string. The
+            # async pool yields AsyncLOB whose read() is a coroutine.
+            if val is not None and not isinstance(val, (str, bytes, int, float)) and hasattr(val, "read"):
+                data = val.read()
+                if inspect.isawaitable(data):
+                    data = await data
+                val = data
 
             # Clean alias: "LOWER(canonical_name) AS name_lower" → "name_lower"
             clean_col = col.strip()
@@ -981,7 +1090,7 @@ class OracleConnection(DatabaseConnection):
                 raise
 
             if ret_cols is not None:
-                row_dict = self._read_returning_values(ret_cols, params)
+                row_dict = await self._read_returning_values(ret_cols, params)
                 return [ResultRow(row_dict)] if row_dict else []
 
             columns = [col[0].lower() for col in cursor.description or []]
@@ -1019,7 +1128,7 @@ class OracleConnection(DatabaseConnection):
                 raise
 
             if ret_cols is not None:
-                row_dict = self._read_returning_values(ret_cols, params)
+                row_dict = await self._read_returning_values(ret_cols, params)
                 return ResultRow(row_dict) if row_dict else None
 
             columns = [col[0].lower() for col in cursor.description or []]
@@ -1052,7 +1161,7 @@ class OracleConnection(DatabaseConnection):
             await cursor.execute(query, params)
 
             if ret_cols is not None:
-                row_dict = self._read_returning_values(ret_cols, params)
+                row_dict = await self._read_returning_values(ret_cols, params)
                 if row_dict is None:
                     return None
                 vals = list(row_dict.values())

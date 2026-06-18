@@ -7,7 +7,7 @@ This provider handles all OpenAI API-compatible models including:
 - Groq: Fast inference with seed control and service tiers
 - Ollama: Local models with native streaming API support
 - LMStudio: Local models with OpenAI-compatible API
-- MiniMax: MiniMax-M2.7 models with 1M context window
+- MiniMax: MiniMax-M3 / MiniMax-M2.7 models with 1M context window
 - DeepSeek: deepseek-v4-flash / deepseek-v4-pro / deepseek-chat / deepseek-reasoner via api.deepseek.com
 - Opencode Go: deepseek-v4-flash via https://opencode.ai/zen/go/v1
 
@@ -26,6 +26,7 @@ import logging
 import os
 import re
 import time
+from email.utils import parsedate_to_datetime
 from typing import Any
 from urllib.parse import parse_qs, urlparse, urlunparse
 
@@ -43,6 +44,16 @@ logger = logging.getLogger(__name__)
 # Seed applied to every Groq request for deterministic behavior
 DEFAULT_LLM_SEED = 4242
 JSON_MODE_USER_HINT = "Return valid json only."
+
+# Self-hosted OpenAI-compatible servers that advertise tool_choice="required"
+# but silently ignore it: instead of forcing a tool call they return
+# finish_reason "stop"/"tool_calls" with an EMPTY tool_calls array and no error.
+# Reflect's agent loop then sees no tool call, runs synthesis with no retrieval,
+# and answers "I don't have information" even when the bank holds the answer.
+# See issues #1563 (LM Studio), #1179 (LM Studio + Qwen), #1877 (vLLM with
+# --enable-auto-tool-choice). llama-server (the "llamacpp" provider) honors
+# "required" correctly and is intentionally excluded (#1179).
+_TOOL_CHOICE_REQUIRED_UNSUPPORTED_PROVIDERS = frozenset({"lmstudio", "ollama"})
 
 
 class ProviderResponseError(RuntimeError):
@@ -223,6 +234,27 @@ def _summarize_status_error(e: APIStatusError, body_max: int = 400) -> str:
     return f"HTTP {e.status_code}: {body_str or '<no body>'}"
 
 
+def _retry_after_seconds(e: APIStatusError, *, max_backoff: float) -> float | None:
+    """Parse Retry-After for provider cooldowns, capped by max_backoff."""
+    response = getattr(e, "response", None)
+    headers = getattr(response, "headers", None)
+    if not headers:
+        return None
+    retry_after = headers.get("retry-after") or headers.get("Retry-After")
+    if not retry_after:
+        return None
+    try:
+        seconds = float(retry_after)
+    except ValueError:
+        try:
+            seconds = parsedate_to_datetime(retry_after).timestamp() - time.time()
+        except (TypeError, ValueError, OverflowError):
+            return None
+    if seconds <= 0:
+        return None
+    return min(seconds, max_backoff)
+
+
 class OpenAICompatibleLLM(LLMInterface):
     """
     LLM provider for OpenAI-compatible APIs.
@@ -232,7 +264,7 @@ class OpenAICompatibleLLM(LLMInterface):
     - Groq: Fast inference with seed control and service tiers
     - Ollama: Local models with native streaming API for better structured output
     - LMStudio: Local models with OpenAI-compatible API
-    - MiniMax: MiniMax-M2.7 models via OpenAI-compatible API (https://api.minimax.io/v1)
+    - MiniMax: MiniMax-M3 / MiniMax-M2.7 models via OpenAI-compatible API (https://api.minimax.io/v1)
     - DeepSeek: deepseek-v4-flash / deepseek-v4-pro / deepseek-chat / deepseek-reasoner via https://api.deepseek.com
     - opencode-go: deepseek-v4-flash via https://opencode.ai/zen/go/v1
     """
@@ -270,6 +302,7 @@ class OpenAICompatibleLLM(LLMInterface):
             "openai",
             "groq",
             "ollama",
+            "ollama-cloud",
             "lmstudio",
             "llamacpp",
             "minimax",
@@ -278,6 +311,7 @@ class OpenAICompatibleLLM(LLMInterface):
             "openrouter",
             "zai",
             "opencode-go",
+            "fireworks",
         ]
         if self.provider not in valid_providers:
             raise ValueError(f"OpenAICompatibleLLM only supports: {', '.join(valid_providers)}. Got: {self.provider}")
@@ -288,6 +322,8 @@ class OpenAICompatibleLLM(LLMInterface):
                 self.base_url = "https://api.groq.com/openai/v1"
             elif self.provider == "ollama":
                 self.base_url = "http://localhost:11434/v1"
+            elif self.provider == "ollama-cloud":
+                self.base_url = "https://ollama.com/v1"
             elif self.provider == "lmstudio":
                 self.base_url = "http://localhost:1234/v1"
             elif self.provider == "minimax":
@@ -300,6 +336,10 @@ class OpenAICompatibleLLM(LLMInterface):
                 self.base_url = "https://api.z.ai/api/coding/paas/v4"
             elif self.provider == "opencode-go":
                 self.base_url = "https://opencode.ai/zen/go/v1"
+            elif self.provider == "fireworks":
+                # OpenAI-compatible inference host (online path). The batch API
+                # lives on a separate control-plane host — see FireworksLLM.
+                self.base_url = "https://api.fireworks.ai/inference/v1"
 
         # For ollama/lmstudio, use dummy key if not provided
         if self.provider in ("ollama", "lmstudio") and not self.api_key:
@@ -316,6 +356,7 @@ class OpenAICompatibleLLM(LLMInterface):
                 "openrouter",
                 "zai",
                 "opencode-go",
+                "ollama-cloud",
             )
             and not self.api_key
         ):
@@ -350,6 +391,21 @@ class OpenAICompatibleLLM(LLMInterface):
             f"OpenAI-compatible client initialized: provider={self.provider}, model={self.model}, "
             f"base_url={self.base_url or 'default'}"
         )
+
+    def _drops_tool_choice_required(self) -> bool:
+        """Whether this endpoint silently ignores ``tool_choice="required"``.
+
+        True for self-hosted OpenAI-compatible servers known to return an empty
+        tool_calls array for "required" instead of forcing a call (#1563/#1179/
+        #1877). Covers LM Studio / Ollama directly, plus any server reached via
+        the generic "openai" provider with a custom ``base_url`` (e.g. a local
+        vLLM endpoint). The real OpenAI API (no base_url override) honors
+        "required", and cloud providers keep their own default base_urls, so both
+        are left untouched.
+        """
+        if self.provider in _TOOL_CHOICE_REQUIRED_UNSUPPORTED_PROVIDERS:
+            return True
+        return self.provider == "openai" and bool(self.base_url)
 
     async def verify_connection(self) -> None:
         """
@@ -451,7 +507,9 @@ class OpenAICompatibleLLM(LLMInterface):
             initial_backoff: Initial backoff time in seconds.
             max_backoff: Maximum backoff time in seconds.
             skip_validation: Return raw JSON without Pydantic validation.
-            strict_schema: Use strict JSON schema enforcement (OpenAI only).
+            strict_schema: Use strict json_schema (grammar-enforced) response_format instead of
+                the soft json_object path. Supported by OpenAI and schema-capable self-hosted
+                backends (llama.cpp, vLLM). Server-wide via HINDSIGHT_API_LLM_STRICT_SCHEMA.
             return_usage: If True, return tuple (result, TokenUsage) instead of just result.
 
         Returns:
@@ -641,6 +699,9 @@ class OpenAICompatibleLLM(LLMInterface):
                 input_tokens = usage.prompt_tokens or 0 if usage else 0
                 output_tokens = usage.completion_tokens or 0 if usage else 0
                 total_tokens = usage.total_tokens or 0 if usage else 0
+                cached_tokens = 0
+                if usage and getattr(usage, "prompt_tokens_details", None):
+                    cached_tokens = getattr(usage.prompt_tokens_details, "cached_tokens", 0) or 0
 
                 # Record LLM metrics
                 metrics = get_metrics_collector()
@@ -670,14 +731,12 @@ class OpenAICompatibleLLM(LLMInterface):
                     duration=duration,
                     finish_reason=finish_reason,
                     error=None,
+                    cached_tokens=cached_tokens,
                 )
 
                 # Log slow calls
                 if duration > 10.0 and usage:
                     ratio = max(1, output_tokens) / max(1, input_tokens)
-                    cached_tokens = 0
-                    if hasattr(usage, "prompt_tokens_details") and usage.prompt_tokens_details:
-                        cached_tokens = getattr(usage.prompt_tokens_details, "cached_tokens", 0) or 0
                     cache_info = f", cached_tokens={cached_tokens}" if cached_tokens > 0 else ""
                     logger.info(
                         f"slow llm call: scope={scope}, model={self.provider}/{self.model}, "
@@ -690,6 +749,7 @@ class OpenAICompatibleLLM(LLMInterface):
                         input_tokens=input_tokens,
                         output_tokens=output_tokens,
                         total_tokens=total_tokens,
+                        cached_tokens=cached_tokens,
                     )
                     return result, token_usage
                 return result
@@ -763,9 +823,18 @@ class OpenAICompatibleLLM(LLMInterface):
                         f"APIStatusError ({self.provider}/{self.model}, scope={scope}, "
                         f"attempt {attempt + 1}/{max_retries + 1}): {_summarize_status_error(e)}"
                     )
-                    backoff = min(initial_backoff * (2**attempt), max_backoff)
-                    jitter = backoff * 0.2 * (2 * (time.time() % 1) - 1)
-                    sleep_time = backoff + jitter
+                    retry_after = _retry_after_seconds(e, max_backoff=max_backoff)
+                    if retry_after is not None:
+                        sleep_time = retry_after
+                    else:
+                        backoff = min(initial_backoff * (2**attempt), max_backoff)
+                        jitter = backoff * 0.2 * (2 * (time.time() % 1) - 1)
+                        sleep_time = max(0.0, backoff + jitter)
+                    if e.status_code == 429:
+                        logger.warning(
+                            f"Rate limited ({self.provider}/{self.model}, scope={scope}); "
+                            f"cooling down for {sleep_time:.2f}s before retry"
+                        )
                     await asyncio.sleep(sleep_time)
                 else:
                     logger.error(
@@ -856,6 +925,16 @@ class OpenAICompatibleLLM(LLMInterface):
         # only when the caller asks for a non-default behaviour avoids those 400s
         # without changing semantics for compliant providers.
         if request_tool_choice == "auto":
+            request_tool_choice = None
+
+        # vLLM (--enable-auto-tool-choice), LM Studio, Ollama and similar
+        # self-hosted servers silently drop tool_choice="required", returning an
+        # empty tool_calls array instead of forcing a call (#1563/#1179/#1877).
+        # Downgrade to auto (None) so the model still gets to call a tool. Named
+        # tool_choice dicts were already normalized to "required" + a single
+        # filtered tool above, so the call stays practically forced even under
+        # auto. The real OpenAI API honors "required" and is left untouched.
+        if request_tool_choice == "required" and self._drops_tool_choice_required():
             request_tool_choice = None
 
         # DeepSeek tool-call replies can carry provider-specific reasoning_content.
@@ -1073,12 +1152,17 @@ class OpenAICompatibleLLM(LLMInterface):
 
         last_exception = None
 
+        # Pass API key as Bearer token for cloud Ollama endpoints
+        headers: dict[str, str] = {}
+        if self.api_key and self.api_key != "local":
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
         async with httpx.AsyncClient(timeout=300.0) as client:
             for attempt in range(max_retries + 1):
                 if attempt > 0:
                     set_stage(f"llm.ollama_native.{scope}.attempt={attempt + 1}/{max_retries + 1}")
                 try:
-                    response = await client.post(native_url, json=payload)
+                    response = await client.post(native_url, json=payload, headers=headers)
                     response.raise_for_status()
 
                     result = response.json()

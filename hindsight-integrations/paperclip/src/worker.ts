@@ -22,12 +22,14 @@
 import { definePlugin, runWorker } from "@paperclipai/plugin-sdk";
 import type { Agent, ToolRunContext } from "@paperclipai/plugin-sdk";
 import { HindsightClient, formatMemories } from "./client.js";
-import { deriveBankId } from "./bank.js";
+import { deriveBankId, extractUserFromIssue } from "./bank.js";
 
 interface PluginConfig {
   hindsightApiUrl: string;
   hindsightApiKeyRef?: string;
-  bankGranularity?: Array<"company" | "agent">;
+  bankId?: string;
+  dynamicBankId?: boolean;
+  bankGranularity?: Array<"company" | "agent" | "user">;
   recallBudget?: "low" | "mid" | "high";
   autoRetain?: boolean;
   seedBankEnabled?: boolean;
@@ -55,6 +57,47 @@ interface CommentCreatedPayload {
   bodySnippet?: string;
   agentId?: string | null;
   runId?: string | null;
+}
+
+export const DEFAULT_MAX_RECALL_QUERY_BYTES = 1200;
+
+function normalizeRecallQueryPart(value: unknown): string {
+  return typeof value === "string" ? value.replace(/\s+/g, " ").trim() : "";
+}
+
+function truncateUtf8(input: string, maxBytes: number): string {
+  if (maxBytes <= 0) return "";
+  if (Buffer.byteLength(input, "utf8") <= maxBytes) return input;
+
+  let out = "";
+  let used = 0;
+  for (const char of input) {
+    const bytes = Buffer.byteLength(char, "utf8");
+    if (used + bytes > maxBytes) break;
+    out += char;
+    used += bytes;
+  }
+  return out.trimEnd();
+}
+
+export function buildRecallQuery(
+  issue: { title?: string | null; description?: string | null },
+  maxBytes = DEFAULT_MAX_RECALL_QUERY_BYTES
+): string {
+  const title = normalizeRecallQueryPart(issue.title);
+  const description = normalizeRecallQueryPart(issue.description);
+  if (!title && !description) return "";
+
+  const full = [title, description].filter(Boolean).join("\n");
+  if (Buffer.byteLength(full, "utf8") <= maxBytes) return full;
+
+  if (!title) return truncateUtf8(description, maxBytes);
+  const titleBytes = Buffer.byteLength(title, "utf8");
+  if (titleBytes >= maxBytes) return truncateUtf8(title, maxBytes);
+
+  const remainingDescriptionBytes = maxBytes - titleBytes - 1; // newline
+  const clippedDescription = truncateUtf8(description, remainingDescriptionBytes);
+  return [title, clippedDescription].filter(Boolean).join("\n").trim();
 }
 
 class SeedBankQueueError extends Error {
@@ -249,13 +292,25 @@ const plugin = definePlugin({
       }
       if (!issue) return;
 
-      const query = [issue.title, issue.description].filter(Boolean).join("\n");
+      const query = buildRecallQuery(issue);
       if (!query.trim()) return;
+
+      // Extract userId from the specific issue being worked on (not an
+      // arbitrary one from list). This is only used when bankGranularity
+      // includes "user".
+      const userId = config.bankGranularity?.includes("user")
+        ? extractUserFromIssue(issue)
+        : undefined;
+
+      // Cache userId so tool calls within this run can derive the same bank ID
+      if (userId) {
+        await ctx.state.set({ scopeKind: "run", scopeId: runId, stateKey: "user-id" }, userId);
+      }
 
       try {
         const apiKey = await resolveApiKey(ctx, config);
         const client = new HindsightClient(config.hindsightApiUrl, apiKey);
-        const bankId = deriveBankId({ companyId, agentId }, config);
+        const bankId = deriveBankId({ companyId, agentId, userId }, config);
 
         const response = await client.recall(bankId, query, config.recallBudget ?? "mid");
 
@@ -320,12 +375,19 @@ const plugin = definePlugin({
       // Bank attribution: comments authored by an agent belong in that agent's
       // bank; user/system comments fall back to the issue's assignee.
       let bankAgentId: string | null = payloadAgentId;
-      if (!bankAgentId) {
+      let userId: string | undefined;
+      let issueForAttribution;
+      if (!bankAgentId || config.bankGranularity?.includes("user")) {
         try {
-          const issue = await ctx.issues.get(issueId, companyId);
-          bankAgentId = issue?.assigneeAgentId ?? null;
+          issueForAttribution = await ctx.issues.get(issueId, companyId);
+          if (!bankAgentId) {
+            bankAgentId = issueForAttribution?.assigneeAgentId ?? null;
+          }
+          if (config.bankGranularity?.includes("user") && issueForAttribution) {
+            userId = extractUserFromIssue(issueForAttribution);
+          }
         } catch {
-          /* ignore */
+          /* ignore — userId stays undefined, bankAgentId fallback already handled */
         }
       }
 
@@ -340,7 +402,7 @@ const plugin = definePlugin({
       try {
         const apiKey = await resolveApiKey(ctx, config);
         const client = new HindsightClient(config.hindsightApiUrl, apiKey);
-        const bankId = deriveBankId({ companyId, agentId: bankAgentId }, config);
+        const bankId = deriveBankId({ companyId, agentId: bankAgentId, userId }, config);
         await client.retain(bankId, body, commentId, {
           agentId: bankAgentId,
           companyId,
@@ -392,8 +454,20 @@ const plugin = definePlugin({
       async (params: unknown, runCtx: ToolRunContext) => {
         const { query } = params as { query: string };
         const config = await getConfig(ctx);
+
+        // Read userId cached by agent.run.started for consistent bank derivation
+        let userId: string | undefined;
+        if (config.bankGranularity?.includes("user")) {
+          const cachedUserId = await ctx.state.get({
+            scopeKind: "run",
+            scopeId: runCtx.runId,
+            stateKey: "user-id",
+          });
+          if (cachedUserId && typeof cachedUserId === "string") userId = cachedUserId;
+        }
+
         const bankId = deriveBankId(
-          { companyId: runCtx.companyId, agentId: runCtx.agentId },
+          { companyId: runCtx.companyId, agentId: runCtx.agentId, userId },
           config
         );
 
@@ -443,8 +517,20 @@ const plugin = definePlugin({
       async (params: unknown, runCtx: ToolRunContext) => {
         const { content } = params as { content: string };
         const config = await getConfig(ctx);
+
+        // Read userId cached by agent.run.started for consistent bank derivation
+        let userId: string | undefined;
+        if (config.bankGranularity?.includes("user")) {
+          const cached = await ctx.state.get({
+            scopeKind: "run",
+            scopeId: runCtx.runId,
+            stateKey: "user-id",
+          });
+          if (cached && typeof cached === "string") userId = cached;
+        }
+
         const bankId = deriveBankId(
-          { companyId: runCtx.companyId, agentId: runCtx.agentId },
+          { companyId: runCtx.companyId, agentId: runCtx.agentId, userId },
           config
         );
 

@@ -12,6 +12,7 @@ concurrency:
 jobs:
   detect-changes:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       pull-requests: read
     outputs:
@@ -38,25 +39,44 @@ jobs:
       integrations-litellm: ${{ steps.filter.outputs.integrations-litellm }}
       integrations-pydantic-ai: ${{ steps.filter.outputs.integrations-pydantic-ai }}
       integrations-ag2: ${{ steps.filter.outputs.integrations-ag2 }}
+      integrations-autogen: ${{ steps.filter.outputs.integrations-autogen }}
+      integrations-langgraph: ${{ steps.filter.outputs.integrations-langgraph }}
       integrations-llamaindex: ${{ steps.filter.outputs.integrations-llamaindex }}
       integrations-paperclip: ${{ steps.filter.outputs.integrations-paperclip }}
       integrations-opencode: ${{ steps.filter.outputs.integrations-opencode }}
       integrations-n8n: ${{ steps.filter.outputs.integrations-n8n }}
       integrations-cloudflare-oauth-proxy: ${{ steps.filter.outputs.integrations-cloudflare-oauth-proxy }}
+      integrations-superagent: ${{ steps.filter.outputs.integrations-superagent }}
       integrations-lockfiles: ${{ steps.filter.outputs.integrations-lockfiles }}
       integrations-openai-agents: ${{ steps.filter.outputs.integrations-openai-agents }}
       integrations-pipecat: ${{ steps.filter.outputs.integrations-pipecat }}
       integrations-agentcore: ${{ steps.filter.outputs.integrations-agentcore }}
       integrations-smolagents: ${{ steps.filter.outputs.integrations-smolagents }}
+      integrations-claude-agent-sdk: ${{ steps.filter.outputs.integrations-claude-agent-sdk }}
       integrations-dify: ${{ steps.filter.outputs.integrations-dify }}
+      integrations-gemini-spark: ${{ steps.filter.outputs.integrations-gemini-spark }}
+      integrations-vapi: ${{ steps.filter.outputs.integrations-vapi }}
+      integrations-flowise: ${{ steps.filter.outputs.integrations-flowise }}
+      integrations-google-adk: ${{ steps.filter.outputs.integrations-google-adk }}
       tools-agent-sdk: ${{ steps.filter.outputs.tools-agent-sdk }}
+      integrations-roo-code: ${{ steps.filter.outputs.integrations-roo-code }}
       dev: ${{ steps.filter.outputs.dev }}
       ci: ${{ steps.filter.outputs.ci }}
-      # Secrets are available for internal PRs and workflow_dispatch.
-      # Fork PRs via pull_request event do NOT have access to secrets.
-      has_secrets: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+      # Secrets are "present" only when the CI repo actually has the cloud
+      # provider keys configured (probed below via COHERE_API_KEY). Upstream
+      # sets them; a fork/mirror that runs hindsight with self-hosted (local)
+      # embeddings won't have them, so secret-dependent jobs skip cleanly
+      # instead of failing on empty keys. (Was: same-repo-PR heuristic, which
+      # wrongly assumed same-repo ⇒ secrets exist.)
+      has_secrets: ${{ steps.secrets.outputs.has }}
     steps:
     - uses: actions/checkout@v6
+
+    - id: secrets
+      env:
+        PROBE: ${{ secrets.COHERE_API_KEY }}
+      run: |
+        if [ -n "$PROBE" ]; then echo "has=true" >> "$GITHUB_OUTPUT"; else echo "has=false" >> "$GITHUB_OUTPUT"; fi
 
     - uses: dorny/paths-filter@v4
       id: filter
@@ -119,6 +139,10 @@ jobs:
             - 'hindsight-integrations/pydantic-ai/**'
           integrations-ag2:
             - 'hindsight-integrations/ag2/**'
+          integrations-autogen:
+            - 'hindsight-integrations/autogen/**'
+          integrations-langgraph:
+            - 'hindsight-integrations/langgraph/**'
           integrations-llamaindex:
             - 'hindsight-integrations/llamaindex/**'
           integrations-paperclip:
@@ -129,6 +153,8 @@ jobs:
             - 'hindsight-integrations/n8n/**'
           integrations-cloudflare-oauth-proxy:
             - 'hindsight-integrations/cloudflare-oauth-proxy/**'
+          integrations-superagent:
+            - 'hindsight-integrations/superagent/**'
           integrations-lockfiles:
             - 'hindsight-integrations/*/package-lock.json'
             - 'hindsight-integrations/*/package.json'
@@ -141,10 +167,22 @@ jobs:
             - 'hindsight-integrations/agentcore/**'
           integrations-smolagents:
             - 'hindsight-integrations/smolagents/**'
+          integrations-claude-agent-sdk:
+            - 'hindsight-integrations/claude-agent-sdk/**'
           integrations-dify:
             - 'hindsight-integrations/dify/**'
+          integrations-gemini-spark:
+            - 'hindsight-integrations/gemini-spark/**'
+          integrations-vapi:
+            - 'hindsight-integrations/vapi/**'
+          integrations-flowise:
+            - 'hindsight-integrations/flowise/**'
+          integrations-google-adk:
+            - 'hindsight-integrations/google-adk/**'
           tools-agent-sdk:
             - 'hindsight-tools/hindsight-agent-sdk/**'
+          integrations-roo-code:
+            - 'hindsight-integrations/roo-code/**'
           dev:
             - 'hindsight-dev/**'
           ci:
@@ -164,6 +202,7 @@ jobs:
       needs.detect-changes.outputs.integrations-lockfiles == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
     - uses: actions/checkout@v6
       with:
@@ -179,6 +218,7 @@ jobs:
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       matrix:
         python-version: ['3.11', '3.12', '3.13', '3.14']
@@ -209,6 +249,7 @@ jobs:
       needs.detect-changes.outputs.clients-ts == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
     - uses: actions/checkout@v6
@@ -235,6 +276,7 @@ jobs:
       needs.detect-changes.outputs.all-npm == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
     - uses: actions/checkout@v6
@@ -266,6 +308,7 @@ jobs:
       needs.detect-changes.outputs.all-npm == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
     - uses: actions/checkout@v6
@@ -321,6 +364,7 @@ jobs:
       needs.detect-changes.outputs.all-npm == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
     - uses: actions/checkout@v6
@@ -376,6 +420,7 @@ jobs:
       needs.detect-changes.outputs.integrations-claude-code == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
     - uses: actions/checkout@v6
@@ -401,6 +446,7 @@ jobs:
       needs.detect-changes.outputs.integrations-codex == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
     - uses: actions/checkout@v6
@@ -426,6 +472,7 @@ jobs:
       needs.detect-changes.outputs.integrations-ai-sdk == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
     - uses: actions/checkout@v6
@@ -456,6 +503,7 @@ jobs:
       needs.detect-changes.outputs.integrations-ai-sdk == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
     - uses: actions/checkout@v6
@@ -487,6 +535,7 @@ jobs:
       needs.detect-changes.outputs.integrations-opencode == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
     - uses: actions/checkout@v6
@@ -517,6 +566,7 @@ jobs:
       needs.detect-changes.outputs.integrations-n8n == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
     - uses: actions/checkout@v6
@@ -547,6 +597,7 @@ jobs:
       needs.detect-changes.outputs.tools-agent-sdk == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
     - uses: actions/checkout@v6
@@ -579,6 +630,7 @@ jobs:
       needs.detect-changes.outputs.integrations-cloudflare-oauth-proxy == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
     - uses: actions/checkout@v6
@@ -609,6 +661,7 @@ jobs:
       needs.detect-changes.outputs.integrations-chat == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
     - uses: actions/checkout@v6
@@ -639,6 +692,7 @@ jobs:
       needs.detect-changes.outputs.integrations-paperclip == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
     - uses: actions/checkout@v6
@@ -669,6 +723,7 @@ jobs:
       needs.detect-changes.outputs.integrations-pipecat == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
     - uses: actions/checkout@v6
@@ -698,6 +753,102 @@ jobs:
       working-directory: ./hindsight-integrations/pipecat
       run: uv run pytest tests -v
 
+  test-google-adk-integration:
+    needs: [detect-changes]
+    if: >-
+      (github.event_name == 'workflow_dispatch' ||
+      needs.detect-changes.outputs.integrations-google-adk == 'true' ||
+      needs.detect-changes.outputs.ci == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event.pull_request.head.sha || '' }}
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v7
+      with:
+        enable-cache: true
+        prune-cache: false
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version-file: ".python-version"
+
+    - name: Build google-adk integration
+      working-directory: ./hindsight-integrations/google-adk
+      run: uv build
+
+    - name: Install dependencies
+      working-directory: ./hindsight-integrations/google-adk
+      run: uv sync --frozen
+
+    - name: Run tests
+      working-directory: ./hindsight-integrations/google-adk
+      run: uv run pytest tests -v
+
+  test-gemini-spark-integration:
+    needs: [detect-changes]
+    if: >-
+      (github.event_name == 'workflow_dispatch' ||
+      needs.detect-changes.outputs.integrations-gemini-spark == 'true' ||
+      needs.detect-changes.outputs.ci == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event.pull_request.head.sha || '' }}
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v7
+      with:
+        enable-cache: true
+        prune-cache: false
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version-file: ".python-version"
+
+    - name: Install dependencies
+      working-directory: ./hindsight-integrations/gemini-spark
+      run: uv sync --frozen
+
+    - name: Run tests
+      working-directory: ./hindsight-integrations/gemini-spark
+      run: uv run pytest tests -v
+
+  test-roo-code-integration:
+    needs: [detect-changes]
+    if: >-
+      github.event_name != 'pull_request_review' &&
+      (github.event_name == 'workflow_dispatch' ||
+      needs.detect-changes.outputs.integrations-roo-code == 'true' ||
+      needs.detect-changes.outputs.ci == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event.pull_request.head.sha || '' }}
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.11'
+
+    - name: Install pytest
+      run: pip install pytest
+
+    - name: Run tests
+      working-directory: ./hindsight-integrations/roo-code
+      run: python -m pytest tests/ -v
 
   build-control-plane:
     needs: [detect-changes]
@@ -707,6 +858,7 @@ jobs:
       needs.detect-changes.outputs.clients-ts == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
     - uses: actions/checkout@v6
@@ -733,6 +885,12 @@ jobs:
         npm install --workspace=hindsight-control-plane
         rm -rf node_modules/lightningcss node_modules/@tailwindcss
         npm install lightningcss @tailwindcss/postcss @tailwindcss/node
+
+    - name: Test Control Plane
+      run: npm test --workspace=hindsight-control-plane
+
+    - name: Check i18n locale parity and hardcoded strings
+      run: npm run i18n:check --workspace=hindsight-control-plane
 
     - name: Build Control Plane
       run: npm run build --workspace=hindsight-control-plane
@@ -766,6 +924,7 @@ jobs:
       needs.detect-changes.outputs.docs == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
     - uses: actions/checkout@v6
@@ -794,6 +953,7 @@ jobs:
       needs.detect-changes.outputs.cli == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       HINDSIGHT_API_LLM_PROVIDER: vertexai
       HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
@@ -921,6 +1081,7 @@ jobs:
       needs.detect-changes.outputs.helm == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
     - uses: actions/checkout@v6
@@ -935,6 +1096,23 @@ jobs:
     - name: Lint Helm chart
       run: helm lint helm/hindsight
 
+  test-standalone-start-script:
+    needs: [detect-changes]
+    if: >-
+      (github.event_name == 'workflow_dispatch' ||
+      needs.detect-changes.outputs.docker == 'true' ||
+      needs.detect-changes.outputs.ci == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event.pull_request.head.sha || '' }}
+
+    - name: Run standalone start script tests
+      run: bash docker/standalone/test-start-all.sh
+
   build-docker-images:
     needs: [detect-changes]
     if: >-
@@ -946,6 +1124,7 @@ jobs:
       needs.detect-changes.outputs.ci == 'true')
     name: Build Docker (${{ matrix.name }})
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       matrix:
         include:
@@ -1010,14 +1189,14 @@ jobs:
     # Only test slim variants to save disk space (they're much smaller)
     # Slim variants require external embedding providers
     - name: Setup GCP credentials for smoke test
-      if: matrix.variant == 'slim'
+      if: matrix.variant == 'slim' && needs.detect-changes.outputs.has_secrets == 'true'
       run: |
         printf '%s' '${{ secrets.GCP_VERTEXAI_CREDENTIALS }}' > /tmp/gcp-credentials.json
         PROJECT_ID=$(jq -r '.project_id' /tmp/gcp-credentials.json)
         echo "HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$PROJECT_ID" >> $GITHUB_ENV
 
     - name: Smoke test - verify container starts
-      if: matrix.variant == 'slim'
+      if: matrix.variant == 'slim' && needs.detect-changes.outputs.has_secrets == 'true'
       env:
         HINDSIGHT_API_LLM_PROVIDER: vertexai
         HINDSIGHT_API_LLM_MODEL: google/gemini-2.5-flash-lite
@@ -1036,6 +1215,16 @@ jobs:
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Sharded with pytest-split. Splits the ~19-min pytest run across 3
+    # parallel jobs, cutting critical-path wall time to ~7-8 min/shard. The
+    # .venv cache lets shards 2+ skip the ~3-min `uv sync` once shard 1
+    # populates the key — same key on re-runs hits cache on all three.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    name: test-api (${{ matrix.shard }}/3)
     env:
       HINDSIGHT_API_LLM_PROVIDER: vertexai
       HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
@@ -1076,6 +1265,18 @@ jobs:
       working-directory: ./hindsight-api-slim
       run: uv build
 
+    - name: Cache hindsight-api-slim/.venv
+      # Keyed on the workspace lockfile, the API package's pyproject, and the
+      # pinned Python version — the only inputs that change the resolved env.
+      # `uv sync --frozen` still runs after restore but is a near-instant link
+      # check when the venv already matches the lock.
+      uses: actions/cache@v5
+      with:
+        path: hindsight-api-slim/.venv
+        key: ${{ runner.os }}-venv-test-api-${{ hashFiles('uv.lock', 'hindsight-api-slim/pyproject.toml', '.python-version') }}
+        restore-keys: |
+          ${{ runner.os }}-venv-test-api-
+
     - name: Install dependencies
       working-directory: ./hindsight-api-slim
       run: uv sync --frozen --all-extras --index-strategy unsafe-best-match
@@ -1100,9 +1301,76 @@ jobs:
         print('Models downloaded successfully')
         "
 
-    - name: Run tests
+    - name: Run tests (shard ${{ matrix.shard }}/3)
       working-directory: ./hindsight-api-slim
-      run: uv run pytest tests -v -m "not hs_llm_mat"
+      # `--with pytest-split` adds the plugin ad-hoc — no uv.lock churn.
+      # pytest-split filters at collection (before xdist takes over), so it
+      # composes cleanly with the `-n 8 --dist loadgroup` baked into addopts.
+      run: uv run --with pytest-split pytest tests -v -m "not hs_llm_mat and not hs_llm_core" --splits 3 --group ${{ matrix.shard }}
+
+  test-api-llm-core:
+    needs: [detect-changes]
+    if: >-
+      needs.detect-changes.outputs.has_secrets == 'true' &&
+      (github.event_name == 'workflow_dispatch' ||
+      needs.detect-changes.outputs.core == 'true' ||
+      needs.detect-changes.outputs.ci == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    name: Core LLM tests
+    env:
+      HINDSIGHT_API_LLM_PROVIDER: vertexai
+      HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
+      HINDSIGHT_API_LLM_MODEL: google/gemini-2.5-flash-lite
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event.pull_request.head.sha || '' }}
+
+    - name: Setup GCP credentials
+      run: |
+        printf '%s' '${{ secrets.GCP_VERTEXAI_CREDENTIALS }}' > /tmp/gcp-credentials.json
+        PROJECT_ID=$(jq -r '.project_id' /tmp/gcp-credentials.json)
+        echo "HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$PROJECT_ID" >> $GITHUB_ENV
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v7
+      with:
+        enable-cache: true
+        prune-cache: false
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version-file: ".python-version"
+
+    - name: Install dependencies
+      working-directory: ./hindsight-api-slim
+      run: uv sync --frozen --all-extras --index-strategy unsafe-best-match
+
+    - name: Cache HuggingFace models
+      uses: actions/cache@v5
+      with:
+        path: ~/.cache/huggingface
+        key: ${{ runner.os }}-huggingface-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
+        restore-keys: |
+          ${{ runner.os }}-huggingface-
+
+    - name: Pre-download models
+      working-directory: ./hindsight-api-slim
+      run: |
+        uv run python -c "
+        from sentence_transformers import SentenceTransformer, CrossEncoder
+        SentenceTransformer('BAAI/bge-small-en-v1.5')
+        CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+        print('Models downloaded successfully')
+        "
+
+    - name: Run core LLM tests
+      working-directory: ./hindsight-api-slim
+      run: uv run pytest tests -v -m "hs_llm_core" --timeout 600
 
   test-api-llm-acceptance:
     needs: [detect-changes]
@@ -1113,6 +1381,7 @@ jobs:
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -1219,6 +1488,7 @@ jobs:
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       HINDSIGHT_API_LLM_PROVIDER: vertexai
       HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
@@ -1260,8 +1530,8 @@ jobs:
         conn = oracledb.connect(user='system', password='oracle', dsn='localhost:1521/FREEPDB1')
         cursor = conn.cursor()
         cursor.execute(\"\"\"
-            CREATE TABLESPACE hindsight_ts
-            DATAFILE 'hindsight_ts.dbf' SIZE 200M AUTOEXTEND ON NEXT 50M
+            CREATE BIGFILE TABLESPACE hindsight_ts
+            DATAFILE 'hindsight_ts.dbf' SIZE 2G AUTOEXTEND ON NEXT 500M MAXSIZE UNLIMITED
             EXTENT MANAGEMENT LOCAL
             SEGMENT SPACE MANAGEMENT AUTO
         \"\"\")
@@ -1338,6 +1608,7 @@ jobs:
       needs.detect-changes.outputs.clients-python == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       HINDSIGHT_API_LLM_PROVIDER: vertexai
       HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
@@ -1449,6 +1720,7 @@ jobs:
       needs.detect-changes.outputs.clients-ts == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       HINDSIGHT_API_LLM_PROVIDER: vertexai
       HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
@@ -1578,6 +1850,7 @@ jobs:
       needs.detect-changes.outputs.clients-python == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       HINDSIGHT_API_LLM_PROVIDER: vertexai
       HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
@@ -1614,8 +1887,8 @@ jobs:
         conn = oracledb.connect(user='system', password='oracle', dsn='localhost:1521/FREEPDB1')
         cursor = conn.cursor()
         cursor.execute(\"\"\"
-            CREATE TABLESPACE hindsight_ts
-            DATAFILE 'hindsight_ts.dbf' SIZE 200M AUTOEXTEND ON NEXT 50M
+            CREATE BIGFILE TABLESPACE hindsight_ts
+            DATAFILE 'hindsight_ts.dbf' SIZE 2G AUTOEXTEND ON NEXT 500M MAXSIZE UNLIMITED
             EXTENT MANAGEMENT LOCAL
             SEGMENT SPACE MANAGEMENT AUTO
         \"\"\")
@@ -1737,6 +2010,7 @@ jobs:
       needs.detect-changes.outputs.clients-ts == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       HINDSIGHT_API_LLM_PROVIDER: vertexai
       HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
@@ -1773,8 +2047,8 @@ jobs:
         conn = oracledb.connect(user='system', password='oracle', dsn='localhost:1521/FREEPDB1')
         cursor = conn.cursor()
         cursor.execute(\"\"\"
-            CREATE TABLESPACE hindsight_ts
-            DATAFILE 'hindsight_ts.dbf' SIZE 200M AUTOEXTEND ON NEXT 50M
+            CREATE BIGFILE TABLESPACE hindsight_ts
+            DATAFILE 'hindsight_ts.dbf' SIZE 2G AUTOEXTEND ON NEXT 500M MAXSIZE UNLIMITED
             EXTENT MANAGEMENT LOCAL
             SEGMENT SPACE MANAGEMENT AUTO
         \"\"\")
@@ -1896,6 +2170,7 @@ jobs:
       needs.detect-changes.outputs.clients-ts == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       HINDSIGHT_API_LLM_PROVIDER: vertexai
       HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
@@ -2016,6 +2291,7 @@ jobs:
       needs.detect-changes.outputs.cli == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
 
     steps:
     - uses: actions/checkout@v6
@@ -2049,6 +2325,7 @@ jobs:
       needs.detect-changes.outputs.clients-rust == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       HINDSIGHT_API_LLM_PROVIDER: vertexai
       HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
@@ -2164,6 +2441,7 @@ jobs:
       needs.detect-changes.outputs.clients-go == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       HINDSIGHT_API_LLM_PROVIDER: vertexai
       HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
@@ -2278,6 +2556,7 @@ jobs:
       needs.detect-changes.outputs.embed == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       HINDSIGHT_API_LLM_PROVIDER: vertexai
       HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
@@ -2409,6 +2688,7 @@ jobs:
       needs.detect-changes.outputs.integration-tests == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       HINDSIGHT_API_LLM_PROVIDER: vertexai
       HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
@@ -2513,6 +2793,7 @@ jobs:
       needs.detect-changes.outputs.integrations-ag2 == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
     - uses: actions/checkout@v6
@@ -2542,6 +2823,45 @@ jobs:
       working-directory: ./hindsight-integrations/ag2
       run: uv run pytest tests -v
 
+  test-autogen-integration:
+    needs: [detect-changes]
+    if: >-
+      (github.event_name == 'workflow_dispatch' ||
+      needs.detect-changes.outputs.integrations-autogen == 'true' ||
+      needs.detect-changes.outputs.ci == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event.pull_request.head.sha || '' }}
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v7
+      with:
+        enable-cache: true
+        prune-cache: false
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version-file: ".python-version"
+
+    - name: Build autogen integration
+      working-directory: ./hindsight-integrations/autogen
+      run: uv build
+
+    - name: Install dependencies
+      working-directory: ./hindsight-integrations/autogen
+      run: uv sync --frozen
+
+    - name: Run tests
+      working-directory: ./hindsight-integrations/autogen
+      # PR CI runs only the deterministic bucket; the real-LLM E2E bucket
+      # (requires_real_llm) needs a live Hindsight server and runs separately.
+      run: uv run pytest tests -v -m "not requires_real_llm"
+
   test-smolagents-integration:
     needs: [detect-changes]
     if: >-
@@ -2549,6 +2869,7 @@ jobs:
       needs.detect-changes.outputs.integrations-smolagents == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
     - uses: actions/checkout@v6
@@ -2586,6 +2907,7 @@ jobs:
       needs.detect-changes.outputs.integrations-dify == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
     - uses: actions/checkout@v6
@@ -2612,6 +2934,37 @@ jobs:
       working-directory: ./hindsight-integrations/dify
       run: pytest tests -v
 
+  test-flowise-integration:
+    needs: [detect-changes]
+    if: >-
+      github.event_name != 'pull_request_review' &&
+      (github.event_name == 'workflow_dispatch' ||
+      needs.detect-changes.outputs.integrations-flowise == 'true' ||
+      needs.detect-changes.outputs.ci == 'true')
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event.pull_request.head.sha || '' }}
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v6
+      with:
+        node-version: '22'
+
+    - name: Install dependencies
+      working-directory: ./hindsight-integrations/flowise
+      run: npm install --no-audit --no-fund
+
+    - name: Type check
+      working-directory: ./hindsight-integrations/flowise
+      run: npx tsc --noEmit
+
+    - name: Run tests
+      working-directory: ./hindsight-integrations/flowise
+      run: npm test
+
   test-crewai-integration:
     needs: [detect-changes]
     if: >-
@@ -2619,6 +2972,7 @@ jobs:
       needs.detect-changes.outputs.integrations-crewai == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
     - uses: actions/checkout@v6
@@ -2648,6 +3002,83 @@ jobs:
       working-directory: ./hindsight-integrations/crewai
       run: uv run pytest tests -v
 
+  test-vapi-integration:
+    needs: [detect-changes]
+    if: >-
+      github.event_name != 'pull_request_review' &&
+      (github.event_name == 'workflow_dispatch' ||
+      needs.detect-changes.outputs.integrations-vapi == 'true' ||
+      needs.detect-changes.outputs.ci == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event.pull_request.head.sha || '' }}
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v7
+      with:
+        enable-cache: true
+        prune-cache: false
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version-file: ".python-version"
+
+    - name: Build vapi integration
+      working-directory: ./hindsight-integrations/vapi
+      run: uv build
+
+    - name: Install dependencies
+      working-directory: ./hindsight-integrations/vapi
+      run: uv sync --frozen
+
+    - name: Run tests
+      working-directory: ./hindsight-integrations/vapi
+      run: uv run pytest tests -v
+
+  test-superagent-integration:
+    needs: [detect-changes]
+    if: >-
+      github.event_name != 'pull_request_review' &&
+      (github.event_name == 'workflow_dispatch' ||
+      needs.detect-changes.outputs.integrations-superagent == 'true' ||
+      needs.detect-changes.outputs.ci == 'true')
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event.pull_request.head.sha || '' }}
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v7
+      with:
+        enable-cache: true
+        prune-cache: false
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version-file: ".python-version"
+
+    - name: Build superagent integration
+      working-directory: ./hindsight-integrations/superagent
+      run: uv build
+
+    - name: Install dependencies
+      working-directory: ./hindsight-integrations/superagent
+      run: uv sync --frozen
+
+    - name: Run tests
+      working-directory: ./hindsight-integrations/superagent
+      # PR CI runs only the deterministic bucket; the real-LLM E2E bucket
+      # (requires_real_llm) needs live Hindsight + provider keys and runs separately.
+      run: uv run pytest tests -v -m "not requires_real_llm"
+
   test-litellm-integration:
     needs: [detect-changes]
     if: >-
@@ -2655,6 +3086,7 @@ jobs:
       needs.detect-changes.outputs.integrations-litellm == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
     - uses: actions/checkout@v6
@@ -2682,7 +3114,9 @@ jobs:
 
     - name: Run tests
       working-directory: ./hindsight-integrations/litellm
-      run: uv run pytest tests -v
+      # PR CI runs only the deterministic bucket; the real-LLM E2E bucket
+      # (requires_real_llm) needs live Hindsight + provider keys and runs separately.
+      run: uv run pytest tests -v -m "not requires_real_llm"
 
   test-pydantic-ai-integration:
     needs: [detect-changes]
@@ -2691,6 +3125,7 @@ jobs:
       needs.detect-changes.outputs.integrations-pydantic-ai == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
     - uses: actions/checkout@v6
@@ -2720,6 +3155,45 @@ jobs:
       working-directory: ./hindsight-integrations/pydantic-ai
       run: uv run pytest tests -v
 
+  test-langgraph-integration:
+    needs: [detect-changes]
+    if: >-
+      (github.event_name == 'workflow_dispatch' ||
+      needs.detect-changes.outputs.integrations-langgraph == 'true' ||
+      needs.detect-changes.outputs.ci == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event.pull_request.head.sha || '' }}
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v7
+      with:
+        enable-cache: true
+        prune-cache: false
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version-file: ".python-version"
+
+    - name: Build langgraph integration
+      working-directory: ./hindsight-integrations/langgraph
+      run: uv build
+
+    - name: Install dependencies
+      working-directory: ./hindsight-integrations/langgraph
+      run: uv sync --frozen
+
+    - name: Run tests
+      working-directory: ./hindsight-integrations/langgraph
+      # PR CI runs only the deterministic bucket; the real-LLM E2E bucket
+      # (requires_real_llm) needs a live Hindsight server and runs separately.
+      run: uv run pytest tests -v -m "not requires_real_llm"
+
   test-llamaindex-integration:
     needs: [detect-changes]
     if: >-
@@ -2727,6 +3201,7 @@ jobs:
       needs.detect-changes.outputs.integrations-llamaindex == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
     - uses: actions/checkout@v6
@@ -2754,7 +3229,9 @@ jobs:
 
     - name: Run tests
       working-directory: ./hindsight-integrations/llamaindex
-      run: uv run pytest tests -v
+      # PR CI runs only the deterministic bucket; the real-LLM E2E bucket
+      # (requires_real_llm) needs a live Hindsight server and runs separately.
+      run: uv run pytest tests -v -m "not requires_real_llm"
 
   test-openai-agents-integration:
     needs: [detect-changes]
@@ -2763,6 +3240,7 @@ jobs:
       needs.detect-changes.outputs.integrations-openai-agents == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
     - uses: actions/checkout@v6
@@ -2790,7 +3268,47 @@ jobs:
 
     - name: Run tests
       working-directory: ./hindsight-integrations/openai-agents
-      run: uv run pytest tests -v
+      # PR CI runs only the deterministic bucket; the real-LLM E2E bucket
+      # (requires_real_llm) needs a live Hindsight server and runs separately.
+      run: uv run pytest tests -v -m "not requires_real_llm"
+
+  test-claude-agent-sdk-integration:
+    needs: [detect-changes]
+    if: >-
+      (github.event_name == 'workflow_dispatch' ||
+      needs.detect-changes.outputs.integrations-claude-agent-sdk == 'true' ||
+      needs.detect-changes.outputs.ci == 'true')
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event.pull_request.head.sha || '' }}
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v7
+      with:
+        enable-cache: true
+        prune-cache: false
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version-file: ".python-version"
+
+    - name: Build claude-agent-sdk integration
+      working-directory: ./hindsight-integrations/claude-agent-sdk
+      run: uv build
+
+    - name: Install dependencies
+      working-directory: ./hindsight-integrations/claude-agent-sdk
+      run: uv sync --frozen
+
+    - name: Run tests
+      working-directory: ./hindsight-integrations/claude-agent-sdk
+      # PR CI runs only the deterministic bucket; the real-LLM E2E bucket
+      # (requires_real_llm) needs a live Hindsight server and runs separately.
+      run: uv run pytest tests -v -m "not requires_real_llm"
 
   test-agentcore-integration:
     needs: [detect-changes]
@@ -2799,6 +3317,7 @@ jobs:
       needs.detect-changes.outputs.integrations-agentcore == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
     - uses: actions/checkout@v6
@@ -2836,6 +3355,7 @@ jobs:
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       HINDSIGHT_API_LLM_PROVIDER: vertexai
       HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
@@ -2905,6 +3425,7 @@ jobs:
       needs.detect-changes.outputs.embed == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       HINDSIGHT_API_LLM_PROVIDER: vertexai
       HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
@@ -2972,6 +3493,7 @@ jobs:
       needs.detect-changes.outputs.embed == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: windows-latest
+    timeout-minutes: 30
     env:
       HINDSIGHT_API_LLM_PROVIDER: vertexai
       HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: ${{ github.workspace }}/gcp-credentials.json
@@ -3149,6 +3671,7 @@ jobs:
       needs.detect-changes.outputs.hindsight-all == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       HINDSIGHT_API_LLM_PROVIDER: vertexai
       HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
@@ -3200,6 +3723,12 @@ jobs:
         rm -rf node_modules/lightningcss node_modules/@tailwindcss
         npm install lightningcss @tailwindcss/postcss @tailwindcss/node
 
+    - name: Test Control Plane
+      run: npm test --workspace=hindsight-control-plane
+
+    - name: Check i18n locale parity and hardcoded strings
+      run: npm run i18n:check --workspace=hindsight-control-plane
+
     - name: Build Control Plane
       run: npm run build --workspace=hindsight-control-plane
 
@@ -3237,6 +3766,7 @@ jobs:
       needs.detect-changes.outputs.docs == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -3385,6 +3915,7 @@ jobs:
       needs.detect-changes.outputs.dev == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       HINDSIGHT_API_LLM_PROVIDER: vertexai
       HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
@@ -3463,6 +3994,7 @@ jobs:
 
   verify-generated-files:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       UV_FROZEN: "1"
     steps:
@@ -3549,6 +4081,7 @@ jobs:
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
     - uses: actions/checkout@v6
       with:
@@ -3602,6 +4135,7 @@ jobs:
       needs.detect-changes.outputs.dev == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
     - uses: actions/checkout@v6
       with:
@@ -3647,10 +4181,15 @@ jobs:
       - build-chat-integration
       - test-paperclip-integration
       - test-pipecat-integration
+      - test-gemini-spark-integration
+      - test-vapi-integration
+      - test-google-adk-integration
+      - test-roo-code-integration
       - build-control-plane
       - build-docs
       - test-rust-cli
       - lint-helm-chart
+      - test-standalone-start-script
       - build-docker-images
       - test-api
       - test-api-oracle
@@ -3665,24 +4204,31 @@ jobs:
       - test-openclaw-integration
       - test-integration
       - test-ag2-integration
+      - test-autogen-integration
       - test-smolagents-integration
       - test-dify-integration
+      - test-flowise-integration
       - test-crewai-integration
+      - test-langgraph-integration
+      - test-superagent-integration
       - test-litellm-integration
       - test-pydantic-ai-integration
       - test-llamaindex-integration
+      - test-openai-agents-integration
       - test-agentcore-integration
       - test-pip-slim
       - test-embed
       - test-embed-windows
       - test-hindsight-all
       - test-hindsight-agent-sdk
+      - test-claude-agent-sdk-integration
       - test-doc-examples
       - test-upgrade
       - verify-generated-files
       - check-openapi-compatibility
       - check-cli-coverage
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       statuses: write
       pull-requests: write

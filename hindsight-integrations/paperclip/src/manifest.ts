@@ -1,9 +1,13 @@
 import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
 
+// Injected by esbuild `define` from package.json at build time — keep in lockstep
+// with the published package version instead of hand-editing this constant.
+declare const __PLUGIN_VERSION__: string;
+
 const manifest: PaperclipPluginManifestV1 = {
   id: "paperclip-plugin-hindsight",
   apiVersion: 1,
-  version: "0.2.3",
+  version: __PLUGIN_VERSION__,
   displayName: "Hindsight Memory",
   author: "Vectorize <support@vectorize.io>",
   description:
@@ -31,8 +35,8 @@ const manifest: PaperclipPluginManifestV1 = {
         type: "string",
         title: "Hindsight API URL",
         description:
-          "Base URL of your Hindsight instance. Use http://localhost:8888 for self-hosted.",
-        default: "http://localhost:8888",
+          "Base URL of your Hindsight instance. Defaults to Hindsight Cloud. Use http://localhost:8888 for self-hosted.",
+        default: "https://api.hindsight.vectorize.io",
       },
       hindsightApiKeyRef: {
         type: "string",
@@ -40,12 +44,25 @@ const manifest: PaperclipPluginManifestV1 = {
         description:
           "Name of the Paperclip secret holding your Hindsight Cloud API key. Leave empty for self-hosted.",
       },
+      dynamicBankId: {
+        type: "boolean",
+        title: "Dynamic Bank ID",
+        description:
+          "When true (default), bank ID is derived from bankGranularity. Set false and provide bankId to use a static shared bank.",
+        default: true,
+      },
+      bankId: {
+        type: "string",
+        title: "Static Bank ID",
+        description:
+          "Static bank ID used when dynamicBankId is false. All agents sharing this value read/write the same memory bank.",
+      },
       bankGranularity: {
         type: "array",
         title: "Bank Granularity",
         description:
-          "Controls memory isolation. Default ['company', 'agent'] gives each agent its own bank per company.",
-        items: { type: "string", enum: ["company", "agent"] },
+          "Controls memory isolation when dynamicBankId is true. Default ['company', 'agent'] gives each agent its own bank per company. Add 'user' for per-user memory isolation (useful for GDPR compliance).",
+        items: { type: "string", enum: ["company", "agent", "user"] },
         default: ["company", "agent"],
       },
       recallBudget: {

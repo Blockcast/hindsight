@@ -160,13 +160,29 @@ class CrossEncoderReranker:
 
         import asyncio
 
+        from hindsight_api.config import ENV_MODEL_INIT_TIMEOUT, get_config
+
         cross_encoder = self.cross_encoder
         # For local providers, run in thread pool to avoid blocking event loop
         if cross_encoder.provider_name == "local":
             loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, lambda: asyncio.run(cross_encoder.initialize()))
+            init = loop.run_in_executor(None, lambda: asyncio.run(cross_encoder.initialize()))
         else:
-            await cross_encoder.initialize()
+            init = cross_encoder.initialize()
+
+        # Cap lazy init with the same wall-clock timeout used at startup so a
+        # hung model download surfaces as a clear error on the request that
+        # triggered it, rather than hanging the caller forever.
+        init_timeout = get_config().model_init_timeout
+        try:
+            await asyncio.wait_for(init, timeout=init_timeout)
+        except TimeoutError as e:
+            raise RuntimeError(
+                f"Cross-encoder initialization did not complete within {init_timeout:g}s. "
+                f"The reranker model is likely blocked loading — e.g. an offline model "
+                f"download. Increase {ENV_MODEL_INIT_TIMEOUT} if the first-time download "
+                f"legitimately needs more time."
+            ) from e
         self._initialized = True
 
     async def rerank(self, query: str, candidates: list[MergedCandidate]) -> list[ScoredResult]:
@@ -212,16 +228,25 @@ class CrossEncoderReranker:
         # Get cross-encoder scores
         scores = await self.cross_encoder.predict(pairs)
 
-        # Normalize scores using sigmoid to [0, 1] range
-        # Cross-encoder returns logits which can be negative
-        import math
-
+        # Normalize scores to [0, 1] range.
+        # External API rerankers (Cohere, Jina, llama.cpp/Qwen, etc.) return
+        # calibrated relevance_score already in [0, 1]. These are used as-is
+        # so that absolute confidence is preserved — a top candidate scoring
+        # 0.007 stays low rather than being inflated to 1.0 by rank normalization.
+        # Local models return logits (any real number) — sigmoid is appropriate.
         import numpy as np
 
-        def sigmoid(x):
+        def _sigmoid(x: float) -> float:
             return 1 / (1 + np.exp(-x))
 
-        normalized_scores = [sigmoid(score) for score in scores]
+        if scores and min(scores) >= 0.0 and max(scores) <= 1.0:
+            # Scores already in [0, 1] — pass through to preserve absolute
+            # confidence signal from calibrated rerankers.
+            normalized_scores = list(scores)
+        else:
+            # Scores are logits (e.g. local sentence-transformers models).
+            # Sigmoid maps (-inf, +inf) to (0, 1).
+            normalized_scores = [_sigmoid(score) for score in scores]
 
         # Create ScoredResult objects with cross-encoder scores
         scored_results = []

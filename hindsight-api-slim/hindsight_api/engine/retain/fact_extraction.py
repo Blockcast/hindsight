@@ -10,7 +10,7 @@ import json
 import logging
 import re
 from datetime import datetime, timedelta
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, create_model, field_validator
 
@@ -25,6 +25,8 @@ from .entity_labels import (
     is_label_entity,
     parse_entity_labels,
 )
+
+MAX_RETAIN_CONTEXT_CHARS = 12_000
 
 
 def _extract_map_entities(
@@ -887,17 +889,15 @@ def _build_extraction_prompt_and_schema(config) -> tuple[str, type]:
     extraction_mode = config.retain_extraction_mode
     extract_causal_links = config.retain_extract_causal_links
 
-    # Build retain_mission section if set - injected before the mode-specific guidelines
-    retain_mission = getattr(config, "retain_mission", None)
-    if retain_mission:
-        retain_mission_section = (
-            f"══════════════════════════════════════════════════════════════════════════\n"
-            f"FOCUS — What to retain for this bank\n"
-            f"══════════════════════════════════════════════════════════════════════════\n\n"
-            f"{retain_mission}\n\n"
-        )
-    else:
-        retain_mission_section = ""
+    # The per-bank retain mission is NOT baked into this system prompt: it would
+    # make the prompt bank-specific and force a separate Gemini context cache per
+    # mission (one per bank). Instead the prompt is bank-agnostic so a single
+    # CachedContent serves every bank, and the mission rides in the per-request
+    # user message via _retain_mission_preamble(). The {retain_mission_section}
+    # placeholder is kept (templates still reference it) but always empty here.
+    from hindsight_api.engine.prompt_utils import escape_for_prompt
+
+    retain_mission_section = ""
 
     # Select base prompt based on extraction mode
     if extraction_mode == "custom":
@@ -910,7 +910,7 @@ def _build_extraction_prompt_and_schema(config) -> tuple[str, type]:
             base_prompt = CUSTOM_FACT_EXTRACTION_PROMPT
             prompt = base_prompt.format(
                 retain_mission_section=retain_mission_section,
-                custom_instructions=config.retain_custom_instructions,
+                custom_instructions=escape_for_prompt(config.retain_custom_instructions),
             )
     elif extraction_mode == "verbose":
         prompt = VERBOSE_FACT_EXTRACTION_PROMPT.format(
@@ -946,6 +946,16 @@ def _build_extraction_prompt_and_schema(config) -> tuple[str, type]:
     labels_section = _build_labels_prompt_section(labels_cfg, free_form_entities)
     if labels_section:
         prompt = prompt + labels_section
+
+    # Force the LLM to emit fact text in the configured language, regardless of
+    # the source content's language. Same directive is applied to consolidation
+    # and reflect so HINDSIGHT_API_LLM_OUTPUT_LANGUAGE has a uniform effect
+    # across the pipeline. This is independent of the BM25 indexing language
+    # (HINDSIGHT_API_TEXT_SEARCH_EXTENSION_NATIVE_LANGUAGE) by design — search
+    # tokenization and LLM output language are separate concerns.
+    from ..prompt_utils import output_language_directive
+
+    prompt = prompt + output_language_directive(getattr(config, "llm_output_language", None))
 
     response_schema = base_response_class
 
@@ -984,6 +994,26 @@ def _build_extraction_prompt_and_schema(config) -> tuple[str, type]:
     return prompt, response_schema
 
 
+def _retain_mission_preamble(config) -> str:
+    """The bank's retain mission, formatted for the per-request user message.
+
+    Kept OUT of the cached system prompt (which must stay bank-agnostic so one
+    CachedContent serves every bank — otherwise each distinct mission spawns its
+    own cache) and prepended to the user message instead. Returns "" when unset.
+    No brace-escaping needed: unlike the system template, the user message is
+    used verbatim, not passed through str.format().
+    """
+    retain_mission = getattr(config, "retain_mission", None)
+    if not retain_mission:
+        return ""
+    return (
+        "══════════════════════════════════════════════════════════════════════════\n"
+        "FOCUS — What to retain for this bank (takes priority over the general guidelines)\n"
+        "══════════════════════════════════════════════════════════════════════════\n\n"
+        f"{retain_mission}\n\n"
+    )
+
+
 def _build_user_message(
     chunk: str,
     chunk_index: int,
@@ -992,12 +1022,24 @@ def _build_user_message(
     context: str,
     metadata: dict[str, str] | None = None,
     agent_name: str | None = None,
+    mission_preamble: str = "",
 ) -> str:
-    """Build user message for fact extraction."""
+    """Build user message for fact extraction.
+
+    ``mission_preamble`` (the bank's retain mission, possibly empty) is prepended
+    so the bank-specific focus lives in the variable user turn rather than the
+    cached, bank-agnostic system prompt.
+    """
     from .orchestrator import parse_datetime_flexible
 
     sanitized_chunk = _sanitize_text(chunk)
     sanitized_context = _sanitize_text(context) if context else "none"
+    if sanitized_context and len(sanitized_context) > MAX_RETAIN_CONTEXT_CHARS:
+        original_context_chars = len(sanitized_context)
+        sanitized_context = (
+            sanitized_context[:MAX_RETAIN_CONTEXT_CHARS]
+            + f"\n[truncated context: {original_context_chars - MAX_RETAIN_CONTEXT_CHARS} chars omitted]"
+        )
 
     if event_date is not None:
         event_date = parse_datetime_flexible(event_date)
@@ -1012,9 +1054,21 @@ def _build_user_message(
 
     narrator_section = ""
     if agent_name:
-        narrator_section = f'\nNarrator: {agent_name} (AI agent — first-person statements like "I did X" are the agent\'s own actions; classify as "assistant")'
+        narrator_section = (
+            f"\nNarrator: {agent_name} (the AI agent whose memory this is). By default, "
+            f'first-person statements like "I did X" are {agent_name}\'s own actions → classify as '
+            f'"assistant".'
+        )
+        # Only defer to the Context when one was actually provided — otherwise this
+        # clause points at a "Context: none" line and just adds noise.
+        if context:
+            narrator_section += (
+                " BUT the Context above takes precedence: if it identifies a different "
+                "first-person speaker (e.g. a user or customer in a transcript), attribute those "
+                'statements to that speaker and classify them as "world", not "assistant".'
+            )
 
-    return f"""Extract facts from the following text chunk.
+    return f"""{mission_preamble}Extract facts from the following text chunk.
 
 Chunk: {chunk_index + 1}/{total_chunks}
 Event Date: {event_date_str}
@@ -1040,12 +1094,15 @@ def _build_request_body(llm_config, config, prompt: str, user_message: str, resp
     if llm_config.provider == "openai" and llm_config._provider_impl.openai_service_tier:
         request_body["service_tier"] = llm_config._provider_impl.openai_service_tier
 
-    # Add response_format (JSON schema)
+    # Add response_format (JSON schema). The batch path builds the request body
+    # directly instead of going through LLMProvider.call(), so honour
+    # HINDSIGHT_API_LLM_STRICT_SCHEMA here too: strict=True grammar-enforces the
+    # output on capable backends rather than relying on the model to emit clean JSON.
     if hasattr(response_schema, "model_json_schema"):
         schema = response_schema.model_json_schema()
         request_body["response_format"] = {
             "type": "json_schema",
-            "json_schema": {"name": "facts", "schema": schema},
+            "json_schema": {"name": "facts", "schema": schema, "strict": config.llm_strict_schema},
         }
 
     return request_body
@@ -1081,8 +1138,38 @@ async def _extract_facts_from_chunk(
     extraction_mode = config.retain_extraction_mode
     extract_causal_links = config.retain_extract_causal_links
 
-    # Build user message using helper function
-    user_message = _build_user_message(chunk, chunk_index, total_chunks, event_date, context, metadata, agent_name)
+    # Build user message — the bank mission rides here (not in the cached prefix).
+    user_message = _build_user_message(
+        chunk,
+        chunk_index,
+        total_chunks,
+        event_date,
+        context,
+        metadata,
+        agent_name,
+        mission_preamble=_retain_mission_preamble(config),
+    )
+
+    # Opt into context caching when the provider supports it. The prompt and
+    # response_schema are bank-agnostic (the mission lives in the user message),
+    # so one cached prefix serves every bank; reusing it across many small-payload
+    # retain calls dramatically lowers per-call input
+    # cost. ``get_or_create_cached_prefix`` returns None when caching is
+    # disabled, unsupported, or the prefix is too small; the LLM call
+    # transparently falls back to the uncached path in that case.
+    cached_prefix_name: str | None = None
+    provider_impl = getattr(llm_config, "_provider_impl", None)
+    if provider_impl is not None and provider_impl.supports_prompt_caching():
+        try:
+            cached_prefix_name = await provider_impl.get_or_create_cached_prefix(
+                system_instruction=prompt,
+                response_schema=response_schema,
+            )
+        except Exception:
+            # Caching is a soft optimisation — never let a cache-side
+            # error block a retain operation.
+            logger.exception("Cache prefix lookup failed; falling back to uncached call")
+            cached_prefix_name = None
 
     # Retry logic for JSON validation errors
     # Use retain-specific overrides if set, otherwise fall back to global LLM config
@@ -1103,7 +1190,7 @@ async def _extract_facts_from_chunk(
                 config.retain_llm_max_backoff if config.retain_llm_max_backoff is not None else config.llm_max_backoff
             )
 
-            extraction_response_json, call_usage = await llm_config.call(
+            call_kwargs: dict[str, Any] = dict(
                 messages=[{"role": "system", "content": prompt}, {"role": "user", "content": user_message}],
                 response_format=response_schema,
                 scope="retain_extract_facts",
@@ -1115,6 +1202,10 @@ async def _extract_facts_from_chunk(
                 skip_validation=True,  # Get raw JSON, we'll validate leniently
                 return_usage=True,
             )
+            if cached_prefix_name is not None:
+                call_kwargs["cached_prefix"] = cached_prefix_name
+
+            extraction_response_json, call_usage = await llm_config.call(**call_kwargs)
             usage = usage + call_usage  # Aggregate usage across retries
 
             # Lenient parsing of facts from raw JSON
@@ -1129,11 +1220,14 @@ async def _extract_facts_from_chunk(
                     )
                     continue
                 else:
-                    logger.warning(
-                        f"LLM returned non-dict JSON after {llm_max_retries} attempts: {type(extraction_response_json).__name__}. "
-                        f"Raw: {str(extraction_response_json)[:500]}"
+                    # A non-dict response is malformed (the schema is {"facts": [...]}).
+                    # Raise instead of returning [] so the failure propagates to the
+                    # worker's retry machinery and ultimately fails loudly — never
+                    # silently commit the document with 0 facts. See issue #1833.
+                    raise RuntimeError(
+                        f"Fact extraction failed: LLM returned non-dict JSON after {llm_max_retries} attempts "
+                        f"({type(extraction_response_json).__name__}). Raw: {str(extraction_response_json)[:500]}"
                     )
-                    return [], usage
 
             raw_facts = extraction_response_json.get("facts", [])
 
@@ -1662,8 +1756,11 @@ async def extract_facts_from_contents_batch_api(
 
     # Check if provider supports batch API
     if not await llm_config._provider_impl.supports_batch_api():
-        logger.warning(f"Batch API not supported for provider {llm_config.provider}, falling back to sync mode")
-        return await extract_facts_from_contents(contents, llm_config, agent_name, config, pool, operation_id, schema)
+        raise RuntimeError(
+            f"retain_batch_enabled=True but provider '{llm_config.provider}' does not "
+            f"support the batch API. This should have been caught at startup — check "
+            f"HINDSIGHT_API_RETAIN_BATCH_ENABLED and your LLM provider configuration."
+        )
 
     # Check if we're resuming an existing batch (crash recovery)
     batch_id = None
@@ -1712,6 +1809,7 @@ async def extract_facts_from_contents_batch_api(
                 item.context,
                 item.metadata or None,
                 agent_name,
+                mission_preamble=_retain_mission_preamble(config),
             )
 
             # Build request body using helper function
@@ -2195,7 +2293,9 @@ async def extract_facts_from_contents(
         fact_extraction_tasks.append(task)
 
     # Step 2: Wait for all fact extractions to complete.
-    # Use return_exceptions=True so one content item failure doesn't discard the rest.
+    # return_exceptions=True so a failing item doesn't cancel its still-running
+    # siblings (which would leave orphaned LLM calls / partial work); we await
+    # them all, then propagate.
     all_fact_results = await asyncio.gather(*fact_extraction_tasks, return_exceptions=True)
 
     # Step 3: Flatten and convert to typed objects
@@ -2206,14 +2306,18 @@ async def extract_facts_from_contents(
     global_chunk_idx = 0
     global_fact_idx = 0
 
-    # Filter out failed content items
+    # Never silently drop a document's memory. Any extraction failure (provider
+    # rate-limit / timeout / 5xx, malformed response, token-limit, etc.)
+    # propagates so the streaming producer surfaces it and the worker's
+    # RetryTaskAt machinery retries the task — and ultimately fails it *loudly*
+    # if the problem persists. Swallowing the error and substituting an empty
+    # result here used to commit the document with 0 facts and mark the
+    # operation `completed`, losing the memory with no signal. See issue #1833.
     valid_results = []
     for content, result in zip(contents, all_fact_results):
         if isinstance(result, Exception):
-            logger.warning(f"Content extraction failed (skipping): {type(result).__name__}: {result}")
-            valid_results.append((content, ([], [], TokenUsage())))
-        else:
-            valid_results.append((content, result))
+            raise result
+        valid_results.append((content, result))
 
     for content_index, (content, (facts_from_llm, chunks_from_llm, content_usage)) in enumerate(valid_results):
         total_usage = total_usage + content_usage

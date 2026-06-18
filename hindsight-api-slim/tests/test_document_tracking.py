@@ -87,6 +87,60 @@ async def test_document_upsert(memory, request_context):
 
 
 @pytest.mark.asyncio
+async def test_no_document_id_is_content_derived_and_idempotent(memory, request_context):
+    """Re-ingesting identical content+context with NO explicit document_id must
+    upsert the same (content-derived) document, not create a duplicate.
+
+    Regression for the random-uuid4 fallback that produced the exact-duplicate
+    documents found in the BLO-9319 bank dedup.
+    """
+    bank_id = f"test_content_derived_{datetime.now(timezone.utc).timestamp()}"
+
+    try:
+        content = "Alice works at Google. Bob works at Microsoft."
+        context = "Team sync notes"
+
+        # First ingest, no document_id provided.
+        await memory.retain_async(
+            bank_id=bank_id,
+            content=content,
+            context=context,
+            request_context=request_context,
+        )
+        docs_v1 = await memory.list_documents(bank_id, request_context=request_context)
+        assert docs_v1["total"] == 1
+
+        # Second ingest, byte-identical content+context, still no document_id.
+        await memory.retain_async(
+            bank_id=bank_id,
+            content=content,
+            context=context,
+            request_context=request_context,
+        )
+        docs_v2 = await memory.list_documents(bank_id, request_context=request_context)
+        assert docs_v2["total"] == 1, (
+            f"expected idempotent re-ingest (1 doc), got {docs_v2['total']}"
+        )
+        assert docs_v1["items"][0]["id"] == docs_v2["items"][0]["id"]
+
+        # Same content but a DIFFERENT context is a distinct document
+        # (namespacing keeps intentionally-separate docs apart).
+        await memory.retain_async(
+            bank_id=bank_id,
+            content=content,
+            context="A different conversation",
+            request_context=request_context,
+        )
+        docs_v3 = await memory.list_documents(bank_id, request_context=request_context)
+        assert docs_v3["total"] == 2, (
+            f"expected context-namespaced split (2 docs), got {docs_v3['total']}"
+        )
+
+    finally:
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+
+@pytest.mark.asyncio
 async def test_document_deletion(memory, request_context):
     """Test that deleting a document cascades to memory units."""
     bank_id = f"test_delete_{datetime.now(timezone.utc).timestamp()}"
@@ -206,13 +260,15 @@ async def test_document_without_metadata(memory, request_context):
 
 
 @pytest.mark.asyncio
-async def test_document_persisted_with_zero_facts(memory, request_context):
+@pytest.mark.hs_llm_core
+async def test_document_persisted_with_zero_facts(memory_real_llm, request_context):
     """
     Test that documents are persisted even when zero facts are extracted.
 
     This is a regression test for issue #324 where documents with no extractable
     facts were reported as disappearing from the system.
     """
+    memory = memory_real_llm
     bank_id = f"test_zero_facts_{datetime.now(timezone.utc).timestamp()}"
 
     try:
@@ -258,12 +314,14 @@ async def test_document_persisted_with_zero_facts(memory, request_context):
 
 
 @pytest.mark.asyncio
-async def test_document_persisted_with_zero_facts_batch(memory, request_context):
+@pytest.mark.hs_llm_core
+async def test_document_persisted_with_zero_facts_batch(memory_real_llm, request_context):
     """
     Test that documents are persisted with zero facts in batch retain operations.
 
     This tests the async batch code path to ensure it also handles zero facts correctly.
     """
+    memory = memory_real_llm
     bank_id = f"test_zero_facts_batch_{datetime.now(timezone.utc).timestamp()}"
 
     try:
@@ -314,13 +372,15 @@ async def test_document_persisted_with_zero_facts_batch(memory, request_context)
 
 
 @pytest.mark.asyncio
-async def test_document_persisted_with_zero_facts_async_submit(memory, request_context):
+@pytest.mark.hs_llm_core
+async def test_document_persisted_with_zero_facts_async_submit(memory_real_llm, request_context):
     """
     Test that documents are persisted with zero facts in fire-and-forget async retain.
 
     This tests the submit_async_retain (background task) code path to ensure it also
     handles zero facts correctly.
     """
+    memory = memory_real_llm
     import asyncio
 
     bank_id = f"test_zero_facts_async_{datetime.now(timezone.utc).timestamp()}"

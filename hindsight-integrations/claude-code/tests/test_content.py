@@ -1,11 +1,14 @@
 """Tests for lib/content.py — pure content-processing functions."""
 
+import re
+
 import pytest
 
 from lib.content import (
     _extract_text_content,
     _is_channel_message_tool,
     compose_recall_query,
+    format_current_time,
     format_memories,
     prepare_retention_transcript,
     should_skip_retry_limit_churn,
@@ -513,3 +516,18 @@ class TestTruncateRetentionTranscript:
         assert result.startswith("start-")
         assert result.endswith("-end")
         assert "Hindsight retain transcript truncated" in result
+
+
+# ---------------------------------------------------------------------------
+# format_current_time
+# ---------------------------------------------------------------------------
+
+
+class TestFormatCurrentTime:
+    def test_includes_utc_suffix(self):
+        # The "UTC" suffix prevents client LLMs from misreading the
+        # timestamp as local time.
+        assert format_current_time().endswith(" UTC")
+
+    def test_format_shape(self):
+        assert re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC", format_current_time())
