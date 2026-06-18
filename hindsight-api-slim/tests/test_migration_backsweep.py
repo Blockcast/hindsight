@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import create_engine, text, inspect
+from sqlalchemy import create_engine, text
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -33,25 +33,35 @@ def _upgrade(db_url: str, revision: str) -> None:
     command.upgrade(_alembic_cfg(db_url), revision)
 
 
-def _downgrade(db_url: str, revision: str) -> None:
-    command.downgrade(_alembic_cfg(db_url), revision)
+def _reset_public_schema(db_url: str) -> None:
+    engine = create_engine(db_url, isolation_level="AUTOCOMMIT")
+    try:
+        with engine.connect() as conn:
+            # This test rewinds/replays migration history against a persistent
+            # pg0 instance. Rebuild only its dedicated public schema so a
+            # previous run cannot leave alembic_version ahead of the real DDL.
+            conn.execute(text("DROP SCHEMA IF EXISTS public CASCADE"))
+            conn.execute(text("CREATE SCHEMA public"))
+    finally:
+        engine.dispose()
 
 
 # ---------------------------------------------------------------------------
 # Fixture: fresh database at the revision just before the backsweep
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture(scope="module")
-def pre_backsweep_db_url():
+def pre_backsweep_db_url() -> str:
     """
     Spin up a dedicated pg0 instance and ensure schema is at the revision
     just before the backsweep so each test can seed orphan data and then
     apply the backsweep itself.
 
-    Because pg0 data directories persist across test runs, the DB may
-    already be at head. We upgrade to head first (to ensure all tables
-    exist), then stamp the revision back to pre-backsweep so Alembic
-    treats the backsweep as not-yet-applied.
+    Because pg0 data directories persist across test runs, the DB may already
+    have schema from a previous test run. Reset this test's dedicated schema
+    first, then migrate to the real pre-backsweep revision instead of stamping
+    a head schema backward.
     """
     from hindsight_api.pg0 import EmbeddedPostgres
 
@@ -62,10 +72,8 @@ def pre_backsweep_db_url():
     finally:
         loop.close()
 
-    # Ensure all tables exist (upgrade to head), then stamp back to
-    # pre-backsweep so the backsweep migration will actually run.
-    _upgrade(url, "heads")
-    command.stamp(_alembic_cfg(url), "f6g7h8i9j0k1")
+    _reset_public_schema(url)
+    _upgrade(url, "f6g7h8i9j0k1")
     return url
 
 
@@ -73,7 +81,8 @@ def pre_backsweep_db_url():
 # The test
 # ---------------------------------------------------------------------------
 
-def test_backsweep_removes_orphans_and_preserves_legit_rows(pre_backsweep_db_url):
+
+def test_backsweep_removes_orphans_and_preserves_legit_rows(pre_backsweep_db_url: str) -> None:
     """
     Seed four kinds of rows then apply the backsweep migration and verify:
 
@@ -100,27 +109,32 @@ def test_backsweep_removes_orphans_and_preserves_legit_rows(pre_backsweep_db_url
     ghost_bank = f"bank_{uuid.uuid4().hex[:8]}"  # never inserted into banks
 
     # UUIDs for memory units
-    id_pass1_world = uuid.uuid4()       # A: world unit, ghost bank
-    id_pass1_obs = uuid.uuid4()         # A: observation, ghost bank
-    id_pass2_obs = uuid.uuid4()         # B: observation, all sources gone
-    id_keep_obs = uuid.uuid4()          # C: observation with one live source
-    id_keep_world = uuid.uuid4()        # D: world unit, alive bank
-    id_live_source = uuid.uuid4()       # live source for C
+    id_pass1_world = uuid.uuid4()  # A: world unit, ghost bank
+    id_pass1_obs = uuid.uuid4()  # A: observation, ghost bank
+    id_pass2_obs = uuid.uuid4()  # B: observation, all sources gone
+    id_keep_obs = uuid.uuid4()  # C: observation with one live source
+    id_keep_world = uuid.uuid4()  # D: world unit, alive bank
+    id_live_source = uuid.uuid4()  # live source for C
 
     with engine.connect() as conn:
         # --- banks ---
         conn.execute(text("INSERT INTO banks (bank_id) VALUES (:b)"), {"b": alive_bank})
 
         # --- seed memory_units ---
-        def insert_mu(uid, bank, fact_type, sources=None):
+        def insert_mu(
+            uid: uuid.UUID,
+            bank: str,
+            fact_type: str,
+            sources: list[uuid.UUID] | None = None,
+        ) -> None:
             src_arr = "{" + ",".join(str(s) for s in (sources or [])) + "}"
             conn.execute(
                 text(
                     """
                     INSERT INTO memory_units
-                        (id, bank_id, text, fact_type, source_memory_ids)
+                        (id, bank_id, text, event_date, fact_type, source_memory_ids)
                     VALUES
-                        (:id, :bank, :text, :ft, CAST(:src AS uuid[]))
+                        (:id, :bank, :text, now(), :ft, CAST(:src AS uuid[]))
                     """
                 ),
                 {"id": uid, "bank": bank, "text": "test", "ft": fact_type, "src": src_arr},
@@ -147,10 +161,9 @@ def test_backsweep_removes_orphans_and_preserves_legit_rows(pre_backsweep_db_url
 
     # --- verify ---
     with engine.connect() as conn:
-        def exists(uid):
-            return conn.execute(
-                text("SELECT 1 FROM memory_units WHERE id = :id"), {"id": uid}
-            ).fetchone() is not None
+
+        def exists(uid: uuid.UUID) -> bool:
+            return conn.execute(text("SELECT 1 FROM memory_units WHERE id = :id"), {"id": uid}).fetchone() is not None
 
         # Must be gone
         assert not exists(id_pass1_world), "Pass 1: world unit with ghost bank should be deleted"

@@ -26,11 +26,8 @@ from ..config import (
     DEFAULT_EMBEDDINGS_GEMINI_MODEL,
     DEFAULT_EMBEDDINGS_LITELLM_MODEL,
     DEFAULT_EMBEDDINGS_LITELLM_SDK_MODEL,
-    DEFAULT_EMBEDDINGS_LOCAL_FORCE_CPU,
     DEFAULT_EMBEDDINGS_LOCAL_MODEL,
-    DEFAULT_EMBEDDINGS_LOCAL_TRUST_REMOTE_CODE,
     DEFAULT_EMBEDDINGS_OPENAI_MODEL,
-    DEFAULT_EMBEDDINGS_PROVIDER,
     DEFAULT_EMBEDDINGS_ZEROENTROPY_BATCH_SIZE,
     DEFAULT_EMBEDDINGS_ZEROENTROPY_DIMENSIONS,
     DEFAULT_EMBEDDINGS_ZEROENTROPY_ENCODING_FORMAT,
@@ -40,13 +37,6 @@ from ..config import (
     DEFAULT_ZEROENTROPY_BASE_URL,
     ENV_EMBEDDINGS_COHERE_API_KEY,
     ENV_EMBEDDINGS_GEMINI_API_KEY,
-    ENV_EMBEDDINGS_LOCAL_FORCE_CPU,
-    ENV_EMBEDDINGS_LOCAL_MODEL,
-    ENV_EMBEDDINGS_LOCAL_TRUST_REMOTE_CODE,
-    ENV_EMBEDDINGS_ONNX_DIMENSIONS,
-    ENV_EMBEDDINGS_ONNX_MODEL_ID,
-    ENV_EMBEDDINGS_ONNX_MODEL_PATH,
-    ENV_EMBEDDINGS_ONNX_TOKENIZER_NAME_OR_PATH,
     ENV_EMBEDDINGS_OPENAI_API_KEY,
     ENV_EMBEDDINGS_OPENAI_BASE_URL,
     ENV_EMBEDDINGS_OPENAI_MODEL,
@@ -57,6 +47,7 @@ from ..config import (
     ENV_EMBEDDINGS_ZEROENTROPY_ENCODING_FORMAT,
     ENV_LLM_API_KEY,
 )
+from .bank_attribution import apply_bank_attribution
 
 logger = logging.getLogger(__name__)
 
@@ -199,7 +190,7 @@ class LocalSTEmbeddings(Embeddings):
             device = "cpu"
             logger.info("Embeddings: forcing CPU mode")
         else:
-            # Check for GPU (CUDA) or Apple Silicon (MPS)
+            # Check for GPU (CUDA), Apple Silicon (MPS), or Intel XPU
             # Wrap in try-except to gracefully handle any device detection issues
             # (e.g., in CI environments or when PyTorch is built without GPU support)
             device = "cpu"  # Default to CPU
@@ -207,10 +198,13 @@ class LocalSTEmbeddings(Embeddings):
                 has_gpu = torch.cuda.is_available() or (
                     hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
                 )
+                # Intel Arc XPU support — torch.xpu is available when the XPU build is loaded
+                if not has_gpu and hasattr(torch, "xpu"):
+                    has_gpu = torch.xpu.is_available()
                 if has_gpu:
-                    device = None  # Let sentence-transformers auto-detect GPU/MPS
+                    device = None  # Let sentence-transformers auto-detect GPU/MPS/XPU
             except Exception as e:
-                logger.warning(f"Failed to detect GPU/MPS, falling back to CPU: {e}")
+                logger.warning(f"Failed to detect GPU/MPS/XPU, falling back to CPU: {e}")
 
         # Suppress verbose transformers warnings during model loading
         # This suppresses the "UNEXPECTED" warnings from BertModel which are harmless
@@ -705,6 +699,7 @@ class OpenAIEmbeddings(Embeddings):
             }
             if self.dimensions is not None:
                 request["dimensions"] = self.dimensions
+            apply_bank_attribution(request)
 
             response = self._client.embeddings.create(**request)
 
@@ -717,7 +712,8 @@ class OpenAIEmbeddings(Embeddings):
 
 class CodexOAuthEmbeddings(OpenAIEmbeddings):
     """
-    OpenAI embeddings using the Codex/ChatGPT OAuth token from ``~/.codex/auth.json``.
+    OpenAI embeddings using the Codex/ChatGPT OAuth token from the Codex
+    ``auth.json`` (``$CODEX_HOME/auth.json``, or ``~/.codex/auth.json`` when unset).
 
     Codex OAuth is an LLM-provider auth path in Hindsight, but the same bearer token
     can also authenticate against the standard OpenAI embeddings endpoint. This keeps
@@ -1347,6 +1343,21 @@ class LiteLLMSDKEmbeddings(Embeddings):
         return all_embeddings
 
 
+# Gemini Embedding 2+ multimodal models return a SINGLE aggregated embedding
+# for a multi-input request instead of one vector per input (see
+# https://ai.google.dev/gemini-api/docs/embeddings#embedding-aggregation). For
+# these models we must embed one input per call to preserve the 1:1 input→vector
+# alignment the rest of the pipeline relies on. The marker matches preview and GA
+# names (e.g. "gemini-embedding-2-preview", "gemini-embedding-2"), with or
+# without a "google/" or "models/" prefix.
+_GEMINI_AGGREGATING_MODEL_MARKER = "gemini-embedding-2"
+
+
+def _gemini_model_aggregates_inputs(model: str) -> bool:
+    """Whether the model aggregates a multi-input request into one embedding."""
+    return _GEMINI_AGGREGATING_MODEL_MARKER in model.lower()
+
+
 class GeminiEmbeddings(Embeddings):
     """
     Google embeddings via the google.genai SDK.
@@ -1356,6 +1367,10 @@ class GeminiEmbeddings(Embeddings):
     2. Vertex AI with service account or Application Default Credentials (ADC)
 
     Uses the embed_content API: client.models.embed_content(model, contents)
+
+    Gemini Embedding 2+ multimodal models aggregate a multi-input request into a
+    single embedding, so for those the batch size is forced to 1 (one input per
+    call) to keep one vector per input.
     """
 
     def __init__(
@@ -1510,9 +1525,13 @@ class GeminiEmbeddings(Embeddings):
 
         all_embeddings = []
 
+        # Gemini Embedding 2+ multimodal models return one aggregated vector for a
+        # multi-input request, so embed one input per call to keep 1:1 alignment.
+        batch_size = 1 if _gemini_model_aggregates_inputs(self.model) else self.batch_size
+
         # Process in batches
-        for i in range(0, len(texts), self.batch_size):
-            batch = texts[i : i + self.batch_size]
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i : i + batch_size]
 
             embed_kwargs = {"model": self.model, "contents": batch}
             if self._embed_config is not None:
@@ -1520,7 +1539,13 @@ class GeminiEmbeddings(Embeddings):
 
             result = self._client.models.embed_content(**embed_kwargs)
 
-            all_embeddings.extend([emb.values for emb in result.embeddings])
+            embeddings = result.embeddings or []
+            if len(embeddings) != len(batch):
+                raise RuntimeError(
+                    f"Gemini embeddings backend returned {len(embeddings)} vectors for "
+                    f"{len(batch)} input texts (model {self.model}); expected exact 1:1 alignment"
+                )
+            all_embeddings.extend([emb.values for emb in embeddings])
 
         # L2-normalize when output_dimensionality is set — Gemini only returns
         # normalized vectors at full 3072 dims; truncated dims need re-normalization

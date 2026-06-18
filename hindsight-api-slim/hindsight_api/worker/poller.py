@@ -16,12 +16,26 @@ import time
 import traceback
 from collections import Counter
 from collections.abc import Awaitable, Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from ..engine.schema import fq_table_explicit as fq_table
+from ..metrics import get_metrics_collector
 from .exceptions import DeferOperation, RetryTaskAt
 from .stage import StageHolder, bind_holder
+
+# Map DB operation_type -> metric `operation` label, collapsing the retain
+# variants onto "retain" so async worker completions land on the same
+# operation="retain" series the synchronous API path emits. Unknown types
+# pass through unchanged.
+_RETAIN_OP_TYPES = {"retain", "batch_retain", "file_convert_retain"}
+
+
+def _metric_operation_label(operation_type: str | None) -> str:
+    if operation_type in _RETAIN_OP_TYPES:
+        return "retain"
+    return operation_type or "unknown"
+
 
 if TYPE_CHECKING:
     from hindsight_api.engine.db.base import DatabaseBackend, DatabaseConnection
@@ -226,38 +240,23 @@ class WorkerPoller:
         """
         async with self._backend.acquire() as conn:
             if await self._optional_routines.is_installed(conn, "schemas_with_pending_work"):
+                # The routine IS the authority on where work exists: every schema
+                # it returns is claimable, and every schema it does NOT return is
+                # treated as having nothing to do this cycle. That is the entire
+                # point of installing it — one round-trip replaces N per-schema
+                # EXISTS probes. We deliberately do NOT re-verify the omitted
+                # schemas with a per-schema scan: that re-runs the exact queries
+                # the routine exists to avoid, on every idle poll, silently
+                # negating the optimisation.
+                #
+                # Because the result is trusted wholesale, the routine is only
+                # appropriate for multi-tenant deployments. A single-schema
+                # (default/public only) install should NOT create it and instead
+                # falls through to the per-schema path below — a single cheap
+                # EXISTS check that cannot starve. See
+                # ``hindsight_api.engine.db.optional_routines``.
                 rows = await conn.fetch("SELECT * FROM public.schemas_with_pending_work()")
-                routine_active = {self._normalize_poll_schema(r[0]) for r in rows}
-                known_schemas = set(schemas)
-                active = routine_active & known_schemas
-                unknown = routine_active - known_schemas
-                if unknown:
-                    logger.warning(
-                        "Optional PG routine public.schemas_with_pending_work() returned schema(s) "
-                        "not present in tenant discovery: %s",
-                        sorted(str(s) for s in unknown),
-                    )
-
-                # The optional routine returns PostgreSQL schema names, but the poller uses
-                # None for the default schema. Older operator-supplied implementations also
-                # commonly scan tenant_% only; when the default schema is in scope but absent
-                # from the routine result, verify via the fully-correct per-schema fallback so
-                # public single-tenant deployments cannot silently starve.
-                should_verify_with_fallback = (None in known_schemas and None not in active) or (
-                    bool(routine_active) and not active
-                )
-                if not should_verify_with_fallback:
-                    return active
-
-                fallback_active = await self._scan_active_schemas_by_exists(conn, schemas)
-                missed = fallback_active - active
-                if missed:
-                    logger.warning(
-                        "Optional PG routine public.schemas_with_pending_work() missed claimable schema(s) %s; "
-                        "using per-schema fallback for this poll",
-                        sorted(str(s) for s in missed),
-                    )
-                return fallback_active
+                return {self._normalize_poll_schema(r[0]) for r in rows}
 
             return await self._scan_active_schemas_by_exists(conn, schemas)
 
@@ -716,6 +715,24 @@ class WorkerPoller:
         """
         task_type = task.task_dict.get("type", "unknown")
         bank_id = task.task_dict.get("bank_id", "unknown")
+        # Operation metric (source="worker"): record on terminal outcomes only, so
+        # async worker throughput and latency (retain, consolidation and the other
+        # worker task types) are visible in Prometheus. Prefer the DB-authoritative
+        # operation_type.
+        #
+        # success semantics are deliberately narrow: success=false means the task
+        # raised out to the poller (an unexpected error, or retry-exhausted). It does
+        # NOT capture deterministic failures that the executor handles itself and
+        # returns from normally (file_convert_retain, non-retryable errors via
+        # memory_engine.execute_task) — those record success=true here. Treat this as
+        # a completion-throughput signal, not a failure-rate one: for authoritative
+        # failure visibility use the hindsight_async_operations{status="failed"} gauge,
+        # which reads each operation's final DB status.
+        op_label = _metric_operation_label(task.task_dict.get("operation_type") or task_type)
+        op_start = time.time()
+        metrics = get_metrics_collector()
+        # None = not a terminal outcome (deferred/retried) → no metric.
+        terminal_success: bool | None = None
 
         # Bind the stage holder in this task's own contextvar scope so engine
         # code running under us can update it via stage.set_stage(). If holder
@@ -732,14 +749,28 @@ class WorkerPoller:
                 task.task_dict["_schema"] = task.schema
             await self._executor(task.task_dict)
             logger.debug(f"Task {task.operation_id} execution finished")
+            terminal_success = True
         except DeferOperation as e:
+            # Deferral is not a terminal outcome — do not record a completion.
             await self._defer_operation(task.operation_id, e.exec_date, e.reason, task.schema)
         except RetryTaskAt as e:
+            # Retry is not a terminal outcome — do not record a completion.
             await self._schedule_retry(task.operation_id, e.retry_at, str(e), task.schema)
         except Exception as e:
             logger.error(f"Task {task.operation_id} failed: {e}")
             traceback.print_exc()
             await self._mark_failed(task.operation_id, str(e), task.schema)
+            terminal_success = False
+
+        # Record the metric outside the executor's exception scope so a metrics
+        # reporting failure can never be mistaken for a task failure and flip terminal state.
+        if terminal_success is not None:
+            try:
+                metrics.record_operation_result(
+                    op_label, bank_id, success=terminal_success, duration=time.time() - op_start, source="worker"
+                )
+            except Exception:
+                logger.warning(f"Failed to record worker operation metric for {task.operation_id}", exc_info=True)
 
     async def recover_own_tasks(self) -> int:
         """
@@ -824,7 +855,6 @@ class WorkerPoller:
             recovered = 0
             for row in rows:
                 operation_id = str(row["operation_id"])
-                task_payload = row["task_payload"]
                 result_metadata = row["result_metadata"]
 
                 # Parse metadata
@@ -837,12 +867,6 @@ class WorkerPoller:
                 logger.info(
                     f"Recovering batch operation: operation_id={operation_id}, batch_id={batch_id}, provider={batch_provider}"
                 )
-
-                # Parse task_payload
-                if isinstance(task_payload, str):
-                    task_dict = json.loads(task_payload)
-                else:
-                    task_dict = task_payload
 
                 # Mark operation as ready for re-processing
                 # Reset to pending with task_payload intact so worker picks it up again

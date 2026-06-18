@@ -3,7 +3,6 @@ import asyncio
 import pytest
 
 from hindsight_api.engine.memory_engine import MemoryEngine
-from hindsight_api.engine.providers.openai_compatible_llm import _retry_after_seconds
 from hindsight_api.engine.retain.fact_extraction import MAX_RETAIN_CONTEXT_CHARS, _build_user_message
 
 
@@ -18,16 +17,6 @@ class _SlowAcquire:
 class _SlowBackend:
     def acquire(self):
         return _SlowAcquire()
-
-
-class _Response:
-    def __init__(self, headers):
-        self.headers = headers
-
-
-class _StatusError:
-    def __init__(self, headers):
-        self.response = _Response(headers)
 
 
 @pytest.mark.asyncio
@@ -62,9 +51,3 @@ def test_retain_fact_prompt_truncates_large_context_before_llm_call():
 
     assert len(message) < MAX_RETAIN_CONTEXT_CHARS + 1_000
     assert "truncated" in message
-
-
-def test_retry_after_seconds_honors_provider_cooldown_without_exceeding_cap():
-    error = _StatusError({"retry-after": "30"})
-
-    assert _retry_after_seconds(error, max_backoff=10) == 10
