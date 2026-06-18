@@ -13,6 +13,7 @@ Tests cover:
 import asyncio
 import json
 import uuid
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
@@ -68,6 +69,99 @@ async def clean_operations(pool):
     await pool.execute(
         "DELETE FROM async_operations WHERE bank_id LIKE 'test-worker-%' OR bank_id LIKE 'test_worker_%'"
     )
+
+
+def test_metric_operation_label_normalises_retain_variants():
+    """Worker completion metrics collapse retain variants onto operation="retain"
+    so they share the API path's series; other types pass through unchanged."""
+    from hindsight_api.worker.poller import _metric_operation_label
+
+    assert _metric_operation_label("retain") == "retain"
+    assert _metric_operation_label("batch_retain") == "retain"
+    assert _metric_operation_label("file_convert_retain") == "retain"
+    assert _metric_operation_label("consolidation") == "consolidation"
+    assert _metric_operation_label("reflect") == "reflect"
+    assert _metric_operation_label(None) == "unknown"
+
+
+class TestWorkerOperationMetrics:
+    """_execute_task_inner emits operation metrics on terminal outcomes only (no DB)."""
+
+    def _make_poller(self, executor):
+        from hindsight_api.worker import WorkerPoller
+
+        poller = WorkerPoller(backend=MagicMock(), worker_id="w-test", executor=executor)
+        # Stub terminal-state handlers so _execute_task_inner never touches the DB.
+        poller._mark_failed = AsyncMock()
+        poller._defer_operation = AsyncMock()
+        poller._schedule_retry = AsyncMock()
+        return poller
+
+    async def _run(self, executor, task_type="batch_retain"):
+        from hindsight_api.worker.poller import ClaimedTask
+
+        poller = self._make_poller(executor)
+        task = ClaimedTask(
+            operation_id=str(uuid.uuid4()),
+            task_dict={"type": task_type, "operation_type": task_type, "bank_id": "bank-1"},
+            schema=None,
+        )
+        collector = MagicMock()
+        with patch("hindsight_api.worker.poller.get_metrics_collector", return_value=collector):
+            await poller._execute_task_inner(task)
+        return collector
+
+    @pytest.mark.asyncio
+    async def test_executor_returning_normally_records_success(self):
+        """Success is inferred from the executor returning without raising to the
+        poller. This deliberately includes deterministic failures that
+        memory_engine.execute_task handles itself and returns from normally
+        (file_convert_retain, non-retryable errors) — at the poller boundary they
+        are indistinguishable from a clean completion, so they also record
+        success=true. The worker counter is therefore a completion-throughput
+        signal; authoritative failure visibility comes from the
+        hindsight_async_operations{status="failed"} gauge, which reads each
+        operation's final DB status.
+        """
+        collector = await self._run(AsyncMock())  # executor returns normally
+        collector.record_operation_result.assert_called_once()
+        call = collector.record_operation_result.call_args
+        assert call.args[0] == "retain"  # batch_retain normalised
+        assert call.kwargs["success"] is True
+        assert call.kwargs["source"] == "worker"
+
+    @pytest.mark.asyncio
+    async def test_failure_records_failure(self):
+        async def boom(_):
+            raise RuntimeError("kaboom")
+
+        collector = await self._run(boom)
+        collector.record_operation_result.assert_called_once()
+        assert collector.record_operation_result.call_args.kwargs["success"] is False
+
+    @pytest.mark.asyncio
+    async def test_deferral_not_counted(self):
+        from datetime import datetime, timezone
+
+        from hindsight_api.worker.exceptions import DeferOperation
+
+        async def defer(_):
+            raise DeferOperation(exec_date=datetime.now(timezone.utc), reason="later")
+
+        collector = await self._run(defer)
+        collector.record_operation_result.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_retry_not_counted(self):
+        from datetime import datetime, timezone
+
+        from hindsight_api.worker.exceptions import RetryTaskAt
+
+        async def retry(_):
+            raise RetryTaskAt(retry_at=datetime.now(timezone.utc), message="transient")
+
+        collector = await self._run(retry)
+        collector.record_operation_result.assert_not_called()
 
 
 def test_all_operation_types_have_slot_reservation_config():
@@ -833,6 +927,34 @@ class TestWorkerPoller:
         assert not isinstance(exc_info.value, RetryTaskAt)
 
     @pytest.mark.asyncio
+    async def test_memory_engine_provider_quota_reset_becomes_defer_operation(self, memory, monkeypatch):
+        """Provider quota windows should park worker tasks until the reset time."""
+        from datetime import UTC, datetime, timedelta
+
+        from hindsight_api.engine.llm_interface import ProviderRateLimitResetError
+        from hindsight_api.worker.exceptions import DeferOperation, RetryTaskAt
+
+        retry_at = (datetime.now(UTC) + timedelta(hours=5)).replace(microsecond=0)
+
+        async def quota_limited_retain(_task_dict: object) -> None:
+            raise ProviderRateLimitResetError(retry_at=retry_at, message="quota resets later")
+
+        monkeypatch.setattr(memory, "_handle_batch_retain", quota_limited_retain)
+
+        with pytest.raises(DeferOperation) as exc_info:
+            await memory.execute_task(
+                {
+                    "type": "batch_retain",
+                    "bank_id": "test-provider-quota-defer",
+                    "contents": [{"content": "x"}],
+                }
+            )
+
+        assert exc_info.value.exec_date == retry_at
+        assert exc_info.value.reason == "quota resets later"
+        assert not isinstance(exc_info.value, RetryTaskAt)
+
+    @pytest.mark.asyncio
     async def test_claim_batch_skips_consolidation_when_same_bank_processing(self, pool, backend, clean_operations):
         """Test that pending consolidation is skipped if same bank has one processing."""
         from hindsight_api.worker import WorkerPoller
@@ -947,9 +1069,11 @@ class TestWorkerPoller:
 
         claimed = await poller.claim_batch()
 
-        # Should claim the retain task (non-consolidation tasks are unaffected)
-        assert len(claimed) == 1
-        assert claimed[0].operation_id == str(retain_op_id)
+        # Should claim the retain task (non-consolidation tasks are unaffected).
+        # Filter to our bank — parallel tests may contribute other claims.
+        my_claims = [c for c in claimed if c.task_dict.get("bank_id") == bank_id]
+        assert len(my_claims) == 1, f"Expected 1 claim for our bank, got {len(my_claims)}"
+        assert my_claims[0].operation_id == str(retain_op_id)
 
 
 class TestWorkerRecovery:
@@ -1586,7 +1710,9 @@ class TestDynamicTenantDiscovery:
         # First claim_batch should call list_tenants
         claimed1 = await poller.claim_batch()
         assert mock_extension.list_tenants_calls == 1
-        assert len(claimed1) == 2
+        # Filter to our bank — parallel tests may contribute other claims.
+        my_claims1 = [c for c in claimed1 if c.task_dict.get("bank_id") == bank_id]
+        assert len(my_claims1) == 2, f"Expected 2 claims for our bank, got {len(my_claims1)}"
 
         # Add more tasks
         for i in range(2):
@@ -1605,7 +1731,8 @@ class TestDynamicTenantDiscovery:
         # Second claim_batch should call list_tenants again
         claimed2 = await poller.claim_batch()
         assert mock_extension.list_tenants_calls == 2
-        assert len(claimed2) == 2
+        my_claims2 = [c for c in claimed2 if c.task_dict.get("bank_id") == bank_id]
+        assert len(my_claims2) == 2, f"Expected 2 claims for our bank, got {len(my_claims2)}"
 
     @pytest.mark.asyncio
     async def test_poller_picks_up_new_tenants_without_restart(self, pool, backend, clean_operations):
@@ -1650,10 +1777,12 @@ class TestDynamicTenantDiscovery:
             tenant_extension=dynamic_extension,
         )
 
-        # First poll - only public schema
+        # First poll - only public schema. Filter to our bank — parallel tests
+        # may contribute other claims.
         claimed1 = await poller.claim_batch()
-        assert len(claimed1) == 1
-        assert claimed1[0].schema is None  # public is represented as None
+        my_claims1 = [c for c in claimed1 if c.task_dict.get("bank_id") == bank_id]
+        assert len(my_claims1) == 1, f"Expected 1 claim for our bank, got {len(my_claims1)}"
+        assert my_claims1[0].schema is None  # public is represented as None
         assert dynamic_extension.list_tenants_calls == 1
 
         # Simulate tenant list changing (but we won't add a non-existent schema)
@@ -1675,12 +1804,14 @@ class TestDynamicTenantDiscovery:
 
         # Second poll - list_tenants should be called again
         claimed2 = await poller.claim_batch()
-        assert len(claimed2) == 1
+        my_claims2 = [c for c in claimed2 if c.task_dict.get("bank_id") == bank_id]
+        assert len(my_claims2) == 1, f"Expected 1 claim for our bank, got {len(my_claims2)}"
         assert dynamic_extension.list_tenants_calls == 2  # Called again on second poll
 
         # Third poll with no tasks - still calls list_tenants
         claimed3 = await poller.claim_batch()
-        assert len(claimed3) == 0
+        my_claims3 = [c for c in claimed3 if c.task_dict.get("bank_id") == bank_id]
+        assert len(my_claims3) == 0, f"Expected 0 claims for our bank, got {len(my_claims3)}"
         assert dynamic_extension.list_tenants_calls == 3  # Called again even with no tasks
 
     @pytest.mark.asyncio
@@ -2896,8 +3027,7 @@ class TestClaimBatchRotation:
         from hindsight_api.worker import WorkerPoller
 
         # Minimal contract-satisfying implementation: returns the empty
-        # set. Use a non-default schema so the default-schema consistency
-        # check does not intentionally fall back to the per-schema scan.
+        # set. Enough to prove the poller follows the server-side path.
         await pool.execute(
             "CREATE OR REPLACE FUNCTION public.schemas_with_pending_work() "
             "RETURNS SETOF text AS $$ BEGIN RETURN; END $$ LANGUAGE plpgsql STABLE"
@@ -2925,7 +3055,7 @@ class TestClaimBatchRotation:
             PostgresConnection.fetch = spy_fetch  # type: ignore[method-assign]
             PostgresConnection.fetchval = spy_fetchval  # type: ignore[method-assign]
             try:
-                await poller._scan_active_schemas(["tenant_alpha"])
+                await poller._scan_active_schemas([None])
             finally:
                 PostgresConnection.fetch = original_fetch  # type: ignore[method-assign]
                 PostgresConnection.fetchval = original_fetchval  # type: ignore[method-assign]
@@ -2970,42 +3100,6 @@ class TestClaimBatchRotation:
             result = await poller._scan_active_schemas([None])
 
             assert result == {None}
-        finally:
-            await pool.execute("DROP FUNCTION IF EXISTS public.schemas_with_pending_work()")
-
-    @pytest.mark.asyncio
-    async def test_scan_falls_back_when_optional_routine_misses_public(self, pool, backend, clean_operations, caplog):
-        """If an installed routine scans tenant schemas only, public
-        single-tenant workers must still use the correct per-schema fallback.
-        """
-        from hindsight_api.worker import WorkerPoller
-
-        bank_id = f"test-worker-missed-{uuid.uuid4().hex[:8]}"
-        await _ensure_bank(pool, bank_id)
-        await pool.execute(
-            """INSERT INTO async_operations
-               (operation_id, bank_id, operation_type, status, task_payload)
-               VALUES ($1, $2, 'test', 'pending', $3::jsonb)""",
-            uuid.uuid4(),
-            bank_id,
-            json.dumps({"type": "test", "bank_id": bank_id}),
-        )
-        await pool.execute(
-            "CREATE OR REPLACE FUNCTION public.schemas_with_pending_work() "
-            "RETURNS SETOF text AS $$ BEGIN RETURN; END $$ LANGUAGE plpgsql STABLE"
-        )
-        try:
-            poller = WorkerPoller(
-                backend=backend,
-                worker_id="test-routine-missed-public",
-                executor=lambda x: None,
-            )
-
-            with caplog.at_level("WARNING", logger="hindsight_api.worker.poller"):
-                result = await poller._scan_active_schemas([None])
-
-            assert None in result
-            assert any("missed claimable schema" in record.message for record in caplog.records)
         finally:
             await pool.execute("DROP FUNCTION IF EXISTS public.schemas_with_pending_work()")
 
