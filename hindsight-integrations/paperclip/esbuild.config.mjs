@@ -1,6 +1,12 @@
 import esbuild from "esbuild";
+import { readFileSync } from "node:fs";
 
 const watch = process.argv.includes("--watch");
+
+// Single source of truth: the manifest version is injected from package.json at
+// build time so dist/manifest.js can never drift from the published package
+// version (the 0.2.0-vs-0.2.x defect that shipped twice in BLO-7607).
+const pkg = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf8"));
 
 const sharedConfig = {
   bundle: true,
@@ -8,6 +14,9 @@ const sharedConfig = {
   target: "node20",
   format: "esm",
   external: ["@paperclipai/plugin-sdk"],
+  define: {
+    __PLUGIN_VERSION__: JSON.stringify(pkg.version),
+  },
 };
 
 const builds = [
