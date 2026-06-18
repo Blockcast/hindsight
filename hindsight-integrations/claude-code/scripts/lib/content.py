@@ -124,6 +124,27 @@ def should_skip_retry_limit_churn(messages: list, transcript: str) -> bool:
     return limit_hits >= 2 and churn_hits >= 2 and len(transcript) > 10000
 
 
+def truncate_retention_transcript(transcript: str, max_chars: int) -> tuple:
+    """Bound a retain payload while preserving session setup and latest work."""
+    if not transcript or max_chars is None or max_chars <= 0 or len(transcript) <= max_chars:
+        return transcript, False
+
+    marker = (
+        "\n\n[... Hindsight retain transcript truncated; "
+        f"kept first and latest content within {max_chars} chars ...]\n\n"
+    )
+    if max_chars <= len(marker) + 200:
+        return transcript[-max_chars:], True
+
+    head_chars = min(4000, max_chars // 4)
+    tail_chars = max_chars - head_chars - len(marker)
+    if tail_chars < 200:
+        tail_chars = 200
+        head_chars = max_chars - tail_chars - len(marker)
+
+    return transcript[:head_chars].rstrip() + marker + transcript[-tail_chars:].lstrip(), True
+
+
 # ---------------------------------------------------------------------------
 # Recall: query composition and truncation
 # ---------------------------------------------------------------------------

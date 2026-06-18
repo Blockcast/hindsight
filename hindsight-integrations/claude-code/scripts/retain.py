@@ -31,6 +31,7 @@ from lib.content import (
     prepare_retention_transcript,
     should_skip_retry_limit_churn,
     slice_last_turns_by_user_boundary,
+    truncate_retention_transcript,
 )
 from lib.daemon import get_api_url
 from lib.state import increment_turn_count, track_retention
@@ -133,6 +134,10 @@ def run_retain(hook_input: dict, force: bool = False) -> None:
     if should_skip_retry_limit_churn(messages_to_retain, transcript):
         debug_log(config, "Retry/limit/continue churn detected, skipping retain")
         return
+
+    transcript, truncated = truncate_retention_transcript(transcript, config.get("retainMaxChars"))
+    if truncated:
+        debug_log(config, f"Retain transcript truncated to {len(transcript)} chars")
 
     # Resolve API URL
     def _dbg(*a):

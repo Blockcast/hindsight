@@ -16,6 +16,7 @@ from lib.content import (
     strip_channel_envelope,
     strip_memory_tags,
     truncate_recall_query,
+    truncate_retention_transcript,
 )
 
 
@@ -498,6 +499,23 @@ class TestShouldSkipRetryLimitChurn:
         )
         transcript, _ = prepare_retention_transcript(msgs, retain_full_window=True)
         assert should_skip_retry_limit_churn(msgs, transcript) is False
+
+
+class TestTruncateRetentionTranscript:
+    def test_short_transcript_unchanged(self):
+        transcript = "[role: user]\nhello\n[user:end]"
+        result, truncated = truncate_retention_transcript(transcript, 1000)
+        assert result == transcript
+        assert truncated is False
+
+    def test_caps_large_transcript_preserving_head_and_tail(self):
+        transcript = "start-" + ("x" * 2000) + "-middle-" + ("y" * 2000) + "-end"
+        result, truncated = truncate_retention_transcript(transcript, 1000)
+        assert truncated is True
+        assert len(result) <= 1000
+        assert result.startswith("start-")
+        assert result.endswith("-end")
+        assert "Hindsight retain transcript truncated" in result
 
 
 # ---------------------------------------------------------------------------
