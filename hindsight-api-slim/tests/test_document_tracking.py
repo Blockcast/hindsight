@@ -119,9 +119,7 @@ async def test_no_document_id_is_content_derived_and_idempotent(memory, request_
             request_context=request_context,
         )
         docs_v2 = await memory.list_documents(bank_id, request_context=request_context)
-        assert docs_v2["total"] == 1, (
-            f"expected idempotent re-ingest (1 doc), got {docs_v2['total']}"
-        )
+        assert docs_v2["total"] == 1, f"expected idempotent re-ingest (1 doc), got {docs_v2['total']}"
         assert docs_v1["items"][0]["id"] == docs_v2["items"][0]["id"]
 
         # Same content but a DIFFERENT context is a distinct document
@@ -133,9 +131,7 @@ async def test_no_document_id_is_content_derived_and_idempotent(memory, request_
             request_context=request_context,
         )
         docs_v3 = await memory.list_documents(bank_id, request_context=request_context)
-        assert docs_v3["total"] == 2, (
-            f"expected context-namespaced split (2 docs), got {docs_v3['total']}"
-        )
+        assert docs_v3["total"] == 2, f"expected context-namespaced split (2 docs), got {docs_v3['total']}"
 
     finally:
         await memory.delete_bank(bank_id, request_context=request_context)
