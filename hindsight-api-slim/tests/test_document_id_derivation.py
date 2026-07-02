@@ -6,6 +6,7 @@ the fallback when a caller supplies no explicit document_id. The end-to-end
 idempotency behaviour is covered by
 tests/test_document_tracking.py::test_no_document_id_is_content_derived_and_idempotent.
 """
+
 import uuid
 
 from hindsight_api.engine.retain.orchestrator import (
