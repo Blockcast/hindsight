@@ -114,7 +114,7 @@ jobs:
       with:
         name: perf-results-${{ github.sha }}
         path: hindsight-dev/perf-results.json
-        retention-days: 90
+        retention-days: 1
 
     # Publish enriched results (perf JSON + commit metadata) to the dashboard
     # repo's gh-pages branch. The static site at
@@ -204,7 +204,7 @@ jobs:
       with:
         name: locomo-results-${{ github.sha }}
         path: hindsight-dev/benchmarks/locomo/results/
-        retention-days: 90
+        retention-days: 1
 
     - name: Publish LoComo to dashboard
       if: success() && (github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch')
@@ -287,7 +287,7 @@ jobs:
       with:
         name: obs-results-${{ github.sha }}
         path: hindsight-dev/obs-results.json
-        retention-days: 90
+        retention-days: 1
 
     - name: Publish obs to dashboard
       if: success() && (github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch')
