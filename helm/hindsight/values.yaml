@@ -39,7 +39,7 @@ api:
   # Liveness and readiness probes
   livenessProbe:
     httpGet:
-      path: /health
+      path: /version
       port: 8888
     initialDelaySeconds: 30
     periodSeconds: 10
@@ -101,6 +101,12 @@ api:
   env:
     #HINDSIGHT_API_LLM_PROVIDER: "groq"
     HINDSIGHT_API_LLM_MODEL: "openai/gpt-oss-120b"
+    # Keep embedded PostgreSQL deployments from opening hundreds of idle
+    # asyncpg connections across API and worker pods under backlog pressure.
+    HINDSIGHT_API_DB_POOL_MIN_SIZE: "1"
+    HINDSIGHT_API_DB_POOL_MAX_SIZE: "10"
+    HINDSIGHT_API_READ_DB_POOL_MIN_SIZE: "1"
+    HINDSIGHT_API_READ_DB_POOL_MAX_SIZE: "10"
 
   # Secret environment variables
   secrets:
@@ -134,7 +140,7 @@ worker:
   # Liveness and readiness probes
   livenessProbe:
     httpGet:
-      path: /health
+      path: /metrics
       port: 8889
     initialDelaySeconds: 30
     periodSeconds: 10
@@ -155,7 +161,12 @@ worker:
     # Poll interval in milliseconds (how often to check for new tasks)
     HINDSIGHT_API_WORKER_POLL_INTERVAL_MS: "500"
     # Number of tasks to claim per poll cycle
-    HINDSIGHT_API_WORKER_BATCH_SIZE: "10"
+    HINDSIGHT_API_WORKER_BATCH_SIZE: "1"
+    # Bound per-worker task and DB write concurrency for the default embedded DB.
+    # Keep one shared slot available for reservation-less task types like retain.
+    HINDSIGHT_API_WORKER_MAX_SLOTS: "2"
+    HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS: "1"
+    HINDSIGHT_API_RETAIN_MAX_CONCURRENT: "1"
     # Max retries before marking a task as failed
     HINDSIGHT_API_WORKER_MAX_RETRIES: "3"
     # HTTP port for metrics/health (matches service.targetPort)
