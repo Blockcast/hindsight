@@ -48,7 +48,7 @@ api:
 
   readinessProbe:
     httpGet:
-      path: /health
+      path: /version
       port: 8888
     initialDelaySeconds: 10
     periodSeconds: 5
@@ -149,7 +149,7 @@ worker:
 
   readinessProbe:
     httpGet:
-      path: /health
+      path: /metrics
       port: 8889
     initialDelaySeconds: 10
     periodSeconds: 5
@@ -166,6 +166,7 @@ worker:
     # Keep one shared slot available for reservation-less task types like retain.
     HINDSIGHT_API_WORKER_MAX_SLOTS: "2"
     HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS: "1"
+    HINDSIGHT_API_WORKER_RETAIN_MAX_SLOTS: "1"
     HINDSIGHT_API_RETAIN_MAX_CONCURRENT: "1"
     # Max retries before marking a task as failed
     HINDSIGHT_API_WORKER_MAX_RETRIES: "3"
