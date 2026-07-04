@@ -163,7 +163,8 @@ worker:
     # Number of tasks to claim per poll cycle
     HINDSIGHT_API_WORKER_BATCH_SIZE: "1"
     # Bound per-worker task and DB write concurrency for the default embedded DB.
-    HINDSIGHT_API_WORKER_MAX_SLOTS: "1"
+    # Keep one shared slot available for reservation-less task types like retain.
+    HINDSIGHT_API_WORKER_MAX_SLOTS: "2"
     HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS: "1"
     HINDSIGHT_API_RETAIN_MAX_CONCURRENT: "1"
     # Max retries before marking a task as failed
