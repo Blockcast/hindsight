@@ -46,9 +46,12 @@ api:
     timeoutSeconds: 5
     failureThreshold: 3
 
+  # readinessProbe hits /health (checks DB connectivity) rather than /version:
+  # unlike liveness, readiness must detect a DB outage so k8s pulls the pod
+  # from rotation instead of routing traffic to a pod that can't serve it.
   readinessProbe:
     httpGet:
-      path: /version
+      path: /health
       port: 8888
     initialDelaySeconds: 10
     periodSeconds: 5
@@ -147,9 +150,12 @@ worker:
     timeoutSeconds: 5
     failureThreshold: 3
 
+  # readinessProbe hits /health (checks DB connectivity) rather than /metrics:
+  # unlike liveness, readiness must detect a DB outage so k8s pulls the pod
+  # from rotation instead of routing traffic to a pod that can't serve it.
   readinessProbe:
     httpGet:
-      path: /metrics
+      path: /health
       port: 8889
     initialDelaySeconds: 10
     periodSeconds: 5
@@ -163,8 +169,12 @@ worker:
     # Number of tasks to claim per poll cycle
     HINDSIGHT_API_WORKER_BATCH_SIZE: "1"
     # Bound per-worker task and DB write concurrency for the default embedded DB.
-    # Keep one shared slot available for reservation-less task types like retain.
-    HINDSIGHT_API_WORKER_MAX_SLOTS: "2"
+    # consolidation and retain each get a reserved slot; the remaining slot is
+    # shared by reservation-less task types (file_convert_retain,
+    # refresh_mental_model, graph_maintenance, import_documents). Keep
+    # MAX_SLOTS one greater than the sum of reservations below or the shared
+    # pool collapses to zero and those task types silently stop running.
+    HINDSIGHT_API_WORKER_MAX_SLOTS: "3"
     HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS: "1"
     HINDSIGHT_API_WORKER_RETAIN_MAX_SLOTS: "1"
     HINDSIGHT_API_RETAIN_MAX_CONCURRENT: "1"
