@@ -51,7 +51,7 @@ api:
   # from rotation instead of routing traffic to a pod that can't serve it.
   readinessProbe:
     httpGet:
-      path: /health
+      path: /version
       port: 8888
     initialDelaySeconds: 10
     periodSeconds: 5
@@ -155,7 +155,7 @@ worker:
   # from rotation instead of routing traffic to a pod that can't serve it.
   readinessProbe:
     httpGet:
-      path: /health
+      path: /metrics
       port: 8889
     initialDelaySeconds: 10
     periodSeconds: 5
