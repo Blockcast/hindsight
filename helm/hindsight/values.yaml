@@ -46,16 +46,15 @@ api:
     timeoutSeconds: 5
     failureThreshold: 3
 
-  # readinessProbe hits /health (checks DB connectivity) rather than /version:
-  # unlike liveness, readiness must detect a DB outage so k8s pulls the pod
-  # from rotation instead of routing traffic to a pod that can't serve it.
+  # Keep readiness on the cheap process/version endpoint so DB pressure cannot
+  # cascade into kube probe failures while workers are draining backlog.
   readinessProbe:
     httpGet:
       path: /version
       port: 8888
     initialDelaySeconds: 10
     periodSeconds: 5
-    timeoutSeconds: 3
+    timeoutSeconds: 5
     failureThreshold: 3
 
   # Pod disruption budget
@@ -147,19 +146,18 @@ worker:
       port: 8889
     initialDelaySeconds: 30
     periodSeconds: 10
-    timeoutSeconds: 5
+    timeoutSeconds: 30
     failureThreshold: 3
 
-  # readinessProbe hits /health (checks DB connectivity) rather than /metrics:
-  # unlike liveness, readiness must detect a DB outage so k8s pulls the pod
-  # from rotation instead of routing traffic to a pod that can't serve it.
+  # Keep readiness on the worker's metrics endpoint so DB pressure cannot
+  # cascade into kube probe failures while workers are draining backlog.
   readinessProbe:
     httpGet:
       path: /metrics
       port: 8889
     initialDelaySeconds: 10
     periodSeconds: 5
-    timeoutSeconds: 3
+    timeoutSeconds: 30
     failureThreshold: 3
 
   # Worker-specific environment variables
@@ -169,12 +167,9 @@ worker:
     # Number of tasks to claim per poll cycle
     HINDSIGHT_API_WORKER_BATCH_SIZE: "1"
     # Bound per-worker task and DB write concurrency for the default embedded DB.
-    # consolidation and retain each get a reserved slot; the remaining slot is
-    # shared by reservation-less task types (file_convert_retain,
-    # refresh_mental_model, graph_maintenance, import_documents). Keep
-    # MAX_SLOTS one greater than the sum of reservations below or the shared
-    # pool collapses to zero and those task types silently stop running.
-    HINDSIGHT_API_WORKER_MAX_SLOTS: "3"
+    # consolidation and retain each get one reserved slot to avoid unbounded DB
+    # pressure from either queue while the embedded DB drains backlog.
+    HINDSIGHT_API_WORKER_MAX_SLOTS: "2"
     HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS: "1"
     HINDSIGHT_API_WORKER_RETAIN_MAX_SLOTS: "1"
     HINDSIGHT_API_RETAIN_MAX_CONCURRENT: "1"
