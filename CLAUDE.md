@@ -121,6 +121,13 @@ PostgreSQL with pgvector. Schema managed via Alembic migrations in `hindsight-ap
 
 Key tables: `banks`, `memory_units`, `documents`, `entities`, `entity_links`
 
+### Helm Health Probes
+
+Keep readiness probes independent of database health so database pressure does not
+cascade into Kubernetes probe failures. The API readiness probe uses `/version`,
+and the worker readiness probe uses `/metrics`; reserve `/health` for explicit
+database-aware health checks.
+
 ### Adding Database Migrations
 
 Hindsight runs the same Alembic tree against PostgreSQL and Oracle 23ai. Each
