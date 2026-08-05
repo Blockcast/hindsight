@@ -167,11 +167,11 @@ worker:
     # Number of tasks to claim per poll cycle
     HINDSIGHT_API_WORKER_BATCH_SIZE: "1"
     # Bound per-worker task and DB write concurrency for the default embedded DB.
-    # consolidation and retain each get one reserved slot to avoid unbounded DB
-    # pressure from either queue while the embedded DB drains backlog.
+    # Reserve one slot for consolidation and leave one shared across all queues.
+    # Retain remains capped at one concurrent task without consuming a reservation.
     HINDSIGHT_API_WORKER_MAX_SLOTS: "2"
     HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS: "1"
-    HINDSIGHT_API_WORKER_RETAIN_MAX_SLOTS: "1"
+    HINDSIGHT_API_WORKER_RETAIN_MAX_SLOTS: "0"
     HINDSIGHT_API_RETAIN_MAX_CONCURRENT: "1"
     # Max retries before marking a task as failed
     HINDSIGHT_API_WORKER_MAX_RETRIES: "3"
