@@ -262,6 +262,12 @@ Rules of thumb:
 - Banks can have background context
 - Bank isolation is strict - no cross-bank data leakage
 
+### Helm Worker Capacity
+
+For the default embedded database, keep `helm/hindsight/values.yaml` at two total
+worker slots with one reserved for consolidation. Cap retain at one concurrent task
+without assigning it a dedicated slot, so the remaining slot stays shared across queues.
+
 ### API Design
 - All endpoints operate on a single bank per request
 - Multi-bank queries are client responsibility to orchestrate
