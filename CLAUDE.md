@@ -72,6 +72,9 @@ cd hindsight-control-plane && npm run dev
 ./scripts/benchmarks/run-perf-test.sh --scale tiny          # Quick smoke test
 ./scripts/benchmarks/run-consolidation.sh
 
+# GitHub Actions perf artifacts intentionally retain for 1 day; durable
+# history is published to the performance dashboard instead.
+
 # Results viewer
 ./scripts/benchmarks/start-visualizer.sh  # View results at localhost:8001
 ```
@@ -121,6 +124,9 @@ PostgreSQL with pgvector. Schema managed via Alembic migrations in `hindsight-ap
 
 Key tables: `banks`, `memory_units`, `documents`, `entities`, `entity_links`
 
+### Helm Operations
+
+Helm liveness probes must stay process-local so database pressure does not restart healthy pods: API liveness uses `/version`, worker liveness uses `/metrics`, and readiness remains DB-backed on `/health`. The default embedded-PostgreSQL chart values intentionally cap API DB pools and worker/retain concurrency; do not raise those defaults without validating connection pressure under retain/consolidation backlog.
 ### Helm Health Probes
 
 Keep readiness probes independent of database health so database pressure does not
