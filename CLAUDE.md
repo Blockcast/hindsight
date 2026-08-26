@@ -127,6 +127,12 @@ Key tables: `banks`, `memory_units`, `documents`, `entities`, `entity_links`
 ### Helm Operations
 
 Helm liveness probes must stay process-local so database pressure does not restart healthy pods: API liveness uses `/version`, worker liveness uses `/metrics`, and readiness remains DB-backed on `/health`. The default embedded-PostgreSQL chart values intentionally cap API DB pools and worker/retain concurrency; do not raise those defaults without validating connection pressure under retain/consolidation backlog.
+### Helm Health Probes
+
+Keep readiness probes independent of database health so database pressure does not
+cascade into Kubernetes probe failures. The API readiness probe uses `/version`,
+and the worker readiness probe uses `/metrics`; reserve `/health` for explicit
+database-aware health checks.
 
 ### Adding Database Migrations
 
@@ -268,6 +274,12 @@ Rules of thumb:
 - Banks have dispositions (skepticism, literalism, empathy traits 1-5) affecting reflect
 - Banks can have background context
 - Bank isolation is strict - no cross-bank data leakage
+
+### Helm Worker Capacity
+
+For the default embedded database, keep `helm/hindsight/values.yaml` at two total
+worker slots with one reserved for consolidation. Cap retain at one concurrent task
+without assigning it a dedicated slot, so the remaining slot stays shared across queues.
 
 ### API Design
 - All endpoints operate on a single bank per request
