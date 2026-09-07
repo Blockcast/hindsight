@@ -126,7 +126,8 @@ Key tables: `banks`, `memory_units`, `documents`, `entities`, `entity_links`
 
 ### Helm Operations
 
-Helm liveness probes must stay process-local so database pressure does not restart healthy pods: API liveness uses `/version`, worker liveness uses `/metrics`, and readiness remains DB-backed on `/health`. The default embedded-PostgreSQL chart values intentionally cap API DB pools and worker/retain concurrency; do not raise those defaults without validating connection pressure under retain/consolidation backlog.
+Helm liveness probes must stay process-local so database pressure does not restart healthy pods: API liveness uses `/version`, worker liveness uses `/metrics`. Readiness is DB-independent as well — see **Helm Health Probes** below. The default embedded-PostgreSQL chart values intentionally cap API DB pools and worker/retain concurrency; do not raise those defaults without validating connection pressure under retain/consolidation backlog.
+
 ### Helm Health Probes
 
 Keep readiness probes independent of database health so database pressure does not
