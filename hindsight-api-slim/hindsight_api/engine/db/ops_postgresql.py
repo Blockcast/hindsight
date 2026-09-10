@@ -440,11 +440,29 @@ class PostgreSQLOps(DataAccessOps):
         mu_table: str,
         unit_ids: list[str],
     ) -> list[ResultRow]:
+        # Cast only canonical UUID text inputs, never the indexed column. The old
+        # ``id::text = ANY($1)`` predicate made the uuid primary-key index unusable
+        # and sequentially scanned every row (~1M in production, 5.4s per call).
+        #
+        # A bare ``id = ANY($1::uuid[])`` would fix the index but change behavior:
+        # the text comparison silently ignored malformed, uppercase, braced and
+        # unhyphenated inputs, while a uuid[] cast raises on them. Filtering before
+        # the cast preserves the old leniency and lets the primary-key index serve
+        # the lookup.
+        #
+        # Ported from upstream vectorize-io/hindsight b475f5cca ("perf: eliminate
+        # redundant graph seed and UUID scans", #2968, first released in v0.8.6).
         return await conn.fetch(
             f"""
             SELECT id, event_date, fact_type
             FROM {mu_table}
-            WHERE id::text = ANY($1)
+            WHERE id = ANY(
+                ARRAY(
+                    SELECT input.unit_id::uuid
+                    FROM unnest($1::text[]) AS input(unit_id)
+                    WHERE input.unit_id ~ '^[0-9a-f]{{8}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{12}}$'
+                )
+            )
             """,
             unit_ids,
         )

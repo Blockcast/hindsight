@@ -30,6 +30,66 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+async def _fetch_with_per_bank_index_plan(conn, query: str, *params: Any) -> list:
+    """Run a bank-scoped ANN query under a custom (re-planned) query plan.
+
+    The per-bank vector indexes are PARTIAL:
+
+        CREATE INDEX ... ON memory_units USING hnsw (embedding vector_cosine_ops)
+        WHERE fact_type = 'world' AND bank_id = '<literal>'
+
+    A partial index is only usable when the planner can *prove* the query's WHERE
+    clause implies the index predicate. ``fact_type`` is inlined as a literal by
+    the arm builders, so that half is always provable. ``bank_id`` is a bind
+    parameter, and under a *generic* plan its value is unknown at plan time — so
+    ``bank_id = $2`` cannot be proven to imply ``bank_id = '<literal>'`` and every
+    per-bank index drops out of consideration.
+
+    asyncpg prepares every statement it executes and caches it per connection, so a
+    hot search connection crosses Postgres' generic-plan threshold (5 executions of
+    the same prepared statement) and then keeps the generic plan for the life of
+    that connection. Production symptom (2026-09-03): the ANN arms silently
+    degraded from a bounded per-bank HNSW probe to a sequential scan over ~1M rows
+    / the unused global embedding index, burning 5-6 CPU cores for minutes and
+    taking single searches past 130s.
+
+    ``plan_cache_mode = force_custom_plan`` makes Postgres re-plan with the actual
+    parameter values on every execution, which is what makes the partial-index
+    predicate provable again. ``SET LOCAL`` scopes it to the surrounding
+    transaction, so it covers this search and reverts, rather than being pinned on
+    the database role (the mitigation this replaces).
+
+    Why not inline ``bank_id`` as a literal, the way ``fact_type`` is? Because
+    ``bank_id`` is free-form tenant text (e.g. ``"paperclip::<uuid>::<uuid>"``),
+    not a UUID or a member of a closed internal enum. It cannot be validated into
+    a provably safe literal, and interpolating it would put caller-controlled text
+    into SQL. Keeping the bind and forcing a custom plan yields the same plan
+    without that exposure.
+
+    Postgres-only: ``plan_cache_mode`` is a PG GUC. Oracle re-optimizes on bind
+    values via adaptive cursor sharing and has no equivalent knob, so other
+    backends execute unchanged.
+    """
+    # ``conn`` is either a DatabaseConnection wrapper or a raw asyncpg connection
+    # — acquire_with_retry accepts a DatabaseBackend or a raw asyncpg.Pool, and the
+    # recall path still passes the latter. A raw asyncpg connection is Postgres by
+    # definition and has no ``backend_type``, so an absent attribute means
+    # Postgres; only the wrapper can report a different backend.
+    if getattr(conn, "backend_type", "postgresql") != "postgresql":
+        return await conn.fetch(query, *params)
+    # SET LOCAL needs a transaction to scope to — outside one it is a no-op that
+    # only emits a warning. conn.transaction() opens one, or a savepoint if the
+    # caller already had a transaction open, in which case the setting lasts until
+    # that outer transaction ends: still bounded, never session-wide.
+    #
+    # The value yielded by transaction() is deliberately ignored: the wrapper
+    # yields the connection but raw asyncpg yields a Transaction, which has no
+    # query methods. Using ``conn`` inside the block is correct for both.
+    async with conn.transaction():
+        await conn.execute("SET LOCAL plan_cache_mode = force_custom_plan")
+        return await conn.fetch(query, *params)
+
+
 def tokenize_query(query_text: str) -> list[str]:
     """Normalize query text and split into BM25 tokens.
 
@@ -246,7 +306,7 @@ async def retrieve_semantic_bm25_combined(
     params.extend(created_range_params)
 
     try:
-        rows = await conn.fetch(query, *params)
+        rows = await _fetch_with_per_bank_index_plan(conn, query, *params)
     except Exception as e:
         # Oracle Text CONTAINS can fail with DRG-10599 ("column is not indexed")
         # if the CTXSYS text index hasn't synced yet or is unavailable.  Fall
@@ -290,7 +350,7 @@ async def retrieve_semantic_bm25_combined(
                 fb_params.append(tags)
             fb_params.extend(groups_params)
             fb_params.extend(created_range_params)
-            rows = await conn.fetch(fb_query, *fb_params)
+            rows = await _fetch_with_per_bank_index_plan(conn, fb_query, *fb_params)
         else:
             raise
 
@@ -500,7 +560,7 @@ async def retrieve_temporal_combined(
         )"""
         for ft in fact_types
     ]
-    pool_rows = await conn.fetch("\nUNION ALL\n".join(arms), *params)
+    pool_rows = await _fetch_with_per_bank_index_plan(conn, "\nUNION ALL\n".join(arms), *params)
 
     if not pool_rows:
         return {ft: [] for ft in fact_types}
