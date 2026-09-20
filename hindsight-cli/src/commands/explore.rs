@@ -5,8 +5,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use hindsight_client::types::{BankListItem, RecallResult, EntityListItem, Budget, TagsMatch};
-use serde_json::{Map, Value};
+use hindsight_client::types::{BankListItem, Budget, EntityListItem, RecallResult, TagsMatch};
 use ratatui::{
     backend::{Backend, CrosstermBackend},
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -15,15 +14,16 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
     Frame, Terminal,
 };
+use serde_json::{Map, Value};
 use std::io;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 // Brand gradient colors: #0074d9 -> #009296
-const BRAND_START: Color = Color::Rgb(0, 116, 217);  // #0074d9
-const BRAND_END: Color = Color::Rgb(0, 146, 150);    // #009296
-const BRAND_MID: Color = Color::Rgb(0, 131, 183);    // Midpoint
+const BRAND_START: Color = Color::Rgb(0, 116, 217); // #0074d9
+const BRAND_END: Color = Color::Rgb(0, 146, 150); // #009296
+const BRAND_MID: Color = Color::Rgb(0, 131, 183); // Midpoint
 
 /// Main view types (like k9s contexts)
 #[derive(Debug, Clone, PartialEq)]
@@ -49,7 +49,9 @@ impl View {
     fn bank_id(&self) -> Option<&str> {
         match self {
             View::Banks => None,
-            View::Memories(id) | View::Entities(id) | View::Documents(id) | View::Query(id) => Some(id),
+            View::Memories(id) | View::Entities(id) | View::Documents(id) | View::Query(id) => {
+                Some(id)
+            }
         }
     }
 }
@@ -180,12 +182,9 @@ impl App {
             query_receiver: None,
         };
 
-        // Select first item by default
+        // Select first bank by default. Headered lists select their first data
+        // row after data is loaded.
         app.banks_state.select(Some(0));
-        app.memories_state.select(Some(0));
-        app.entities_state.select(Some(0));
-        app.documents_state.select(Some(0));
-        app.query_results_state.select(Some(0));
 
         app
     }
@@ -209,16 +208,6 @@ impl App {
         }
 
         Ok(())
-    }
-
-    fn toggle_auto_refresh(&mut self) {
-        self.auto_refresh_enabled = !self.auto_refresh_enabled;
-        if self.auto_refresh_enabled {
-            self.status_message = "Auto-refresh enabled (5s)".to_string();
-            self.last_refresh = Instant::now();
-        } else {
-            self.status_message = "Auto-refresh disabled".to_string();
-        }
     }
 
     fn should_refresh(&self) -> bool {
@@ -251,16 +240,18 @@ impl App {
             None,
             Some(self.memories_limit),
             Some(self.memories_offset),
-            false
+            false,
         )?;
-        self.memories = response.items;
+        self.memories = rows_as_maps(&response.items)?;
 
-        if !self.memories.is_empty() && self.memories_state.selected().is_none() {
-            self.memories_state.select(Some(0));
-        }
+        normalize_headered_selection(&mut self.memories_state, self.memories.len());
 
-        self.status_message = format!("Loaded {} memories (limit: {}, offset: {})",
-            self.memories.len(), self.memories_limit, self.memories_offset);
+        self.status_message = format!(
+            "Loaded {} memories (limit: {}, offset: {})",
+            self.memories.len(),
+            self.memories_limit,
+            self.memories_offset
+        );
         Ok(())
     }
 
@@ -286,21 +277,19 @@ impl App {
         let response = self.client.list_entities(bank_id, Some(100), None, false)?;
         self.entities = response.items;
 
-        if !self.entities.is_empty() && self.entities_state.selected().is_none() {
-            self.entities_state.select(Some(0));
-        }
+        normalize_headered_selection(&mut self.entities_state, self.entities.len());
 
         self.status_message = format!("Loaded {} entities", self.entities.len());
         Ok(())
     }
 
     fn load_documents(&mut self, bank_id: &str) -> Result<()> {
-        let response = self.client.list_documents(bank_id, None, Some(100), Some(0), false)?;
-        self.documents = response.items;
+        let response = self
+            .client
+            .list_documents(bank_id, None, Some(100), Some(0), false)?;
+        self.documents = rows_as_maps(&response.items)?;
 
-        if !self.documents.is_empty() && self.documents_state.selected().is_none() {
-            self.documents_state.select(Some(0));
-        }
+        normalize_headered_selection(&mut self.documents_state, self.documents.len());
 
         self.status_message = format!("Loaded {} documents", self.documents.len());
         Ok(())
@@ -330,50 +319,57 @@ impl App {
             let query_max_tokens = self.query_max_tokens;
 
             // Spawn background thread
-            thread::spawn(move || {
-                match query_mode {
-                    QueryMode::Recall => {
-                        let request = RecallRequest {
-                            query: query_text,
-                            types: None,
-                            budget: Some(query_budget),
-                            max_tokens: query_max_tokens,
-                            trace: false,
-                            query_timestamp: None,
-                            include: None,
-                            tags: None,
-                            tags_match: TagsMatch::Any,
-                            tag_groups: None,
-                        };
+            thread::spawn(move || match query_mode {
+                QueryMode::Recall => {
+                    let request = RecallRequest {
+                        query: query_text,
+                        types: None,
+                        budget: Some(query_budget),
+                        max_tokens: query_max_tokens,
+                        trace: false,
+                        query_timestamp: None,
+                        prefer_observations: false,
+                        include: None,
+                        tags: None,
+                        tags_match: TagsMatch::Any,
+                        tag_groups: None,
+                        min_scores: None,
+                        temporal_window: None,
+                    };
 
-                        let result = client.recall(&bank_id, &request, false)
-                            .map(|r| r.results)
-                            .map_err(|e| e.to_string());
+                    let result = client
+                        .recall(&bank_id, &request, false)
+                        .map(|r| r.results)
+                        .map_err(|e| e.to_string());
 
-                        let _ = tx.send(QueryResult::Recall(result));
-                    }
-                    QueryMode::Reflect => {
-                        let request = ReflectRequest {
-                            query: query_text,
-                            budget: Some(query_budget),
-                            context: None,
-                            max_tokens: 4096,
-                            include: None,
-                            response_schema: None,
-                            tags: None,
-                            tags_match: TagsMatch::Any,
-                            tag_groups: None,
-                            fact_types: None,
-                            exclude_mental_models: false,
-                            exclude_mental_model_ids: None,
-                        };
+                    let _ = tx.send(QueryResult::Recall(result));
+                }
+                QueryMode::Reflect => {
+                    let request = ReflectRequest {
+                        query: query_text,
+                        budget: Some(query_budget),
+                        context: None,
+                        max_tokens: 4096,
+                        include: None,
+                        response_schema: None,
+                        tags: None,
+                        tags_match: TagsMatch::Any,
+                        tag_groups: None,
+                        apply_all_directives: false,
+                        fact_types: None,
+                        exclude_mental_models: false,
+                        exclude_mental_model_ids: None,
+                        // See memory.rs: set per bank, not per CLI call.
+                        reflect_search_observations_max_tokens: None,
+                        reflect_search_observations_include_entities: None,
+                    };
 
-                        let result = client.reflect(&bank_id, &request, false)
-                            .map(|r| r.text)
-                            .map_err(|e| e.to_string());
+                    let result = client
+                        .reflect(&bank_id, &request, false)
+                        .map(|r| r.text)
+                        .map_err(|e| e.to_string());
 
-                        let _ = tx.send(QueryResult::Reflect(result));
-                    }
+                    let _ = tx.send(QueryResult::Reflect(result));
                 }
             });
         }
@@ -384,9 +380,10 @@ impl App {
             match receiver.try_recv() {
                 Ok(QueryResult::Recall(Ok(results))) => {
                     self.query_results = results;
-                    if !self.query_results.is_empty() {
-                        self.query_results_state.select(Some(0));
-                    }
+                    normalize_headered_selection(
+                        &mut self.query_results_state,
+                        self.query_results.len(),
+                    );
                     self.loading = false;
                     self.status_message = format!("Found {} results", self.query_results.len());
                     self.query_receiver = None;
@@ -424,10 +421,13 @@ impl App {
             QueryMode::Recall => QueryMode::Reflect,
             QueryMode::Reflect => QueryMode::Recall,
         };
-        self.status_message = format!("Switched to {} mode", match self.query_mode {
-            QueryMode::Recall => "Recall",
-            QueryMode::Reflect => "Reflect",
-        });
+        self.status_message = format!(
+            "Switched to {} mode",
+            match self.query_mode {
+                QueryMode::Recall => "Recall",
+                QueryMode::Reflect => "Reflect",
+            }
+        );
     }
 
     fn cycle_budget(&mut self) {
@@ -476,57 +476,20 @@ impl App {
                 self.banks_state.select(Some(i));
             }
             View::Memories(_) => {
-                let i = match self.memories_state.selected() {
-                    Some(i) => {
-                        if i >= self.memories.len().saturating_sub(1) {
-                            0
-                        } else {
-                            i + 1
-                        }
-                    }
-                    None => 0,
-                };
-                self.memories_state.select(Some(i));
+                select_next_headered_row(&mut self.memories_state, self.memories.len());
             }
             View::Entities(_) => {
-                let i = match self.entities_state.selected() {
-                    Some(i) => {
-                        if i >= self.entities.len().saturating_sub(1) {
-                            0
-                        } else {
-                            i + 1
-                        }
-                    }
-                    None => 0,
-                };
-                self.entities_state.select(Some(i));
+                select_next_headered_row(&mut self.entities_state, self.entities.len());
             }
             View::Documents(_) => {
-                let i = match self.documents_state.selected() {
-                    Some(i) => {
-                        if i >= self.documents.len().saturating_sub(1) {
-                            0
-                        } else {
-                            i + 1
-                        }
-                    }
-                    None => 0,
-                };
-                self.documents_state.select(Some(i));
+                select_next_headered_row(&mut self.documents_state, self.documents.len());
             }
             View::Query(_) => {
                 if self.query_mode == QueryMode::Recall {
-                    let i = match self.query_results_state.selected() {
-                        Some(i) => {
-                            if i >= self.query_results.len().saturating_sub(1) {
-                                0
-                            } else {
-                                i + 1
-                            }
-                        }
-                        None => 0,
-                    };
-                    self.query_results_state.select(Some(i));
+                    select_next_headered_row(
+                        &mut self.query_results_state,
+                        self.query_results.len(),
+                    );
                 }
             }
         }
@@ -548,57 +511,20 @@ impl App {
                 self.banks_state.select(Some(i));
             }
             View::Memories(_) => {
-                let i = match self.memories_state.selected() {
-                    Some(i) => {
-                        if i == 0 {
-                            self.memories.len().saturating_sub(1)
-                        } else {
-                            i - 1
-                        }
-                    }
-                    None => 0,
-                };
-                self.memories_state.select(Some(i));
+                select_previous_headered_row(&mut self.memories_state, self.memories.len());
             }
             View::Entities(_) => {
-                let i = match self.entities_state.selected() {
-                    Some(i) => {
-                        if i == 0 {
-                            self.entities.len().saturating_sub(1)
-                        } else {
-                            i - 1
-                        }
-                    }
-                    None => 0,
-                };
-                self.entities_state.select(Some(i));
+                select_previous_headered_row(&mut self.entities_state, self.entities.len());
             }
             View::Documents(_) => {
-                let i = match self.documents_state.selected() {
-                    Some(i) => {
-                        if i == 0 {
-                            self.documents.len().saturating_sub(1)
-                        } else {
-                            i - 1
-                        }
-                    }
-                    None => 0,
-                };
-                self.documents_state.select(Some(i));
+                select_previous_headered_row(&mut self.documents_state, self.documents.len());
             }
             View::Query(_) => {
                 if self.query_mode == QueryMode::Recall {
-                    let i = match self.query_results_state.selected() {
-                        Some(i) => {
-                            if i == 0 {
-                                self.query_results.len().saturating_sub(1)
-                            } else {
-                                i - 1
-                            }
-                        }
-                        None => 0,
-                    };
-                    self.query_results_state.select(Some(i));
+                    select_previous_headered_row(
+                        &mut self.query_results_state,
+                        self.query_results.len(),
+                    );
                 }
             }
         }
@@ -618,7 +544,7 @@ impl App {
                 }
             }
             View::Memories(_) => {
-                if let Some(i) = self.memories_state.selected() {
+                if let Some(i) = selected_headered_data_index(&self.memories_state) {
                     if let Some(memory) = self.memories.get(i) {
                         self.viewing_memory = Some(memory.clone());
                         self.status_message = "Viewing memory details (Esc to close)".to_string();
@@ -626,7 +552,7 @@ impl App {
                 }
             }
             View::Entities(_) => {
-                if let Some(i) = self.entities_state.selected() {
+                if let Some(i) = selected_headered_data_index(&self.entities_state) {
                     if let Some(entity) = self.entities.get(i).cloned() {
                         self.viewing_entity = Some(entity);
                         self.status_message = "Viewing entity details (Esc to close)".to_string();
@@ -634,20 +560,17 @@ impl App {
                 }
             }
             View::Documents(bank_id) => {
-                if let Some(i) = self.documents_state.selected() {
+                if let Some(i) = selected_headered_data_index(&self.documents_state) {
                     if let Some(doc) = self.documents.get(i) {
                         // Fetch full document content
-                        let doc_id = doc.get("id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
+                        let doc_id = doc.get("id").and_then(|v| v.as_str()).unwrap_or("");
 
                         if !doc_id.is_empty() {
                             match self.client.get_document(bank_id, doc_id, false) {
                                 Ok(full_doc) => {
                                     // Convert to Map for display
-                                    let doc_map: Map<String, Value> = serde_json::from_value(
-                                        serde_json::to_value(full_doc)?
-                                    )?;
+                                    let doc_map: Map<String, Value> =
+                                        serde_json::from_value(serde_json::to_value(full_doc)?)?;
                                     self.viewing_document = Some(doc_map);
                                     self.status_message = format!("Viewing document: {}", doc_id);
                                 }
@@ -662,10 +585,11 @@ impl App {
             View::Query(_) => {
                 // View recall result details if in recall mode
                 if self.query_mode == QueryMode::Recall {
-                    if let Some(i) = self.query_results_state.selected() {
+                    if let Some(i) = selected_headered_data_index(&self.query_results_state) {
                         if let Some(result) = self.query_results.get(i).cloned() {
                             self.viewing_recall_result = Some(result);
-                            self.status_message = "Viewing recall result (Esc to close)".to_string();
+                            self.status_message =
+                                "Viewing recall result (Esc to close)".to_string();
                         }
                     }
                 }
@@ -715,11 +639,9 @@ impl App {
 
     fn delete_selected_document(&mut self) -> Result<()> {
         if let View::Documents(bank_id) = &self.view {
-            if let Some(i) = self.documents_state.selected() {
+            if let Some(i) = selected_headered_data_index(&self.documents_state) {
                 if let Some(doc) = self.documents.get(i) {
-                    let doc_id = doc.get("id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                    let doc_id = doc.get("id").and_then(|v| v.as_str()).unwrap_or("");
 
                     if !doc_id.is_empty() {
                         match self.client.delete_document(bank_id, doc_id, false) {
@@ -739,14 +661,72 @@ impl App {
     }
 }
 
+/// Render typed API rows back into the loose maps the TUI's table/detail views read.
+///
+/// The list endpoints return typed rows (#4218); the views index them by column name and
+/// dump the whole row in the detail pane, which stays simplest over a map.
+fn rows_as_maps<T: serde::Serialize>(rows: &[T]) -> Result<Vec<Map<String, Value>>> {
+    rows.iter()
+        .map(|row| Ok(serde_json::from_value(serde_json::to_value(row)?)?))
+        .collect()
+}
+
+fn normalize_headered_selection(state: &mut ListState, data_len: usize) {
+    if data_len == 0 {
+        state.select(None);
+        return;
+    }
+
+    let selected = match state.selected() {
+        Some(i) if (1..=data_len).contains(&i) => i,
+        Some(i) if i > data_len => data_len,
+        _ => 1,
+    };
+    state.select(Some(selected));
+}
+
+fn selected_headered_data_index(state: &ListState) -> Option<usize> {
+    state.selected()?.checked_sub(1)
+}
+
+fn select_next_headered_row(state: &mut ListState, data_len: usize) {
+    if data_len == 0 {
+        state.select(None);
+        return;
+    }
+
+    let current = selected_headered_data_index(state).unwrap_or(0);
+    let next = if current + 1 >= data_len {
+        0
+    } else {
+        current + 1
+    };
+    state.select(Some(next + 1));
+}
+
+fn select_previous_headered_row(state: &mut ListState, data_len: usize) {
+    if data_len == 0 {
+        state.select(None);
+        return;
+    }
+
+    let current = selected_headered_data_index(state).unwrap_or(0);
+    let previous = if current == 0 {
+        data_len - 1
+    } else {
+        current - 1
+    };
+    state.select(Some(previous + 1));
+}
+
 fn ui(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5),  // Shortcuts bar (context + shortcuts, max 3 rows + 2 border)
-            Constraint::Length(3),  // Header
-            Constraint::Min(0),     // Main content
-            Constraint::Length(1),  // Footer/status only (no border)
+            Constraint::Length(5), // Shortcuts bar (context + shortcuts, max 3 rows + 2 border)
+            Constraint::Length(3), // Header
+            Constraint::Min(0),    // Main content
+            Constraint::Length(1), // Footer/status only (no border)
         ])
         .split(f.area());
 
@@ -813,10 +793,7 @@ fn render_control_bar(f: &mut Frame, app: &App, area: Rect) {
             ("q", "Quit", Color::Red),
         ],
         (View::Query(_), InputMode::Normal) => {
-            let mut shortcuts = vec![
-                ("/", "Query", BRAND_MID),
-                ("m", "Mode", BRAND_START),
-            ];
+            let mut shortcuts = vec![("/", "Query", BRAND_MID), ("m", "Mode", BRAND_START)];
             if app.query_mode == QueryMode::Recall {
                 shortcuts.push(("←→", "Scroll", BRAND_START));
             }
@@ -828,23 +805,20 @@ fn render_control_bar(f: &mut Frame, app: &App, area: Rect) {
                 ("q", "Quit", Color::Red),
             ]);
             shortcuts
-        },
+        }
         (View::Query(_), InputMode::Query) => vec![
             ("Enter", "Execute", BRAND_MID),
             ("Esc", "Cancel", Color::Red),
         ],
-        _ => vec![
-            ("?", "Help", BRAND_END),
-            ("q", "Quit", Color::Red),
-        ],
+        _ => vec![("?", "Help", BRAND_END), ("q", "Quit", Color::Red)],
     };
 
     // Split into left (context) and right (shortcuts) sections
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(30),  // Context on left
-            Constraint::Percentage(70),  // Shortcuts on right
+            Constraint::Percentage(30), // Context on left
+            Constraint::Percentage(70), // Shortcuts on right
         ])
         .split(area);
 
@@ -859,15 +833,20 @@ fn render_control_bar(f: &mut Frame, app: &App, area: Rect) {
                 QueryMode::Recall => "Recall",
                 QueryMode::Reflect => "Reflect",
             };
-            format!("Mode: {}\nBudget: {:?} | Tokens: {}", mode, app.query_budget, app.query_max_tokens)
+            format!(
+                "Mode: {}\nBudget: {:?} | Tokens: {}",
+                mode, app.query_budget, app.query_max_tokens
+            )
         }
     };
 
     let context_widget = Paragraph::new(context_info)
-        .block(Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(BRAND_START))
-            .title(" Context "))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(BRAND_START))
+                .title(" Context "),
+        )
         .style(Style::default().fg(BRAND_END).add_modifier(Modifier::BOLD))
         .alignment(Alignment::Left);
     f.render_widget(context_widget, columns[0]);
@@ -891,7 +870,7 @@ fn render_control_bar(f: &mut Frame, app: &App, area: Rect) {
 
                 line_spans.push(Span::styled(
                     shortcut_text,
-                    Style::default().fg(*color).add_modifier(Modifier::BOLD)
+                    Style::default().fg(*color).add_modifier(Modifier::BOLD),
                 ));
             }
         }
@@ -902,10 +881,12 @@ fn render_control_bar(f: &mut Frame, app: &App, area: Rect) {
     }
 
     let shortcuts_widget = Paragraph::new(shortcut_lines)
-        .block(Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(BRAND_START))
-            .title(" Shortcuts "))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(BRAND_START))
+                .title(" Shortcuts "),
+        )
         .alignment(Alignment::Left);
 
     f.render_widget(shortcuts_widget, columns[1]);
@@ -921,7 +902,11 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
     let title = format!("Hindsight Explorer - {}{}", app.view.title(), bank_info);
 
     let header = Paragraph::new(title)
-        .style(Style::default().fg(BRAND_START).add_modifier(Modifier::BOLD))
+        .style(
+            Style::default()
+                .fg(BRAND_START)
+                .add_modifier(Modifier::BOLD),
+        )
         .alignment(Alignment::Center)
         .block(Block::default().borders(Borders::ALL));
 
@@ -932,11 +917,17 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     // Simple status line only (shortcuts are now at the top, no border)
     let status_line = if !app.error_message.is_empty() {
         Line::from(vec![
-            Span::styled(" Error: ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " Error: ",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
             Span::raw(&app.error_message),
         ])
     } else if app.loading {
-        Line::from(Span::styled(" Loading...", Style::default().fg(BRAND_END).add_modifier(Modifier::BOLD)))
+        Line::from(Span::styled(
+            " Loading...",
+            Style::default().fg(BRAND_END).add_modifier(Modifier::BOLD),
+        ))
     } else if !app.status_message.is_empty() {
         Line::from(vec![
             Span::raw(" "),
@@ -955,7 +946,11 @@ fn render_banks(f: &mut Frame, app: &mut App, area: Rect) {
         .banks
         .iter()
         .map(|bank| {
-            let name = bank.name.as_deref().filter(|s| !s.is_empty()).unwrap_or("Unnamed");
+            let name = bank
+                .name
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("Unnamed");
             let content = format!("{} - {}", bank.bank_id, name);
             ListItem::new(content).style(Style::default().fg(Color::White))
         })
@@ -979,22 +974,27 @@ fn render_memories(f: &mut Frame, app: &mut App, area: Rect) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(7),  // Memory metadata
-                Constraint::Min(0),     // Full text content
+                Constraint::Length(7),      // Memory metadata
+                Constraint::Percentage(45), // Full text content
+                Constraint::Percentage(55), // Complete JSON details
             ])
             .split(area);
 
         // Metadata section
-        let mem_type = memory.get("fact_type")
+        let mem_type = memory
+            .get("fact_type")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
-        let mentioned_at = memory.get("mentioned_at")
+        let mentioned_at = memory
+            .get("mentioned_at")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
-        let occurred_start = memory.get("occurred_start")
+        let occurred_start = memory
+            .get("occurred_start")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
-        let occurred_end = memory.get("occurred_end")
+        let occurred_end = memory
+            .get("occurred_end")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
 
@@ -1004,38 +1004,66 @@ fn render_memories(f: &mut Frame, app: &mut App, area: Rect) {
         );
 
         let metadata = Paragraph::new(metadata_text)
-            .block(Block::default().borders(Borders::ALL).title("Memory Metadata"))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Memory Metadata"),
+            )
             .style(Style::default().fg(BRAND_START));
 
         f.render_widget(metadata, chunks[0]);
 
         // Full text content
-        let text = memory.get("text").and_then(|v| v.as_str()).unwrap_or("No text available");
+        let text = memory
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("No text available");
 
         let content_widget = Paragraph::new(text)
-            .block(Block::default().borders(Borders::ALL).title("Full Text (Esc to close)"))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Full Text (Esc to close)"),
+            )
             .wrap(Wrap { trim: false })
             .style(Style::default().fg(Color::White));
 
         f.render_widget(content_widget, chunks[1]);
+
+        let details_widget = Paragraph::new(format_memory_details_json(memory))
+            .block(Block::default().borders(Borders::ALL).title("Details JSON"))
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(Color::White));
+
+        f.render_widget(details_widget, chunks[2]);
     } else {
         // Show memory list as table
         let mut items = vec![
             // Header row
-            ListItem::new(format!("{:<10} {:<18} {:<18} {}", "TYPE", "MENTIONED AT", "OCCURRED AT", "TEXT"))
-                .style(Style::default().fg(BRAND_START).add_modifier(Modifier::BOLD))
+            ListItem::new(format!(
+                "{:<10} {:<18} {:<18} {}",
+                "TYPE", "MENTIONED AT", "OCCURRED AT", "TEXT"
+            ))
+            .style(
+                Style::default()
+                    .fg(BRAND_START)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ];
 
         // Data rows
         for memory in &app.memories {
-            let mem_type = memory.get("fact_type")
+            let mem_type = memory
+                .get("fact_type")
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
-            let mentioned = memory.get("mentioned_at")
+            let mentioned = memory
+                .get("mentioned_at")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.split('T').next())
                 .unwrap_or("-");
-            let occurred = memory.get("occurred_start")
+            let occurred = memory
+                .get("occurred_start")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.split('T').next())
                 .unwrap_or("-");
@@ -1044,12 +1072,18 @@ fn render_memories(f: &mut Frame, app: &mut App, area: Rect) {
             // Apply horizontal scroll
             let scrolled_text: String = text.chars().skip(app.horizontal_scroll).take(80).collect();
 
-            let content = format!("{:<10} {:<18} {:<18} {}", mem_type, mentioned, occurred, scrolled_text);
+            let content = format!(
+                "{:<10} {:<18} {:<18} {}",
+                mem_type, mentioned, occurred, scrolled_text
+            );
             items.push(ListItem::new(content).style(Style::default().fg(Color::White)));
         }
 
         let list = List::new(items)
-            .block(Block::default().borders(Borders::ALL).title(format!("Memories ({}) - Press Enter to view full text", app.memories.len())))
+            .block(Block::default().borders(Borders::ALL).title(format!(
+                "Memories ({}) - Press Enter to view full text",
+                app.memories.len()
+            )))
             .highlight_style(
                 Style::default()
                     .bg(Color::DarkGray)
@@ -1061,10 +1095,17 @@ fn render_memories(f: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
+fn format_memory_details_json(memory: &Map<String, Value>) -> String {
+    serde_json::to_string_pretty(memory)
+        .unwrap_or_else(|_| "Unable to render memory details".to_string())
+}
+
 fn render_entities(f: &mut Frame, app: &mut App, area: Rect) {
     // If viewing an entity, show its details
     if let Some(entity) = &app.viewing_entity {
-        let entity_type = entity.metadata.as_ref()
+        let entity_type = entity
+            .metadata
+            .as_ref()
             .and_then(|m| m.get("type"))
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
@@ -1078,7 +1119,11 @@ fn render_entities(f: &mut Frame, app: &mut App, area: Rect) {
         );
 
         let metadata = Paragraph::new(metadata_text)
-            .block(Block::default().borders(Borders::ALL).title("Entity Details (Esc to close)"))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Entity Details (Esc to close)"),
+            )
             .style(Style::default().fg(BRAND_START))
             .wrap(Wrap { trim: false });
 
@@ -1087,8 +1132,11 @@ fn render_entities(f: &mut Frame, app: &mut App, area: Rect) {
         // Show entity list as table
         let mut items = vec![
             // Header row
-            ListItem::new(format!("{:<40} {:<15} {:<10}", "NAME", "TYPE", "MENTIONS"))
-                .style(Style::default().fg(BRAND_START).add_modifier(Modifier::BOLD))
+            ListItem::new(format!("{:<40} {:<15} {:<10}", "NAME", "TYPE", "MENTIONS")).style(
+                Style::default()
+                    .fg(BRAND_START)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ];
 
         // Data rows
@@ -1096,7 +1144,9 @@ fn render_entities(f: &mut Frame, app: &mut App, area: Rect) {
             let name = &entity.canonical_name;
             // Apply horizontal scroll to name
             let scrolled_name: String = name.chars().skip(app.horizontal_scroll).take(40).collect();
-            let entity_type = entity.metadata.as_ref()
+            let entity_type = entity
+                .metadata
+                .as_ref()
                 .and_then(|m| m.get("type"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
@@ -1107,7 +1157,10 @@ fn render_entities(f: &mut Frame, app: &mut App, area: Rect) {
         }
 
         let list = List::new(items)
-            .block(Block::default().borders(Borders::ALL).title(format!("Entities ({}) - Press Enter to view details", app.entities.len())))
+            .block(Block::default().borders(Borders::ALL).title(format!(
+                "Entities ({}) - Press Enter to view details",
+                app.entities.len()
+            )))
             .highlight_style(
                 Style::default()
                     .bg(Color::DarkGray)
@@ -1125,19 +1178,19 @@ fn render_documents(f: &mut Frame, app: &mut App, area: Rect) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(5),  // Document metadata
-                Constraint::Min(0),     // Content
+                Constraint::Length(5), // Document metadata
+                Constraint::Min(0),    // Content
             ])
             .split(area);
 
         // Metadata section
-        let doc_id = doc.get("id")
+        let doc_id = doc.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
+        let content_type = doc
+            .get("content_type")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
-        let content_type = doc.get("content_type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-        let created_at = doc.get("created_at")
+        let created_at = doc
+            .get("created_at")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
 
@@ -1147,18 +1200,27 @@ fn render_documents(f: &mut Frame, app: &mut App, area: Rect) {
         );
 
         let metadata = Paragraph::new(metadata_text)
-            .block(Block::default().borders(Borders::ALL).title("Document Metadata"))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Document Metadata"),
+            )
             .style(Style::default().fg(BRAND_START));
 
         f.render_widget(metadata, chunks[0]);
 
         // Content section
-        let content = doc.get("content")
+        let content = doc
+            .get("content")
             .and_then(|v| v.as_str())
             .unwrap_or("No content available");
 
         let content_widget = Paragraph::new(content)
-            .block(Block::default().borders(Borders::ALL).title("Content (Esc to close)"))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Content (Esc to close)"),
+            )
             .wrap(Wrap { trim: false })
             .style(Style::default().fg(Color::White));
 
@@ -1167,21 +1229,24 @@ fn render_documents(f: &mut Frame, app: &mut App, area: Rect) {
         // Show document list as table
         let mut items = vec![
             // Header row
-            ListItem::new(format!("{:<40} {:<20} {}", "ID", "TYPE", "CREATED"))
-                .style(Style::default().fg(BRAND_START).add_modifier(Modifier::BOLD))
+            ListItem::new(format!("{:<40} {:<20} {}", "ID", "TYPE", "CREATED")).style(
+                Style::default()
+                    .fg(BRAND_START)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ];
 
         // Data rows
         for doc in &app.documents {
-            let id = doc.get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
+            let id = doc.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
             // Apply horizontal scroll to id
             let scrolled_id: String = id.chars().skip(app.horizontal_scroll).take(40).collect();
-            let content_type = doc.get("content_type")
+            let content_type = doc
+                .get("content_type")
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
-            let created = doc.get("created_at")
+            let created = doc
+                .get("created_at")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.split('T').next())
                 .unwrap_or("unknown");
@@ -1191,7 +1256,10 @@ fn render_documents(f: &mut Frame, app: &mut App, area: Rect) {
         }
 
         let list = List::new(items)
-            .block(Block::default().borders(Borders::ALL).title(format!("Documents ({}) - Press Enter to view content", app.documents.len())))
+            .block(Block::default().borders(Borders::ALL).title(format!(
+                "Documents ({}) - Press Enter to view content",
+                app.documents.len()
+            )))
             .highlight_style(
                 Style::default()
                     .bg(Color::DarkGray)
@@ -1207,8 +1275,8 @@ fn render_query(f: &mut Frame, app: &mut App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // Query input
-            Constraint::Min(0),     // Results or Response
+            Constraint::Length(3), // Query input
+            Constraint::Min(0),    // Results or Response
         ])
         .split(area);
 
@@ -1239,24 +1307,38 @@ fn render_query(f: &mut Frame, app: &mut App, area: Rect) {
         };
 
         // Create animated dots based on time
-        let dots = ".".repeat(((std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() / 500) % 4) as usize);
+        let dots = ".".repeat(
+            ((std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                / 500)
+                % 4) as usize,
+        );
 
         let loading_lines = vec![
             Line::from(""),
             Line::from(""),
             Line::from(vec![
                 Span::styled("    ", Style::default()),
-                Span::styled(format!("{}{}", loading_text, dots), Style::default().fg(BRAND_MID).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    format!("{}{}", loading_text, dots),
+                    Style::default().fg(BRAND_MID).add_modifier(Modifier::BOLD),
+                ),
             ]),
             Line::from(""),
-            Line::from(Span::styled("    Please wait while we process your query...", Style::default().fg(Color::DarkGray))),
+            Line::from(Span::styled(
+                "    Please wait while we process your query...",
+                Style::default().fg(Color::DarkGray),
+            )),
         ];
 
         let loading_widget = Paragraph::new(loading_lines)
-            .block(Block::default().borders(Borders::ALL).title(format!("{} in progress", mode_label)))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!("{} in progress", mode_label)),
+            )
             .alignment(Alignment::Left);
 
         f.render_widget(loading_widget, chunks[1]);
@@ -1271,8 +1353,8 @@ fn render_query(f: &mut Frame, app: &mut App, area: Rect) {
                 let recall_chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
-                        Constraint::Length(7),  // Metadata
-                        Constraint::Min(0),     // Full text
+                        Constraint::Length(7), // Metadata
+                        Constraint::Min(0),    // Full text
                     ])
                     .split(chunks[1]);
 
@@ -1288,14 +1370,22 @@ fn render_query(f: &mut Frame, app: &mut App, area: Rect) {
                 );
 
                 let metadata = Paragraph::new(metadata_text)
-                    .block(Block::default().borders(Borders::ALL).title("Recall Result Metadata"))
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title("Recall Result Metadata"),
+                    )
                     .style(Style::default().fg(BRAND_START));
 
                 f.render_widget(metadata, recall_chunks[0]);
 
                 // Full text content
                 let content_widget = Paragraph::new(result.text.as_str())
-                    .block(Block::default().borders(Borders::ALL).title("Full Text (Esc to close)"))
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title("Full Text (Esc to close)"),
+                    )
                     .wrap(Wrap { trim: false })
                     .style(Style::default().fg(Color::White));
 
@@ -1304,30 +1394,48 @@ fn render_query(f: &mut Frame, app: &mut App, area: Rect) {
                 // Show results as a table like memories
                 let mut items = vec![
                     // Header row
-                    ListItem::new(format!("{:<10} {:<18} {:<18} {}", "TYPE", "OCCURRED START", "OCCURRED END", "TEXT"))
-                        .style(Style::default().fg(BRAND_START).add_modifier(Modifier::BOLD))
+                    ListItem::new(format!(
+                        "{:<10} {:<18} {:<18} {}",
+                        "TYPE", "OCCURRED START", "OCCURRED END", "TEXT"
+                    ))
+                    .style(
+                        Style::default()
+                            .fg(BRAND_START)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                 ];
 
                 // Data rows
                 for result in &app.query_results {
                     let mem_type = result.type_.as_deref().unwrap_or("unknown");
-                    let occurred_start = result.occurred_start.as_deref()
+                    let occurred_start = result
+                        .occurred_start
+                        .as_deref()
                         .and_then(|s| s.split('T').next())
                         .unwrap_or("-");
-                    let occurred_end = result.occurred_end.as_deref()
+                    let occurred_end = result
+                        .occurred_end
+                        .as_deref()
                         .and_then(|s| s.split('T').next())
                         .unwrap_or("-");
                     let text = &result.text;
 
                     // Apply horizontal scroll
-                    let scrolled_text: String = text.chars().skip(app.horizontal_scroll).take(80).collect();
+                    let scrolled_text: String =
+                        text.chars().skip(app.horizontal_scroll).take(80).collect();
 
-                    let content = format!("{:<10} {:<18} {:<18} {}", mem_type, occurred_start, occurred_end, scrolled_text);
+                    let content = format!(
+                        "{:<10} {:<18} {:<18} {}",
+                        mem_type, occurred_start, occurred_end, scrolled_text
+                    );
                     items.push(ListItem::new(content).style(Style::default().fg(Color::White)));
                 }
 
                 let list = List::new(items)
-                    .block(Block::default().borders(Borders::ALL).title(format!("Recall Results ({}) - Press Enter to view full text", app.query_results.len())))
+                    .block(Block::default().borders(Borders::ALL).title(format!(
+                        "Recall Results ({}) - Press Enter to view full text",
+                        app.query_results.len()
+                    )))
                     .highlight_style(
                         Style::default()
                             .bg(Color::DarkGray)
@@ -1347,7 +1455,11 @@ fn render_query(f: &mut Frame, app: &mut App, area: Rect) {
 
             let response = Paragraph::new(response_text)
                 .style(Style::default().fg(Color::White))
-                .block(Block::default().borders(Borders::ALL).title("Reflect Response"))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("Reflect Response"),
+                )
                 .wrap(Wrap { trim: false });
 
             f.render_widget(response, chunks[1]);
@@ -1357,40 +1469,52 @@ fn render_query(f: &mut Frame, app: &mut App, area: Rect) {
 
 fn render_help(f: &mut Frame, area: Rect) {
     let help_text = vec![
-        Line::from(Span::styled("Hindsight Explorer - Keyboard Shortcuts", Style::default().fg(BRAND_START).add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled(
+            "Hindsight Explorer - Keyboard Shortcuts",
+            Style::default()
+                .fg(BRAND_START)
+                .add_modifier(Modifier::BOLD),
+        )),
         Line::from(""),
-        Line::from(vec![
-            Span::styled("Navigation Flow", Style::default().fg(BRAND_END).add_modifier(Modifier::BOLD)),
-        ]),
+        Line::from(vec![Span::styled(
+            "Navigation Flow",
+            Style::default().fg(BRAND_END).add_modifier(Modifier::BOLD),
+        )]),
         Line::from("  1. Start by selecting a bank (Enter)"),
         Line::from("  2. View memories, entities, or documents for that bank"),
         Line::from("  3. Press / from any view to query (recall/reflect)"),
         Line::from(""),
-        Line::from(vec![
-            Span::styled("Basic Navigation", Style::default().fg(BRAND_END).add_modifier(Modifier::BOLD)),
-        ]),
+        Line::from(vec![Span::styled(
+            "Basic Navigation",
+            Style::default().fg(BRAND_END).add_modifier(Modifier::BOLD),
+        )]),
         Line::from("  ↑/↓, j/k    - Navigate up/down in lists"),
         Line::from("  ←/→, h/l    - Scroll text left/right in tables"),
         Line::from("  Enter       - Select item / view details"),
         Line::from("  Esc         - Go back / close detail view"),
         Line::from(""),
-        Line::from(vec![
-            Span::styled("Query View", Style::default().fg(BRAND_END).add_modifier(Modifier::BOLD)),
-        ]),
+        Line::from(vec![Span::styled(
+            "Query View",
+            Style::default().fg(BRAND_END).add_modifier(Modifier::BOLD),
+        )]),
         Line::from("  /           - Start or edit query (from any non-bank view)"),
         Line::from("  m           - Toggle mode (Recall ↔ Reflect)"),
         Line::from("  b           - Cycle budget (Low → Mid → High)"),
         Line::from("  +/-         - Adjust max tokens"),
         Line::from("  Enter       - Execute query"),
         Line::from(""),
-        Line::from(vec![
-            Span::styled("General", Style::default().fg(BRAND_END).add_modifier(Modifier::BOLD)),
-        ]),
+        Line::from(vec![Span::styled(
+            "General",
+            Style::default().fg(BRAND_END).add_modifier(Modifier::BOLD),
+        )]),
         Line::from("  R           - Refresh current view"),
         Line::from("  ?           - Toggle this help screen"),
         Line::from("  q           - Quit"),
         Line::from(""),
-        Line::from(Span::styled("Press ? to close help", Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled(
+            "Press ? to close help",
+            Style::default().fg(Color::DarkGray),
+        )),
     ];
 
     let help = Paragraph::new(help_text)
@@ -1410,7 +1534,11 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<()> {
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
                 // Handle Ctrl+C to exit
-                if key.code == KeyCode::Char('c') && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+                if key.code == KeyCode::Char('c')
+                    && key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL)
+                {
                     return Ok(());
                 }
 
@@ -1504,29 +1632,27 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<()> {
                             _ => {}
                         }
                     }
-                    InputMode::Query => {
-                        match key.code {
-                            KeyCode::Enter => {
-                                if matches!(app.view, View::Query(_)) {
-                                    app.execute_query();
-                                }
+                    InputMode::Query => match key.code {
+                        KeyCode::Enter => {
+                            if matches!(app.view, View::Query(_)) {
+                                app.execute_query();
                             }
-                            KeyCode::Esc => {
-                                app.input_mode = InputMode::Normal;
-                            }
-                            KeyCode::Char(c) => {
-                                if matches!(app.view, View::Query(_)) {
-                                    app.query_text.push(c);
-                                }
-                            }
-                            KeyCode::Backspace => {
-                                if matches!(app.view, View::Query(_)) {
-                                    app.query_text.pop();
-                                }
-                            }
-                            _ => {}
                         }
-                    }
+                        KeyCode::Esc => {
+                            app.input_mode = InputMode::Normal;
+                        }
+                        KeyCode::Char(c) => {
+                            if matches!(app.view, View::Query(_)) {
+                                app.query_text.push(c);
+                            }
+                        }
+                        KeyCode::Backspace => {
+                            if matches!(app.view, View::Query(_)) {
+                                app.query_text.pop();
+                            }
+                        }
+                        _ => {}
+                    },
                 }
             }
         }
@@ -1565,4 +1691,76 @@ pub fn run(client: &ApiClient) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn headered_selection_maps_visible_rows_to_data_indices() {
+        let mut state = ListState::default();
+
+        normalize_headered_selection(&mut state, 3);
+        assert_eq!(state.selected(), Some(1));
+        assert_eq!(selected_headered_data_index(&state), Some(0));
+
+        select_next_headered_row(&mut state, 3);
+        assert_eq!(state.selected(), Some(2));
+        assert_eq!(selected_headered_data_index(&state), Some(1));
+
+        select_next_headered_row(&mut state, 3);
+        assert_eq!(state.selected(), Some(3));
+        assert_eq!(selected_headered_data_index(&state), Some(2));
+
+        select_next_headered_row(&mut state, 3);
+        assert_eq!(state.selected(), Some(1));
+        assert_eq!(selected_headered_data_index(&state), Some(0));
+    }
+
+    #[test]
+    fn headered_selection_never_selects_the_header_row() {
+        let mut state = ListState::default();
+        state.select(Some(0));
+
+        normalize_headered_selection(&mut state, 2);
+        assert_eq!(state.selected(), Some(1));
+
+        select_previous_headered_row(&mut state, 2);
+        assert_eq!(state.selected(), Some(2));
+        assert_eq!(selected_headered_data_index(&state), Some(1));
+    }
+
+    #[test]
+    fn headered_selection_clears_when_no_data_exists() {
+        let mut state = ListState::default();
+        state.select(Some(2));
+
+        normalize_headered_selection(&mut state, 0);
+        assert_eq!(state.selected(), None);
+
+        select_next_headered_row(&mut state, 0);
+        assert_eq!(state.selected(), None);
+    }
+
+    #[test]
+    fn memory_details_json_includes_non_text_attributes() {
+        let memory = serde_json::json!({
+            "id": "mem_123",
+            "fact_type": "world",
+            "text": "Alice works at Google",
+            "entities": [
+                {"canonical_name": "Alice", "type": "person"}
+            ],
+            "metadata": {
+                "source": "import"
+            }
+        });
+
+        let details = format_memory_details_json(memory.as_object().unwrap());
+
+        assert!(details.contains("\"id\": \"mem_123\""));
+        assert!(details.contains("\"entities\""));
+        assert!(details.contains("\"metadata\""));
+    }
 }

@@ -8,7 +8,7 @@ This page explains each operation type, when it fires, and how to inspect or man
 {/* Import raw source files */}
 
 > **💡 Prerequisites**
-> 
+>
 Make sure you've completed the [Quick Start](./quickstart) and understand [how retain works](./retain).
 ## How operations work
 
@@ -24,9 +24,11 @@ By default, every operation runs in-process: no external queue, no extra process
 | `processing` | A worker has claimed the row and is actively running the handler. |
 | `completed` | The handler returned successfully. |
 | `failed` | The handler raised. `error_message` carries the reason; you can re-queue with `POST /…/retry`. |
-| `cancelled` | The operation was cancelled via `DELETE /…/operations/{id}` before a worker picked it up. Cancelling a `processing` operation is not supported. |
+| `cancelled` | The operation was cancelled via `DELETE /…/operations/{id}`. Works on `pending` and `processing` operations alike. |
 
 The worker retries failed operations up to `HINDSIGHT_API_WORKER_MAX_RETRIES` times before settling on `failed`. Deterministic failures (e.g., invalid embedding dimensions, integrity violations) skip retries — they won't succeed by re-running.
+
+Completed, failed, and cancelled operations are kept indefinitely by default. Set `HINDSIGHT_API_OPERATION_RETENTION_DAYS` to a positive number of days to bound that history: the background maintenance loop then prunes expired terminal rows in bounded batches, on its own schedule rather than as a side effect of task processing. PostgreSQL only — the maintenance loop does not run on Oracle, so operation history is unbounded there. The full row shares that TTL, so while an operation is retained its payload stays available — failed and cancelled operations can be retried, and completed ones inspected with `include_payload=true`. Pending and processing operations are never removed by retention cleanup.
 
 ## Operation types
 
@@ -70,13 +72,14 @@ Triggered either manually via `POST /v1/default/banks/{bank_id}/mental-models/{i
 
 ### `graph_maintenance`
 
-Reconciles derived state that goes stale after a delete. Every invocation runs three passes:
+Reconciles derived state that goes stale after a delete. Every invocation drains two queues, both filled by the delete itself, so a run only ever looks at what that delete touched:
 
-1. **Link top-up.** Drains the `graph_maintenance_queue` (units whose outgoing temporal/semantic links lost a neighbour). For each, if the unit is under its cap (20 temporal, 50 semantic), Hindsight re-runs the same probes retain uses and inserts the missing links. Without this, the retain pipeline's top-K capping would leave surviving units permanently under-capped after every delete — degrading graph-expansion recall.
-2. **Orphan entity prune.** Deletes entities in the bank with no remaining `unit_entities` references. FK `ON DELETE CASCADE` on `entity_cooccurrences` then removes any cooccurrence row pointing at a pruned entity.
-3. **Stale cooccurrence prune.** Cleans up `entity_cooccurrences` rows where both endpoints still exist but no current memory_unit references both of them — the cooccurrence was real when it was recorded, but every unit that witnessed it has since been deleted.
+1. **Link top-up.** Drains the units whose outgoing temporal/semantic links lost a neighbour. For each, if the unit is under its cap (20 temporal, 50 semantic), Hindsight re-runs the same probes retain uses and inserts the missing links. Without this, the retain pipeline's top-K capping would leave surviving units permanently under-capped after every delete — degrading graph-expansion recall.
+2. **Entity prune.** Drains the entities the delete may have stranded. Those with no remaining `unit_entities` reference are deleted (FK `ON DELETE CASCADE` removes their `entity_cooccurrences` rows with them); for the survivors, cooccurrence rows where both endpoints still exist but no current memory_unit references both are cleaned up — the cooccurrence was real when recorded, but every unit that witnessed it has since been deleted.
 
 Bank-deduped at submit time, so concurrent triggers against the same bank coalesce into one drain.
+
+Each run works in committed batches under a wall-clock budget. A backlog too large for one run — a bulk delete, say — is not an error: the run reports what it finished and the next one resumes where it stopped.
 
 **Triggers:** any delete that removes memory_units — `DELETE /documents/{id}`, `DELETE /memories/{id}`, and re-retaining an existing `document_id` (the upsert path). A full bank wipe (`delete_bank`) is a no-op: there's nothing left in the bank to maintain.
 
@@ -212,9 +215,21 @@ A few response fields are worth calling out:
 | `total` | Total units of work for the operation, when known. |
 | `detail` | Operation-specific counters (e.g. `observations_created`, `round`, `items_in_sub_batch`). |
 
-### Cancel a pending operation
+### Cancel an operation
 
-Returns `409` if the operation is already in `processing`, `completed`, or `failed` state.
+Cancels a `pending` or `processing` operation. Returns `409` if it has already reached a
+terminal state (`completed`, `failed`, `cancelled`).
+
+The row is marked `cancelled` straight away, but cancelling running work is **cooperative
+and not immediate**. A worker executing the operation notices at its next checkpoint — the
+boundary between sub-batches or documents for retain, between LLM batches for consolidation —
+and stops there, so whatever it had already committed stays committed and the batch in
+progress may still finish. Operation types without checkpoints run to the end; the row stays
+`cancelled` either way, because no worker write may overwrite that status.
+
+This is also how you clear an operation stranded in `processing` by a worker that was killed
+before it could finish: nothing is running, so the cancel takes effect immediately. Use
+`POST /…/operations/{id}/retry` to re-queue the work afterwards.
 
 ### Python
 
@@ -343,6 +358,8 @@ done
 Each worker has a single concurrency budget (`HINDSIGHT_API_WORKER_MAX_SLOTS`, default 10) shared across all operation types. Per-type slot reservations (`HINDSIGHT_API_WORKER_<TYPE>_MAX_SLOTS`) carve out guaranteed capacity within that budget; remaining slots form a shared pool any type can use. See [Configuration → Worker Configuration](../configuration#distributed-workers) for the full table.
 
 For most deployments the defaults are fine. Reserve slots for an operation type if you've seen it starved by a flood of another type (e.g., a long file_convert_retain blocking graph_maintenance on a deletion-heavy workload).
+
+Slots are also rotated across banks. Each claim serves the next bank in turn — one operation — then fills the rest of the pool oldest-first from anywhere. So a bank ingesting in bulk cannot own the whole pool while another bank's single write waits behind its backlog, and it is not throttled either: when no one else is waiting it still takes every slot.
 
 ## Next Steps
 

@@ -6,7 +6,7 @@ Track and manage document sources in your memory bank. Documents provide traceab
 {/* Import raw source files */}
 
 > **💡 Prerequisites**
-> 
+>
 Make sure you've completed the [Quick Start](./quickstart) and understand [how retain works](./retain).
 ## What Are Documents?
 
@@ -26,7 +26,7 @@ When you retain content, Hindsight splits it into chunks before extracting facts
 - **Richer recall** — Including chunks in recall provides surrounding context for matched facts
 
 > **💡 Include Chunks in Recall**
-> 
+>
 Use `include_chunks=True` in your recall calls to get the original text chunks alongside fact results. See [Recall](./recall) for details.
 ## Retain with Document ID
 
@@ -201,6 +201,8 @@ hindsight document get my-bank meeting-2024-03-15
 
 Update mutable fields on an existing document without re-processing the content. Currently supports updating `tags`.
 
+The `tags` array **replaces** the document's tags — it is not merged into them. Send the complete set you want the document to end up with: any tag you leave out is dropped, and an empty array clears them all. To remove a single tag, read the document's current tags, drop the one you want gone, and send the rest. Omitting the field entirely is not an update at all and is rejected with a `422`.
+
 ### Python
 
 ```python
@@ -250,8 +252,12 @@ hindsight document update-tags my-bank meeting-2024-03-15
 ```
 
 > **ℹ️ Observations are re-consolidated**
-> 
+>
 When tags change, any consolidated observations derived from the document's memories are invalidated and queued for re-consolidation under the new tags. Co-source memories from other documents that shared those observations are also reset.
+
+This is required for correctness rather than incidental: consolidation scopes a memory by its tag set, so an observation built under the old tags is no longer valid, and deleting it would strand every other memory that observation was consolidated from unless those are requeued too. The size of that requeue is the number of memories co-sourced with this document's — on a densely co-sourced bank it can be many times the document's own memory count.
+
+Tags are compared as a **set** against the document's current tags, and an update that leaves the set unchanged — including one that only reorders the array — performs no retag and queues no re-consolidation. A repeatable tag-normalisation sweep therefore only pays the re-consolidation cost on the run that actually changes something.
 ## Delete Document
 
 Remove a document and all its associated memories:
@@ -303,11 +309,15 @@ hindsight document delete my-bank meeting-2024-03-15
 ```
 
 > **⚠️ Warning**
-> 
+>
 Deleting a document permanently removes all memories extracted from it. This action cannot be undone.
 ## List Documents
 
-List documents in a bank with optional filtering by ID and tags.
+List documents in a bank with optional filtering by ID, tags, and time.
+
+`start_date=` and `end_date=` restrict the results to a half-open range `[start, end)` on the timestamp named by `time_field=` — either `created_at` (when the document first arrived) or `updated_at` (its last write, and the default ordering). `time_field` also becomes the sort order, newest first.
+
+Because filtering and ordering follow the same column, `total` counts only the documents inside the window rather than the whole bank. Omit all three parameters to keep the default listing.
 
 ### Python
 

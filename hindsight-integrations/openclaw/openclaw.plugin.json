@@ -33,7 +33,7 @@
     "properties": {
       "daemonIdleTimeout": {
         "type": "number",
-        "description": "Seconds before daemon shuts down from inactivity (0 = never)",
+        "description": "Deprecated and ignored: the daemon no longer shuts down from inactivity",
         "default": 0
       },
       "embedPort": {
@@ -53,6 +53,40 @@
       "observationsMission": {
         "type": "string",
         "description": "Mission stamped onto the bank's observations_mission column on first use. Controls what gets synthesised into observations during consolidation."
+      },
+      "retainExtractionMode": {
+        "type": "string",
+        "description": "Fact extraction mode stamped onto each bank on first use (dynamic or static). Options: concise, verbose, custom, verbatim, chunks. Leave unset to keep the Hindsight server default for new banks.",
+        "enum": ["concise", "verbose", "custom", "verbatim", "chunks"]
+      },
+      "enableObservations": {
+        "type": "boolean",
+        "description": "When set, stamped onto each bank on first use to toggle observation consolidation after retain."
+      },
+      "enableAutoConsolidation": {
+        "type": "boolean",
+        "description": "When set, stamped onto each bank on first use via PATCH /banks/{id}/config to toggle automatic consolidation scheduling."
+      },
+      "dispositionSkepticism": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 5,
+        "description": "Reflect skepticism trait (1=trusting, 5=skeptical) stamped on first bank use."
+      },
+      "dispositionLiteralism": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 5,
+        "description": "Reflect literalism trait (1=flexible, 5=literal) stamped on first bank use."
+      },
+      "dispositionEmpathy": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 5,
+        "description": "Reflect empathy trait (1=detached, 5=empathetic) stamped on first bank use."
+      },
+      "entityLabels": {
+        "description": "Controlled vocabulary for entity labels. Either a list of attribute defs (e.g. [{\"name\":\"person\",\"description\":\"Human user\"}]) or a { \"attributes\": [...] } object, passed through to PATCH /banks/{id}/config as entity_labels on first bank use. Other shapes are ignored."
       },
       "embedVersion": {
         "type": "string",
@@ -105,6 +139,13 @@
       "bankIdPrefix": {
         "type": "string",
         "description": "Optional prefix for bank IDs (e.g., 'prod' results in 'prod-slack-U123'). Useful for separating environments."
+      },
+      "agentBankMap": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "string"
+        },
+        "description": "Explicit agentId -> bankId routing, checked before static/dynamic derivation. Lets a group of agents share one named bank while other agents keep their derived banks. Mapped names are used exactly as given (bankIdPrefix is not applied)."
       },
       "retainTags": {
         "type": "array",
@@ -203,6 +244,22 @@
         "description": "Memory types to recall. Defaults to ['observation'] — surfaces only the consolidated, deduplicated view; raw world/experience facts can drive the same answer multiple times when many memories say the same thing.",
         "default": ["observation"]
       },
+      "preferObservations": {
+        "type": "boolean",
+        "description": "When true, recall drops raw facts already consolidated into an observation while keeping unconsolidated ones. Pair with recallTypes including raw types (e.g. ['observation', 'world', 'experience']) to surface just-retained facts before consolidation, without duplicating already-consolidated content. Default: false.",
+        "default": false
+      },
+      "recallMinScores": {
+        "type": "object",
+        "description": "Optional per-stage score floors for auto-recall. Missing fields impose no floor; memories with a missing or null score for a configured stage pass.",
+        "additionalProperties": false,
+        "properties": {
+          "semantic": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+          "keyword": { "type": ["number", "null"] },
+          "reranker": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+          "final": { "type": ["number", "null"] }
+        }
+      },
       "recallRoles": {
         "type": "array",
         "items": {
@@ -243,8 +300,8 @@
       "recallInjectionPosition": {
         "type": "string",
         "enum": ["prepend", "append", "user"],
-        "description": "Where to inject recalled memories. 'prepend' = start of system prompt (default), 'append' = end of system prompt (preserves prompt cache), 'user' = before user message.",
-        "default": "prepend"
+        "description": "Where to inject recalled memories. 'user' = before the user message (default, preserves system prompt cache), 'prepend' = start of system prompt, 'append' = end of system prompt.",
+        "default": "user"
       },
       "debug": {
         "type": "boolean",
@@ -269,7 +326,7 @@
       },
       "retainQueuePath": {
         "type": "string",
-        "description": "Path to JSONL file for buffering failed retains (external API mode only). Default: ~/.openclaw/data/hindsight-retain-queue.jsonl"
+        "description": "Path to JSONL file for buffering failed retains. Default: ~/.openclaw/data/hindsight-retain-queue.jsonl"
       },
       "retainQueueMaxAgeMs": {
         "type": "number",
@@ -304,6 +361,10 @@
         "type": "boolean",
         "description": "Register agent_knowledge_* tools for explicit lookup, reflection, ingest, and knowledge-page management. Set automatically by the self-driving-agents CLI.",
         "default": false
+      },
+      "senderPrefixPattern": {
+        "type": "string",
+        "description": "Regex matching a human display-name prefix some channels prepend to user text (e.g. 'Alice: today weather?'). Supply the name part only — 'Alice|Bob' or '[A-Za-z ]{1,20}' — the ':' separator and anchoring are added by the plugin. When set, the prefix is stripped from both recall queries and retained transcripts. Unset strips nothing; an invalid regex is ignored."
       }
     },
     "additionalProperties": false
@@ -311,7 +372,7 @@
   "uiHints": {
     "daemonIdleTimeout": {
       "label": "Daemon Idle Timeout",
-      "placeholder": "0 (never timeout)"
+      "placeholder": "deprecated, ignored"
     },
     "embedPort": {
       "label": "Embed Server Port",
@@ -328,6 +389,34 @@
     "observationsMission": {
       "label": "Observations Mission",
       "placeholder": "Controls what gets synthesised into observations..."
+    },
+    "retainExtractionMode": {
+      "label": "Retain Extraction Mode",
+      "placeholder": "verbose, concise, custom, verbatim, or chunks"
+    },
+    "enableObservations": {
+      "label": "Enable Observations",
+      "placeholder": "true or false — stamped on first bank use"
+    },
+    "enableAutoConsolidation": {
+      "label": "Enable Auto Consolidation",
+      "placeholder": "true or false — stamped on first bank use"
+    },
+    "dispositionSkepticism": {
+      "label": "Disposition Skepticism",
+      "placeholder": "1–5"
+    },
+    "dispositionLiteralism": {
+      "label": "Disposition Literalism",
+      "placeholder": "1–5"
+    },
+    "dispositionEmpathy": {
+      "label": "Disposition Empathy",
+      "placeholder": "1–5"
+    },
+    "entityLabels": {
+      "label": "Entity Labels",
+      "placeholder": "e.g. [{\"name\":\"person\",\"description\":\"Human user\"}]"
     },
     "embedVersion": {
       "label": "Hindsight Embed Version",
@@ -378,6 +467,10 @@
     "bankIdPrefix": {
       "label": "Bank ID Prefix",
       "placeholder": "e.g., prod, staging (optional)"
+    },
+    "agentBankMap": {
+      "label": "Agent Bank Map",
+      "placeholder": "e.g. {\"inbound\": \"ps-technology\", \"limpieza\": \"ps-limpieza\"}"
     },
     "retainTags": {
       "label": "Retain Tags",
@@ -438,6 +531,14 @@
     "recallTypes": {
       "label": "Recall Types",
       "placeholder": "['observation'] (default)"
+    },
+    "preferObservations": {
+      "label": "Prefer Observations",
+      "placeholder": "false (default)"
+    },
+    "recallMinScores": {
+      "label": "Recall Minimum Scores",
+      "placeholder": "e.g. {\"reranker\": 0.3}"
     },
     "recallRoles": {
       "label": "Recall Roles",
@@ -508,6 +609,10 @@
     "skipStatelessSessions": {
       "label": "Skip Stateless Sessions",
       "placeholder": "true (default)"
+    },
+    "senderPrefixPattern": {
+      "label": "Sender Prefix Pattern",
+      "placeholder": "e.g. Alice|Bob (strips 'Alice: ' from recall and retain)"
     }
   }
 }

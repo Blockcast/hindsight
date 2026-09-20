@@ -7,13 +7,21 @@ from fastapi import APIRouter
 from fastapi.testclient import TestClient
 
 from hindsight_api.extensions import (
-    ApiKeyTenantExtension,
     AuthenticationError,
+    BankReadContext,
+    BankReadOperation,
+    BankWriteContext,
+    BankWriteOperation,
+    # Consolidation operation
+    ConsolidateContext,
+    ConsolidateResult,
+    CreateBankContext,
     Extension,
     HttpExtension,
     OperationValidationError,
     OperationValidatorExtension,
     PrecheckContext,
+    PrecheckOperation,
     RecallContext,
     RecallResult,
     ReflectContext,
@@ -21,14 +29,10 @@ from hindsight_api.extensions import (
     RequestContext,
     RetainContext,
     RetainResult,
-    TenantContext,
-    TenantExtension,
     ValidationResult,
     load_extension,
-    # Consolidation operation
-    ConsolidateContext,
-    ConsolidateResult,
 )
+from hindsight_api.extensions.builtin.tenant import ApiKeyTenantExtension
 
 
 class TestExtensionLoader:
@@ -67,6 +71,36 @@ class TestExtensionLoader:
 
         await ext.on_shutdown()
         assert ext.stopped
+
+    def test_operation_enums_remain_string_compatible(self):
+        """Operation enums centralize names without breaking string comparisons."""
+        request_context = RequestContext(tenant_id="tenant-1")
+
+        precheck_ctx = PrecheckContext(
+            bank_id="bank-1",
+            operation=PrecheckOperation.RETAIN,
+            request_context=request_context,
+        )
+        read_ctx = BankReadContext(
+            bank_id="bank-1",
+            operation=BankReadOperation.GET_BANK_STATS,
+            request_context=request_context,
+        )
+        write_ctx = BankWriteContext(
+            bank_id="bank-1",
+            operation=BankWriteOperation.UPDATE_BANK_CONFIG,
+            request_context=request_context,
+        )
+
+        assert precheck_ctx.operation is PrecheckOperation.RETAIN
+        assert read_ctx.operation is BankReadOperation.GET_BANK_STATS
+        assert write_ctx.operation is BankWriteOperation.UPDATE_BANK_CONFIG
+        assert precheck_ctx.operation == "retain"
+        assert read_ctx.operation == "get_bank_stats"
+        assert write_ctx.operation == "update_bank_config"
+        assert isinstance(precheck_ctx.operation, str)
+        assert isinstance(read_ctx.operation, str)
+        assert isinstance(write_ctx.operation, str)
 
 
 class LifecycleTestExtension(Extension):
@@ -169,6 +203,30 @@ class TrackingValidator(OperationValidatorExtension):
         self.post_consolidate_calls.append(result)
 
 
+class CreateBankRejectingValidator(OperationValidatorExtension):
+    """Validator that records create-bank checks and can reject them."""
+
+    def __init__(self, *, reject: bool = True):
+        super().__init__({})
+        self.reject = reject
+        self.create_bank_calls: list[CreateBankContext] = []
+
+    async def validate_retain(self, ctx: RetainContext) -> ValidationResult:
+        return ValidationResult.accept()
+
+    async def validate_recall(self, ctx: RecallContext) -> ValidationResult:
+        return ValidationResult.accept()
+
+    async def validate_reflect(self, ctx: ReflectContext) -> ValidationResult:
+        return ValidationResult.accept()
+
+    async def validate_create_bank(self, ctx: CreateBankContext) -> ValidationResult:
+        self.create_bank_calls.append(ctx)
+        if self.reject:
+            return ValidationResult.reject("bank creation not allowed", status_code=402)
+        return ValidationResult.accept()
+
+
 class TestMemoryEngineValidation:
     """Tests for validation integration with MemoryEngine.
 
@@ -222,6 +280,8 @@ class TestMemoryEngineValidation:
         memory = memory_with_validator
         bank_id = "test-recall-validation"
         ctx = RequestContext()
+        # Recall 404s for a bank nobody created (#4442), so create it first.
+        await memory.ensure_bank_profile(bank_id, request_context=ctx)
 
         # First recall should pass validation
         await memory.recall_async(bank_id, "test query", fact_type=["world"], request_context=ctx)
@@ -263,6 +323,109 @@ class TestMemoryEngineValidation:
             await memory.reflect_async(bank_id, "blocked question", request_context=ctx)
 
         assert "limit exceeded" in str(exc_info.value).lower()
+
+    @pytest.mark.asyncio
+    async def test_retain_validates_create_bank_for_missing_bank(self, memory):
+        """Retain may lazily create a bank, so missing-bank retain validates create_bank."""
+        bank_id = "test-retain-create-bank-validation"
+        ctx = RequestContext()
+        validator = CreateBankRejectingValidator()
+        memory._operation_validator = validator
+
+        with pytest.raises(OperationValidationError) as exc_info:
+            await memory.retain_batch_async(
+                bank_id=bank_id,
+                contents=[{"content": "Should not create a bank"}],
+                request_context=ctx,
+            )
+
+        assert "bank creation not allowed" in str(exc_info.value)
+        assert len(validator.create_bank_calls) == 1
+        assert validator.create_bank_calls[0].bank_id == bank_id
+        assert await memory.get_bank_profile(bank_id, request_context=ctx) is None
+
+    @pytest.mark.asyncio
+    async def test_async_retain_validates_create_bank_for_missing_bank(self, memory):
+        """Async retain validates create_bank before creating its parent operation."""
+        bank_id = "test-async-retain-create-bank-validation"
+        ctx = RequestContext()
+        validator = CreateBankRejectingValidator()
+        memory._operation_validator = validator
+
+        with pytest.raises(OperationValidationError) as exc_info:
+            await memory.submit_async_retain(
+                bank_id=bank_id,
+                contents=[{"content": "Should not create a bank"}],
+                request_context=ctx,
+            )
+
+        assert "bank creation not allowed" in str(exc_info.value)
+        assert len(validator.create_bank_calls) == 1
+        assert validator.create_bank_calls[0].bank_id == bank_id
+        assert await memory.get_bank_profile(bank_id, request_context=ctx) is None
+
+    @pytest.mark.asyncio
+    async def test_create_bank_validation_skips_existing_bank(self, memory):
+        """Existing banks do not require create_bank validation."""
+        bank_id = "test-create-bank-existing"
+        ctx = RequestContext()
+        await memory.ensure_bank_profile(bank_id, request_context=ctx)
+
+        validator = CreateBankRejectingValidator()
+        memory._operation_validator = validator
+
+        created = await memory._ensure_bank_exists(bank_id, ctx)
+
+        assert created is False
+        assert validator.create_bank_calls == []
+
+    @pytest.mark.asyncio
+    async def test_get_bank_profile_validates_create_bank_for_missing_bank(self, memory):
+        """The default auto-create profile path validates create_bank."""
+        bank_id = "test-profile-create-bank-validation"
+        ctx = RequestContext()
+        validator = CreateBankRejectingValidator()
+        memory._operation_validator = validator
+
+        with pytest.raises(OperationValidationError) as exc_info:
+            await memory.ensure_bank_profile(bank_id, request_context=ctx)
+
+        assert "bank creation not allowed" in str(exc_info.value)
+        assert len(validator.create_bank_calls) == 1
+        assert validator.create_bank_calls[0].bank_id == bank_id
+        assert await memory.get_bank_profile(bank_id, request_context=ctx) is None
+
+    @pytest.mark.asyncio
+    async def test_http_create_or_update_validates_create_bank(self, api_client, memory):
+        bank_id = "test-http-put-create-bank-validation"
+        validator = CreateBankRejectingValidator()
+        memory._operation_validator = validator
+
+        resp = await api_client.put(
+            f"/v1/default/banks/{bank_id}",
+            json={"name": "Blocked Bank"},
+        )
+
+        assert resp.status_code == 402
+        assert resp.json()["detail"] == "bank creation not allowed"
+        assert len(validator.create_bank_calls) == 1
+        assert validator.create_bank_calls[0].bank_id == bank_id
+
+    @pytest.mark.asyncio
+    async def test_http_template_import_validates_create_bank(self, api_client, memory):
+        bank_id = "test-http-import-create-bank-validation"
+        validator = CreateBankRejectingValidator()
+        memory._operation_validator = validator
+
+        resp = await api_client.post(
+            f"/v1/default/banks/{bank_id}/import",
+            json={"version": "1"},
+        )
+
+        assert resp.status_code == 402
+        assert resp.json()["detail"] == "bank creation not allowed"
+        assert len(validator.create_bank_calls) == 1
+        assert validator.create_bank_calls[0].bank_id == bank_id
 
 
 @pytest.fixture
@@ -356,11 +519,14 @@ class TestOperationHooksParameters:
     async def test_recall_pre_hook_receives_all_parameters(self, memory_with_tracking_validator):
         """Pre-recall hook receives all user-provided parameters."""
         from datetime import datetime, timezone
+
         from hindsight_api.engine.memory_engine import Budget
 
         memory, validator = memory_with_tracking_validator
         bank_id = "test-recall-params"
         ctx = RequestContext(api_key="test-key")
+        # Recall 404s for a bank nobody created (#4442), so create it first.
+        await memory.ensure_bank_profile(bank_id, request_context=ctx)
         query = "test query"
         question_date = datetime(2024, 1, 15, tzinfo=timezone.utc)
 
@@ -404,6 +570,8 @@ class TestOperationHooksParameters:
         memory, validator = memory_with_tracking_validator
         bank_id = "test-recall-post"
         ctx = RequestContext(api_key="test-key")
+        # Recall 404s for a bank nobody created (#4442), so create it first.
+        await memory.ensure_bank_profile(bank_id, request_context=ctx)
 
         result = await memory.recall_async(
             bank_id=bank_id,
@@ -882,7 +1050,7 @@ class TestPrecheckDefault:
         validator = RecordingPrecheckValidator(reject=False)
         # Bypass our override by calling the base implementation directly.
         ctx = PrecheckContext(
-            operation="retain",
+            operation=PrecheckOperation.RETAIN,
             bank_id="bank-x",
             request_context=RequestContext(),
         )
@@ -914,7 +1082,7 @@ class TestPrecheckHttpWiring:
         from fastapi import Depends, FastAPI, HTTPException, Request
         from pydantic import BaseModel, model_validator
 
-        from hindsight_api.extensions import PrecheckContext
+        from hindsight_api.extensions import PrecheckContext, PrecheckOperation
         from hindsight_api.models import RequestContext
 
         body_parses: list[str] = []
@@ -949,7 +1117,7 @@ class TestPrecheckHttpWiring:
         async def _request_context() -> RequestContext:
             return RequestContext()
 
-        def _precheck_for(operation: str):
+        def _precheck_for(operation: PrecheckOperation):
             async def _dep(
                 bank_id: str,
                 request: Request,
@@ -985,7 +1153,7 @@ class TestPrecheckHttpWiring:
         async def retain(
             bank_id: str,
             body: _RetainBody,
-            _: None = Depends(_precheck_for("retain")),
+            _: None = Depends(_precheck_for(PrecheckOperation.RETAIN)),
         ):
             return {"ok": True, "bank_id": bank_id, "n": len(body.items)}
 
@@ -993,7 +1161,7 @@ class TestPrecheckHttpWiring:
         async def recall(
             bank_id: str,
             body: _RecallBody,
-            _: None = Depends(_precheck_for("recall")),
+            _: None = Depends(_precheck_for(PrecheckOperation.RECALL)),
         ):
             return {"ok": True}
 
@@ -1001,7 +1169,7 @@ class TestPrecheckHttpWiring:
         async def reflect(
             bank_id: str,
             body: _ReflectBody,
-            _: None = Depends(_precheck_for("reflect")),
+            _: None = Depends(_precheck_for(PrecheckOperation.REFLECT)),
         ):
             return {"ok": True}
 
@@ -1168,7 +1336,7 @@ class TestPrecheckHttpWiring:
                 content_length = parsed
 
         ctx = PrecheckContext(
-            operation="retain",
+            operation=PrecheckOperation.RETAIN,
             bank_id="bank-x",
             request_context=RequestContext(),
             content_length=content_length,

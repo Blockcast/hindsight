@@ -13,133 +13,23 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from hindsight_api.cancellation import OperationCancelledError
+from hindsight_api.engine.llm_interface import LLM_TOOL_CHOICE_AUTO, LLMToolChoice
 from hindsight_api.engine.reflect.agent import (
+    ReflectNoAnswerError,
+    ReflectToolCallError,
+    ReflectToolExecutionError,
     _all_mental_models_are_usable_and_fresh,
-    _clean_answer_text,
-    _clean_done_answer,
+    _cache_cleanup_tasks,
     _count_messages_tokens,
+    _generate_structured_output,
     _is_context_overflow_error,
     _is_done_tool,
     _normalize_tool_name,
     run_reflect_agent,
 )
-from hindsight_api.engine.response_models import LLMToolCall, LLMToolCallResult, TokenUsage
+from hindsight_api.engine.response_models import LLMCallResult, LLMToolCall, LLMToolCallResult, TokenUsage
 from tests.llm_judge import assert_meets_criteria
-
-
-class TestCleanAnswerText:
-    """Test cleanup of answer text that includes done() tool call syntax."""
-
-    def test_clean_text_with_done_call(self):
-        """Text ending with done() call should have it stripped."""
-        text = """The team's OKRs focus on performance.done({"answer":"The team's OKRs","memory_ids":[]})"""
-        cleaned = _clean_answer_text(text)
-        assert cleaned == "The team's OKRs focus on performance."
-        assert "done(" not in cleaned
-
-    def test_clean_text_with_done_call_and_whitespace(self):
-        """done() call with whitespace should be stripped."""
-        text = """Answer text here. done( {"answer": "short", "memory_ids": []} )"""
-        cleaned = _clean_answer_text(text)
-        assert cleaned == "Answer text here."
-
-    def test_clean_text_without_done_call(self):
-        """Text without done() call should be unchanged."""
-        text = "This is a normal answer without any tool calls."
-        cleaned = _clean_answer_text(text)
-        assert cleaned == text
-
-    def test_clean_text_with_done_word_in_content(self):
-        """The word 'done' in regular text should not be stripped."""
-        text = "The task is done and completed successfully."
-        cleaned = _clean_answer_text(text)
-        assert cleaned == text
-
-    def test_clean_empty_text(self):
-        """Empty text should return empty."""
-        assert _clean_answer_text("") == ""
-
-    def test_clean_text_multiline_done(self):
-        """done() call spanning multiple lines should be stripped."""
-        text = """Summary of findings.done({
-            "answer": "Summary",
-            "memory_ids": ["id1", "id2"]
-        })"""
-        cleaned = _clean_answer_text(text)
-        assert cleaned == "Summary of findings."
-
-
-class TestCleanDoneAnswer:
-    """Test cleanup of answer field from done() tool call that leaks structured output."""
-
-    def test_clean_answer_with_leaked_json_code_block(self):
-        """Answer with leaked JSON code block at the end should be cleaned."""
-        text = """The user's favorite color is blue.
-
-```json
-{"observation_ids": ["obs-1", "obs-2"]}
-```"""
-        cleaned = _clean_done_answer(text)
-        assert cleaned == "The user's favorite color is blue."
-        assert "observation_ids" not in cleaned
-
-    def test_clean_answer_with_memory_ids_code_block(self):
-        """Answer with leaked memory_ids JSON code block should be cleaned."""
-        text = """Here is the answer.
-
-```json
-{"memory_ids": ["mem-1"]}
-```"""
-        cleaned = _clean_done_answer(text)
-        assert cleaned == "Here is the answer."
-
-    def test_clean_answer_with_raw_json_object(self):
-        """Answer with raw JSON object containing IDs at the end should be cleaned."""
-        text = 'The answer is 42. {"observation_ids": ["obs-1"]}'
-        cleaned = _clean_done_answer(text)
-        assert cleaned == "The answer is 42."
-
-    def test_clean_answer_with_trailing_ids_pattern(self):
-        """Answer with 'observation_ids: [...]' pattern at the end should be cleaned."""
-        text = 'This is the answer.\n\nobservation_ids: ["obs-1", "obs-2"]'
-        cleaned = _clean_done_answer(text)
-        assert cleaned == "This is the answer."
-
-    def test_clean_answer_with_memory_ids_equals(self):
-        """Answer with 'memory_ids = [...]' pattern at the end should be cleaned."""
-        text = 'Answer text here.\nmemory_ids = ["mem-1"]'
-        cleaned = _clean_done_answer(text)
-        assert cleaned == "Answer text here."
-
-    def test_clean_normal_answer_unchanged(self):
-        """Normal answer without leaked output should be unchanged."""
-        text = "This is a normal answer about observation strategies."
-        cleaned = _clean_done_answer(text)
-        assert cleaned == text
-
-    def test_clean_empty_answer(self):
-        """Empty answer should return empty."""
-        assert _clean_done_answer("") == ""
-
-    def test_clean_answer_with_observation_word_in_content(self):
-        """The word 'observation' in regular text should not be stripped."""
-        text = "Based on my observation, the user prefers dark mode."
-        cleaned = _clean_done_answer(text)
-        assert cleaned == text
-
-    def test_clean_answer_multiline_with_markdown(self):
-        """Answer with markdown and leaked JSON at end should clean only the leak."""
-        text = """Summary:
-- Point 1
-- Point 2
-
-```json
-{"mental_model_ids": ["mm-1"]}
-```"""
-        cleaned = _clean_done_answer(text)
-        assert "Point 1" in cleaned
-        assert "Point 2" in cleaned
-        assert "mental_model_ids" not in cleaned
 
 
 class TestToolNameNormalization:
@@ -234,6 +124,151 @@ class TestMentalModelFreshnessHelper:
         assert _all_mental_models_are_usable_and_fresh({}) is True
 
 
+class TestReflectStructuredOutput:
+    """Tests for the second-pass structured-output extraction."""
+
+    @pytest.mark.asyncio
+    async def test_structured_output_uses_short_retry_budget(self):
+        """A provider-specific structured-output failure must not consume the full reflect timeout."""
+        llm = MagicMock()
+        llm.call = AsyncMock(side_effect=RuntimeError("empty message content: finish_reason=length"))
+
+        result = await _generate_structured_output(
+            answer="Alice prefers concise engineering updates.",
+            response_schema={
+                "type": "object",
+                "properties": {
+                    "summary": {"type": "string"},
+                },
+                "required": ["summary"],
+            },
+            llm_config=llm,
+            reflect_id="test-reflect",
+        )
+
+        assert result.structured_output is None
+        assert result.error is not None
+        call_kwargs = llm.call.await_args.kwargs
+        assert call_kwargs["scope"] == "reflect_structured"
+        assert call_kwargs["max_retries"] == 1
+        assert call_kwargs["initial_backoff"] == 0.25
+        assert call_kwargs["max_backoff"] == 1.0
+
+    @pytest.mark.asyncio
+    async def test_structured_output_forwards_max_tokens(self):
+        """Structured extraction must receive the reflect output-token budget so
+        reasoning / preamble models do not exhaust the provider default before
+        emitting JSON (finish_reason=length, empty content -> issue #2431). The
+        plain reflect calls already pass max_completion_tokens=max_tokens; the
+        structured second pass must too."""
+        llm = MagicMock()
+        llm.call = AsyncMock(side_effect=RuntimeError("empty message content: finish_reason=length"))
+
+        await _generate_structured_output(
+            answer="Alice prefers concise engineering updates.",
+            response_schema={
+                "type": "object",
+                "properties": {"summary": {"type": "string"}},
+                "required": ["summary"],
+            },
+            llm_config=llm,
+            reflect_id="test-reflect",
+            max_tokens=4096,
+        )
+
+        call_kwargs = llm.call.await_args.kwargs
+        assert call_kwargs["max_completion_tokens"] == 4096
+
+    @pytest.mark.asyncio
+    async def test_structured_output_uses_deterministic_temperature(self, monkeypatch):
+        """Structured extraction is deterministic even when reflect generation is not."""
+        config = MagicMock(llm_temperature_reflect=0.17, llm_strict_schema_reflect=False)
+        monkeypatch.setattr("hindsight_api.engine.reflect.agent.get_config", lambda: config)
+        llm = MagicMock()
+        llm.call = AsyncMock(side_effect=RuntimeError("stop after request capture"))
+
+        await _generate_structured_output(
+            answer="Alice prefers concise engineering updates.",
+            response_schema={
+                "type": "object",
+                "properties": {"summary": {"type": "string"}},
+                "required": ["summary"],
+            },
+            llm_config=llm,
+            reflect_id="test-reflect",
+        )
+
+        assert llm.call.await_args.kwargs["temperature"] == 0.0
+
+    @pytest.mark.asyncio
+    async def test_structured_output_omits_budget_when_unset(self):
+        """With no max_tokens (default), the structured call forwards
+        max_completion_tokens=None -- which LLMProvider.call omits, exactly like
+        the plain reflect calls -- so behavior is unchanged for callers that do
+        not request a budget."""
+        llm = MagicMock()
+        llm.call = AsyncMock(side_effect=RuntimeError("boom"))
+
+        await _generate_structured_output(
+            answer="Alice prefers concise engineering updates.",
+            response_schema={
+                "type": "object",
+                "properties": {"summary": {"type": "string"}},
+                "required": ["summary"],
+            },
+            llm_config=llm,
+            reflect_id="test-reflect",
+        )
+
+        assert llm.call.await_args.kwargs.get("max_completion_tokens") is None
+
+    @pytest.mark.asyncio
+    async def test_failed_extraction_reports_why(self):
+        """A failed extraction carries the reason, so a caller can tell it apart from
+        an answer that simply held nothing matching the schema (issue #4230)."""
+        llm = MagicMock()
+        llm.call = AsyncMock(side_effect=RuntimeError("provider is down"))
+
+        result = await _generate_structured_output(
+            answer="Alice prefers concise engineering updates.",
+            response_schema={
+                "type": "object",
+                "properties": {"summary": {"type": "string"}},
+                "required": ["summary"],
+            },
+            llm_config=llm,
+            reflect_id="test-reflect",
+        )
+
+        assert result.structured_output is None
+        assert result.error == "RuntimeError: provider is down"
+
+    @pytest.mark.asyncio
+    async def test_successful_extraction_reports_no_error(self):
+        """The success path leaves ``error`` unset, so its presence alone means failure."""
+        llm = MagicMock()
+        llm.call = AsyncMock(
+            return_value=LLMCallResult(
+                content={"summary": "Alice likes short updates."},
+                usage=TokenUsage(input_tokens=10, output_tokens=5, total_tokens=15),
+            )
+        )
+
+        result = await _generate_structured_output(
+            answer="Alice prefers concise engineering updates.",
+            response_schema={
+                "type": "object",
+                "properties": {"summary": {"type": "string"}},
+                "required": ["summary"],
+            },
+            llm_config=llm,
+            reflect_id="test-reflect",
+        )
+
+        assert result.structured_output == {"summary": "Alice likes short updates."}
+        assert result.error is None
+
+
 class TestReflectAgentMocked:
     """Test reflect agent with mocked LLM outputs."""
 
@@ -242,11 +277,11 @@ class TestReflectAgentMocked:
         """Create a mock LLM provider."""
         llm = MagicMock()
         llm.call_with_tools = AsyncMock()
-        # Also mock call() for final iteration fallback - returns (response, usage) tuple
+        # Also mock call() for the final-iteration fallback.
         llm.call = AsyncMock(
-            return_value=(
-                "Fallback answer from final iteration",
-                TokenUsage(input_tokens=100, output_tokens=50, total_tokens=150),
+            return_value=LLMCallResult(
+                content="Fallback answer from final iteration",
+                usage=TokenUsage(input_tokens=100, output_tokens=50, total_tokens=150),
             )
         )
         return llm
@@ -311,8 +346,284 @@ class TestReflectAgentMocked:
         mock_functions["recall_fn"].assert_not_called()
         # First iteration forced mental models; second was released to auto.
         first_choice = mock_llm.call_with_tools.await_args_list[0].kwargs["tool_choice"]
-        assert first_choice == {"type": "function", "function": {"name": "search_mental_models"}}
-        assert mock_llm.call_with_tools.await_args_list[1].kwargs["tool_choice"] == "auto"
+        assert first_choice == LLMToolChoice.named("search_mental_models")
+        assert mock_llm.call_with_tools.await_args_list[1].kwargs["tool_choice"] is LLM_TOOL_CHOICE_AUTO
+        tool_result = mock_llm.call_with_tools.await_args_list[1].kwargs["messages"][-1]
+        assert tool_result["role"] == "tool"
+        assert tool_result["tool_call_id"] == "1"
+        assert "name" not in tool_result
+
+    @pytest.mark.asyncio
+    async def test_output_language_reaches_the_done_path(self, mock_llm, mock_functions):
+        """The tool-calling model — the one that writes done() — sees the configured
+        language: its system prompt drops the answer-in-the-question's-language rule and
+        the directive closes the user message. Forced synthesis is never reached here, so
+        fixing ``build_final_system_prompt`` alone would leave this call untouched (#3776).
+        """
+        mock_functions["search_mental_models_fn"].return_value = {
+            "mental_models": [{"id": "mm-1", "name": "User prefs", "content": "Fresh content.", "is_stale": False}]
+        }
+        mock_llm.call_with_tools.side_effect = [
+            self._mm_call(),
+            LLMToolCallResult(
+                tool_calls=[
+                    LLMToolCall(id="2", name="done", arguments={"answer": "Done.", "mental_model_ids": ["mm-1"]})
+                ],
+                finish_reason="tool_calls",
+            ),
+        ]
+
+        result = await run_reflect_agent(
+            llm_config=mock_llm,
+            bank_id="test-bank",
+            query="张伟负责什么工作？",
+            bank_profile={"name": "Test", "mission": ""},
+            has_mental_models=True,
+            budget="low",
+            max_iterations=5,
+            llm_output_language="English",
+            **mock_functions,
+        )
+
+        assert result.text == "Done."
+        mock_llm.call.assert_not_called()  # answered via done(), not forced synthesis
+        for call in mock_llm.call_with_tools.await_args_list:
+            messages = call.kwargs["messages"]
+            assert messages[0]["role"] == "system"
+            assert "respond in that SAME language" not in messages[0]["content"]
+            assert "Respond exclusively in English" not in messages[0]["content"]
+            assert messages[1]["role"] == "user"
+            assert messages[1]["content"].startswith("张伟负责什么工作？")
+            assert "Respond exclusively in English" in messages[1]["content"]
+            # The done tool schema is the last thing the model reads before writing the
+            # answer; its own "SAME language" rule has to go too, or it wins from there.
+            done_tool = next(t for t in call.kwargs["tools"] if t["function"]["name"] == "done")
+            assert "SAME language" not in done_tool["function"]["parameters"]["properties"]["answer"]["description"]
+            assert "exclusively in English" in done_tool["function"]["description"]
+
+    @pytest.mark.asyncio
+    async def test_done_tool_answer_respects_max_tokens(self, mock_llm, mock_functions, monkeypatch):
+        config = MagicMock(
+            reflect_prompt_cache_enabled=False,
+            reflect_max_completion_tokens=None,
+            llm_temperature_reflect=0.17,
+        )
+        monkeypatch.setattr("hindsight_api.engine.reflect.agent.get_config", lambda: config)
+        mock_functions["search_mental_models_fn"].return_value = {
+            "mental_models": [{"id": "mm-1", "name": "User prefs", "content": "Fresh content.", "is_stale": False}]
+        }
+        mock_llm.call_with_tools.side_effect = [
+            self._mm_call(),
+            LLMToolCallResult(
+                tool_calls=[
+                    LLMToolCall(
+                        id="2",
+                        name="done",
+                        arguments={"answer": "important detail " * 100, "mental_model_ids": ["mm-1"]},
+                    )
+                ],
+                finish_reason="tool_calls",
+            ),
+        ]
+
+        result = await run_reflect_agent(
+            llm_config=mock_llm,
+            bank_id="test-bank",
+            query="test query",
+            bank_profile={"name": "Test", "mission": "Testing"},
+            has_mental_models=True,
+            budget="low",
+            max_iterations=5,
+            max_tokens=8,
+            **mock_functions,
+        )
+
+        assert result.text == "Fallback answer from final iteration"
+        # The page budget is now enforced via the rewrite PROMPT, not a hard
+        # transport cap: max_completion_tokens is left uncapped (None) by default
+        # so thinking models don't truncate the rewrite mid-word (#3365), while the
+        # target still reaches the model through the prompt.
+        assert mock_llm.call.await_args.kwargs["max_completion_tokens"] is None
+        assert mock_llm.call.await_args.kwargs["temperature"] == 0.17
+        assert all(call.kwargs["temperature"] == 0.17 for call in mock_llm.call_with_tools.await_args_list)
+        rewrite_user_msg = mock_llm.call.await_args.kwargs["messages"][1]["content"]
+        assert "Target budget: 8 tokens" in rewrite_user_msg
+        assert result.usage.total_tokens == 150
+        assert result.llm_trace[-1].scope == "final_rewrite"
+
+    @pytest.mark.asyncio
+    async def test_forced_synthesis_answer_respects_max_tokens(self, mock_llm, mock_functions, monkeypatch):
+        """The rewrite runs on the forced path too, not only after ``done`` (#4156).
+
+        ``max_tokens`` stopped being a transport cap on the forced path in #3389,
+        and the rewrite that replaced it lived only in ``_process_done_tool`` --
+        which left the forced path enforcing nothing at all, on exactly the
+        long-running questions that end there.
+        """
+        config = MagicMock(
+            reflect_prompt_cache_enabled=False,
+            reflect_max_completion_tokens=None,
+            llm_temperature_reflect=0.17,
+        )
+        monkeypatch.setattr("hindsight_api.engine.reflect.agent.get_config", lambda: config)
+        mock_functions["search_mental_models_fn"].return_value = {
+            "mental_models": [{"id": "mm-1", "name": "Prefs", "content": "Fresh content.", "is_stale": False}]
+        }
+        mock_llm.call_with_tools.side_effect = [
+            self._mm_call(),
+            # No tool call on turn 1 -> forced final synthesis.
+            LLMToolCallResult(tool_calls=[], content="I have enough to answer.", finish_reason="stop"),
+        ]
+        mock_llm.call = AsyncMock(
+            side_effect=[
+                # The synthesis honours the prompt directive only as far as it likes.
+                LLMCallResult(
+                    content="important detail " * 100,
+                    usage=TokenUsage(input_tokens=40, output_tokens=12, total_tokens=52),
+                ),
+                LLMCallResult(
+                    content="Short capped answer.",
+                    usage=TokenUsage(input_tokens=30, output_tokens=6, total_tokens=36),
+                ),
+            ]
+        )
+
+        result = await run_reflect_agent(
+            llm_config=mock_llm,
+            bank_id="test-bank",
+            query="test query",
+            bank_profile={"name": "Test", "mission": "Testing"},
+            has_mental_models=True,
+            budget="low",
+            max_tokens=8,
+            **mock_functions,
+        )
+
+        # The returned answer is the rewritten one, and the rewrite is traced and billed.
+        assert result.text == "Short capped answer."
+        assert mock_llm.call.await_count == 2
+        rewrite_user_msg = mock_llm.call.await_args.kwargs["messages"][1]["content"]
+        assert "Target budget: 8 tokens" in rewrite_user_msg
+        # Uncapped transport on the rewrite as well -- the budget is a prompt target (#3365).
+        assert mock_llm.call.await_args.kwargs["max_completion_tokens"] is None
+        assert mock_llm.call.await_args.kwargs["temperature"] == 0.17
+        rewrite_trace = result.llm_trace[-1]
+        assert rewrite_trace.scope == "final_rewrite"
+        assert rewrite_trace.input_tokens == 30
+        assert rewrite_trace.output_tokens == 6
+
+    @pytest.mark.asyncio
+    async def test_forced_synthesis_skips_rewrite_within_budget(self, mock_llm, mock_functions):
+        """An answer already inside the budget must not pay for a second call."""
+        mock_functions["search_mental_models_fn"].return_value = {
+            "mental_models": [{"id": "mm-1", "name": "Prefs", "content": "Fresh content.", "is_stale": False}]
+        }
+        mock_llm.call_with_tools.side_effect = [
+            self._mm_call(),
+            LLMToolCallResult(tool_calls=[], content="I have enough to answer.", finish_reason="stop"),
+        ]
+        mock_llm.call = AsyncMock(
+            return_value=LLMCallResult(
+                content="Synthesized final answer.",
+                usage=TokenUsage(input_tokens=40, output_tokens=12, total_tokens=52),
+            )
+        )
+
+        result = await run_reflect_agent(
+            llm_config=mock_llm,
+            bank_id="test-bank",
+            query="test query",
+            bank_profile={"name": "Test", "mission": "Testing"},
+            has_mental_models=True,
+            budget="low",
+            max_tokens=64,
+            **mock_functions,
+        )
+
+        assert result.text == "Synthesized final answer."
+        assert mock_llm.call.await_count == 1
+        assert not any(call.scope == "final_rewrite" for call in result.llm_trace)
+
+    @pytest.mark.asyncio
+    async def test_empty_rewrite_keeps_the_original_answer(self, mock_llm, mock_functions):
+        """A blank rewrite must not blank the answer.
+
+        The rewrite runs *past* the ReflectNoAnswerError guard, so returning the
+        model's empty string would hand back a blank result from a run that had a
+        complete synthesis -- the exact failure #2959 made loud. The document
+        branch already falls back in _document_from_rewrite; prose must too.
+        """
+        mock_functions["search_mental_models_fn"].return_value = {
+            "mental_models": [{"id": "mm-1", "name": "Prefs", "content": "Fresh content.", "is_stale": False}]
+        }
+        mock_llm.call_with_tools.side_effect = [
+            self._mm_call(),
+            LLMToolCallResult(tool_calls=[], content="I have enough to answer.", finish_reason="stop"),
+        ]
+        long_answer = "important detail " * 100
+        mock_llm.call = AsyncMock(
+            side_effect=[
+                LLMCallResult(
+                    content=long_answer,
+                    usage=TokenUsage(input_tokens=40, output_tokens=12, total_tokens=52),
+                ),
+                # The rewrite model returns nothing usable.
+                LLMCallResult(
+                    content="   ",
+                    usage=TokenUsage(input_tokens=30, output_tokens=0, total_tokens=30),
+                ),
+            ]
+        )
+
+        result = await run_reflect_agent(
+            llm_config=mock_llm,
+            bank_id="test-bank",
+            query="test query",
+            bank_profile={"name": "Test", "mission": "Testing"},
+            has_mental_models=True,
+            budget="low",
+            max_tokens=8,
+            **mock_functions,
+        )
+
+        # Over budget, but a real answer beats a blank one. (The synthesis call
+        # strips its response, so compare against the stripped form.)
+        assert result.text == long_answer.strip()
+        assert mock_llm.call.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_no_tool_call_ever_raises_tool_call_error(self, mock_llm, mock_functions):
+        """A transport that strips tool support (never yields a tool call) fails loudly.
+
+        This is the harmony/gpt-oss-via-Vertex-MaaS case: the model returns free text
+        that mimics a done() payload with sibling id fields. We must NOT salvage it as
+        the answer -- reflect raises ReflectToolCallError instead.
+        """
+        mock_llm.provider = "litellm"
+        mock_llm.model = "vertex_ai/openai/gpt-oss-120b-maas"
+        leaked = '{"answer": "The user has a cat named Luna.", "memory_ids": ["mem-1"], "observation_ids": []}'
+        mock_llm.call_with_tools.side_effect = [
+            LLMToolCallResult(content=leaked, tool_calls=[], finish_reason="stop"),
+        ]
+
+        with pytest.raises(ReflectToolCallError) as exc_info:
+            await run_reflect_agent(
+                llm_config=mock_llm,
+                bank_id="test-bank",
+                query="what pets does the user have?",
+                bank_profile={"name": "Test", "mission": "Testing"},
+                has_mental_models=True,
+                budget="low",
+                max_iterations=5,
+                **mock_functions,
+            )
+
+        msg = str(exc_info.value)
+        assert "vertex_ai/openai/gpt-oss-120b-maas" in msg
+        assert "no usable tool call" in msg
+        # The forced-final fallback (mock_llm.call) must NOT have run: we fail fast
+        # rather than synthesizing a hollow answer from zero evidence.
+        mock_llm.call.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_short_circuited_agent_may_still_retrieve_under_auto(self, mock_llm, mock_functions):
@@ -355,7 +666,7 @@ class TestReflectAgentMocked:
         assert result.text == "Confirmed."
         # recall ran because the model chose it under auto, not because it was forced,
         # and it used the model's own targeted query (not a forced override).
-        assert mock_llm.call_with_tools.await_args_list[1].kwargs["tool_choice"] == "auto"
+        assert mock_llm.call_with_tools.await_args_list[1].kwargs["tool_choice"] is LLM_TOOL_CHOICE_AUTO
         mock_functions["recall_fn"].assert_called_once()
         assert mock_functions["recall_fn"].await_args.args[0] == "launch completion proof"
         mock_functions["search_observations_fn"].assert_not_called()
@@ -409,9 +720,9 @@ class TestReflectAgentMocked:
         mock_functions["recall_fn"].assert_called_once()
         choices = [c.kwargs["tool_choice"] for c in mock_llm.call_with_tools.await_args_list[:3]]
         assert choices == [
-            {"type": "function", "function": {"name": "search_mental_models"}},
-            {"type": "function", "function": {"name": "search_observations"}},
-            {"type": "function", "function": {"name": "recall"}},
+            LLMToolChoice.named("search_mental_models"),
+            LLMToolChoice.named("search_observations"),
+            LLMToolChoice.named("recall"),
         ]
 
     @pytest.mark.asyncio
@@ -455,10 +766,9 @@ class TestReflectAgentMocked:
         assert result.text == "Verified."
         mock_functions["search_observations_fn"].assert_called_once()
         mock_functions["recall_fn"].assert_called_once()
-        assert mock_llm.call_with_tools.await_args_list[1].kwargs["tool_choice"] == {
-            "type": "function",
-            "function": {"name": "search_observations"},
-        }
+        assert mock_llm.call_with_tools.await_args_list[1].kwargs["tool_choice"] == LLMToolChoice.named(
+            "search_observations"
+        )
 
     @pytest.mark.asyncio
     async def test_no_mental_models_keeps_forced_retrieval(self, mock_llm, mock_functions):
@@ -598,22 +908,91 @@ class TestReflectAgentMocked:
         assert mock_llm.call_with_tools.call_count == 3
 
     @pytest.mark.asyncio
-    async def test_recovery_from_tool_execution_error(self, mock_llm, mock_functions):
-        """Test that LLM can recover after a tool execution fails."""
-        # Make recall fail the first time, succeed the second time
-        mock_functions["recall_fn"].side_effect = [
-            Exception("Database connection failed"),
-            {"memories": [{"id": "mem-1", "content": "test memory"}]},
-        ]
+    async def test_tool_execution_error_fails_the_run(self, mock_llm, mock_functions):
+        """A tool that raises fails the whole run — the loop must not answer around it.
+
+        Reflect used to feed the exception back as a tool result and let the model
+        try again. Whatever it answered was then indistinguishable from a run over
+        a bank that genuinely holds nothing, and a mental-model refresh wrote that
+        answer over a real document (#2894). A raising tool is a broken dependency,
+        so the run fails and the caller never reaches its write.
+        """
+        mock_functions["recall_fn"].side_effect = Exception("Database connection failed")
 
         mock_llm.call_with_tools.side_effect = [
             LLMToolCallResult(
                 tool_calls=[LLMToolCall(id="1", name="recall", arguments={"query": "test"})],
                 finish_reason="tool_calls",
             ),
-            # LLM tries again after seeing error
             LLMToolCallResult(
-                tool_calls=[LLMToolCall(id="2", name="recall", arguments={"query": "test retry"})],
+                tool_calls=[
+                    LLMToolCall(
+                        id="2",
+                        name="done",
+                        arguments={"answer": "I don't have information about that.", "memory_ids": []},
+                    )
+                ],
+                finish_reason="tool_calls",
+            ),
+        ]
+
+        with pytest.raises(ReflectToolExecutionError) as exc_info:
+            await run_reflect_agent(
+                llm_config=mock_llm,
+                bank_id="test-bank",
+                query="test query",
+                bank_profile={"name": "Test", "mission": "Testing"},
+                **mock_functions,
+            )
+
+        assert "recall" in str(exc_info.value)
+        assert "Database connection failed" in str(exc_info.value)
+        # The failure is immediate: the model is never asked to carry on without it.
+        assert mock_llm.call_with_tools.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_one_failing_tool_fails_a_parallel_batch(self, mock_llm, mock_functions):
+        """Even one failure in a parallel batch fails the run, however much the others returned."""
+        mock_functions["search_observations_fn"].side_effect = Exception("pgroonga index unavailable")
+
+        mock_llm.call_with_tools.side_effect = [
+            LLMToolCallResult(
+                tool_calls=[
+                    LLMToolCall(id="1", name="recall", arguments={"query": "test"}),
+                    LLMToolCall(id="2", name="search_observations", arguments={"query": "test"}),
+                ],
+                finish_reason="tool_calls",
+            ),
+        ]
+
+        with pytest.raises(ReflectToolExecutionError) as exc_info:
+            await run_reflect_agent(
+                llm_config=mock_llm,
+                bank_id="test-bank",
+                query="test query",
+                bank_profile={"name": "Test", "mission": "Testing"},
+                **mock_functions,
+            )
+
+        assert "search_observations" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_tool_argument_errors_are_still_fed_back(self, mock_llm, mock_functions):
+        """A malformed call is the model's mistake, not a broken dependency.
+
+        ``_execute_tool`` returns ``{"error": ...}`` for a missing argument or a
+        hallucinated tool name. Those are fixable by calling again with different
+        arguments, so they keep going back to the model — only tools that *raise*
+        fail the run.
+        """
+        mock_llm.call_with_tools.side_effect = [
+            # No query argument: the dispatcher answers with an error dict.
+            LLMToolCallResult(
+                tool_calls=[LLMToolCall(id="1", name="recall", arguments={})],
+                finish_reason="tool_calls",
+            ),
+            LLMToolCallResult(
+                tool_calls=[LLMToolCall(id="2", name="recall", arguments={"query": "test"})],
                 finish_reason="tool_calls",
             ),
             LLMToolCallResult(
@@ -621,7 +1000,7 @@ class TestReflectAgentMocked:
                     LLMToolCall(
                         id="3",
                         name="done",
-                        arguments={"answer": "Recovered from error", "memory_ids": ["mem-1"]},
+                        arguments={"answer": "Recovered from a bad call", "memory_ids": ["mem-1"]},
                     )
                 ],
                 finish_reason="tool_calls",
@@ -636,8 +1015,111 @@ class TestReflectAgentMocked:
             **mock_functions,
         )
 
-        assert result.text == "Recovered from error"
+        assert result.text == "Recovered from a bad call"
         assert mock_llm.call_with_tools.call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_persistent_llm_error_fails_instead_of_synthesizing(self, mock_llm, mock_functions):
+        """A provider that keeps failing fails the run, rather than answering around it.
+
+        The loop used to fall through to a forced final synthesis on any LLM error.
+        With retrieval never completed, that synthesis had nothing to work from and
+        produced a confident "no information" answer that callers stored (#2894).
+        The provider's own 429/5xx retries already ran inside the call, so reaching
+        here twice means the failure is not transient.
+        """
+        mock_llm.call_with_tools.side_effect = RuntimeError("provider unavailable")
+
+        with pytest.raises(RuntimeError, match="provider unavailable"):
+            await run_reflect_agent(
+                llm_config=mock_llm,
+                bank_id="test-bank",
+                query="test query",
+                bank_profile={"name": "Test", "mission": "Testing"},
+                **mock_functions,
+            )
+
+        # Retried once (capped at 2 consecutive errors), then gave up.
+        assert mock_llm.call_with_tools.call_count == 2
+        mock_llm.call.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_transient_llm_error_is_still_retried(self, mock_llm, mock_functions):
+        """One failed turn followed by a good one is a normal run, not a failure."""
+        mock_llm.call_with_tools.side_effect = [
+            RuntimeError("connection reset"),
+            LLMToolCallResult(
+                tool_calls=[LLMToolCall(id="1", name="recall", arguments={"query": "test"})],
+                finish_reason="tool_calls",
+            ),
+            LLMToolCallResult(
+                tool_calls=[
+                    LLMToolCall(
+                        id="2",
+                        name="done",
+                        arguments={"answer": "Recovered after a blip", "memory_ids": ["mem-1"]},
+                    )
+                ],
+                finish_reason="tool_calls",
+            ),
+        ]
+
+        result = await run_reflect_agent(
+            llm_config=mock_llm,
+            bank_id="test-bank",
+            query="test query",
+            bank_profile={"name": "Test", "mission": "Testing"},
+            **mock_functions,
+        )
+
+        assert result.text == "Recovered after a blip"
+
+    @pytest.mark.asyncio
+    async def test_cancellation_from_a_tool_is_not_wrapped(self, mock_llm, mock_functions):
+        """A client disconnect must stay a cancellation, not become a tool failure.
+
+        ``recall`` re-raises ``OperationCancelledError`` so the HTTP layer can
+        answer 499 (issue #2122). Wrapping it in ``ReflectToolExecutionError``
+        would report a client that went away as a server-side retrieval failure.
+        """
+        mock_functions["recall_fn"].side_effect = OperationCancelledError("client disconnected")
+
+        mock_llm.call_with_tools.side_effect = [
+            LLMToolCallResult(
+                tool_calls=[LLMToolCall(id="1", name="recall", arguments={"query": "test"})],
+                finish_reason="tool_calls",
+            ),
+        ]
+
+        with pytest.raises(OperationCancelledError):
+            await run_reflect_agent(
+                llm_config=mock_llm,
+                bank_id="test-bank",
+                query="test query",
+                bank_profile={"name": "Test", "mission": "Testing"},
+                **mock_functions,
+            )
+
+    @pytest.mark.asyncio
+    async def test_cancellation_from_the_llm_call_is_not_retried(self, mock_llm, mock_functions):
+        """A cancellation raised by the LLM call is not a provider failure.
+
+        It must not be retried and must not be synthesized around — it reaches the
+        HTTP layer as itself, so a client disconnect stays a 499 (issue #2122).
+        """
+        mock_llm.call_with_tools.side_effect = OperationCancelledError("client disconnected")
+
+        with pytest.raises(OperationCancelledError):
+            await run_reflect_agent(
+                llm_config=mock_llm,
+                bank_id="test-bank",
+                query="test query",
+                bank_profile={"name": "Test", "mission": "Testing"},
+                **mock_functions,
+            )
+
+        assert mock_llm.call_with_tools.call_count == 1
+        mock_llm.call.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_normalizes_tool_names_in_other_tools(self, mock_llm, mock_functions):
@@ -673,82 +1155,49 @@ class TestReflectAgentMocked:
         mock_functions["recall_fn"].assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_short_circuit_answer_is_capped_by_max_tokens(self, mock_llm, mock_functions):
-        """When the LLM short-circuits (returns text without calling a tool) and the text
-        exceeds max_tokens, the agent must rewrite it through a capped call so the final
-        user-visible answer respects the configured limit.
+    async def test_stop_after_evidence_uses_forced_final_synthesis(self, mock_llm, mock_functions):
+        """A model that tool-called at least once and then stops (no tool call) is a
+        legitimate completion: reflect does a clean forced final-synthesis call (tools
+        disabled) rather than salvaging free text or raising ReflectToolCallError.
         """
-        # Build a long response that's well over the cap in cl100k_base tokens.
-        long_answer = " ".join(
-            ["This is a detailed paragraph about the team, their roles, and their recurring meetings."] * 80
-        )
-        # The short-circuit path: tool_calls empty, content populated.
-        mock_llm.call_with_tools.return_value = LLMToolCallResult(
-            tool_calls=[],
-            content=long_answer,
-            finish_reason="stop",
-            input_tokens=10,
-            output_tokens=500,
-        )
+        mock_functions["search_mental_models_fn"].return_value = {
+            "mental_models": [{"id": "mm-1", "name": "Prefs", "content": "Fresh content.", "is_stale": False}]
+        }
+        mock_llm.call_with_tools.side_effect = [
+            # Turn 0: a real tool call -> saw_tool_call becomes True.
+            self._mm_call(),
+            # Turn 1: model stops with plain text and no tool call.
+            LLMToolCallResult(tool_calls=[], content="I have enough to answer.", finish_reason="stop"),
+        ]
         mock_llm.call = AsyncMock(
-            return_value=(
-                "Short rewritten answer.",
-                TokenUsage(input_tokens=50, output_tokens=10, total_tokens=60),
+            return_value=LLMCallResult(
+                content="Synthesized final answer.",
+                usage=TokenUsage(input_tokens=40, output_tokens=12, total_tokens=52),
             )
         )
 
-        cap = 50
+        cap = 64
         result = await run_reflect_agent(
             llm_config=mock_llm,
             bank_id="test-bank",
             query="test query",
             bank_profile={"name": "Test", "mission": "Testing"},
+            has_mental_models=True,
+            budget="low",
             max_tokens=cap,
             **mock_functions,
         )
 
-        # The rewrite call must have been made, and it must carry the cap.
-        assert mock_llm.call.await_count == 1, (
-            f"expected exactly one capped rewrite call, got {mock_llm.call.await_count}"
-        )
-        rewrite_kwargs = mock_llm.call.await_args.kwargs
-        assert rewrite_kwargs.get("max_completion_tokens") == cap, (
-            f"rewrite call should use max_completion_tokens={cap}, got {rewrite_kwargs.get('max_completion_tokens')}"
-        )
-
-        # The final answer is the rewritten text, not the oversized original.
-        assert result.text == "Short rewritten answer."
-
-        # The trace records the rewrite step so we can see it was invoked.
-        assert any(entry.scope == "final_rewrite" for entry in result.llm_trace), (
-            f"llm_trace should include a final_rewrite entry, got {result.llm_trace}"
-        )
-
-    @pytest.mark.asyncio
-    async def test_short_circuit_answer_under_cap_is_not_rewritten(self, mock_llm, mock_functions):
-        """If the short-circuit answer already fits within max_tokens, no extra rewrite
-        call should happen — we don't want to pay for a second LLM call in the common case.
-        """
-        short_answer = "Small answer that already fits."
-        mock_llm.call_with_tools.return_value = LLMToolCallResult(
-            tool_calls=[],
-            content=short_answer,
-            finish_reason="stop",
-            input_tokens=10,
-            output_tokens=8,
-        )
-
-        result = await run_reflect_agent(
-            llm_config=mock_llm,
-            bank_id="test-bank",
-            query="test query",
-            bank_profile={"name": "Test", "mission": "Testing"},
-            max_tokens=200,
-            **mock_functions,
-        )
-
-        assert result.text == short_answer
-        mock_llm.call.assert_not_called()
+        # Answer comes from the clean forced-final call, not the turn-1 free text.
+        assert result.text == "Synthesized final answer."
+        assert mock_llm.call.await_count == 1
+        # The forced-final synthesis no longer hard-caps the transport at the page
+        # budget (that truncates thinking models mid-word, #3365): the call is
+        # uncapped by default and the page length reaches the model as a prompt
+        # directive instead.
+        assert mock_llm.call.await_args.kwargs["max_completion_tokens"] is None
+        final_prompt = mock_llm.call.await_args.kwargs["messages"][1]["content"]
+        assert f"approximately {cap} tokens" in final_prompt
 
     @pytest.mark.asyncio
     async def test_max_iterations_reached(self, mock_llm, mock_functions):
@@ -798,6 +1247,233 @@ class TestReflectAgentMocked:
                 timeout=0.1,  # Very short timeout to trigger quickly
             )
 
+    @pytest.mark.asyncio
+    async def test_tool_results_follow_the_models_tool_call_order(
+        self, mock_llm: MagicMock, mock_functions: dict[str, AsyncMock]
+    ) -> None:
+        """A mixed [allowed, hallucinated, allowed] batch serializes in the model's order.
+
+        Anthropic requires the tool_result blocks to line up with the assistant
+        tool_use blocks. Rejections for hallucinated tools used to be written
+        before the executed tools' results, so a hallucinated call in the middle
+        of a batch produced an out-of-order history the API rejects.
+        """
+        mock_llm.call_with_tools.side_effect = [
+            LLMToolCallResult(
+                tool_calls=[
+                    LLMToolCall(id="a", name="recall", arguments={"query": "q1"}),
+                    LLMToolCall(id="b", name="totally_made_up", arguments={}),
+                    LLMToolCall(id="c", name="search_observations", arguments={"query": "q2"}),
+                ],
+                finish_reason="tool_calls",
+            ),
+            LLMToolCallResult(
+                tool_calls=[LLMToolCall(id="d", name="done", arguments={"answer": "A", "memory_ids": ["mem-1"]})],
+                finish_reason="tool_calls",
+            ),
+        ]
+
+        await run_reflect_agent(
+            llm_config=mock_llm,
+            bank_id="test-bank",
+            query="test query",
+            bank_profile={"name": "Test", "mission": "Testing"},
+            **mock_functions,
+        )
+
+        messages = mock_llm.call_with_tools.call_args_list[-1].kwargs["messages"]
+        assistant = [m for m in messages if m.get("role") == "assistant" and m.get("tool_calls")][-1]
+        assert [tc["id"] for tc in assistant["tool_calls"]] == ["a", "b", "c"]
+        tool_messages = [m for m in messages if m.get("role") == "tool"]
+        assert [m["tool_call_id"] for m in tool_messages] == ["a", "b", "c"]
+        # Each slot carries its OWN payload rather than a neighbour's.
+        assert "memories" in tool_messages[0]["content"]
+        assert "totally_made_up" in tool_messages[1]["content"]
+        assert "observations" in tool_messages[2]["content"]
+
+    @pytest.mark.asyncio
+    async def test_duplicate_tool_call_ids_keep_their_own_results(
+        self, mock_llm: MagicMock, mock_functions: dict[str, AsyncMock]
+    ) -> None:
+        """Results are slotted by position, so a reused tool_call_id loses nothing.
+
+        Every first-party provider mints unique ids, but a non-conforming
+        OpenAI-compatible gateway can repeat one (or send an empty string) across
+        a parallel batch. Keying the results by id would drop one tool's evidence
+        and duplicate the other's.
+        """
+        mock_functions["recall_fn"].side_effect = [
+            {"memories": [{"id": "mem-1", "content": "first"}]},
+            {"memories": [{"id": "mem-2", "content": "second"}]},
+        ]
+        mock_llm.call_with_tools.side_effect = [
+            LLMToolCallResult(
+                tool_calls=[
+                    LLMToolCall(id="dup", name="recall", arguments={"query": "q1"}),
+                    LLMToolCall(id="dup", name="recall", arguments={"query": "q2"}),
+                ],
+                finish_reason="tool_calls",
+            ),
+            LLMToolCallResult(
+                tool_calls=[LLMToolCall(id="d", name="done", arguments={"answer": "A", "memory_ids": ["mem-1"]})],
+                finish_reason="tool_calls",
+            ),
+        ]
+
+        await run_reflect_agent(
+            llm_config=mock_llm,
+            bank_id="test-bank",
+            query="test query",
+            bank_profile={"name": "Test", "mission": "Testing"},
+            **mock_functions,
+        )
+
+        messages = mock_llm.call_with_tools.call_args_list[-1].kwargs["messages"]
+        contents = [m["content"] for m in messages if m.get("role") == "tool"]
+        assert len(contents) == 2
+        assert "first" in contents[0], contents
+        assert "second" in contents[1], contents
+
+    @pytest.mark.asyncio
+    async def test_duplicate_tool_call_ids_are_uniquified_on_the_wire(
+        self, mock_llm: MagicMock, mock_functions: dict[str, AsyncMock]
+    ) -> None:
+        """Repeated or empty ids get unique wire ids so a strict Anthropic API accepts the turn.
+
+        Anthropic rejects a turn where two tool_use blocks share an id
+        ("each tool_use must have a single result"), which used to make the whole
+        reflect loop fail on the first tool round-trip against a strict endpoint.
+        """
+        mock_functions["recall_fn"].side_effect = [
+            {"memories": [{"id": "mem-1", "content": "first"}]},
+            {"memories": [{"id": "mem-2", "content": "second"}]},
+            {"memories": [{"id": "mem-3", "content": "third"}]},
+        ]
+        mock_llm.call_with_tools.side_effect = [
+            LLMToolCallResult(
+                tool_calls=[
+                    LLMToolCall(id="dup", name="recall", arguments={"query": "q1"}),
+                    LLMToolCall(id="dup", name="recall", arguments={"query": "q2"}),
+                    LLMToolCall(id="", name="recall", arguments={"query": "q3"}),
+                ],
+                finish_reason="tool_calls",
+            ),
+            LLMToolCallResult(
+                tool_calls=[LLMToolCall(id="d", name="done", arguments={"answer": "A", "memory_ids": ["mem-1"]})],
+                finish_reason="tool_calls",
+            ),
+        ]
+
+        await run_reflect_agent(
+            llm_config=mock_llm,
+            bank_id="test-bank",
+            query="test query",
+            bank_profile={"name": "Test", "mission": "Testing"},
+            **mock_functions,
+        )
+
+        messages = mock_llm.call_with_tools.call_args_list[-1].kwargs["messages"]
+        assistant = [m for m in messages if m.get("role") == "assistant" and m.get("tool_calls")][-1]
+        tool_use_ids = [tc["id"] for tc in assistant["tool_calls"]]
+        assert len(tool_use_ids) == 3
+        assert all(tool_use_id for tool_use_id in tool_use_ids), tool_use_ids
+        assert len(set(tool_use_ids)) == 3, tool_use_ids
+        # Every tool_result maps to exactly one tool_use, in the model's order.
+        tool_messages = [m for m in messages if m.get("role") == "tool"]
+        assert [m["tool_call_id"] for m in tool_messages] == tool_use_ids
+        # ...and each slot still carries its OWN payload.
+        assert "first" in tool_messages[0]["content"], tool_messages
+        assert "second" in tool_messages[1]["content"], tool_messages
+        assert "third" in tool_messages[2]["content"], tool_messages
+
+    @pytest.mark.asyncio
+    async def test_wire_ids_stay_unique_across_iterations(
+        self, mock_llm: MagicMock, mock_functions: dict[str, AsyncMock]
+    ) -> None:
+        """A gateway that blanks ids blanks them EVERY turn; the replacements must still differ.
+
+        The whole reflect loop serializes into one request, so deduping per batch
+        would mint the same replacement id on turn 1 and turn 2 and hand the
+        strict API back the collision it was supposed to remove.
+        """
+        mock_functions["recall_fn"].side_effect = [
+            {"memories": [{"id": "mem-1", "content": "first"}]},
+            {"memories": [{"id": "mem-2", "content": "second"}]},
+        ]
+        mock_llm.call_with_tools.side_effect = [
+            LLMToolCallResult(
+                tool_calls=[LLMToolCall(id="", name="recall", arguments={"query": "q1"})],
+                finish_reason="tool_calls",
+            ),
+            LLMToolCallResult(
+                tool_calls=[LLMToolCall(id="", name="recall", arguments={"query": "q2"})],
+                finish_reason="tool_calls",
+            ),
+            LLMToolCallResult(
+                tool_calls=[LLMToolCall(id="d", name="done", arguments={"answer": "A", "memory_ids": ["mem-1"]})],
+                finish_reason="tool_calls",
+            ),
+        ]
+
+        await run_reflect_agent(
+            llm_config=mock_llm,
+            bank_id="test-bank",
+            query="test query",
+            bank_profile={"name": "Test", "mission": "Testing"},
+            **mock_functions,
+        )
+
+        messages = mock_llm.call_with_tools.call_args_list[-1].kwargs["messages"]
+        tool_use_ids = [
+            tc["id"] for m in messages if m.get("role") == "assistant" and m.get("tool_calls") for tc in m["tool_calls"]
+        ]
+        assert len(tool_use_ids) == 2, tool_use_ids
+        assert len(set(tool_use_ids)) == 2, tool_use_ids
+        # Each tool_use is still answered by exactly one tool_result.
+        assert [m["tool_call_id"] for m in messages if m.get("role") == "tool"] == tool_use_ids
+
+    @pytest.mark.asyncio
+    async def test_premature_done_guardrail_emits_a_usable_wire_id(
+        self, mock_llm: MagicMock, mock_functions: dict[str, AsyncMock]
+    ) -> None:
+        """The "search first" guardrail loops, so its tool_use needs a deduped id too.
+
+        An empty id reaches Anthropic verbatim as ``tool_use.id: ""`` and is
+        rejected, taking the whole reflect run with it.
+        """
+        mock_functions["recall_fn"].side_effect = [{"memories": [{"id": "mem-1", "content": "first"}]}]
+        mock_llm.call_with_tools.side_effect = [
+            LLMToolCallResult(
+                tool_calls=[LLMToolCall(id="", name="done", arguments={"answer": "premature"})],
+                finish_reason="tool_calls",
+            ),
+            LLMToolCallResult(
+                tool_calls=[LLMToolCall(id="", name="recall", arguments={"query": "q"})],
+                finish_reason="tool_calls",
+            ),
+            LLMToolCallResult(
+                tool_calls=[LLMToolCall(id="d", name="done", arguments={"answer": "A", "memory_ids": ["mem-1"]})],
+                finish_reason="tool_calls",
+            ),
+        ]
+
+        await run_reflect_agent(
+            llm_config=mock_llm,
+            bank_id="test-bank",
+            query="test query",
+            bank_profile={"name": "Test", "mission": "Testing"},
+            **mock_functions,
+        )
+
+        messages = mock_llm.call_with_tools.call_args_list[-1].kwargs["messages"]
+        tool_use_ids = [
+            tc["id"] for m in messages if m.get("role") == "assistant" and m.get("tool_calls") for tc in m["tool_calls"]
+        ]
+        assert len(tool_use_ids) == 2, tool_use_ids
+        assert all(tool_use_id for tool_use_id in tool_use_ids), tool_use_ids
+        assert len(set(tool_use_ids)) == 2, tool_use_ids
+        assert [m["tool_call_id"] for m in messages if m.get("role") == "tool"] == tool_use_ids
+
 
 class TestContextOverflowHelpers:
     """Unit tests for context-overflow detection helpers."""
@@ -820,7 +1496,6 @@ class TestContextOverflowHelpers:
             {
                 "role": "tool",
                 "tool_call_id": "x",
-                "name": "recall",
                 "content": '{"memories": ['
                 + ", ".join(
                     [
@@ -868,9 +1543,9 @@ class TestContextOverflowBehavior:
         llm = MagicMock()
         llm.call_with_tools = AsyncMock()
         llm.call = AsyncMock(
-            return_value=(
-                "Synthesized answer from gathered evidence.",
-                TokenUsage(input_tokens=50, output_tokens=20, total_tokens=70),
+            return_value=LLMCallResult(
+                content="Synthesized answer from gathered evidence.",
+                usage=TokenUsage(input_tokens=50, output_tokens=20, total_tokens=70),
             )
         )
         return llm
@@ -890,7 +1565,8 @@ class TestContextOverflowBehavior:
     async def test_proactive_guard_fires_when_budget_exceeded(self, mock_llm, mock_functions_with_large_output):
         """When token count exceeds max_context_tokens after a tool call, the agent
         should immediately synthesize from gathered evidence instead of making
-        another LLM call that would overflow."""
+        another LLM call that would overflow. Evidence beyond the prompt budget
+        is split-synthesized (parallel claim extraction + reduce), never dropped."""
         # First call: LLM calls recall (forced by iter 0 with no mental models)
         mock_llm.call_with_tools.return_value = LLMToolCallResult(
             tool_calls=[LLMToolCall(id="1", name="recall", arguments={"query": "test"})],
@@ -911,8 +1587,12 @@ class TestContextOverflowBehavior:
         # call_with_tools was called once (for the forced recall), then the guard
         # kicked in — no further tool-call iterations
         assert mock_llm.call_with_tools.call_count == 1
-        # llm.call() was invoked to generate the final synthesis
-        mock_llm.call.assert_called_once()
+        # The synthesis ran: at least one no-tools call, ending with the final
+        # (single-shot or reduce) call. Whether the history split depends on its
+        # rendered size vs the floored chunk budget — both shapes are valid here.
+        assert mock_llm.call.call_count >= 1
+        scopes = [c.scope for c in result.llm_trace]
+        assert scopes[-1] == "final"
 
     @pytest.mark.asyncio
     async def test_context_overflow_error_skips_retry(self, mock_llm, mock_functions_with_large_output):
@@ -934,6 +1614,128 @@ class TestContextOverflowBehavior:
         assert mock_llm.call_with_tools.call_count == 1
         # Final synthesis was called
         mock_llm.call.assert_called_once()
+
+
+class TestNoAnswerFailsHard:
+    """A run that produces no answer raises instead of inventing placeholder text (#2959).
+
+    Reflect used to substitute "No answer provided." (or an iteration-limit
+    sentence) whenever a terminal path came up empty. Both are non-empty strings,
+    so every downstream emptiness guard read them as a real answer: a mental-model
+    refresh persisted the stub over a document built across months of refreshes and
+    recorded the operation as ``completed`` with no error. There is no answer to
+    return in these cases, so the run fails.
+    """
+
+    @pytest.fixture
+    def mock_llm(self):
+        llm = MagicMock()
+        llm.provider = "openai"
+        llm.model = "gpt-test"
+        llm.call_with_tools = AsyncMock()
+        llm.call = AsyncMock(
+            return_value=LLMCallResult(
+                content="Synthesized answer from gathered evidence.",
+                usage=TokenUsage(input_tokens=10, output_tokens=5, total_tokens=15),
+            )
+        )
+        return llm
+
+    @pytest.fixture
+    def mock_functions(self):
+        return {
+            "search_mental_models_fn": AsyncMock(return_value={"mental_models": []}),
+            "search_observations_fn": AsyncMock(return_value={"observations": []}),
+            "recall_fn": AsyncMock(return_value={"memories": [{"id": "mem-1", "content": "test memory"}]}),
+            "expand_fn": AsyncMock(return_value={"memories": []}),
+        }
+
+    @staticmethod
+    def _recall_then(done_arguments: dict) -> list[LLMToolCallResult]:
+        """Gather evidence first, so ``done`` is not rejected by the evidence guardrail."""
+        return [
+            LLMToolCallResult(
+                tool_calls=[LLMToolCall(id="1", name="recall", arguments={"query": "test query"})],
+                finish_reason="tool_calls",
+            ),
+            LLMToolCallResult(
+                tool_calls=[LLMToolCall(id="2", name="done", arguments=done_arguments)],
+                finish_reason="tool_calls",
+            ),
+        ]
+
+    async def _run(self, mock_llm, mock_functions):
+        return await run_reflect_agent(
+            llm_config=mock_llm,
+            bank_id="test-bank",
+            query="test query",
+            bank_profile={"name": "Test", "mission": "Testing"},
+            has_mental_models=False,
+            budget="low",
+            max_iterations=5,
+            **mock_functions,
+        )
+
+    @pytest.mark.asyncio
+    async def test_blank_done_answer_raises(self, mock_llm, mock_functions):
+        """The production trigger: output truncated mid-tool-call, so ``answer`` arrives empty."""
+        mock_llm.call_with_tools.side_effect = self._recall_then({"answer": "   ", "memory_ids": ["mem-1"]})
+
+        with pytest.raises(ReflectNoAnswerError) as exc_info:
+            await self._run(mock_llm, mock_functions)
+
+        assert "no answer" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_missing_done_answer_raises(self, mock_llm, mock_functions):
+        """``answer`` absent entirely, not just blank."""
+        mock_llm.call_with_tools.side_effect = self._recall_then({"memory_ids": ["mem-1"]})
+
+        with pytest.raises(ReflectNoAnswerError):
+            await self._run(mock_llm, mock_functions)
+
+    @pytest.mark.asyncio
+    async def test_empty_document_mode_answer_raises(self, mock_llm, mock_functions):
+        """Document mode that renders to nothing is the same failure as a blank answer."""
+        mock_llm.call_with_tools.side_effect = self._recall_then(
+            {"document": {"sections": []}, "memory_ids": ["mem-1"]}
+        )
+
+        with pytest.raises(ReflectNoAnswerError):
+            await self._run(mock_llm, mock_functions)
+
+    @pytest.mark.asyncio
+    async def test_empty_final_synthesis_raises(self, mock_llm, mock_functions):
+        """The forced final synthesis (tools disabled) returning nothing also fails."""
+        mock_llm.call.return_value = LLMCallResult(
+            content="   ",
+            usage=TokenUsage(input_tokens=10, output_tokens=0, total_tokens=10),
+        )
+        # Gather evidence, then stop tool-calling: the agent falls through to the
+        # forced synthesis, which is where the empty text comes from.
+        mock_llm.call_with_tools.side_effect = [
+            LLMToolCallResult(
+                tool_calls=[LLMToolCall(id="1", name="recall", arguments={"query": "test query"})],
+                finish_reason="tool_calls",
+            ),
+            LLMToolCallResult(content="", tool_calls=[], finish_reason="stop"),
+        ]
+
+        with pytest.raises(ReflectNoAnswerError) as exc_info:
+            await self._run(mock_llm, mock_functions)
+
+        assert "final synthesis" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_real_answer_still_returned(self, mock_llm, mock_functions):
+        """The guard must not touch a run that did produce an answer."""
+        mock_llm.call_with_tools.side_effect = self._recall_then(
+            {"answer": "The user has a cat named Luna.", "memory_ids": ["mem-1"]}
+        )
+
+        result = await self._run(mock_llm, mock_functions)
+
+        assert result.text == "The user has a cat named Luna."
 
 
 class TestDirectiveLeakageOnEmptyBank:
@@ -958,7 +1760,7 @@ class TestDirectiveLeakageOnEmptyBank:
         bank_id = f"test-directive-leak-{uuid.uuid4().hex[:8]}"
         try:
             # Ensure bank exists (auto-creates it), but retain nothing.
-            await memory.get_bank_profile(bank_id, request_context=request_context)
+            await memory.ensure_bank_profile(bank_id, request_context=request_context)
 
             await memory.create_directive(
                 bank_id=bank_id,
@@ -1022,7 +1824,6 @@ class TestContextOverflowIntegration:
 
             # Patch get_config where memory_engine uses it, injecting a tiny
             # max_context_tokens.  Everything else delegates to the real config.
-            real_config = memory._get_raw_config() if hasattr(memory, "_get_raw_config") else None
             from hindsight_api.config import get_config as _real_get_config
 
             class _TinyContextProxy:
@@ -1183,3 +1984,151 @@ class TestMentalModelShortCircuitRealLLM:
             context="A stale mental model claimed the launch was still pending, but the freshly retrieved raw "
             "fact (deploy log A-1029) shows it shipped on Friday. The agent should correct the stale summary.",
         )
+
+
+class _StepCacheProvider:
+    """Fake provider that records the step-by-step incremental-cache protocol.
+
+    Serves as both ``llm_config`` and its own ``_provider_impl``: the reflect loop
+    reaches the cache methods via ``llm_config._provider_impl`` and issues LLM
+    turns via ``llm_config.call_with_tools``. Every ``call_with_tools`` records the
+    ``cached_prefix`` / ``cached_prefix_message_count`` it was handed, so a test
+    can assert that each ``auto`` turn reuses exactly the previous turn's full
+    input and that the caches are torn down at the end.
+    """
+
+    def __init__(self, scripted: list[LLMToolCallResult]):
+        self._scripted = scripted
+        self._i = 0
+        self._provider_impl = self
+        self.cache_counter = 0
+        self.created: list[tuple[str, int]] = []  # (session_id, #messages covered)
+        self.deleted_sessions: list[str] = []
+        self.calls: list[dict] = []  # per call_with_tools: tool_choice / cached_prefix / count / #messages
+
+    # -- incremental cache capability --
+    def supports_incremental_prompt_cache(self) -> bool:
+        return True
+
+    async def create_incremental_cache(self, *, session_id, messages, tools=None):
+        self.cache_counter += 1
+        self.created.append((session_id, len(messages)))
+        return f"cache-{self.cache_counter}"
+
+    async def delete_cached_prefix(self, name):  # pragma: no cover - not exercised here
+        pass
+
+    async def delete_cache_session(self, session_id):
+        self.deleted_sessions.append(session_id)
+
+    # -- llm surface --
+    async def call_with_tools(
+        self,
+        *,
+        messages,
+        tools,
+        scope="tools",
+        tool_choice="auto",
+        cached_prefix=None,
+        cached_prefix_message_count=0,
+        **_,
+    ):
+        self.calls.append(
+            {
+                "tool_choice": tool_choice,
+                "cached_prefix": cached_prefix,
+                "cached_prefix_message_count": cached_prefix_message_count,
+                "n_messages": len(messages),
+            }
+        )
+        res = self._scripted[self._i]
+        self._i += 1
+        return res
+
+    async def call(self, *args, **kwargs):  # final-synthesis fallback (unused on the happy path)
+        return LLMCallResult(content="final", usage=TokenUsage(input_tokens=1, output_tokens=1, total_tokens=2))
+
+
+class TestReflectIncrementalCache:
+    """The step-by-step Gemini context cache: each auto turn reuses the previous
+    turn's full input, and every per-reflect cache is deleted at the end."""
+
+    @pytest.mark.asyncio
+    async def test_each_auto_turn_reuses_previous_step_cache_and_cleans_up(self):
+        functions = {
+            "search_observations_fn": AsyncMock(return_value={"observations": [{"id": "obs-1"}]}),
+            "recall_fn": AsyncMock(return_value={"memories": [{"id": "mem-1", "content": "x"}]}),
+            "search_mental_models_fn": AsyncMock(return_value={"mental_models": []}),
+            "expand_fn": AsyncMock(return_value={"memories": []}),
+        }
+
+        def _tc(cid, name):
+            # A real query arg so the stubbed tools return evidence (not an
+            # error), which lets the terminal ``done`` call be accepted.
+            return LLMToolCallResult(
+                tool_calls=[LLMToolCall(id=cid, name=name, arguments={"query": "q"})], finish_reason="tool_calls"
+            )
+
+        # Forced obs -> forced recall -> two auto recalls -> done.
+        provider = _StepCacheProvider(
+            scripted=[
+                _tc("0", "search_observations"),
+                _tc("1", "recall"),
+                _tc("2", "recall"),
+                _tc("3", "recall"),
+                LLMToolCallResult(
+                    tool_calls=[LLMToolCall(id="4", name="done", arguments={"answer": "A", "memory_ids": ["mem-1"]})],
+                    finish_reason="tool_calls",
+                ),
+            ]
+        )
+
+        result = await run_reflect_agent(
+            llm_config=provider,
+            bank_id="cache-bank",
+            query="q",
+            bank_profile={"name": "T", "mission": "M"},
+            has_mental_models=False,
+            include_observations=True,
+            include_recall=True,
+            budget="high",  # keep the full forced path (no early release) so counts are deterministic
+            max_iterations=8,
+            **functions,
+        )
+        assert result.text == "A"
+
+        calls = provider.calls
+        # 2 forced turns (obs, recall) then 3 auto turns (recall, recall, done).
+        assert [c["tool_choice"] for c in calls[:2]] == [
+            LLMToolChoice.named("search_observations"),
+            LLMToolChoice.named("recall"),
+        ]
+        assert all(c["tool_choice"] is LLM_TOOL_CHOICE_AUTO for c in calls[2:])
+
+        # Forced turns never reference a cache (Gemini forbids cache + tool_config).
+        assert calls[0]["cached_prefix"] is None
+        assert calls[1]["cached_prefix"] is None
+
+        # Every auto turn references a cache, and the count it was handed equals the
+        # PREVIOUS turn's full input length — i.e. it reuses the previous step entirely.
+        for i in range(2, len(calls)):
+            assert calls[i]["cached_prefix"] is not None, f"auto call {i} should use the cache"
+            assert calls[i]["cached_prefix_message_count"] == calls[i - 1]["n_messages"], (
+                f"auto call {i} must cache exactly the previous step's input"
+            )
+
+        # Caches are created covering a strictly growing prefix, one per auto turn.
+        assert [n for _, n in provider.created] == [
+            calls[1]["n_messages"],
+            calls[2]["n_messages"],
+            calls[3]["n_messages"],
+        ]
+        assert all(sid.startswith("reflect:") for sid, _ in provider.created)
+
+        # Ephemeral: the session is torn down exactly once when the reflect ends.
+        # Teardown is deliberately detached (the caller must not wait on deletes),
+        # so drain the background task before asserting it ran.
+        await asyncio.gather(*list(_cache_cleanup_tasks), return_exceptions=True)
+        assert len(provider.deleted_sessions) == 1
+        assert provider.deleted_sessions[0].startswith("reflect:")
+        assert provider.deleted_sessions[0] == provider.created[0][0]

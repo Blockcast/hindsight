@@ -3,6 +3,7 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
+from enum import StrEnum
 from typing import TYPE_CHECKING
 
 from hindsight_api.extensions.base import Extension
@@ -82,6 +83,18 @@ class ValidationResult:
 # =============================================================================
 
 
+class PrecheckOperation(StrEnum):
+    """Route operation names passed to the pre-body-parse precheck hook."""
+
+    DRY_RUN_EXTRACT = "dry_run_extract"
+    FILES_RETAIN = "files_retain"
+    MENTAL_MODEL_CREATE = "mental_model_create"
+    MENTAL_MODEL_REFRESH = "mental_model_refresh"
+    RECALL = "recall"
+    REFLECT = "reflect"
+    RETAIN = "retain"
+
+
 @dataclass
 class PrecheckContext:
     """Context for a pre-body-parse precheck on an operation.
@@ -91,9 +104,7 @@ class PrecheckContext:
     therefore intentionally carries only the cheap, already-resolved
     pieces of request state:
 
-    - ``operation``: a short string identifying the route, e.g. ``"retain"``,
-      ``"recall"``, ``"reflect"``, ``"files_retain"``, ``"mental_model_create"``,
-      ``"mental_model_refresh"``.
+    - ``operation``: a short string-compatible enum identifying the route.
     - ``bank_id``: parsed from the URL path.
     - ``request_context``: the authenticated :class:`RequestContext` (tenant
       already resolved by the tenant extension).
@@ -108,10 +119,32 @@ class PrecheckContext:
     the source of truth for the precise per-call cost / quota arithmetic.
     """
 
-    operation: str
+    operation: PrecheckOperation
     bank_id: str
     request_context: "RequestContext"
     content_length: int | None = None
+
+
+@dataclass
+class RetainAttachmentInfo:
+    """One inline attachment carried by a retain, described but not decoded.
+
+    A validator sees the *facts about* each attachment — how big it is, what the
+    caller says it is, what it was called — without the bytes, which can be tens
+    of megabytes and are almost never what a policy decision turns on. The
+    ``short_id`` matches the ``⟦hs-att:…⟧`` placeholder in the item's text, so a
+    validator can tell which item an attachment belongs to.
+
+    ``media_type`` is the caller's declaration and nothing more: the accepted
+    type list is deliberately open, so treat it as a claim to be checked, not a
+    fact about the bytes.
+    """
+
+    short_id: str
+    media_type: str
+    byte_size: int
+    kind: str
+    filename: str | None = None
 
 
 @dataclass
@@ -126,8 +159,19 @@ class RetainContext:
     bank_id: str
     contents: list[dict]  # List of {content, context, event_date, document_id, tags, strategy}
     request_context: "RequestContext"
+    #: The document every item belongs to; None when items name different
+    #: documents (or none) — read ``contents[i]["document_id"]`` then.
     document_id: str | None = None
     fact_type_override: str | None = None
+    #: Inline attachments this retain carries, in first-appearance order. Empty
+    #: for a text-only retain. Each item's own text holds the matching
+    #: ``⟦hs-att:<short_id>⟧`` placeholders, so a validator that only needs a
+    #: total (a size quota, say) can read it here rather than parsing them.
+    #:
+    #: Refusing the retain also discards the bytes: they are written to storage
+    #: before this hook runs — the async path cannot carry megabytes of base64
+    #: through its operation row — and are reclaimed when validation rejects.
+    attachments: list[RetainAttachmentInfo] = field(default_factory=list)
 
 
 @dataclass
@@ -208,6 +252,16 @@ class RetainResult:
     llm_input_tokens: int | None = None
     llm_output_tokens: int | None = None
     llm_total_tokens: int | None = None
+    # Diagnostic token splits surfaced for cost attribution and prompt-cache
+    # tuning. ``llm_cached_input_tokens`` is the subset of llm_input_tokens
+    # served from the provider's prompt cache (e.g. Gemini's
+    # cached_content_token_count). ``llm_thoughts_tokens`` is reasoning tokens
+    # that are billed at the output rate by some providers (Gemini 2.5+) but
+    # are not part of the visible response. Both default to None when the
+    # engine/provider didn't report them; downstream metering extensions
+    # should treat None as 0.
+    llm_cached_input_tokens: int | None = None
+    llm_thoughts_tokens: int | None = None
     # Content tokens the retain pipeline actually processed, after
     # chunk-level content-hash deduplication. Semantics:
     #   None — no dedup signal available (e.g. a first-time retain or a
@@ -224,6 +278,17 @@ class RetainResult:
     # when the customer's client resubmits growing payloads to the same
     # document_id (e.g. a session transcript appended to on each turn).
     processed_content_tokens: int | None = None
+    # Operation ids of every submission that ran as one execution with this
+    # one, when several queued retains for a document were coalesced (see
+    # ``engine.retain.fold``). None for an ordinary, unfolded retain.
+    #
+    # A fold fires this hook once per member, in submission order, so an
+    # extension still sees every operation it was given. The execution's LLM
+    # usage cannot be attributed per member — the members were extracted as one
+    # document — so it is reported in full on the FIRST member and as zero on
+    # the rest. Summing across a fold therefore yields exactly the tokens the
+    # execution spent, the same total an unfolded run would have reported.
+    folded_with: list[str] | None = None
 
 
 @dataclass
@@ -293,12 +358,90 @@ class ConsolidateResult:
 # =============================================================================
 
 
+class BankReadOperation(StrEnum):
+    """Bank-scoped read operation names passed to validate_bank_read."""
+
+    EXPORT_KNOWLEDGE_BASE = "export_knowledge_base"
+    GET_BANK_CONFIG = "get_bank_config"
+    GET_BANK_PROFILE = "get_bank_profile"
+    GET_BANK_STATS = "get_bank_stats"
+    GET_CHUNK = "get_chunk"
+    GET_DIRECTIVE = "get_directive"
+    GET_DOCUMENT = "get_document"
+    GET_ENTITY = "get_entity"
+    GET_ENTITY_GRAPH = "get_entity_graph"
+    GET_ENTITY_STATE = "get_entity_state"
+    GET_GRAPH_DATA = "get_graph_data"
+    GET_KNOWLEDGE_BASE_TREE = "get_knowledge_base_tree"
+    GET_KNOWLEDGE_PAGE = "get_knowledge_page"
+    GET_MEMORIES_TIMESERIES = "get_memories_timeseries"
+    GET_MEMORY_UNIT = "get_memory_unit"
+    GET_MENTAL_MODEL_HISTORY = "get_mental_model_history"
+    GET_OBSERVATION_HISTORY = "get_observation_history"
+    GET_OPERATION_STATUS = "get_operation_status"
+    LIST_DIRECTIVES = "list_directives"
+    LIST_DOCUMENT_CHUNKS = "list_document_chunks"
+    LIST_DOCUMENTS = "list_documents"
+    LIST_ENTITIES = "list_entities"
+    LIST_MEMORY_UNITS = "list_memory_units"
+    LIST_MENTAL_MODEL_TAGS = "list_mental_model_tags"
+    LIST_MENTAL_MODELS = "list_mental_models"
+    LIST_OBSERVATION_SCOPES = "list_observation_scopes"
+    LIST_OPERATIONS = "list_operations"
+    LIST_TAGS = "list_tags"
+    LIST_WEBHOOK_DELIVERIES = "list_webhook_deliveries"
+    LIST_WEBHOOKS = "list_webhooks"
+    SEARCH_KNOWLEDGE_BASE = "search_knowledge_base"
+
+
+class BankWriteOperation(StrEnum):
+    """Bank-scoped write operation names passed to validate_bank_write."""
+
+    CANCEL_OPERATION = "cancel_operation"
+    CLEAR_MENTAL_MODEL = "clear_mental_model"
+    CLEAR_OBSERVATIONS = "clear_observations"
+    CLEAR_OBSERVATIONS_FOR_MEMORY = "clear_observations_for_memory"
+    CREATE_DIRECTIVE = "create_directive"
+    CREATE_KNOWLEDGE_FOLDER = "create_knowledge_folder"
+    CREATE_KNOWLEDGE_PAGE = "create_knowledge_page"
+    CREATE_MENTAL_MODEL = "create_mental_model"
+    CREATE_WEBHOOK = "create_webhook"
+    DELETE_BANK = "delete_bank"
+    DELETE_DIRECTIVE = "delete_directive"
+    DELETE_DOCUMENT = "delete_document"
+    DELETE_KNOWLEDGE_NODE = "delete_knowledge_node"
+    DELETE_MENTAL_MODEL = "delete_mental_model"
+    DELETE_OPERATION = "delete_operation"
+    DELETE_WEBHOOK = "delete_webhook"
+    MERGE_BANK_MISSION = "merge_bank_mission"
+    MOVE_KNOWLEDGE_NODE = "move_knowledge_node"
+    RENAME_KNOWLEDGE_NODE = "rename_knowledge_node"
+    REPROCESS_DOCUMENT = "reprocess_document"
+    RESET_BANK_CONFIG = "reset_bank_config"
+    RETRY_FAILED_CONSOLIDATION = "retry_failed_consolidation"
+    RETRY_OPERATION = "retry_operation"
+    RUN_CONSOLIDATION = "run_consolidation"
+    SET_BANK_MISSION = "set_bank_mission"
+    SUBMIT_ASYNC_CONSOLIDATION = "submit_async_consolidation"
+    SUBMIT_ASYNC_GRAPH_MAINTENANCE = "submit_async_graph_maintenance"
+    SUBMIT_ASYNC_VECTOR_INDEX_MAINTENANCE = "submit_async_vector_index_maintenance"
+    UPDATE_BANK = "update_bank"
+    UPDATE_BANK_CONFIG = "update_bank_config"
+    UPDATE_BANK_DISPOSITION = "update_bank_disposition"
+    UPDATE_DIRECTIVE = "update_directive"
+    UPDATE_DOCUMENT = "update_document"
+    UPDATE_KNOWLEDGE_PAGE = "update_knowledge_page"
+    UPDATE_MEMORY_UNIT = "update_memory_unit"
+    UPDATE_MENTAL_MODEL = "update_mental_model"
+    UPDATE_WEBHOOK = "update_webhook"
+
+
 @dataclass
 class BankReadContext:
     """Context for a bank read operation validation (pre-operation)."""
 
     bank_id: str
-    operation: str  # "get_bank_profile", "get_bank_stats"
+    operation: BankReadOperation
     request_context: "RequestContext"
 
 
@@ -307,7 +450,15 @@ class BankWriteContext:
     """Context for a bank write operation validation (pre-operation)."""
 
     bank_id: str
-    operation: str  # "delete_bank", "update_bank", "update_bank_disposition", "set_bank_mission", "merge_bank_mission", "clear_observations", "clear_observations_for_memory"
+    operation: BankWriteOperation
+    request_context: "RequestContext"
+
+
+@dataclass
+class CreateBankContext:
+    """Context for validating creation of a new bank."""
+
+    bank_id: str
     request_context: "RequestContext"
 
 
@@ -437,6 +588,12 @@ class OperationValidatorExtension(Extension, ABC):
     Supported operations:
         - retain, recall, reflect (core memory operations)
         - consolidate (mental models consolidation)
+
+    ``self.context`` is the process-wide ExtensionContext, set by the engine at
+    construction: use it for process-global handles, e.g. ``get_memory_engine()`` for the
+    data-plane pool. It carries NO per-request state -- take the tenant and bank from the
+    hook's own argument (``ctx.bank_id``, ``ctx.request_context``), never from the context
+    or other shared engine state.
     """
 
     # =========================================================================
@@ -763,7 +920,9 @@ class OperationValidatorExtension(Extension, ABC):
         Validate a bank read operation before execution.
 
         Override to implement custom validation logic for bank reads
-        (get_bank_profile, get_bank_stats).
+        (get_bank_profile, get_bank_stats, and the knowledge-base reads —
+        knowledge_base_tree / get_knowledge_page / search_knowledge_base /
+        export_knowledge_base, which expose mental-model content).
 
         Args:
             ctx: Context containing:
@@ -782,7 +941,10 @@ class OperationValidatorExtension(Extension, ABC):
 
         Override to implement custom validation logic for bank writes
         (delete_bank, update_bank, update_bank_disposition, set_bank_mission,
-        merge_bank_mission, clear_observations, clear_observations_for_memory).
+        merge_bank_mission, clear_observations, clear_observations_for_memory,
+        and the knowledge-base writes — create_knowledge_folder /
+        create_knowledge_page / update_knowledge_page / rename_knowledge_node /
+        move_knowledge_node / delete_knowledge_node).
 
         Args:
             ctx: Context containing:
@@ -792,6 +954,23 @@ class OperationValidatorExtension(Extension, ABC):
 
         Returns:
             ValidationResult indicating whether the operation is allowed.
+        """
+        return ValidationResult.accept()
+
+    async def validate_create_bank(self, ctx: CreateBankContext) -> ValidationResult:
+        """
+        Validate creation of a new bank before the bank row is inserted.
+
+        Override to implement custom validation logic for operations that
+        explicitly or implicitly create a bank.
+
+        Args:
+            ctx: Context containing:
+                - bank_id: Bank identifier
+                - request_context: Request context with auth info
+
+        Returns:
+            ValidationResult indicating whether the bank may be created.
         """
         return ValidationResult.accept()
 

@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback } from "react";
 import { useTranslations } from "next-intl";
+import { resolveDateRangePreset } from "@/lib/date-range-preset";
 import { useBank } from "@/lib/bank-context";
 import { client, AuditLogEntry, AuditStatsBucket } from "@/lib/api";
 import { Button } from "@/components/ui/button";
@@ -24,6 +25,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { RefreshCw, ChevronLeft, ChevronRight } from "lucide-react";
+import { Spinner } from "@/components/ui/spinner";
 import { LineChart, Line, XAxis, Tooltip, ResponsiveContainer } from "recharts";
 
 type TranslateFn = (key: string) => string;
@@ -197,8 +199,9 @@ function AuditChart({ bankId }: { bankId: string }) {
       <CardContent>
         <div className="h-[120px]">
           {loading ? (
-            <div className="flex items-center justify-center h-full text-muted-foreground text-sm">
-              {t("chartLoading")}
+            <div className="flex flex-col items-center justify-center gap-2 h-full text-muted-foreground text-sm">
+              <Spinner size="md" />
+              <span>{t("chartLoading")}</span>
             </div>
           ) : chartData.length === 0 ? (
             <div className="flex items-center justify-center h-full text-muted-foreground text-sm">
@@ -258,17 +261,6 @@ export function AuditLogsView() {
   const [selectedLog, setSelectedLog] = useState<AuditLogEntry | null>(null);
   const [dialogOpen, setDialogOpen] = useState(false);
 
-  const getDateRange = useCallback((range: string): { start_date?: string; end_date?: string } => {
-    if (range === "all") return {};
-    const now = new Date();
-    const start = new Date();
-    if (range === "1h") start.setHours(now.getHours() - 1);
-    else if (range === "1d") start.setDate(now.getDate() - 1);
-    else if (range === "7d") start.setDate(now.getDate() - 7);
-    else if (range === "30d") start.setDate(now.getDate() - 30);
-    return { start_date: start.toISOString() };
-  }, []);
-
   const loadLogs = useCallback(
     async (
       newActionFilter: string | null = actionFilter,
@@ -280,7 +272,7 @@ export function AuditLogsView() {
 
       setLoading(true);
       try {
-        const dates = getDateRange(newDateRange);
+        const dates = resolveDateRangePreset(newDateRange);
         const data = await client.listAuditLogs(currentBank, {
           action: newActionFilter || undefined,
           transport: newTransportFilter || undefined,
@@ -297,7 +289,7 @@ export function AuditLogsView() {
         setLoading(false);
       }
     },
-    [currentBank, actionFilter, transportFilter, dateRange, offset, limit, getDateRange]
+    [currentBank, actionFilter, transportFilter, dateRange, offset, limit]
   );
 
   const handleActionFilterChange = (value: string) => {

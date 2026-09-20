@@ -44,6 +44,7 @@ hindsight-api
 | `autoRetain`         | `true`                               | Automatically retain run output after every run                                                                                                                        |
 | `seedBankEnabled`    | `true`                               | Create/touch new-agent banks and enable optional seeding hook (Blockcast fork)                                                                                         |
 | `seedBankWebhookUrl` | —                                    | Optional queue endpoint for one seed job on `agent.created` (Blockcast fork)                                                                                           |
+| `enabledAgentIds`    | —                                    | Restrict recall/retain to these agent IDs only. Leave empty to enable for all agents (default)                                                                         |
 
 ## Bank ID Format
 

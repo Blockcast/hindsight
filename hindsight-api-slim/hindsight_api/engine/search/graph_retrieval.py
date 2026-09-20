@@ -11,7 +11,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 
 from .tags import TagGroup, TagsMatch
-from .types import GraphRetrievalTimings, RetrievalResult
+from .types import GraphRetrieval, RetrievalResult
 
 logger = logging.getLogger(__name__)
 
@@ -40,15 +40,14 @@ class GraphRetriever(ABC):
         fact_type: str,
         budget: int,
         query_text: str | None = None,
-        semantic_seeds: list[RetrievalResult] | None = None,
-        temporal_seeds: list[RetrievalResult] | None = None,
         adjacency=None,  # TypedAdjacency, optional pre-loaded graph
         tags: list[str] | None = None,  # Visibility scope tags for filtering
         tags_match: TagsMatch = "any",  # How to match tags: 'any' (OR) or 'all' (AND)
         tag_groups: list[TagGroup] | None = None,  # Compound boolean tag filter groups
         created_after: datetime | None = None,  # Only include memory_units created after this time
         created_before: datetime | None = None,  # Only include memory_units created before this time
-    ) -> tuple[list[RetrievalResult], GraphRetrievalTimings | None]:
+        preselected_semantic_seeds: list[RetrievalResult] | None = None,
+    ) -> GraphRetrieval:
         """
         Retrieve relevant facts via graph traversal.
 
@@ -59,10 +58,9 @@ class GraphRetriever(ABC):
             fact_type: Fact type to filter ('world', 'experience', 'observation')
             budget: Maximum number of nodes to explore/return
             query_text: Original query text (optional, for some strategies)
-            semantic_seeds: Pre-computed semantic entry points (from semantic retrieval)
-            temporal_seeds: Pre-computed temporal entry points (from temporal retrieval)
             adjacency: Pre-loaded typed adjacency graph (optional)
             tags: Optional list of tags for visibility filtering (OR matching)
+            preselected_semantic_seeds: Independently thresholded graph entry points already fetched by the caller
 
         Returns:
             Tuple of (List of RetrievalResult with activation scores, optional timing info)

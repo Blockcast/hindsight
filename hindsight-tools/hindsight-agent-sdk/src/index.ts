@@ -90,6 +90,23 @@ function normalizeFactTypes(input: unknown, defaultTypes: readonly FactType[]): 
   return [...new Set(normalized)];
 }
 
+const DEFAULT_RECALL_MAX_TOKENS = 1024;
+
+function parseRecallMaxTokens(input: unknown): number {
+  if (input === undefined || input === null) return DEFAULT_RECALL_MAX_TOKENS;
+  const n = Math.floor(Number(input));
+  if (!Number.isFinite(n) || n < 1) return DEFAULT_RECALL_MAX_TOKENS;
+  return n;
+}
+
+/** Undefined on absent/invalid input so the client's own chunk budget default applies. */
+function parseChunkMaxTokens(input: unknown): number | undefined {
+  if (input === undefined || input === null) return undefined;
+  const n = Math.floor(Number(input));
+  if (!Number.isFinite(n) || n < 1) return undefined;
+  return n;
+}
+
 // ── Factory ────────────────────────────────────────────
 
 /**
@@ -237,7 +254,10 @@ export function createKnowledgeTools(opts: CreateKnowledgeToolsOptions): Knowled
         type: "object",
         properties: {
           query: { type: "string", description: "What to search for" },
-          max_tokens: { type: "number", description: "Token budget for results (default 1024)" },
+          max_tokens: {
+            type: "number",
+            description: "Token budget for recall results (default 1024).",
+          },
           fact_types: {
             type: "array",
             items: { type: "string", enum: ["world", "experience", "observation"] },
@@ -249,14 +269,22 @@ export function createKnowledgeTools(opts: CreateKnowledgeToolsOptions): Knowled
             items: { type: "string", enum: ["world", "experience", "observation"] },
             description: "Alias for fact_types.",
           },
+          include_chunks: {
+            type: "boolean",
+            description:
+              "Also return the raw source text the memories were extracted from (default false). " +
+              "Use only when the answer needs verbatim wording, an exact quote, or an exact number " +
+              "that an extracted fact may have rounded or paraphrased — it costs significantly more tokens.",
+          },
+          max_chunk_tokens: {
+            type: "number",
+            description: "Token budget for the returned source chunks (default 8192).",
+          },
         },
         required: ["query"],
       },
       async execute(params: Record<string, unknown>) {
-        const maxTokens =
-          (params.max_tokens as number | undefined) ??
-          (params.max_results as number | undefined) ??
-          1024;
+        const maxTokens = parseRecallMaxTokens(params.max_tokens);
         const types = normalizeFactTypes(
           params.fact_types ?? params.types,
           DEFAULT_RECALL_FACT_TYPES
@@ -264,6 +292,8 @@ export function createKnowledgeTools(opts: CreateKnowledgeToolsOptions): Knowled
         const result = await client.recall(bankId, params.query as string, {
           maxTokens,
           types,
+          includeChunks: params.include_chunks === true,
+          maxChunkTokens: parseChunkMaxTokens(params.max_chunk_tokens),
         });
         return ok(result);
       },

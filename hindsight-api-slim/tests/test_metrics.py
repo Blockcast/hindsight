@@ -66,14 +66,11 @@ class TestMetricsCollector:
     def mock_meter(self):
         """Create a mock meter for testing."""
         meter = MagicMock()
-        # Create separate mocks for each histogram (operation_duration, llm_duration, http_request_duration)
-        histogram_mocks = [MagicMock(), MagicMock(), MagicMock()]
-        meter.create_histogram.side_effect = histogram_mocks
-        # Create separate mocks for each counter (operation_total, llm_tokens_input,
-        # llm_tokens_output, llm_calls_total, llm_tokens_cached_input,
-        # llm_tokens_thoughts, http_requests_total)
-        counter_mocks = [MagicMock() for _ in range(7)]
-        meter.create_counter.side_effect = counter_mocks
+        # Return a fresh mock per instrument, regardless of how many the collector
+        # creates — so adding a histogram/counter to MetricsCollector never requires
+        # bumping a hard-coded count here.
+        meter.create_histogram.side_effect = lambda *a, **k: MagicMock()
+        meter.create_counter.side_effect = lambda *a, **k: MagicMock()
         return meter
 
     @pytest.fixture
@@ -233,6 +230,23 @@ class TestMetricsCollector:
         assert attributes["success"] == "false"
         collector.operation_total.add.assert_called_once_with(1, attributes)
 
+    def test_record_retain_document_labels_facts_outcome(self, collector):
+        """A document left with memory units is labelled outcome=facts."""
+        collector.record_retain_document(bank_id="test_bank", memory_unit_count=3)
+
+        count, attributes = collector.retain_documents_total.add.call_args[0]
+        assert count == 1
+        assert attributes["outcome"] == "facts"
+        assert "bank_id" not in attributes  # excluded by default, like every other metric
+
+    def test_record_retain_document_labels_no_facts_outcome(self, collector):
+        """A document left with zero memory units is the alertable case (#3040)."""
+        collector.record_retain_document(bank_id="test_bank", memory_unit_count=0)
+
+        count, attributes = collector.retain_documents_total.add.call_args[0]
+        assert count == 1
+        assert attributes["outcome"] == "no_facts"
+
     def test_record_operation_includes_bank_id_when_enabled(self):
         """Test that bank_id is included in attributes when metrics_include_bank_id is enabled."""
         mock_config = MagicMock()
@@ -249,6 +263,45 @@ class TestMetricsCollector:
 
         attributes = collector.operation_duration.record.call_args[0][1]
         assert attributes["bank_id"] == "test_bank"
+
+    @pytest.mark.parametrize("enabled", [True, False])
+    def test_recall_diagnostic_phases_follow_config(self, enabled):
+        """Diagnostic phases are dropped when disabled; ordinary phases are always recorded, once."""
+        mock_config = MagicMock()
+        mock_config.metrics_include_bank_id = False
+        mock_config.recall_diagnostic_phases = enabled
+        mock_config.recall_phase_sample_every = 1
+        with (
+            patch("hindsight_api.metrics.get_meter", return_value=MagicMock()),
+            patch("hindsight_api.config.get_config", return_value=mock_config),
+        ):
+            collector = MetricsCollector()
+
+        collector.record_recall_phase("engine_call", 0.01, diagnostic=True)
+        collector.record_recall_phase("engine_auth", 0.01)
+
+        phases = [c.args[1]["phase"] for c in collector.recall_phase_duration.record.call_args_list]
+        assert phases == (["engine_call", "engine_auth"] if enabled else ["engine_auth"])
+
+    def test_recall_phase_sampling_records_one_in_n(self):
+        """With a sample rate of N, a phase is recorded only when the draw lands in the 1/N slice."""
+        mock_config = MagicMock()
+        mock_config.metrics_include_bank_id = False
+        mock_config.recall_diagnostic_phases = True
+        mock_config.recall_phase_sample_every = 10
+        with (
+            patch("hindsight_api.metrics.get_meter", return_value=MagicMock()),
+            patch("hindsight_api.config.get_config", return_value=mock_config),
+        ):
+            collector = MetricsCollector()
+
+        # random() * 10 < 1 keeps the observation: 0.05 and 0.099 are kept, 0.1 and 0.9 are dropped.
+        with patch("hindsight_api.metrics.random.random", side_effect=[0.05, 0.1, 0.9, 0.099]):
+            for phase in ("a", "b", "c", "d"):
+                collector.record_recall_phase(phase, 0.01)
+
+        phases = [c.args[1]["phase"] for c in collector.recall_phase_duration.record.call_args_list]
+        assert phases == ["a", "d"]
 
 
 class TestGetMetricsCollector:
@@ -361,14 +414,11 @@ class TestLLMMetrics:
     def mock_meter(self):
         """Create a mock meter for testing."""
         meter = MagicMock()
-        # Create separate mocks for each histogram (operation_duration, llm_duration, http_request_duration)
-        histogram_mocks = [MagicMock(), MagicMock(), MagicMock()]
-        meter.create_histogram.side_effect = histogram_mocks
-        # Create separate mocks for each counter (operation_total, llm_tokens_input,
-        # llm_tokens_output, llm_calls_total, llm_tokens_cached_input,
-        # llm_tokens_thoughts, http_requests_total)
-        counter_mocks = [MagicMock() for _ in range(7)]
-        meter.create_counter.side_effect = counter_mocks
+        # Return a fresh mock per instrument, regardless of how many the collector
+        # creates — so adding a histogram/counter to MetricsCollector never requires
+        # bumping a hard-coded count here.
+        meter.create_histogram.side_effect = lambda *a, **k: MagicMock()
+        meter.create_counter.side_effect = lambda *a, **k: MagicMock()
         return meter
 
     @pytest.fixture

@@ -8,9 +8,13 @@ relevance score, independent of the cross-encoder model's score calibration.
 
 from datetime import datetime, timedelta, timezone
 
-import pytest
-
-from hindsight_api.engine.search.reranking import apply_combined_scoring, _RECENCY_ALPHA, _TEMPORAL_ALPHA
+from hindsight_api.engine.search.reranking import (
+    _RECENCY_ALPHA,
+    _TEMPORAL_ALPHA,
+    _spans_calendar_period,
+    apply_combined_scoring,
+    compute_recency_decay,
+)
 from hindsight_api.engine.search.types import MergedCandidate, RetrievalResult, ScoredResult
 
 UTC = timezone.utc
@@ -200,3 +204,227 @@ class TestBoostFormula:
 
     def test_empty_list_is_noop(self):
         apply_combined_scoring([], now=NOW)  # must not raise
+
+
+class TestRecencyDecayFunction:
+    """The configurable age→freshness curve (compute_recency_decay)."""
+
+    def test_linear_is_default_and_unchanged(self):
+        """Default function reproduces the historical linear decay over 365 days."""
+        assert compute_recency_decay(0) == 1.0
+        assert abs(compute_recency_decay(182.5) - 0.5) < 1e-6  # neutral at half the window
+        assert compute_recency_decay(400) == 0.1  # floored past the window
+
+    def test_linear_window_is_configurable(self):
+        """A custom window moves the neutral crossing; 730d window → neutral at 365d."""
+        assert abs(compute_recency_decay(365, "linear", linear_window_days=730) - 0.5) < 1e-6
+
+    def test_exponential_neutral_at_halflife(self):
+        """Exponential decay is exactly neutral (0.5) at the configured half-life."""
+        assert compute_recency_decay(0, "exponential", halflife_days=90) == 1.0
+        assert abs(compute_recency_decay(90, "exponential", halflife_days=90) - 0.5) < 1e-9
+        assert abs(compute_recency_decay(180, "exponential", halflife_days=90) - 0.25) < 1e-9
+
+    def test_exponential_penalises_old_less_harshly_than_linear(self):
+        """A 1-year-old memory keeps more freshness under a 90d-halflife exponential
+        than under the linear floor — the curve never hard-cuts to 0.1."""
+        lin = compute_recency_decay(365, "linear")
+        exp = compute_recency_decay(365, "exponential", halflife_days=180)
+        assert exp > lin
+
+    def test_none_is_always_neutral(self):
+        """'none' disables the recency signal — always neutral, no boost."""
+        assert compute_recency_decay(0, "none") == 0.5
+        assert compute_recency_decay(10_000, "none") == 0.5
+
+    def test_future_dates_clamp_to_max(self):
+        """Negative ages (future-dated memories) never exceed full freshness."""
+        assert compute_recency_decay(-100, "linear") == 1.0
+        assert compute_recency_decay(-100, "exponential", halflife_days=90) == 1.0
+
+    def test_far_future_dates_clamp_without_overflowing(self):
+        """The clamp has to run before the power: 0.5 ** a large negative exponent
+        overflows float, so min() never gets to cap it."""
+        assert compute_recency_decay(-92_160, "exponential", halflife_days=90) == 1.0
+        assert compute_recency_decay(-200_000, "exponential", halflife_days=7) == 1.0
+
+    def test_far_future_unit_does_not_fail_scoring(self):
+        """One far-future memory must not take the whole recall down with it."""
+        sr = _make_result(ce_norm=0.5, occurred_start=NOW + timedelta(days=20_000))
+        apply_combined_scoring([sr], now=NOW, recency_decay_function="exponential", recency_decay_halflife_days=7.0)
+        assert sr.recency == 1.0
+
+    def test_nonpositive_halflife_falls_back_to_neutral(self):
+        """A misconfigured (<=0) half-life degrades to neutral rather than dividing by zero."""
+        assert compute_recency_decay(30, "exponential", halflife_days=0) == 0.5
+
+    def test_function_threads_through_apply_combined_scoring(self):
+        """The decay function chosen at the call site is what scores sr.recency."""
+        old = NOW - timedelta(days=180)
+        sr = _make_result(ce_norm=0.5, occurred_start=old)
+        apply_combined_scoring([sr], now=NOW, recency_decay_function="none")
+        assert sr.recency == 0.5
+        assert abs(sr.weight - 0.5) < 1e-9  # neutral → no recency boost
+
+
+class TestPeriodDatedRecency:
+    """Recency for memories dated to a period rather than an instant (issue #3893).
+
+    Fact extraction emits coarse dates as a full span — "in 2015" becomes
+    2015-01-01 → 2015-12-31 — so the granularity is already in the data. Scoring
+    such a memory from occurred_start invents an age it never had.
+    """
+
+    def test_coarse_current_year_is_neutral_not_stale(self):
+        """A year-coarse date inside the current year scores neutral, not 5 months stale.
+
+        The #3893 regression: 2026-01-01 read as an exact date is ~5 months old and
+        gets a recency *penalty*, even though the event may have happened yesterday.
+        """
+        sr = _make_result(
+            ce_norm=0.5,
+            occurred_start=datetime(2024, 1, 1, tzinfo=UTC),
+            occurred_end=datetime(2024, 12, 31, 23, 59, 59, tzinfo=UTC),
+        )
+        apply_combined_scoring([sr], now=NOW)  # NOW = 2024-06-01, mid-period
+        assert sr.recency == 0.5
+
+    def test_coarse_month_is_neutral(self):
+        """Month-coarse dates get the same treatment as year-coarse ones."""
+        sr = _make_result(
+            ce_norm=0.5,
+            occurred_start=datetime(2024, 5, 1, tzinfo=UTC),
+            occurred_end=datetime(2024, 5, 31, 23, 59, 59, tzinfo=UTC),
+        )
+        apply_combined_scoring([sr], now=NOW)
+        assert sr.recency == 0.5
+
+    def test_old_coarse_dates_still_decay(self):
+        """The neutral cap is a ceiling, not a flattening — old periods still decay.
+
+        Guards the obvious over-correction: returning a flat 0.5 for every coarse
+        date would make a 2015 memory look as fresh as a current-year one.
+        """
+        sr = _make_result(
+            ce_norm=0.5,
+            occurred_start=datetime(2015, 1, 1, tzinfo=UTC),
+            occurred_end=datetime(2015, 12, 31, 23, 59, 59, tzinfo=UTC),
+        )
+        apply_combined_scoring([sr], now=NOW)
+        assert sr.recency == 0.1  # linear floor, ~8 years past the 365d window
+
+    def test_coarse_date_scored_from_end_not_start(self):
+        """The coarse period is aged from its end; its start would look far older."""
+        # A period old enough that BOTH ends decay below the 0.5 cap, so the cap
+        # cannot mask which end was used and the value alone identifies it.
+        start = datetime(2023, 10, 1, tzinfo=UTC)
+        end = datetime(2023, 10, 31, 23, 59, 59, tzinfo=UTC)
+        sr = _make_result(ce_norm=0.5, occurred_start=start, occurred_end=end)
+        apply_combined_scoring([sr], now=NOW)
+
+        days_from_end = (NOW - end).total_seconds() / 86400
+        days_from_start = (NOW - start).total_seconds() / 86400
+        assert sr.recency < 0.5  # uncapped: the cap is not what we are measuring
+        assert abs(sr.recency - compute_recency_decay(days_from_end)) < 1e-9
+        assert sr.recency > compute_recency_decay(days_from_start)
+
+    def test_genuine_interval_keeps_existing_behaviour(self):
+        """A multi-day interval is not a coarse date and is deliberately untouched.
+
+        Its span is not a calendar period, so it stays aged from occurred_start as
+        it always has been. Whether intervals *should* age from their end is a
+        separate ranking question, out of scope for #3893.
+        """
+        sr = _make_result(
+            ce_norm=0.5,
+            occurred_start=NOW - timedelta(days=300),
+            occurred_end=NOW - timedelta(days=5),
+        )
+        apply_combined_scoring([sr], now=NOW)
+        assert sr.recency == compute_recency_decay(300)
+
+    def test_single_day_span_is_an_instant(self):
+        """A day encoded as 00:00:00 → 23:59:59 is a precise date, not a period.
+
+        It must score identically to the same day encoded as a point, or every
+        full-day encoding would silently lose its recency boost.
+        """
+        day = datetime(2024, 5, 30, tzinfo=UTC)
+        spanned = _make_result(ce_norm=0.5, occurred_start=day, occurred_end=day.replace(hour=23, minute=59, second=59))
+        point = _make_result(ce_norm=0.5, occurred_start=day, occurred_end=day)
+        apply_combined_scoring([spanned, point], now=NOW)
+        assert spanned.recency == point.recency
+        assert spanned.recency > 0.9
+
+    def test_point_dates_are_unaffected(self):
+        """Precise dates keep the historical behaviour — recency still ranks them."""
+        recent = _make_result(ce_norm=0.5, occurred_start=NOW - timedelta(days=2))
+        old = _make_result(ce_norm=0.5, occurred_start=NOW - timedelta(days=200))
+        apply_combined_scoring([recent, old], now=NOW)
+        assert recent.recency == compute_recency_decay(2)
+        assert old.recency == compute_recency_decay(200)
+        assert recent.combined_score > old.combined_score
+
+    def test_leap_year_span_is_recognised(self):
+        """A 366-day span is a calendar year too — 2024 must not read as an interval."""
+        sr = _make_result(
+            ce_norm=0.5,
+            occurred_start=datetime(2024, 1, 1, tzinfo=UTC),
+            occurred_end=datetime(2025, 1, 1, tzinfo=UTC),
+        )
+        apply_combined_scoring([sr], now=NOW)
+        assert sr.recency == 0.5
+
+    def test_all_three_period_end_encodings_are_recognised(self):
+        """Extraction spells a period's last instant three ways; all must match.
+
+        The tolerance exists for exactly this. Dec 31 23:59:59 and the exclusive
+        Jan 1 boundary are covered elsewhere; the midnight-on-the-last-day form
+        is a full day short of the period and is what the window has to absorb.
+        """
+        year_start = datetime(2015, 1, 1, tzinfo=UTC)
+        for year_end in (
+            datetime(2015, 12, 31, 23, 59, 59, tzinfo=UTC),  # period - 1s
+            datetime(2015, 12, 31, tzinfo=UTC),  # period - 1 day
+            datetime(2016, 1, 1, tzinfo=UTC),  # exclusive next boundary
+        ):
+            assert _spans_calendar_period(year_start, year_end), year_end
+
+    def test_span_longer_than_the_period_is_not_coarse(self):
+        """The window is one-sided: overshooting a year is an interval, not a year.
+
+        "worked at Acme from Jan 2015 to Mar 2016" spans more than a calendar year
+        and must keep the interval behaviour rather than being capped as coarse.
+        """
+        assert not _spans_calendar_period(datetime(2015, 1, 1, tzinfo=UTC), datetime(2016, 3, 1, tzinfo=UTC))
+        assert not _spans_calendar_period(datetime(2015, 1, 1, tzinfo=UTC), datetime(2015, 3, 1, tzinfo=UTC))
+
+    def test_sub_second_ordering_offset_does_not_break_detection(self):
+        """_add_temporal_offsets shifts both ends equally; the span must still match.
+
+        Detection keys on span length rather than midnight alignment precisely so
+        this offset (i * 0.01s, applied at retain) cannot hide a coarse date.
+        """
+        offset = timedelta(milliseconds=430)
+        sr = _make_result(
+            ce_norm=0.5,
+            occurred_start=datetime(2015, 1, 1, tzinfo=UTC) + offset,
+            occurred_end=datetime(2015, 12, 31, 23, 59, 59, tzinfo=UTC) + offset,
+        )
+        apply_combined_scoring([sr], now=NOW)
+        assert sr.recency == 0.1  # still classified coarse, still decayed
+
+    def test_coarse_date_no_longer_loses_to_newer_unrelated_fact(self):
+        """End-to-end #3893: the reranker's preferred result keeps rank 1.
+
+        Before the fix the recency boost on a 6-day-old fact overturned a ~10%
+        cross-encoder lead held by a year-coarse fact from the current year.
+        """
+        relevant_coarse = _make_result(
+            ce_norm=0.999924,
+            occurred_start=datetime(2024, 1, 1, tzinfo=UTC),
+            occurred_end=datetime(2024, 12, 31, 23, 59, 59, tzinfo=UTC),
+        )
+        irrelevant_recent = _make_result(ce_norm=0.900004, occurred_start=NOW - timedelta(days=6))
+        apply_combined_scoring([relevant_coarse, irrelevant_recent], now=NOW)
+        assert relevant_coarse.combined_score > irrelevant_recent.combined_score

@@ -36,7 +36,7 @@ func main() {
 	} {
 		client.MemoryAPI.RetainMemories(ctx, memBankID).
 			RetainRequest(hindsight.RetainRequest{
-				Items: []hindsight.MemoryItem{{Content: content}},
+				Items: []hindsight.MemoryItem{{Content: hindsight.TextContent(content)}},
 			}).Execute()
 	}
 	time.Sleep(3 * time.Second)
@@ -49,7 +49,7 @@ func main() {
 	// List memory units in a bank. Invalidated rows are included by default.
 	memories, _, _ := client.MemoryAPI.ListMemories(ctx, memBankID).Execute()
 	for _, unit := range memories.GetItems() {
-		fmt.Printf("- [%v] %v\n", unit["fact_type"], unit["text"])
+		fmt.Printf("- [%v] %v\n", unit.GetFactType(), unit.GetText())
 	}
 
 	// Filter to only the invalidated facts (e.g. to review duplicates).
@@ -60,15 +60,15 @@ func main() {
 	// Pick a raw fact (world/experience) to curate below.
 	var memoryID string
 	for _, unit := range memories.GetItems() {
-		if ft, _ := unit["fact_type"].(string); ft == "world" || ft == "experience" {
-			memoryID, _ = unit["id"].(string)
+		if ft := unit.GetFactType(); ft == "world" || ft == "experience" {
+			memoryID = unit.Id
 			break
 		}
 	}
 
 	if memoryID != "" {
 		// [docs:get-memory]
-		// Fetch a single memory unit (entities, dates, state).
+		// Fetch a single memory unit (metadata, entities, dates, state).
 		memory, _, _ := client.MemoryAPI.GetMemory(ctx, memBankID, memoryID).Execute()
 		fmt.Printf("Memory: %v\n", memory)
 		// [/docs:get-memory]
@@ -86,11 +86,14 @@ func main() {
 		// [docs:edit-memory-fields]
 		// Correct dates, fact type, and entities in one call. "" clears a field;
 		// entities replaces the set ([] detaches all); omit to leave unchanged.
+		// ResolveEntities false keeps the entity names you wrote from being matched
+		// onto a similar entity that already exists.
 		client.MemoryAPI.UpdateMemory(ctx, memBankID, memoryID).
 			UpdateMemoryRequest(hindsight.UpdateMemoryRequest{
-				OccurredStart: *hindsight.NewNullableString(hindsight.PtrString("2023-06-01")),
-				FactType:      *hindsight.NewNullableString(hindsight.PtrString("experience")),
-				Entities:      []string{"Alice", "Paris"},
+				OccurredStart:   *hindsight.NewNullableString(hindsight.PtrString("2023-06-01")),
+				FactType:        *hindsight.NewNullableString(hindsight.PtrString("experience")),
+				Entities:        []string{"Alice", "Paris"},
+				ResolveEntities: hindsight.PtrBool(false),
 			}).Execute()
 		// [/docs:edit-memory-fields]
 
@@ -116,8 +119,8 @@ func main() {
 	// An observation (derived) exposes how it evolved as sources arrived.
 	var observationID string
 	for _, unit := range memories.GetItems() {
-		if ft, _ := unit["fact_type"].(string); ft == "observation" {
-			observationID, _ = unit["id"].(string)
+		if unit.GetFactType() == "observation" {
+			observationID = unit.Id
 			break
 		}
 	}

@@ -179,7 +179,6 @@ These settings control how the plugin connects to the Hindsight API.
 | `hindsightApiUrl` | `HINDSIGHT_API_URL` | `""` (empty) | URL of an external Hindsight API server. When empty, the plugin uses a local daemon instead. |
 | `hindsightApiToken` | `HINDSIGHT_API_TOKEN` | `null` | Authentication token for the external API. Only needed when `hindsightApiUrl` is set. |
 | `apiPort` | `HINDSIGHT_API_PORT` | `9077` | Port used by the local `hindsight-embed` daemon. Change this if you run multiple instances or have a port conflict. |
-| `daemonIdleTimeout` | `HINDSIGHT_DAEMON_IDLE_TIMEOUT` | `0` | Seconds of inactivity before the local daemon shuts itself down. `0` means the daemon stays running until the session ends. |
 | `embedVersion` | `HINDSIGHT_EMBED_VERSION` | `"latest"` | Which version of `hindsight-embed` to install via `uvx`. Pin to a specific version (e.g. `"0.5.2"`) for reproducibility. |
 | `embedPackagePath` | `HINDSIGHT_EMBED_PACKAGE_PATH` | `null` | Local filesystem path to a `hindsight-embed` checkout. When set, the plugin runs from this path instead of installing via `uvx`. Useful for development. |
 | `requestTimeoutSeconds` | `HINDSIGHT_REQUEST_TIMEOUT_SECONDS` | `null` | Overrides the per-call request timeout for recall (default `10s`), retain (default `15s`) and knowledge tool calls (`10–15s`). When unset, the per-call defaults are preserved. Bump this when self-hosted Hindsight legitimately takes longer than 10s under contention (e.g. parallel recalls), to avoid client-side `read operation timed out` errors on requests the server completes successfully. Does not affect the health check, which intentionally stays fast (5s). |
@@ -223,10 +222,15 @@ Auto-recall runs on every user prompt. It queries Hindsight for relevant memorie
 | `autoRecall` | `HINDSIGHT_AUTO_RECALL` | `true` | Master switch for auto-recall. Set to `false` to disable memory retrieval entirely. |
 | `recallBudget` | `HINDSIGHT_RECALL_BUDGET` | `"mid"` | Controls how hard Hindsight searches for memories. `"low"` = fast, fewer strategies; `"mid"` = balanced; `"high"` = thorough, slower. Affects latency directly. |
 | `recallMaxTokens` | `HINDSIGHT_RECALL_MAX_TOKENS` | `1024` | Maximum number of tokens in the recalled memory block. Lower values reduce context usage but may truncate relevant memories. |
+| `recallMinScores` | — | `{}` | Optional score floors applied after recall from the main and additional banks, keyed by score field (for example `{"semantic": 0.65, "reranker": 0.2}`). Missing or `null` scores pass so BM25-only and passthrough-reranker hits are not accidentally suppressed. When a cross-encoder reranker is active, the `reranker` floor is the main precision gate; treat reranker scores as query-local and not calibrated across queries. |
 | `recallTypes` | — | `["observation"]` | Which memory types to retrieve. `"world"` = general facts; `"experience"` = personal experiences; `"observation"` = consolidated, deduplicated beliefs built from multiple facts. Defaults to observations so the same answer doesn't surface multiple times when many raw memories say the same thing. |
 | `recallContextTurns` | `HINDSIGHT_RECALL_CONTEXT_TURNS` | `1` | How many prior conversation turns to include when composing the recall query. `1` = only the latest user message; higher values give more context but may dilute the query. |
 | `recallMaxQueryChars` | `HINDSIGHT_RECALL_MAX_QUERY_CHARS` | `800` | Maximum character length of the query sent to Hindsight. Longer queries are truncated. |
 | `recallRoles` | — | `["user", "assistant"]` | Which message roles to include when building the recall query from prior turns. |
+| `recallTags` | `HINDSIGHT_RECALL_TAGS` | `[]` | Optional tags to pass to the recall API, such as `["memory_type:rule"]`. The env var accepts JSON or a comma-separated list. |
+| `recallTagsMatch` | `HINDSIGHT_RECALL_TAGS_MATCH` | `"any"` | Tag matching mode used with `recallTags` or `recallTagGroups`: `"any"`, `"all"`, `"any_strict"`, or `"all_strict"`. |
+| `recallTagGroups` | `HINDSIGHT_RECALL_TAG_GROUPS` | `null` | Optional compound tag filter passed through to the recall API. The env var must be JSON. |
+| `recallAdditionalBankFilters` | `HINDSIGHT_RECALL_ADDITIONAL_BANK_FILTERS` | `{}` | Optional per-bank tag filter overrides for banks listed in `recallAdditionalBanks`, keyed by bank ID. Each value may set `recallTags`, `recallTagsMatch`, and `recallTagGroups`. The env var must be JSON. |
 | `recallPromptPreamble` | — | built-in string | Text placed above the recalled memories in the injected context block. Customize this to change how Claude interprets the memories. |
 
 ---
@@ -238,7 +242,7 @@ Auto-retain runs after Claude responds. It extracts the conversation transcript 
 | Setting | Env Var | Default | Description |
 |---------|---------|---------|-------------|
 | `autoRetain` | `HINDSIGHT_AUTO_RETAIN` | `true` | Master switch for auto-retain. Set to `false` to disable memory storage entirely. |
-| `retainMode` | `HINDSIGHT_RETAIN_MODE` | `"full-session"` | Retention strategy. `"full-session"` sends the full conversation transcript (with chunking). |
+| `retainMode` | `HINDSIGHT_RETAIN_MODE` | `"full-session"` | Retention strategy. `"full-session"` sends the initial transcript once, then only new messages in chunk documents; compaction starts a fresh chunk. |
 | `retainEveryNTurns` | — | `10` | How often to retain. `1` = every turn; `10` = every 10th turn. Higher values reduce API calls but delay memory capture. Values > 1 enable **chunked retention** with a sliding window. |
 | `retainOverlapTurns` | — | `2` | When chunked retention fires, this many extra turns from the previous chunk are included for continuity. Total window size = `retainEveryNTurns + retainOverlapTurns`. |
 | `retainMaxChars` | `HINDSIGHT_RETAIN_MAX_CHARS` | `30000` | Maximum characters sent per retain payload. Oversized transcripts keep the session head and latest tail with a truncation marker. Set `0` to disable the cap. |

@@ -103,24 +103,26 @@ mod tests {
             async_: false,
             items: vec![
                 types::MemoryItem {
-                    content: "Alice is a software engineer at Google".to_string(),
+                    content: types::Content::Variant0("Alice is a software engineer at Google".to_string()),
                     context: None,
                     document_id: None,
                     metadata: None,
                     timestamp: None,
                     entities: None,
+                    resolve_entities: true,
                     tags: None,
                     observation_scopes: None,
                     strategy: None,
                     update_mode: None,
                 },
                 types::MemoryItem {
-                    content: "Bob works with Alice on the search team".to_string(),
+                    content: types::Content::Variant0("Bob works with Alice on the search team".to_string()),
                     context: None,
                     document_id: None,
                     metadata: None,
                     timestamp: None,
                     entities: None,
+                    resolve_entities: true,
                     tags: None,
                     observation_scopes: None,
                     strategy: None,
@@ -128,6 +130,7 @@ mod tests {
                 },
             ],
             document_tags: None,
+            operation_id: None,
         };
         let retain_response = client
             .retain_memories(&bank_id, None, &retain_request)
@@ -140,6 +143,7 @@ mod tests {
             query: "Who is Alice?".to_string(),
             max_tokens: 4096,
             trace: false,
+            prefer_observations: false,
             budget: None,
             include: None,
             query_timestamp: None,
@@ -147,6 +151,8 @@ mod tests {
             tags: None,
             tags_match: types::TagsMatch::Any,
             tag_groups: None,
+            min_scores: None,
+            temporal_window: None,
         };
         let recall_response = client
             .recall_memories(&bank_id, None, &recall_request)

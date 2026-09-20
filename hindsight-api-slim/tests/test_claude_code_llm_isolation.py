@@ -31,6 +31,7 @@ class _FakeOptions:
     tools: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
     mcp_servers: dict[str, Any] = field(default_factory=dict)
+    model: str | None = None
 
 
 class _FakeAssistantMessage:
@@ -81,11 +82,13 @@ async def test_call_passes_isolation_env_to_sdk_options(monkeypatch):
     monkeypatch.setattr(claude_agent_sdk, "query", fake_query)
 
     provider = _instantiate_provider()
-    result = await provider.call(
-        messages=[{"role": "user", "content": "hi"}],
-        max_retries=0,
-        scope="test",
-    )
+    result = (
+        await provider.call(
+            messages=[{"role": "user", "content": "hi"}],
+            max_retries=0,
+            scope="test",
+        )
+    ).content
 
     assert result == "ok"
     assert "options" in captured, "fake query was not called"

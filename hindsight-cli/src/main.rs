@@ -4,7 +4,6 @@ mod config;
 mod errors;
 mod output;
 mod ui;
-mod utils;
 
 use anyhow::Result;
 use api::ApiClient;
@@ -68,7 +67,7 @@ fn get_after_help() -> String {
 }
 
 fn get_before_help() -> &'static str {
-    ui::get_logo()
+    ui::before_help_logo()
 }
 
 #[derive(Subcommand)]
@@ -97,13 +96,17 @@ enum Commands {
     #[command(subcommand)]
     Chunk(ChunkCommands),
 
-    /// Manage async operations (list, get, cancel)
+    /// Manage async operations (list, get, cancel, retry, delete)
     #[command(subcommand)]
     Operation(OperationCommands),
 
     /// Manage mental models (user-curated summaries)
     #[command(subcommand)]
     MentalModel(MentalModelCommands),
+
+    /// Manage the knowledge base (folder/page tree, search, export)
+    #[command(subcommand)]
+    KnowledgeBase(KnowledgeBaseCommands),
 
     /// Manage directives (behavioral rules)
     #[command(subcommand)]
@@ -116,6 +119,10 @@ enum Commands {
     /// Inspect audit logs (list, stats)
     #[command(subcommand)]
     Audit(AuditCommands),
+
+    /// Mirror a bank's knowledge base as a live local folder of markdown files
+    #[command(subcommand)]
+    Fs(commands::fs::FsCommands),
 
     /// Check API health status
     Health,
@@ -268,20 +275,6 @@ enum BankCommands {
         mission: String,
     },
 
-    /// Set or merge bank background (deprecated: use mission instead)
-    #[command(hide = true)]
-    Background {
-        /// Bank ID
-        bank_id: String,
-
-        /// Background content
-        content: String,
-
-        /// Skip automatic disposition inference
-        #[arg(long)]
-        no_update_disposition: bool,
-    },
-
     /// Get memory graph data
     Graph {
         /// Bank ID
@@ -408,7 +401,7 @@ enum BankCommands {
         yes: bool,
     },
 
-    /// Set disposition traits directly (1-5 each, via PUT /profile)
+    /// Set disposition traits directly (1-5 each, stored as bank config)
     SetDisposition {
         /// Bank ID
         bank_id: String,
@@ -532,6 +525,18 @@ enum MemoryCommands {
         /// Reference timestamp for recall (ISO 8601, e.g. 2023-05-30T23:40:00)
         #[arg(long)]
         query_timestamp: Option<String>,
+
+        /// Prefer observations: drop raw facts a returned observation was consolidated from (no effect unless observation + a raw type are both recalled)
+        #[arg(long)]
+        prefer_observations: bool,
+
+        /// Start of the time window to search over (ISO 8601; no offset means UTC). Requires --window-end
+        #[arg(long)]
+        window_start: Option<String>,
+
+        /// End of the time window. Ranks memories dated in the window higher; it does not hide the ones outside it
+        #[arg(long)]
+        window_end: Option<String>,
     },
 
     /// Generate answers using bank identity (reflect/reasoning)
@@ -789,7 +794,7 @@ enum OperationCommands {
         operation_id: String,
     },
 
-    /// Cancel a pending async operation
+    /// Cancel a pending or in-flight async operation
     Cancel {
         /// Bank ID
         bank_id: String,
@@ -805,6 +810,19 @@ enum OperationCommands {
 
         /// Operation ID
         operation_id: String,
+    },
+
+    /// Permanently delete a terminal async operation
+    Delete {
+        /// Bank ID
+        bank_id: String,
+
+        /// Operation ID
+        operation_id: String,
+
+        /// Skip confirmation prompt
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
 }
 
@@ -1010,9 +1028,21 @@ enum MentalModelCommands {
         #[arg(long, default_value = "2048")]
         max_tokens: i64,
 
+        /// How the model's tags filter source memories on refresh: any, all,
+        /// any_strict, all_strict, exact. When omitted, a tagged model defaults
+        /// to all_strict (a memory must carry every tag); pass "any" to match
+        /// memories carrying any of the tags.
+        #[arg(long)]
+        tags_match: Option<String>,
+
         /// Refresh this mental model automatically after observations consolidation
         #[arg(long)]
         trigger_refresh_after_consolidation: bool,
+
+        /// Refresh mode: full (default) regenerates the content from scratch on
+        /// each refresh, delta edits the existing content in place
+        #[arg(long)]
+        trigger_mode: Option<String>,
     },
 
     /// Update a mental model
@@ -1042,6 +1072,35 @@ enum MentalModelCommands {
         /// Enable/disable automatic refresh after observations consolidation
         #[arg(long)]
         trigger_refresh_after_consolidation: Option<bool>,
+
+        /// Refresh mode: full or delta. Trigger settings you do not pass keep
+        /// their stored values.
+        #[arg(long)]
+        trigger_mode: Option<String>,
+
+        /// Cron expression (UTC, 5-field, e.g. '0 3 * * *') for scheduled
+        /// refreshes. Setting one turns off refresh-after-consolidation, which
+        /// it is mutually exclusive with. Empty string removes the schedule
+        #[arg(long)]
+        trigger_refresh_cron: Option<String>,
+
+        /// Minimum seconds between two automatic refreshes (0 disables the floor)
+        #[arg(long)]
+        trigger_min_refresh_interval_seconds: Option<u64>,
+
+        /// How the model's tags filter memories during refresh: any, all,
+        /// any_strict, all_strict, exact. Pass an empty string to fall back to
+        /// the server default
+        #[arg(long)]
+        trigger_tags_match: Option<String>,
+
+        /// Record how each refresh reached its result under reflect_response.trace
+        #[arg(long)]
+        trigger_keep_trace: Option<bool>,
+
+        /// Exclude all mental models from the reflect loop during refresh
+        #[arg(long)]
+        trigger_exclude_mental_models: Option<bool>,
     },
 
     /// Delete a mental model
@@ -1066,6 +1125,15 @@ enum MentalModelCommands {
         mental_model_id: String,
     },
 
+    /// Preview a refresh without changing the mental model
+    DryRunRefresh {
+        /// Bank ID
+        bank_id: String,
+
+        /// Mental model ID
+        mental_model_id: String,
+    },
+
     /// Get the change history of a mental model
     History {
         /// Bank ID
@@ -1073,6 +1141,132 @@ enum MentalModelCommands {
 
         /// Mental model ID
         mental_model_id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum KnowledgeBaseCommands {
+    /// Show the folder/page tree for a bank
+    Tree {
+        /// Bank ID
+        bank_id: String,
+    },
+
+    /// Create a folder
+    CreateFolder {
+        /// Bank ID
+        bank_id: String,
+
+        /// Folder name
+        name: String,
+
+        /// Parent folder ID (omit to create at the root)
+        #[arg(long)]
+        parent_id: Option<String>,
+    },
+
+    /// Create a page (content is generated in the background)
+    CreatePage {
+        /// Bank ID
+        bank_id: String,
+
+        /// Page name (must be unique within its folder)
+        name: String,
+
+        /// The question the page answers, re-asked on every refresh
+        source_query: String,
+
+        /// Parent folder ID (omit to create at the root)
+        #[arg(long)]
+        parent_id: Option<String>,
+
+        /// Tags scoping which memories the page is built from (comma-separated).
+        /// A `type:<x>` tag also sets the page's rendered type.
+        #[arg(long, value_delimiter = ',')]
+        tags: Vec<String>,
+
+        /// Maximum tokens for generated content (server default: 4096)
+        #[arg(long)]
+        max_tokens: Option<i64>,
+
+        /// Refresh mode: full or delta. Omit to keep the page default (delta).
+        #[arg(long)]
+        mode: Option<String>,
+
+        /// Fact types the page is built from (comma-separated): world,
+        /// experience, observation. Omit to keep the page default (observation).
+        #[arg(long, value_delimiter = ',')]
+        fact_types: Vec<String>,
+    },
+
+    /// Read a page as a markdown document
+    GetPage {
+        /// Bank ID
+        bank_id: String,
+
+        /// Page ID
+        page_id: String,
+    },
+
+    /// Search pages (hybrid full-text + vector)
+    Search {
+        /// Bank ID
+        bank_id: String,
+
+        /// Search query
+        query: String,
+
+        /// Maximum results to return (1-50)
+        #[arg(long)]
+        limit: Option<u64>,
+    },
+
+    /// Rename/move a node, or update a page's options
+    Update {
+        /// Bank ID
+        bank_id: String,
+
+        /// Folder or page ID
+        node_id: String,
+
+        /// New name
+        #[arg(long)]
+        name: Option<String>,
+
+        /// New parent folder ID
+        #[arg(long)]
+        parent_id: Option<String>,
+
+        /// Pages only: new question. Changing it rebuilds the page.
+        #[arg(long)]
+        source_query: Option<String>,
+
+        /// Pages only: replace tags (comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        tags: Option<Vec<String>>,
+
+        /// Pages only: new maximum tokens for generated content
+        #[arg(long)]
+        max_tokens: Option<i64>,
+    },
+
+    /// Delete a folder or page and its whole subtree
+    Delete {
+        /// Bank ID
+        bank_id: String,
+
+        /// Folder or page ID
+        node_id: String,
+
+        /// Skip the confirmation prompt
+        #[arg(short, long)]
+        yes: bool,
+    },
+
+    /// Export the knowledge base as a markdown bundle
+    Export {
+        /// Bank ID
+        bank_id: String,
     },
 }
 
@@ -1149,6 +1343,22 @@ enum DirectiveCommands {
 }
 
 fn main() {
+    // Rust ignores SIGPIPE at startup so that `println!`/`print!` surface a
+    // closed stdout pipe as an `EPIPE` error rather than a signal. But the
+    // release profile sets `panic = "abort"`, so that write error becomes a
+    // silent SIGABRT — a spurious "fatal error" with no message — whenever
+    // the reader closes early (e.g. `hindsight ... | head`).
+    //
+    // Restore the default SIGPIPE disposition on Unix so the CLI terminates
+    // cleanly on a broken pipe, like other Unix CLI tools. Note this also
+    // applies to socket writes: on Linux a peer closing a connection mid-write
+    // surfaces as SIGPIPE rather than an `Err(EPIPE)`. ripgrep and fd accept
+    // the same trade-off, and it is the correct behavior here too.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     if let Err(e) = run() {
         ui::print_error(&format!("{:#}", e));
         std::process::exit(1);
@@ -1188,7 +1398,7 @@ fn run() -> Result<()> {
     let api_key = config.api_key.clone();
 
     // Create API client
-    let client = ApiClient::new(api_url.clone(), api_key).unwrap_or_else(|e| {
+    let client = ApiClient::new(api_url.clone(), api_key.clone()).unwrap_or_else(|e| {
         errors::handle_api_error(e, &api_url);
     });
 
@@ -1198,6 +1408,12 @@ fn run() -> Result<()> {
         Commands::Profile(_) => unreachable!(),       // Handled above
         Commands::Ui => unreachable!(),               // Handled above
         Commands::Explore => commands::explore::run(&client),
+
+        // Filesystem mirror — talks to the API directly (blocking client), so it
+        // uses the resolved endpoint rather than the generated async client.
+        Commands::Fs(fs_cmd) => {
+            commands::fs::dispatch(fs_cmd, &api_url, api_key.as_deref(), output_format)
+        }
 
         // Health, Metrics, and Version
         Commands::Health => commands::health::health(&client, verbose, output_format),
@@ -1255,18 +1471,6 @@ fn run() -> Result<()> {
             BankCommands::Mission { bank_id, mission } => {
                 commands::bank::mission(&client, &bank_id, &mission, verbose, output_format)
             }
-            BankCommands::Background {
-                bank_id,
-                content,
-                no_update_disposition,
-            } => commands::bank::update_background(
-                &client,
-                &bank_id,
-                &content,
-                no_update_disposition,
-                verbose,
-                output_format,
-            ),
             BankCommands::Graph {
                 bank_id,
                 fact_type,
@@ -1401,6 +1605,9 @@ fn run() -> Result<()> {
                 tags,
                 tags_match,
                 query_timestamp,
+                prefer_observations,
+                window_start,
+                window_end,
             } => commands::memory::recall(
                 &client,
                 &bank_id,
@@ -1414,6 +1621,9 @@ fn run() -> Result<()> {
                 tags,
                 tags_match,
                 query_timestamp,
+                prefer_observations,
+                window_start,
+                window_end,
                 verbose,
                 output_format,
             ),
@@ -1618,6 +1828,18 @@ fn run() -> Result<()> {
             } => {
                 commands::operation::retry(&client, &bank_id, &operation_id, verbose, output_format)
             }
+            OperationCommands::Delete {
+                bank_id,
+                operation_id,
+                yes,
+            } => commands::operation::delete(
+                &client,
+                &bank_id,
+                &operation_id,
+                yes,
+                verbose,
+                output_format,
+            ),
         },
 
         // Mental model commands
@@ -1642,7 +1864,9 @@ fn run() -> Result<()> {
                 id,
                 tags,
                 max_tokens,
+                tags_match,
                 trigger_refresh_after_consolidation,
+                trigger_mode,
             } => commands::mental_model::create(
                 &client,
                 &bank_id,
@@ -1651,7 +1875,9 @@ fn run() -> Result<()> {
                 id.as_deref(),
                 tags,
                 max_tokens,
+                tags_match.as_deref(),
                 trigger_refresh_after_consolidation,
+                trigger_mode.as_deref(),
                 verbose,
                 output_format,
             ),
@@ -1663,6 +1889,12 @@ fn run() -> Result<()> {
                 max_tokens,
                 tags,
                 trigger_refresh_after_consolidation,
+                trigger_mode,
+                trigger_refresh_cron,
+                trigger_min_refresh_interval_seconds,
+                trigger_tags_match,
+                trigger_keep_trace,
+                trigger_exclude_mental_models,
             } => commands::mental_model::update(
                 &client,
                 &bank_id,
@@ -1671,7 +1903,15 @@ fn run() -> Result<()> {
                 source_query,
                 max_tokens,
                 tags,
-                trigger_refresh_after_consolidation,
+                &commands::mental_model::TriggerUpdate {
+                    mode: trigger_mode,
+                    refresh_after_consolidation: trigger_refresh_after_consolidation,
+                    refresh_cron: trigger_refresh_cron,
+                    min_refresh_interval_seconds: trigger_min_refresh_interval_seconds,
+                    tags_match: trigger_tags_match,
+                    keep_trace: trigger_keep_trace,
+                    exclude_mental_models: trigger_exclude_mental_models,
+                },
                 verbose,
                 output_format,
             ),
@@ -1697,6 +1937,16 @@ fn run() -> Result<()> {
                 verbose,
                 output_format,
             ),
+            MentalModelCommands::DryRunRefresh {
+                bank_id,
+                mental_model_id,
+            } => commands::mental_model::dry_run_refresh(
+                &client,
+                &bank_id,
+                &mental_model_id,
+                verbose,
+                output_format,
+            ),
             MentalModelCommands::History {
                 bank_id,
                 mental_model_id,
@@ -1707,6 +1957,103 @@ fn run() -> Result<()> {
                 verbose,
                 output_format,
             ),
+        },
+
+        // Knowledge base commands
+        Commands::KnowledgeBase(kb_cmd) => match kb_cmd {
+            KnowledgeBaseCommands::Tree { bank_id } => {
+                commands::knowledge_base::tree(&client, &bank_id, verbose, output_format)
+            }
+            KnowledgeBaseCommands::CreateFolder {
+                bank_id,
+                name,
+                parent_id,
+            } => commands::knowledge_base::create_folder(
+                &client,
+                &bank_id,
+                &name,
+                parent_id.as_deref(),
+                verbose,
+                output_format,
+            ),
+            KnowledgeBaseCommands::CreatePage {
+                bank_id,
+                name,
+                source_query,
+                parent_id,
+                tags,
+                max_tokens,
+                mode,
+                fact_types,
+            } => commands::knowledge_base::create_page(
+                &client,
+                &bank_id,
+                &name,
+                &source_query,
+                parent_id.as_deref(),
+                tags,
+                max_tokens,
+                mode.as_deref(),
+                fact_types,
+                verbose,
+                output_format,
+            ),
+            KnowledgeBaseCommands::GetPage { bank_id, page_id } => {
+                commands::knowledge_base::get_page(
+                    &client,
+                    &bank_id,
+                    &page_id,
+                    verbose,
+                    output_format,
+                )
+            }
+            KnowledgeBaseCommands::Search {
+                bank_id,
+                query,
+                limit,
+            } => commands::knowledge_base::search(
+                &client,
+                &bank_id,
+                &query,
+                limit,
+                verbose,
+                output_format,
+            ),
+            KnowledgeBaseCommands::Update {
+                bank_id,
+                node_id,
+                name,
+                parent_id,
+                source_query,
+                tags,
+                max_tokens,
+            } => commands::knowledge_base::update(
+                &client,
+                &bank_id,
+                &node_id,
+                name,
+                parent_id,
+                source_query,
+                tags,
+                max_tokens,
+                verbose,
+                output_format,
+            ),
+            KnowledgeBaseCommands::Delete {
+                bank_id,
+                node_id,
+                yes,
+            } => commands::knowledge_base::delete(
+                &client,
+                &bank_id,
+                &node_id,
+                yes,
+                verbose,
+                output_format,
+            ),
+            KnowledgeBaseCommands::Export { bank_id } => {
+                commands::knowledge_base::export(&client, &bank_id, verbose, output_format)
+            }
         },
 
         // Directive commands
@@ -1910,11 +2257,10 @@ fn handle_configure(
 
     // Validate the URL
     if !new_api_url.starts_with("http://") && !new_api_url.starts_with("https://") {
-        ui::print_error(&format!(
+        anyhow::bail!(
             "Invalid API URL: {}. Must start with http:// or https://",
             new_api_url
-        ));
-        return Ok(());
+        );
     }
 
     // Use provided api_key, or keep existing one if not provided
@@ -2111,6 +2457,38 @@ fn handle_profile(cmd: ProfileCommands, output_format: OutputFormat) -> Result<(
                 )?;
             }
             Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Commands, OperationCommands};
+    use clap::Parser;
+
+    #[test]
+    fn parses_operation_delete_with_confirmation_bypass() {
+        let cli = Cli::try_parse_from([
+            "hindsight",
+            "operation",
+            "delete",
+            "bank-1",
+            "operation-1",
+            "--yes",
+        ])
+        .expect("operation delete should be a valid command");
+
+        match cli.command {
+            Commands::Operation(OperationCommands::Delete {
+                bank_id,
+                operation_id,
+                yes,
+            }) => {
+                assert_eq!(bank_id, "bank-1");
+                assert_eq!(operation_id, "operation-1");
+                assert!(yes);
+            }
+            _ => panic!("expected operation delete command"),
         }
     }
 }

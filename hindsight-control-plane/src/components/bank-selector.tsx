@@ -6,8 +6,22 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { useTranslations } from "next-intl";
 import { useBank } from "@/lib/bank-context";
 import { bankRoute } from "@/lib/bank-url";
+import { hoistCurrentBank } from "@/lib/bank-order";
 import { withBasePath } from "@/lib/base-path";
 import { client } from "@/lib/api";
+import type { RetainContentBlock as ContentBlock } from "@/lib/api";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+
+/** One element of a document composed as an ordered block list. */
+type DocBlock =
+  | { kind: "text"; text: string }
+  | { kind: "attachment"; name: string; mediaType: string; data: string; size: number };
+
 import { LanguageSwitcher } from "@/components/language-switcher";
 import { Button } from "@/components/ui/button";
 import {
@@ -42,7 +56,10 @@ import {
   ChevronRight,
   LogOut,
   Copy,
+  Paperclip,
+  ChevronUp,
 } from "lucide-react";
+import { Spinner } from "@/components/ui/spinner";
 import { toast } from "sonner";
 import { useTheme } from "@/lib/theme-context";
 import { useFeatures } from "@/lib/features-context";
@@ -59,7 +76,7 @@ import {
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
-import type { BankInfo } from "@/lib/bank-context";
+import { BANKS_PAGE_SIZE, type BankInfo } from "@/lib/bank-context";
 
 function formatCompact(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1)}M`;
@@ -94,10 +111,26 @@ function BankSelectorInner() {
   const tNavBank = useTranslations("nav.bank");
   const tCommon = useTranslations("common");
   const tAddDocument = useTranslations("addDocument");
-  const { currentBank, setCurrentBank, banks, bankInfos, banksLoading, loadBanks } = useBank();
+  const tApiError = useTranslations("api.errors.files");
+  const {
+    currentBank,
+    setCurrentBank,
+    bankInfos,
+    banksLoading,
+    banksLoadingMore,
+    hasMoreBanks,
+    bankSearch,
+    currentBankName,
+    searchBanks,
+    loadBanks,
+    loadMoreBanks,
+  } = useBank();
   const { theme, toggleTheme } = useTheme();
   const { features } = useFeatures();
   const [open, setOpen] = React.useState(false);
+  // One-shot spin of the header logo, fired by sidebar navigation (see the
+  // "hindsight:logo-spin" listener below). Reset on animationEnd so it can replay.
+  const [logoSpinning, setLogoSpinning] = React.useState(false);
   const [createDialogOpen, setCreateDialogOpen] = React.useState(false);
   const [newBankId, setNewBankId] = React.useState("");
   const [isCreating, setIsCreating] = React.useState(false);
@@ -110,6 +143,18 @@ function BankSelectorInner() {
   const [docDialogOpen, setDocDialogOpen] = React.useState(false);
   const [docTab, setDocTab] = React.useState<"text" | "upload">("text");
   const [docContent, setDocContent] = React.useState("");
+  // Attachments to interleave into the document's content. Kept in order, and
+  // appended after the prose: the API takes an ordered block list, and a form
+  // with one textarea has no way to express "this picture goes *here*". Anyone
+  // needing exact placement sends blocks through the API directly.
+  // How the document's content is being composed. "text" is the plain textarea
+  // every document has always used; "blocks" is the ordered list that lets an
+  // attachment sit *between* two runs of prose, which is the whole point of
+  // inline attachments and cannot be expressed with one textarea. Kept as a
+  // switch so the common case — typing some text — is not cluttered by an
+  // editor most documents never need.
+  const [docComposeMode, setDocComposeMode] = React.useState<"text" | "blocks">("text");
+  const [docBlocks, setDocBlocks] = React.useState<DocBlock[]>([]);
   const [docContext, setDocContext] = React.useState("");
   const [docEventDate, setDocEventDate] = React.useState("");
   const [docDocumentId, setDocDocumentId] = React.useState("");
@@ -172,19 +217,68 @@ function BankSelectorInner() {
       });
   }, []);
 
-  const sortedBanks = React.useMemo(() => {
-    // Sort by last document inserted descending, then by created_at
-    return [...bankInfos].sort((a, b) => {
-      const aTime = a.last_document_at || a.created_at || "";
-      const bTime = b.last_document_at || b.created_at || "";
-      return bTime.localeCompare(aTime);
-    });
-  }, [bankInfos]);
+  // Spin the header logo whenever a sidebar item is clicked. Decoupled via a
+  // window event (like DOCUMENTS_REFRESH_EVENT) since the sidebar and this header
+  // are siblings, not parent/child. onAnimationEnd clears the flag so the next
+  // click replays it. (A mid-spin re-click is a no-op — the flag is already set —
+  // which is fine; we avoid a requestAnimationFrame restart because rAF is paused
+  // in background tabs, which would drop the spin entirely.)
+  React.useEffect(() => {
+    const spin = () => setLogoSpinning(true);
+    window.addEventListener("hindsight:logo-spin", spin);
+    return () => window.removeEventListener("hindsight:logo-spin", spin);
+  }, []);
+
+  // The banks overview page has its own "create bank" button; the dialog (with its
+  // template import) lives here, so that button asks for it rather than duplicating it.
+  React.useEffect(() => {
+    const openCreate = () => setCreateDialogOpen(true);
+    window.addEventListener("hindsight:create-bank", openCreate);
+    return () => window.removeEventListener("hindsight:create-bank", openCreate);
+  }, []);
 
   const maxFactCount = React.useMemo(
-    () => Math.max(1, ...sortedBanks.map((b) => b.fact_count)),
-    [sortedBanks]
+    () => Math.max(1, ...bankInfos.map((b) => b.fact_count)),
+    [bankInfos]
   );
+
+  // Banks arrive already ordered by last write descending, one page at a time, so the
+  // list stays in server order — re-sorting it here would only shuffle a later page
+  // above an earlier one. The single exception is hoisting the current bank; see
+  // hoistCurrentBank for why that one is worth the reorder.
+  const orderedBanks = React.useMemo(
+    () => hoistCurrentBank(bankInfos, currentBank),
+    [bankInfos, currentBank]
+  );
+
+  // Search runs server-side (the bank list is paginated), so the input holds a draft
+  // that is debounced into a fresh first page.
+  const [searchDraft, setSearchDraft] = React.useState("");
+  React.useEffect(() => {
+    if (!open || searchDraft === bankSearch) return;
+    const timer = setTimeout(() => searchBanks(searchDraft), 250);
+    return () => clearTimeout(timer);
+  }, [open, searchDraft, bankSearch, searchBanks]);
+
+  // Infinite scroll: fetch the next page once the end of the list scrolls into view.
+  // The nodes are tracked as state via callback refs, not useRef: the popover content
+  // mounts in a portal after the commit that flips `open`, so an effect reading
+  // ref.current would find null and never re-run. The observer is also rebuilt
+  // whenever a page lands, so a sentinel that is still visible (a page shorter than
+  // the list viewport) keeps paging instead of stalling.
+  const [listEl, setListEl] = React.useState<HTMLDivElement | null>(null);
+  const [sentinelEl, setSentinelEl] = React.useState<HTMLDivElement | null>(null);
+  React.useEffect(() => {
+    if (!hasMoreBanks || !listEl || !sentinelEl) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) loadMoreBanks();
+      },
+      { root: listEl, rootMargin: "120px" }
+    );
+    observer.observe(sentinelEl);
+    return () => observer.disconnect();
+  }, [hasMoreBanks, listEl, sentinelEl, loadMoreBanks, bankInfos.length]);
 
   const handleCreateBank = async () => {
     if (!newBankId.trim()) return;
@@ -376,10 +470,17 @@ function BankSelectorInner() {
       setDocAsync(false);
       setUploadProgress("");
 
+      // Nudge the documents view to surface the new file_convert_retain
+      // operations right away (it derives pending rows from the server).
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(new Event("hindsight:documents-refresh"));
+      }
+
       // Navigate to documents view
       router.push(bankRoute(currentBank!, "?view=documents"));
-    } catch {
-      // Error toast is shown automatically by the API client interceptor
+    } catch (error) {
+      // Multipart uploads bypass the API client's shared error interceptor.
+      toast.error(error instanceof Error ? error.message : tApiError("upload"));
     } finally {
       setIsCreatingDoc(false);
       setUploadProgress("");
@@ -387,7 +488,11 @@ function BankSelectorInner() {
   };
 
   const handleCreateDocument = async () => {
-    if (!currentBank || !docContent.trim()) return;
+    const hasBlockContent = docBlocks.some((b) =>
+      b.kind === "text" ? b.text.trim().length > 0 : true
+    );
+    const hasContent = docComposeMode === "blocks" ? hasBlockContent : docContent.trim().length > 0;
+    if (!currentBank || !hasContent) return;
 
     setIsCreatingDoc(true);
 
@@ -398,7 +503,7 @@ function BankSelectorInner() {
         .filter(Boolean);
 
       const item: {
-        content: string;
+        content: string | ContentBlock[];
         context?: string;
         timestamp?: string;
         document_id?: string;
@@ -408,6 +513,28 @@ function BankSelectorInner() {
         entities?: Array<{ text: string }>;
         strategy?: string;
       } = { content: docContent };
+      if (docComposeMode === "blocks") {
+        // Sent in the order they were arranged, so an attachment reaches the
+        // extractor between the sentences that frame it. An image block for
+        // images and a file block for everything else — the distinction the API
+        // keeps because the providers keep it.
+        item.content = docBlocks
+          .filter((b) => (b.kind === "text" ? b.text.trim().length > 0 : true))
+          .map((b) =>
+            b.kind === "text"
+              ? { type: "text" as const, text: b.text }
+              : b.mediaType.startsWith("image/")
+                ? {
+                    type: "image" as const,
+                    source: { type: "base64" as const, media_type: b.mediaType, data: b.data },
+                  }
+                : {
+                    type: "file" as const,
+                    filename: b.name,
+                    source: { type: "base64" as const, media_type: b.mediaType, data: b.data },
+                  }
+          );
+      }
       if (docContext) item.context = docContext;
       if (docEventDate) item.timestamp = toIsoTimestamp(docEventDate);
       if (docDocumentId) item.document_id = docDocumentId;
@@ -447,6 +574,8 @@ function BankSelectorInner() {
       // Reset form and close dialog
       setDocDialogOpen(false);
       setDocContent("");
+      setDocBlocks([]);
+      setDocComposeMode("text");
       setDocContext("");
       setDocEventDate("");
       setDocDocumentId("");
@@ -471,15 +600,35 @@ function BankSelectorInner() {
   return (
     <div className="bg-card text-card-foreground px-5 py-3 border-b-4 border-primary-gradient">
       <div className="flex items-center gap-4 text-sm">
-        {/* Logo */}
-        <Image
-          src={withBasePath("/logo.png")}
-          alt="Hindsight"
-          width={40}
-          height={40}
-          className="h-10 w-auto"
-          unoptimized
-        />
+        {/* Logo, split so only the mark spins on navigation while the wordmark
+            stays put. The mark is the standalone favicon.png (so it can rotate
+            freely); the wordmark is the right slice of the full lockup (logo.png)
+            shown via a cropped background. Their widths sum to the full logo, so
+            the two pieces butt together seamlessly at h-10. */}
+        {/* The logo is the way back to the banks overview, as it is in most apps. */}
+        <button
+          type="button"
+          className="flex items-center h-10 select-none cursor-pointer"
+          aria-label={tNavBank("allBanks")}
+          title={tNavBank("allBanks")}
+          onClick={() => router.push("/dashboard")}
+        >
+          <img
+            src={withBasePath("/favicon.png")}
+            alt=""
+            className={cn("h-10 w-auto", logoSpinning && "animate-logo-wiggle")}
+            onAnimationEnd={() => setLogoSpinning(false)}
+          />
+          <div
+            className="h-10 w-[99px]"
+            style={{
+              backgroundImage: `url(${withBasePath("/logo.png")})`,
+              backgroundSize: "auto 100%",
+              backgroundPosition: "right center",
+              backgroundRepeat: "no-repeat",
+            }}
+          />
+        </button>
 
         {/* Separator */}
         <div className="h-8 w-px bg-border" />
@@ -489,7 +638,12 @@ function BankSelectorInner() {
           open={open}
           onOpenChange={(isOpen) => {
             setOpen(isOpen);
-            if (isOpen) loadBanks();
+            if (isOpen) {
+              // Reopen on an unfiltered first page rather than whatever was typed last.
+              setSearchDraft("");
+              if (bankSearch) searchBanks("");
+              else loadBanks();
+            }
           }}
         >
           <PopoverTrigger asChild>
@@ -499,28 +653,53 @@ function BankSelectorInner() {
               aria-expanded={open}
               className="w-[250px] justify-between font-bold border-2 border-primary hover:bg-accent"
             >
-              <span className="truncate">{currentBank || tNavBank("select")}</span>
+              <span className="truncate">
+                {currentBankName || currentBank || tNavBank("select")}
+              </span>
               <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
             </Button>
           </PopoverTrigger>
           <PopoverContent className="w-[420px] p-0" align="start">
-            <Command>
-              {sortedBanks.length > 0 && <CommandInput placeholder={tNavBank("search")} />}
-              <CommandList>
+            {/* shouldFilter={false}: matching is done by the server so search reaches
+                banks that haven't been paged in yet. */}
+            <Command shouldFilter={false}>
+              <CommandInput
+                placeholder={tNavBank("search")}
+                value={searchDraft}
+                onValueChange={setSearchDraft}
+              />
+              <CommandList
+                ref={setListEl}
+                // cmdk keeps --cmdk-list-height in sync with the rendered rows, so the
+                // popover eases down to the filtered set instead of snapping shut.
+                className="h-[min(300px,var(--cmdk-list-height,300px))] transition-[height] duration-200 ease-out motion-reduce:transition-none"
+              >
                 <CommandEmpty>
                   {banksLoading ? (
                     <div className="flex items-center justify-center gap-2 py-2">
-                      <div className="h-4 w-4 animate-spin rounded-full border-2 border-primary border-t-transparent" />
+                      <Spinner size="sm" />
                       <span>{tCommon("loading")}</span>
                     </div>
+                  ) : bankSearch ? (
+                    tNavBank("noSearchResults")
                   ) : (
                     tNavBank("empty")
                   )}
                 </CommandEmpty>
-                <CommandGroup>
-                  {sortedBanks.map((bank) => {
+                {/* The previous results stay put and dim while a search is in flight —
+                    blanking the list first makes every keystroke flash. */}
+                <CommandGroup
+                  className={cn(
+                    "transition-opacity duration-150 motion-reduce:transition-none",
+                    banksLoading && bankInfos.length > 0 && "opacity-40"
+                  )}
+                >
+                  {orderedBanks.map((bank, index) => {
                     const barPct = (bank.fact_count / maxFactCount) * 100;
                     const isSelected = currentBank === bank.bank_id;
+                    // Last write, not last ingestion: appends to an existing document
+                    // bump last_write_at only.
+                    const lastWriteAt = bank.last_write_at || bank.last_document_at;
                     return (
                       <CommandItem
                         key={bank.bank_id}
@@ -535,7 +714,20 @@ function BankSelectorInner() {
                             : `?view=${view}`;
                           router.push(bankRoute(value, queryString));
                         }}
-                        className="relative overflow-hidden py-2.5 mb-0.5 group"
+                        // Only rows that actually mount animate: React keeps the pages
+                        // already on screen, so appending page 2 flows in without
+                        // replaying page 1. The stagger restarts per page and is capped
+                        // so the tail of a 50-row page doesn't crawl in.
+                        className={cn(
+                          "relative overflow-hidden py-2.5 mb-0.5 group animate-list-row-enter",
+                          // Not bg-accent: cmdk paints the keyboard-active row with
+                          // data-[selected=true]:bg-accent, so reusing it here would
+                          // make two rows look active at once while arrowing down.
+                          isSelected && "ring-1 ring-inset ring-primary/50"
+                        )}
+                        style={{
+                          animationDelay: `${Math.min(index % BANKS_PAGE_SIZE, 10) * 18}ms`,
+                        }}
                       >
                         {/* Background bar — proportional to memory count */}
                         <div
@@ -546,11 +738,17 @@ function BankSelectorInner() {
                           <Check
                             className={cn(
                               "h-4 w-4 shrink-0",
-                              isSelected ? "opacity-100" : "opacity-0"
+                              isSelected ? "opacity-100 text-primary" : "opacity-0"
                             )}
                           />
-                          <span className="truncate flex-1 font-medium" title={bank.bank_id}>
-                            {bank.bank_id}
+                          <span
+                            className={cn(
+                              "truncate flex-1",
+                              isSelected ? "font-semibold" : "font-medium"
+                            )}
+                            title={bank.name || bank.bank_id}
+                          >
+                            {bank.name || bank.bank_id}
                           </span>
                           <button
                             type="button"
@@ -577,9 +775,7 @@ function BankSelectorInner() {
                               <>
                                 {formatCompact(bank.fact_count)}
                                 <span className="ml-1.5 text-muted-foreground/40">
-                                  {bank.last_document_at
-                                    ? formatTimeAgo(bank.last_document_at)
-                                    : ""}
+                                  {lastWriteAt ? formatTimeAgo(lastWriteAt) : ""}
                                 </span>
                               </>
                             ) : (
@@ -591,6 +787,15 @@ function BankSelectorInner() {
                     );
                   })}
                 </CommandGroup>
+                {hasMoreBanks && (
+                  <div ref={setSentinelEl} className="flex items-center justify-center py-2">
+                    {banksLoadingMore && (
+                      <span className="animate-soft-fade-in">
+                        <Spinner size="sm" />
+                      </span>
+                    )}
+                  </div>
+                )}
               </CommandList>
               {/* Footer: Create new bank */}
               <div className="border-t border-border p-1">
@@ -798,16 +1003,204 @@ function BankSelectorInner() {
                 </TabsList>
 
                 <TabsContent value="text" className="mt-3">
-                  <label className="font-bold block mb-1 text-sm text-foreground">
-                    {tAddDocument("contentLabel")}
-                  </label>
-                  <Textarea
-                    value={docContent}
-                    onChange={(e) => setDocContent(e.target.value)}
-                    placeholder={tAddDocument("contentPlaceholder")}
-                    className="min-h-[150px] resize-y"
-                    autoFocus
-                  />
+                  <div className="flex items-center justify-between mb-1">
+                    <label className="font-bold text-sm text-foreground">
+                      {tAddDocument("contentLabel")}
+                    </label>
+                    {/* The switch, rather than always showing the block editor:
+                        most documents are just text, and an ordered block list
+                        would be clutter in front of every one of them. */}
+                    <div className="flex items-center rounded border border-border overflow-hidden text-xs">
+                      <button
+                        type="button"
+                        onClick={() => setDocComposeMode("text")}
+                        className={`px-2 py-1 ${
+                          docComposeMode === "text"
+                            ? "bg-muted text-foreground font-semibold"
+                            : "text-muted-foreground hover:bg-muted/50"
+                        }`}
+                      >
+                        {tAddDocument("composeText")}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          // Carry the typed text across so switching never
+                          // silently loses what is already written.
+                          setDocBlocks((current) =>
+                            current.length > 0 ? current : [{ kind: "text", text: docContent }]
+                          );
+                          setDocComposeMode("blocks");
+                        }}
+                        className={`px-2 py-1 border-l border-border ${
+                          docComposeMode === "blocks"
+                            ? "bg-muted text-foreground font-semibold"
+                            : "text-muted-foreground hover:bg-muted/50"
+                        }`}
+                      >
+                        {tAddDocument("composeBlocks")}
+                      </button>
+                    </div>
+                  </div>
+
+                  {docComposeMode === "text" ? (
+                    <Textarea
+                      value={docContent}
+                      onChange={(e) => setDocContent(e.target.value)}
+                      placeholder={tAddDocument("contentPlaceholder")}
+                      className="min-h-[150px] resize-y"
+                      autoFocus
+                    />
+                  ) : (
+                    <div className="space-y-2">
+                      <p className="text-xs text-muted-foreground">
+                        {tAddDocument("composeBlocksHint")}
+                      </p>
+                      {docBlocks.map((block, index) => (
+                        <div
+                          key={index}
+                          className="group relative rounded border border-border bg-muted/20 p-2"
+                        >
+                          {/* Controls overlay the block rather than sitting in a
+                              column beside it: at this width a fixed gutter of
+                              arrows and a close button squeezed the content into
+                              a sliver. Revealed on hover and on keyboard focus,
+                              so they stay reachable without a pointer. */}
+                          <div className="absolute top-1 right-1 flex items-center gap-0.5 rounded bg-background/80 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
+                            <button
+                              type="button"
+                              aria-label={tAddDocument("blockMoveUp")}
+                              disabled={index === 0}
+                              onClick={() =>
+                                setDocBlocks((current) => {
+                                  const next = [...current];
+                                  [next[index - 1], next[index]] = [next[index], next[index - 1]];
+                                  return next;
+                                })
+                              }
+                              className="p-1 rounded text-muted-foreground hover:text-foreground hover:bg-muted disabled:opacity-25"
+                            >
+                              <ChevronUp className="h-3.5 w-3.5" />
+                            </button>
+                            <button
+                              type="button"
+                              aria-label={tAddDocument("blockMoveDown")}
+                              disabled={index === docBlocks.length - 1}
+                              onClick={() =>
+                                setDocBlocks((current) => {
+                                  const next = [...current];
+                                  [next[index], next[index + 1]] = [next[index + 1], next[index]];
+                                  return next;
+                                })
+                              }
+                              className="p-1 rounded text-muted-foreground hover:text-foreground hover:bg-muted disabled:opacity-25"
+                            >
+                              <ChevronDown className="h-3.5 w-3.5" />
+                            </button>
+                            <button
+                              type="button"
+                              aria-label={tAddDocument("blockRemove")}
+                              onClick={() =>
+                                setDocBlocks((current) => current.filter((_, i) => i !== index))
+                              }
+                              className="p-1 rounded text-muted-foreground hover:text-foreground hover:bg-muted"
+                            >
+                              <X className="h-3.5 w-3.5" />
+                            </button>
+                          </div>
+
+                          {block.kind === "text" ? (
+                            <Textarea
+                              value={block.text}
+                              onChange={(e) =>
+                                setDocBlocks((current) =>
+                                  current.map((b, i) =>
+                                    i === index && b.kind === "text"
+                                      ? { ...b, text: e.target.value }
+                                      : b
+                                  )
+                                )
+                              }
+                              placeholder={tAddDocument("contentPlaceholder")}
+                              // Room for the overlay so the first line never runs
+                              // underneath it.
+                              className="min-h-[80px] resize-y border-0 bg-transparent p-0 pr-20 shadow-none focus-visible:ring-0"
+                            />
+                          ) : (
+                            <div className="flex items-center gap-2 pr-20 text-sm">
+                              <Paperclip className="h-4 w-4 shrink-0 text-muted-foreground" />
+                              <span className="truncate">{block.name}</span>
+                              <span className="shrink-0 text-xs text-muted-foreground">
+                                {(block.size / 1024).toFixed(0)} KB
+                              </span>
+                            </div>
+                          )}
+                        </div>
+                      ))}
+
+                      <input
+                        id="doc-attachment-input"
+                        type="file"
+                        multiple
+                        className="hidden"
+                        onChange={async (e) => {
+                          const files = Array.from(e.target.files ?? []);
+                          const encoded = await Promise.all(
+                            files.map(
+                              (file) =>
+                                new Promise<DocBlock>((resolve, reject) => {
+                                  const reader = new FileReader();
+                                  reader.onerror = () => reject(reader.error);
+                                  reader.onload = () =>
+                                    resolve({
+                                      kind: "attachment",
+                                      name: file.name,
+                                      // Some browsers report "" for unusual
+                                      // extensions; the API accepts any
+                                      // well-formed type, so fall back to a
+                                      // generic one rather than refusing it.
+                                      mediaType: file.type || "application/octet-stream",
+                                      size: file.size,
+                                      // readAsDataURL gives "data:<type>;base64,<payload>";
+                                      // the API wants the payload alone.
+                                      data: String(reader.result).split(",", 2)[1] ?? "",
+                                    });
+                                  reader.readAsDataURL(file);
+                                })
+                            )
+                          );
+                          setDocBlocks((current) => [...current, ...encoded]);
+                          // Let the same file be picked again after removal.
+                          e.target.value = "";
+                        }}
+                      />
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <Button type="button" variant="outline" size="sm">
+                            <Plus className="mr-1.5 h-3.5 w-3.5" />
+                            {tAddDocument("blockAdd")}
+                            <ChevronDown className="ml-1.5 h-3.5 w-3.5" />
+                          </Button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="start">
+                          <DropdownMenuItem
+                            onSelect={() =>
+                              setDocBlocks((current) => [...current, { kind: "text", text: "" }])
+                            }
+                          >
+                            {tAddDocument("blockAddText")}
+                          </DropdownMenuItem>
+                          <DropdownMenuItem
+                            onSelect={() =>
+                              document.getElementById("doc-attachment-input")?.click()
+                            }
+                          >
+                            {tAddDocument("blockAddAttachment")}
+                          </DropdownMenuItem>
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+                    </div>
+                  )}
                 </TabsContent>
 
                 <TabsContent value="upload" className="mt-3">
@@ -1333,6 +1726,8 @@ function BankSelectorInner() {
                 onClick={() => {
                   setDocDialogOpen(false);
                   setDocContent("");
+                  setDocBlocks([]);
+                  setDocComposeMode("text");
                   setDocContext("");
                   setDocEventDate("");
                   setDocDocumentId("");
@@ -1353,7 +1748,14 @@ function BankSelectorInner() {
               {docTab === "text" ? (
                 <Button
                   onClick={handleCreateDocument}
-                  disabled={isCreatingDoc || !docContent.trim()}
+                  disabled={
+                    isCreatingDoc ||
+                    (docComposeMode === "blocks"
+                      ? !docBlocks.some((b) =>
+                          b.kind === "text" ? b.text.trim().length > 0 : true
+                        )
+                      : !docContent.trim())
+                  }
                 >
                   {isCreatingDoc
                     ? tAddDocument("addingDocument")

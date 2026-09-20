@@ -91,6 +91,13 @@ const manifest: PaperclipPluginManifestV1 = {
         description:
           "Optional operator-provided queue endpoint. When set, agent.created posts one seed job with the canonical bank id and deterministic query plan.",
       },
+      enabledAgentIds: {
+        type: "array",
+        title: "Enabled Agent IDs",
+        description:
+          "Restrict Hindsight recall/retain to these agent IDs only. Leave empty to enable for all agents (default).",
+        items: { type: "string" },
+      },
     },
   },
   tools: [

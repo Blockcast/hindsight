@@ -65,12 +65,14 @@ class TestRecallConfigFields:
     """Hierarchical config fields for internal recall."""
 
     def test_fields_exist_on_dataclass(self):
-        from hindsight_api.config import HindsightConfig
+        from hindsight_api.config import DEFAULT_BM25_MAX_QUERY_TERMS, HindsightConfig
 
         names = {f.name for f in dataclasses.fields(HindsightConfig)}
         assert "recall_include_chunks" in names
         assert "recall_max_tokens" in names
         assert "recall_chunks_max_tokens" in names
+        assert "bm25_max_query_terms" in names
+        assert HindsightConfig.__dataclass_fields__["bm25_max_query_terms"].default == DEFAULT_BM25_MAX_QUERY_TERMS
 
     def test_fields_are_configurable(self):
         from hindsight_api.config import HindsightConfig
@@ -82,6 +84,7 @@ class TestRecallConfigFields:
 
     def test_default_values(self):
         from hindsight_api.config import (
+            DEFAULT_BM25_MAX_QUERY_TERMS,
             DEFAULT_RECALL_CHUNKS_MAX_TOKENS,
             DEFAULT_RECALL_INCLUDE_CHUNKS,
             DEFAULT_RECALL_MAX_TOKENS,
@@ -90,9 +93,11 @@ class TestRecallConfigFields:
         assert DEFAULT_RECALL_INCLUDE_CHUNKS is True
         assert DEFAULT_RECALL_MAX_TOKENS == 2048
         assert DEFAULT_RECALL_CHUNKS_MAX_TOKENS == 1000
+        assert DEFAULT_BM25_MAX_QUERY_TERMS == 16
 
     def test_env_var_constants(self):
         from hindsight_api.config import (
+            ENV_BM25_MAX_QUERY_TERMS,
             ENV_RECALL_CHUNKS_MAX_TOKENS,
             ENV_RECALL_INCLUDE_CHUNKS,
             ENV_RECALL_MAX_TOKENS,
@@ -101,6 +106,7 @@ class TestRecallConfigFields:
         assert ENV_RECALL_INCLUDE_CHUNKS == "HINDSIGHT_API_RECALL_INCLUDE_CHUNKS"
         assert ENV_RECALL_MAX_TOKENS == "HINDSIGHT_API_RECALL_MAX_TOKENS"
         assert ENV_RECALL_CHUNKS_MAX_TOKENS == "HINDSIGHT_API_RECALL_CHUNKS_MAX_TOKENS"
+        assert ENV_BM25_MAX_QUERY_TERMS == "HINDSIGHT_API_BM25_MAX_QUERY_TERMS"
 
     @patch.dict(
         "os.environ",
@@ -108,6 +114,7 @@ class TestRecallConfigFields:
             "HINDSIGHT_API_RECALL_INCLUDE_CHUNKS": "false",
             "HINDSIGHT_API_RECALL_MAX_TOKENS": "777",
             "HINDSIGHT_API_RECALL_CHUNKS_MAX_TOKENS": "333",
+            "HINDSIGHT_API_BM25_MAX_QUERY_TERMS": "24",
         },
     )
     def test_from_env_reads_overrides(self):
@@ -117,6 +124,14 @@ class TestRecallConfigFields:
         assert config.recall_include_chunks is False
         assert config.recall_max_tokens == 777
         assert config.recall_chunks_max_tokens == 333
+        assert config.bm25_max_query_terms == 24
+
+    @patch.dict("os.environ", {"HINDSIGHT_API_BM25_MAX_QUERY_TERMS": "-1"})
+    def test_from_env_rejects_negative_bm25_max_query_terms(self):
+        from hindsight_api.config import HindsightConfig
+
+        with pytest.raises(ValueError, match="HINDSIGHT_API_BM25_MAX_QUERY_TERMS must be >= 0"):
+            HindsightConfig.from_env()
 
 
 class TestMentalModelTriggerRecallFields:
@@ -148,7 +163,9 @@ class TestRefreshTriggerWiring:
 
     @pytest.mark.asyncio
     async def test_trigger_overrides_passed_to_reflect_async(self, mock_request_context):
-        from hindsight_api.engine.memory_engine import MemoryEngine
+        from datetime import datetime, timezone
+
+        from hindsight_api.engine.memory_engine import MemoryEngine, _MentalModelScopeWatermark
         from hindsight_api.engine.response_models import ReflectResult
 
         engine = MemoryEngine.__new__(MemoryEngine)
@@ -180,6 +197,17 @@ class TestRefreshTriggerWiring:
         engine.update_mental_model = fake_update_mental_model
         engine._operation_validator = None
         engine._tenant_extension = None
+        # DB-time refresh watermark — stub so this mock test doesn't reach a real
+        # pool (matches the other collaborator stubs above).
+        engine._mental_model_refresh_cutoff = AsyncMock(return_value=datetime(2026, 1, 1, tzinfo=timezone.utc))
+        # A scope with a memory in it: the reading this returns is also what decides
+        # whether the refresh has anything to reflect over (#3875), so a stub saying
+        # "empty" would skip the reflect call these tests assert on.
+        engine._mental_model_scope_watermark = AsyncMock(
+            return_value=_MentalModelScopeWatermark(
+                newest_in_scope=datetime(2025, 12, 1, tzinfo=timezone.utc), watermark=None
+            )
+        )
 
         await engine.refresh_mental_model(
             bank_id="bank-1",
@@ -194,7 +222,9 @@ class TestRefreshTriggerWiring:
 
     @pytest.mark.asyncio
     async def test_missing_trigger_fields_pass_none(self, mock_request_context):
-        from hindsight_api.engine.memory_engine import MemoryEngine
+        from datetime import datetime, timezone
+
+        from hindsight_api.engine.memory_engine import MemoryEngine, _MentalModelScopeWatermark
         from hindsight_api.engine.response_models import ReflectResult
 
         engine = MemoryEngine.__new__(MemoryEngine)
@@ -216,6 +246,17 @@ class TestRefreshTriggerWiring:
         engine.update_mental_model = fake_update_mental_model
         engine._operation_validator = None
         engine._tenant_extension = None
+        # DB-time refresh watermark — stub so this mock test doesn't reach a real
+        # pool (matches the other collaborator stubs above).
+        engine._mental_model_refresh_cutoff = AsyncMock(return_value=datetime(2026, 1, 1, tzinfo=timezone.utc))
+        # A scope with a memory in it: the reading this returns is also what decides
+        # whether the refresh has anything to reflect over (#3875), so a stub saying
+        # "empty" would skip the reflect call these tests assert on.
+        engine._mental_model_scope_watermark = AsyncMock(
+            return_value=_MentalModelScopeWatermark(
+                newest_in_scope=datetime(2025, 12, 1, tzinfo=timezone.utc), watermark=None
+            )
+        )
 
         await engine.refresh_mental_model(
             bank_id="bank-1",

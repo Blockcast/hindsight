@@ -6,7 +6,9 @@ These tests cover the move semantics, lossless revert (incl. entity
 associations), edit, the guards, listing, and recall exclusion.
 """
 
+import json
 import uuid
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -15,27 +17,50 @@ from hindsight_api import RequestContext
 from hindsight_api.engine.memory_engine import MemoryEngine
 from hindsight_api.engine.retain import embedding_processing
 
+# This module seeds every case with `_insert_memory`, an INSERT into `memory_units` (plus `memory_links` / `unit_entities`). A MEMORIES extension owns those rows in its own store and leaves the Postgres
+# table empty, so the seed lands nowhere the code under test can see it: the failing cases find
+# nothing, and the ones that still pass do so vacuously (an assertion that a result set is EMPTY
+# holds trivially when nothing was ever seeded). Deselected when the suite runs against an
+# alternative store; unchanged, and still required, on Postgres.
+pytestmark = pytest.mark.memory_backend_incompatible
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
+# Most of this module seeds its fixtures by INSERTing memory_units / memory_links /
+# entities directly with the helpers below, then asserts on those rows (including the
+# embedding and search_vector columns). Those classes and tests carry
+# ``memory_backend_incompatible``; the handful that go through the engine end to end
+# — test_not_found_returns_none, test_recall_excludes_invalidated — deliberately do not.
+
+
 async def _insert_memory(
-    conn, memory: MemoryEngine, bank_id: str, text: str, fact_type: str = "experience"
+    conn,
+    memory: MemoryEngine,
+    bank_id: str,
+    text: str,
+    fact_type: str = "experience",
+    metadata: dict | None = None,
 ) -> uuid.UUID:
     """Insert a live memory unit with a real embedding, bypassing the LLM pipeline."""
     mem_id = uuid.uuid4()
     emb = await embedding_processing.generate_embeddings_batch(memory.embeddings, [text])
     await conn.execute(
         """
-        INSERT INTO memory_units (id, bank_id, text, fact_type, embedding, event_date, created_at, updated_at, consolidated_at)
-        VALUES ($1, $2, $3, $4, $5::vector, NOW(), NOW(), NOW(), NOW())
+        INSERT INTO memory_units (
+            id, bank_id, text, fact_type, embedding, event_date, metadata, created_at, updated_at, consolidated_at
+        )
+        VALUES ($1, $2, $3, $4, $5::vector, NOW(), $6::jsonb, NOW(), NOW(), NOW())
         """,
         mem_id,
         bank_id,
         text,
         fact_type,
         str(emb[0]),
+        json.dumps(metadata or {}),
     )
     return mem_id
 
@@ -67,6 +92,59 @@ async def _insert_link(conn, bank_id: str, from_id: uuid.UUID, to_id: uuid.UUID)
         to_id,
         bank_id,
     )
+
+
+async def _insert_causal_link(
+    conn,
+    bank_id: str,
+    from_id: uuid.UUID,
+    to_id: uuid.UUID,
+    link_type: str = "caused_by",
+    weight: float = 1.0,
+) -> None:
+    await conn.execute(
+        """
+        INSERT INTO memory_links (from_unit_id, to_unit_id, link_type, weight, bank_id)
+        VALUES ($1, $2, $3, $4, $5)
+        """,
+        from_id,
+        to_id,
+        link_type,
+        weight,
+        bank_id,
+    )
+
+
+async def _causal_links(conn, bank_id: str) -> set[tuple[str, str, str]]:
+    """(from, to, link_type) of every materialized causal edge in the bank."""
+    rows = await conn.fetch(
+        "SELECT from_unit_id, to_unit_id, link_type FROM memory_links "
+        "WHERE bank_id = $1 AND link_type IN ('caused_by', 'causes', 'enables', 'prevents')",
+        bank_id,
+    )
+    return {(str(r["from_unit_id"]), str(r["to_unit_id"]), r["link_type"]) for r in rows}
+
+
+async def _archived_causal_links(conn, mem_id: uuid.UUID) -> list[dict]:
+    raw = await conn.fetchval("SELECT causal_links FROM invalidated_memory_units WHERE id = $1", mem_id)
+    return json.loads(raw) if raw else []
+
+
+async def _link_exists(conn, bank_id: str, from_id: uuid.UUID, to_id: uuid.UUID, link_type: str = "temporal") -> bool:
+    return bool(
+        await conn.fetchval(
+            "SELECT 1 FROM memory_links "
+            "WHERE bank_id = $1 AND from_unit_id = $2 AND to_unit_id = $3 AND link_type = $4",
+            bank_id,
+            from_id,
+            to_id,
+            link_type,
+        )
+    )
+
+
+async def _queue_empty(conn, bank_id: str) -> bool:
+    return not await conn.fetchval("SELECT 1 FROM graph_maintenance_queue WHERE bank_id = $1", bank_id)
 
 
 async def _insert_entity(conn, bank_id: str, name: str) -> uuid.UUID:
@@ -101,11 +179,12 @@ async def _archive_row(conn, mem_id: uuid.UUID) -> dict | None:
     return dict(row) if row else None
 
 
-async def _archive_has_embedding_column(conn) -> bool:
+async def _archive_has_column(conn, column: str) -> bool:
     return bool(
         await conn.fetchval(
             "SELECT 1 FROM information_schema.columns "
-            "WHERE table_name = 'invalidated_memory_units' AND column_name = 'embedding'"
+            "WHERE table_name = 'invalidated_memory_units' AND column_name = $1",
+            column,
         )
     )
 
@@ -122,12 +201,11 @@ async def _entity_ids_for(conn, unit_id: uuid.UUID) -> list[uuid.UUID]:
     return [r["entity_id"] for r in rows]
 
 
-async def _obs_ids(conn, bank_id: str) -> list[str]:
-    rows = await conn.fetch(
-        "SELECT id FROM memory_units WHERE bank_id = $1 AND fact_type = 'observation'",
-        bank_id,
+async def _obs_ids(memory: MemoryEngine, bank_id: str, request_context: RequestContext) -> list[str]:
+    listing = await memory.list_memory_units(
+        bank_id, fact_type="observation", limit=1000, request_context=request_context
     )
-    return [str(r["id"]) for r in rows]
+    return [item["id"] for item in listing["items"]]
 
 
 async def _consolidated_at(conn, mem_id: uuid.UUID):
@@ -135,7 +213,7 @@ async def _consolidated_at(conn, mem_id: uuid.UUID):
 
 
 async def _ensure_bank(memory: MemoryEngine, bank_id: str, request_context: RequestContext) -> None:
-    await memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+    await memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +222,8 @@ async def _ensure_bank(memory: MemoryEngine, bank_id: str, request_context: Requ
 
 
 class TestInvalidate:
+    pytestmark = pytest.mark.memory_backend_incompatible
+
     @pytest.mark.asyncio
     async def test_invalidate_moves_to_archive_and_prunes(self, memory: MemoryEngine, request_context: RequestContext):
         bank_id = f"test-curation-inv-{uuid.uuid4().hex[:8]}"
@@ -155,6 +235,11 @@ class TestInvalidate:
             m2 = await _insert_memory(conn, memory, bank_id, "srv-04 is in the eu-west datacenter.")
             obs_id = await _insert_observation(conn, bank_id, "srv-04 runs PG14 in eu-west.", [m1, m2])
             await _insert_link(conn, bank_id, m1, m2)
+            await conn.execute(
+                "UPDATE memory_units SET observation_scopes = $1::jsonb WHERE id = $2",
+                json.dumps("shared"),
+                m1,
+            )
 
         with (
             patch.object(memory, "submit_async_consolidation", new=AsyncMock()),
@@ -168,17 +253,21 @@ class TestInvalidate:
         assert result["state"] == "invalidated"
         assert result["invalidation_reason"] == "decommissioned"
         assert result["invalidated_at"] is not None
+        assert result["observation_scopes"] == "shared"
 
         async with pool.acquire() as conn:
             assert not await _in_live(conn, m1), "invalidated row must leave memory_units"
             arch = await _archive_row(conn, m1)
             assert arch is not None, "row must be in the archive"
             assert arch["invalidation_reason"] == "decommissioned"
-            assert not await _archive_has_embedding_column(conn), (
+            assert not await _archive_has_column(conn, "embedding"), (
                 "archive is cold storage; the schema drops the embedding column (#2209)"
             )
+            assert not await _archive_has_column(conn, "search_vector"), (
+                "archive is cold storage with no index; the schema drops search_vector (#2503)"
+            )
             assert await _link_count(conn, m1) == 0, "links cascade-pruned on move"
-            assert str(obs_id) not in await _obs_ids(conn, bank_id), "derived observation removed"
+            assert str(obs_id) not in await _obs_ids(memory, bank_id, request_context), "derived observation removed"
             assert await _consolidated_at(conn, m2) is None, "surviving source reset for re-consolidation"
 
         await memory.delete_bank(bank_id, request_context=request_context)
@@ -191,8 +280,10 @@ class TestInvalidate:
         pool = await memory._get_pool()
         async with pool.acquire() as conn:
             m1 = await _insert_memory(conn, memory, bank_id, "Alice prefers tea over coffee.")
+            m2 = await _insert_memory(conn, memory, bank_id, "Bob prefers coffee over tea.")
             e1 = await _insert_entity(conn, bank_id, "Alice")
             await _link_entity(conn, m1, e1)
+            await _insert_link(conn, bank_id, m1, m2)
 
         with (
             patch.object(memory, "submit_async_consolidation", new=AsyncMock()),
@@ -204,6 +295,7 @@ class TestInvalidate:
                 arch = await _archive_row(conn, m1)
                 assert arch is not None and e1 in (arch["entity_ids"] or []), "entity ids snapshotted on invalidate"
                 assert await _entity_ids_for(conn, m1) == [], "unit_entities cascade-pruned on move"
+                assert await _queue_empty(conn, bank_id), "an outgoing-only link has no surviving source victim"
 
             result = await memory.update_memory_unit(bank_id, str(m1), state="valid", request_context=request_context)
 
@@ -216,6 +308,12 @@ class TestInvalidate:
             assert e1 in await _entity_ids_for(conn, m1), "entity associations restored on revert"
             reverted_emb = await conn.fetchval("SELECT embedding FROM memory_units WHERE id = $1", m1)
             assert reverted_emb is not None, "embedding recomputed on revert (archive keeps none)"
+            # Native backend (test default) stores a real tsvector; it must be rebuilt on
+            # revert so the reverted fact is keyword-searchable again (archive keeps none, #2503).
+            reverted_sv = await conn.fetchval("SELECT search_vector FROM memory_units WHERE id = $1", m1)
+            assert reverted_sv is not None, "search_vector recomputed on revert (archive keeps none)"
+            queued_ids = await conn.fetch("SELECT unit_id FROM graph_maintenance_queue WHERE bank_id = $1", bank_id)
+            assert {row["unit_id"] for row in queued_ids} == {m1}, "reverted memory queued to rebuild outgoing links"
 
         await memory.delete_bank(bank_id, request_context=request_context)
 
@@ -253,6 +351,8 @@ class TestInvalidate:
 
 
 class TestEdit:
+    pytestmark = pytest.mark.memory_backend_incompatible
+
     @pytest.mark.asyncio
     async def test_edit_changes_text_and_rederives(self, memory: MemoryEngine, request_context: RequestContext):
         bank_id = f"test-curation-edit-{uuid.uuid4().hex[:8]}"
@@ -261,9 +361,22 @@ class TestEdit:
         pool = await memory._get_pool()
         async with pool.acquire() as conn:
             m1 = await _insert_memory(conn, memory, bank_id, "The assistant visited Paris in 2023.")
+            m2 = await _insert_memory(conn, memory, bank_id, "Paris is in France.")
+            await _insert_link(conn, bank_id, m1, m2)
+            await _insert_link(conn, bank_id, m2, m1)
+            await conn.execute(
+                "UPDATE memory_units SET search_vector = to_tsvector('english'::regconfig, text) WHERE id = $1",
+                m1,
+            )
             obs_id = await _insert_observation(conn, bank_id, "The assistant went to Paris.", [m1])
 
+        backend = await memory._get_backend()
         with (
+            patch.object(
+                backend.ops,
+                "enqueue_graph_maintenance",
+                wraps=backend.ops.enqueue_graph_maintenance,
+            ) as enqueue_mock,
             patch.object(memory, "submit_async_consolidation", new=AsyncMock()),
             patch.object(memory, "submit_async_graph_maintenance", new=AsyncMock()),
         ):
@@ -277,12 +390,23 @@ class TestEdit:
 
         assert result["text"] == "The user visited Paris in 2023."
         assert result["state"] == "valid"
+        assert enqueue_mock.await_count == 1, "self and victims must share one lock-ordered queue insert"
         async with pool.acquire() as conn:
             assert await _in_live(conn, m1), "edited row stays live"
-            row = dict(await conn.fetchrow("SELECT text, consolidated_at FROM memory_units WHERE id = $1", m1))
+            row = dict(
+                await conn.fetchrow(
+                    "SELECT text, consolidated_at, search_vector::text AS search_vector "
+                    "FROM memory_units WHERE id = $1",
+                    m1,
+                )
+            )
             assert row["text"] == "The user visited Paris in 2023."
             assert row["consolidated_at"] is None, "edited memory re-consolidates"
-            assert str(obs_id) not in await _obs_ids(conn, bank_id), "stale observation re-derived"
+            assert "'assist'" not in row["search_vector"], "old text must not stay in native FTS search_vector"
+            assert "'user'" in row["search_vector"], "new text must refresh native FTS search_vector"
+            assert str(obs_id) not in await _obs_ids(memory, bank_id, request_context), "stale observation re-derived"
+            queued_ids = await conn.fetch("SELECT unit_id FROM graph_maintenance_queue WHERE bank_id = $1", bank_id)
+            assert {row["unit_id"] for row in queued_ids} == {m1, m2}, "edited memory and incoming victim both queued"
 
         await memory.delete_bank(bank_id, request_context=request_context)
 
@@ -326,6 +450,74 @@ class TestEdit:
         await memory.delete_bank(bank_id, request_context=request_context)
 
     @pytest.mark.asyncio
+    async def test_clearing_occurred_start_clears_stale_event_date(
+        self, memory: MemoryEngine, request_context: RequestContext
+    ):
+        """Clearing occurred_start must not leave the legacy event_date on the old occurrence.
+
+        `event_date` drives temporal-link regeneration and the date the curation UI shows, so a
+        cleared occurrence that keeps its old event_date silently keeps both. Retain derives the
+        column as `occurred_start or mentioned_at` (memories/pg/writes.py), and an explicit clear
+        follows the same rule.
+        """
+        bank_id = f"test-curation-cleardate-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(memory, bank_id, request_context)
+
+        pool = await memory._get_pool()
+        async with pool.acquire() as conn:
+            m1 = await _insert_memory(conn, memory, bank_id, "The user visited Paris.")
+            m2 = await _insert_memory(conn, memory, bank_id, "The user visited Rome.")
+            # Seeded with raw SQL because no public API sets these columns independently:
+            # the pre-edit state under test is a memory as retain leaves it — an occurrence
+            # plus the mention that carried it, with the legacy event_date on the occurrence.
+            # m2 has no mention at all (what retain writes for timestamp 'unset').
+            await conn.execute(
+                "UPDATE memory_units SET occurred_start = $2, occurred_end = $3, "
+                "mentioned_at = $4, event_date = $2 WHERE id = $1",
+                m1,
+                datetime(2023, 6, 1, tzinfo=UTC),
+                datetime(2023, 6, 30, tzinfo=UTC),
+                datetime(2024, 1, 15, tzinfo=UTC),
+            )
+            await conn.execute(
+                "UPDATE memory_units SET occurred_start = $2, mentioned_at = NULL, event_date = $2 WHERE id = $1",
+                m2,
+                datetime(2023, 6, 1, tzinfo=UTC),
+            )
+
+        with (
+            patch.object(memory, "submit_async_consolidation", new=AsyncMock()),
+            patch.object(memory, "submit_async_graph_maintenance", new=AsyncMock()),
+        ):
+            result = await memory.update_memory_unit(
+                bank_id,
+                str(m1),
+                occurred_start="",
+                occurred_end="",
+                request_context=request_context,
+            )
+            cleared_no_mention = await memory.update_memory_unit(
+                bank_id, str(m2), occurred_start="", request_context=request_context
+            )
+            # A text-only edit must leave the legacy date alone: it is not an occurrence edit.
+            text_only = await memory.update_memory_unit(
+                bank_id, str(m2), text="The user visited Rome twice.", request_context=request_context
+            )
+
+        # `date` is the legacy event_date as the API exposes it.
+        assert result["occurred_start"] is None and result["occurred_end"] is None
+        assert result["date"] == result["mentioned_at"], (
+            "clearing the occurrence must fall back to mentioned_at, not keep the old occurrence"
+        )
+
+        assert cleared_no_mention["occurred_start"] is None
+        assert cleared_no_mention["date"] == "", "no mention to fall back to: the legacy date clears too"
+        assert text_only["date"] == "", "a text-only edit leaves the cleared legacy date alone"
+        assert text_only["text"] == "The user visited Rome twice."
+
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    @pytest.mark.asyncio
     async def test_edit_replaces_entities(self, memory: MemoryEngine, request_context: RequestContext):
         bank_id = f"test-curation-editent-{uuid.uuid4().hex[:8]}"
         await _ensure_bank(memory, bank_id, request_context)
@@ -360,6 +552,93 @@ class TestEdit:
             )
             assert {r["canonical_name"] for r in names} == {"Alice", "Bob"}, "unit_entities rebuilt"
             assert wrong not in await _entity_ids_for(conn, m1), "wrong entity detached"
+
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    @pytest.mark.asyncio
+    async def _near_duplicate_entity_bank(self, memory: MemoryEngine, request_context: RequestContext):
+        """A bank in the shape reported in #3479, returned as (bank_id, unit_id, typo_entity_id).
+
+        Extraction created a typo entity ("Dr Wall") that co-occurs with the other name in the
+        edit, so fuzzy scoring puts it above the 0.6 match threshold for the corrected spelling
+        "Dr. Waller" — name similarity 0.41 plus the full 0.3 co-occurrence bonus.
+        """
+        bank_id = f"test-curation-entmode-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(memory, bank_id, request_context)
+
+        pool = await memory._get_pool()
+        async with pool.acquire() as conn:
+            unit_id = await _insert_memory(conn, memory, bank_id, "Dr. Waller referred the patient to CareOrg.")
+            typo = await _insert_entity(conn, bank_id, "Dr Wall")
+            careorg = await _insert_entity(conn, bank_id, "CareOrg")
+            await _link_entity(conn, unit_id, typo)
+            await _link_entity(conn, unit_id, careorg)
+            # The co-occurrence edge is what lets the typo entity outscore the corrected name.
+            await conn.execute(
+                "INSERT INTO entity_cooccurrences (entity_id_1, entity_id_2, cooccurrence_count) VALUES ($1, $2, 5)",
+                *sorted([typo, careorg], key=str),
+            )
+        return bank_id, unit_id, typo
+
+    @pytest.mark.asyncio
+    async def test_edit_entities_unresolved_keeps_the_submitted_names(
+        self, memory: MemoryEngine, request_context: RequestContext
+    ):
+        """resolve_entities=False links the names the caller wrote (#3479)."""
+        bank_id, m1, typo = await self._near_duplicate_entity_bank(memory, request_context)
+        pool = await memory._get_pool()
+
+        with (
+            patch.object(memory, "submit_async_consolidation", new=AsyncMock()),
+            patch.object(memory, "submit_async_graph_maintenance", new=AsyncMock()),
+        ):
+            result = await memory.update_memory_unit(
+                bank_id,
+                str(m1),
+                entities=["Dr. Waller", "CareOrg"],
+                resolve_entities=False,
+                request_context=request_context,
+            )
+
+        assert set(result["entities"]) == {"Dr. Waller", "CareOrg"}, "the submitted names are stored verbatim"
+        async with pool.acquire() as conn:
+            linked = await conn.fetch(
+                "SELECT e.canonical_name FROM unit_entities ue "
+                "JOIN entities e ON e.id = ue.entity_id WHERE ue.unit_id = $1",
+                m1,
+            )
+            assert {r["canonical_name"] for r in linked} == {"Dr. Waller", "CareOrg"}
+            assert typo not in await _entity_ids_for(conn, m1), "the typo entity is detached, not reused"
+            assert await conn.fetchval("SELECT 1 FROM entities WHERE id = $1", typo), (
+                "the typo entity itself survives for the graph-maintenance sweep to reclaim"
+            )
+
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    @pytest.mark.asyncio
+    async def test_edit_entities_default_still_resolves(self, memory: MemoryEngine, request_context: RequestContext):
+        """Omitting the flag keeps retain's resolution, so existing callers are unaffected.
+
+        This pins the backwards-compatible default rather than endorsing the outcome: the same
+        edit that resolve_entities=False gets right lands on the near-duplicate here.
+        """
+        bank_id, m1, typo = await self._near_duplicate_entity_bank(memory, request_context)
+        pool = await memory._get_pool()
+
+        with (
+            patch.object(memory, "submit_async_consolidation", new=AsyncMock()),
+            patch.object(memory, "submit_async_graph_maintenance", new=AsyncMock()),
+        ):
+            result = await memory.update_memory_unit(
+                bank_id,
+                str(m1),
+                entities=["Dr. Waller", "CareOrg"],
+                request_context=request_context,
+            )
+
+        assert set(result["entities"]) == {"Dr Wall", "CareOrg"}, "the default still resolves fuzzily"
+        async with pool.acquire() as conn:
+            assert typo in await _entity_ids_for(conn, m1)
 
         await memory.delete_bank(bank_id, request_context=request_context)
 
@@ -407,12 +686,119 @@ class TestEdit:
 
 
 # ---------------------------------------------------------------------------
+# Graph relinking after curation (#2889)
+# ---------------------------------------------------------------------------
+
+
+class TestCurationRelinking:
+    """Curation drops a memory's incident temporal/semantic links; the memory
+    must be queued so graph maintenance rebuilds its OWN outgoing adjacency.
+
+    ``enqueue_relink_victims`` alone only queues *other* sources that lost an
+    edge, so a memory with outgoing links but no incoming ones left the queue
+    empty and the submission short-circuited on ``no_work``.
+
+    The fixture's task backend is ``SyncTaskBackend``, so the two end-to-end
+    tests below drain the queue inline: by the time ``update_memory_unit``
+    returns, the links are already rebuilt.
+    """
+
+    pytestmark = pytest.mark.memory_backend_incompatible
+
+    @pytest.mark.asyncio
+    async def test_edit_with_only_outgoing_links_queues_itself(
+        self, memory: MemoryEngine, request_context: RequestContext
+    ):
+        """The clearest pre-fix failure: no incoming edge, so no victim, so no work."""
+        bank_id = f"test-curation-outonly-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(memory, bank_id, request_context)
+
+        pool = await memory._get_pool()
+        async with pool.acquire() as conn:
+            m1 = await _insert_memory(conn, memory, bank_id, "The assistant visited Paris in 2023.")
+            m2 = await _insert_memory(conn, memory, bank_id, "Paris is in France.")
+            await _insert_link(conn, bank_id, m1, m2)  # outgoing only — nothing points at m1
+
+        with (
+            patch.object(memory, "submit_async_consolidation", new=AsyncMock()),
+            patch.object(memory, "submit_async_graph_maintenance", new=AsyncMock()),
+        ):
+            await memory.update_memory_unit(
+                bank_id,
+                str(m1),
+                text="The user visited Paris in 2023.",
+                request_context=request_context,
+            )
+
+        async with pool.acquire() as conn:
+            queued = await conn.fetch("SELECT unit_id FROM graph_maintenance_queue WHERE bank_id = $1", bank_id)
+            assert {row["unit_id"] for row in queued} == {m1}, "edited memory queued even with no incoming victim"
+            assert not await _link_exists(conn, bank_id, m1, m2), "edit drops the unit's own outgoing links"
+
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    @pytest.mark.asyncio
+    async def test_edit_rebuilds_outgoing_links(self, memory: MemoryEngine, request_context: RequestContext):
+        """End-to-end: the queued edit actually gets its temporal link back."""
+        bank_id = f"test-curation-relink-edit-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(memory, bank_id, request_context)
+
+        pool = await memory._get_pool()
+        async with pool.acquire() as conn:
+            m1 = await _insert_memory(conn, memory, bank_id, "The assistant visited Paris in 2023.")
+            m2 = await _insert_memory(conn, memory, bank_id, "Paris is in France.")
+            await _insert_link(conn, bank_id, m1, m2)
+
+        # Graph maintenance is NOT patched here — it runs inline and drains the queue.
+        with patch.object(memory, "submit_async_consolidation", new=AsyncMock()):
+            await memory.update_memory_unit(
+                bank_id,
+                str(m1),
+                text="The user visited Paris in 2023.",
+                request_context=request_context,
+            )
+
+        async with pool.acquire() as conn:
+            assert await _link_exists(conn, bank_id, m1, m2), "edited memory's outgoing temporal link rebuilt"
+            assert await _queue_empty(conn, bank_id), "queue drained by the inline worker"
+
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    @pytest.mark.asyncio
+    async def test_revert_rebuilds_outgoing_links(self, memory: MemoryEngine, request_context: RequestContext):
+        """End-to-end: invalidate cascades the links away, revert brings them back."""
+        bank_id = f"test-curation-relink-revert-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(memory, bank_id, request_context)
+
+        pool = await memory._get_pool()
+        async with pool.acquire() as conn:
+            m1 = await _insert_memory(conn, memory, bank_id, "The assistant visited Paris in 2023.")
+            m2 = await _insert_memory(conn, memory, bank_id, "Paris is in France.")
+            await _insert_link(conn, bank_id, m1, m2)
+
+        with patch.object(memory, "submit_async_consolidation", new=AsyncMock()):
+            await memory.update_memory_unit(bank_id, str(m1), state="invalidated", request_context=request_context)
+
+            async with pool.acquire() as conn:
+                assert not await _link_exists(conn, bank_id, m1, m2), "archive cascade removed the link"
+
+            await memory.update_memory_unit(bank_id, str(m1), state="valid", request_context=request_context)
+
+        async with pool.acquire() as conn:
+            assert await _link_exists(conn, bank_id, m1, m2), "reverted memory's outgoing temporal link rebuilt"
+            assert await _queue_empty(conn, bank_id), "queue drained by the inline worker"
+
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+
+# ---------------------------------------------------------------------------
 # Guards / listing / recall
 # ---------------------------------------------------------------------------
 
 
 class TestGuardsAndListing:
     @pytest.mark.asyncio
+    @pytest.mark.memory_backend_incompatible
     async def test_cannot_curate_observation(self, memory: MemoryEngine, request_context: RequestContext):
         bank_id = f"test-curation-obs-{uuid.uuid4().hex[:8]}"
         await _ensure_bank(memory, bank_id, request_context)
@@ -438,6 +824,7 @@ class TestGuardsAndListing:
         await memory.delete_bank(bank_id, request_context=request_context)
 
     @pytest.mark.asyncio
+    @pytest.mark.memory_backend_incompatible
     async def test_list_filters_by_state(self, memory: MemoryEngine, request_context: RequestContext):
         bank_id = f"test-curation-list-{uuid.uuid4().hex[:8]}"
         await _ensure_bank(memory, bank_id, request_context)
@@ -473,6 +860,49 @@ class TestGuardsAndListing:
         await memory.delete_bank(bank_id, request_context=request_context)
 
     @pytest.mark.asyncio
+    @pytest.mark.memory_backend_incompatible
+    async def test_list_and_get_memory_units_include_metadata(
+        self, memory: MemoryEngine, request_context: RequestContext
+    ):
+        bank_id = f"test-curation-metadata-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(memory, bank_id, request_context)
+        metadata = {"source": "slack", "channel": "engineering", "thread_id": "T123"}
+
+        pool = await memory._get_pool()
+        async with pool.acquire() as conn:
+            mem_id = await _insert_memory(conn, memory, bank_id, "Fact with metadata.", metadata=metadata)
+
+        live = (await memory.list_memory_units(bank_id, request_context=request_context))["items"]
+        live_item = next(item for item in live if item["id"] == str(mem_id))
+        assert live_item["metadata"] == metadata
+
+        detail = await memory.get_memory_unit(bank_id, str(mem_id), request_context=request_context)
+        assert detail is not None
+        assert detail["metadata"] == metadata
+
+        with (
+            patch.object(memory, "submit_async_consolidation", new=AsyncMock()),
+            patch.object(memory, "submit_async_graph_maintenance", new=AsyncMock()),
+        ):
+            await memory.update_memory_unit(
+                bank_id, str(mem_id), state="invalidated", reason="stale", request_context=request_context
+            )
+
+        invalid = (await memory.list_memory_units(bank_id, state="invalidated", request_context=request_context))[
+            "items"
+        ]
+        assert invalid[0]["id"] == str(mem_id)
+        assert invalid[0]["metadata"] == metadata
+
+        invalid_detail = await memory.get_memory_unit(bank_id, str(mem_id), request_context=request_context)
+        assert invalid_detail is not None
+        assert invalid_detail["state"] == "invalidated"
+        assert invalid_detail["metadata"] == metadata
+
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    @pytest.mark.asyncio
+    @pytest.mark.memory_backend_incompatible
     async def test_list_filters_by_document(self, memory: MemoryEngine, request_context: RequestContext):
         bank_id = f"test-curation-doc-{uuid.uuid4().hex[:8]}"
         await _ensure_bank(memory, bank_id, request_context)
@@ -512,6 +942,62 @@ class TestGuardsAndListing:
         await memory.delete_bank(bank_id, request_context=request_context)
 
     @pytest.mark.asyncio
+    @pytest.mark.memory_backend_incompatible
+    async def test_list_filters_by_entity(self, memory: MemoryEngine, request_context: RequestContext):
+        bank_id = f"test-curation-entity-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(memory, bank_id, request_context)
+
+        pool = await memory._get_pool()
+        async with pool.acquire() as conn:
+            alice = await _insert_entity(conn, bank_id, "Alice")
+            bob = await _insert_entity(conn, bank_id, "Bob")
+            m_alice = await _insert_memory(conn, memory, bank_id, "Alice shipped the release.")
+            m_bob = await _insert_memory(conn, memory, bank_id, "Bob reviewed the docs.")
+            obs_alice = await _insert_observation(conn, bank_id, "Alice tends to ship on Fridays.", [m_alice])
+            await _link_entity(conn, m_alice, alice)
+            await _link_entity(conn, obs_alice, alice)
+            await _link_entity(conn, m_bob, bob)
+
+        # Reverse lookup returns only the units linked to Alice (both fact types).
+        alice_units = (await memory.list_memory_units(bank_id, entity_id=str(alice), request_context=request_context))[
+            "items"
+        ]
+        assert {i["id"] for i in alice_units} == {str(m_alice), str(obs_alice)}
+
+        # Combining with a type filter narrows to observations (the UI's entity timeline path).
+        alice_obs = (
+            await memory.list_memory_units(
+                bank_id, entity_id=str(alice), fact_type="observation", request_context=request_context
+            )
+        )["items"]
+        assert {i["id"] for i in alice_obs} == {str(obs_alice)}
+
+        # A different entity is isolated; an unlinked entity yields nothing.
+        bob_units = (await memory.list_memory_units(bank_id, entity_id=str(bob), request_context=request_context))[
+            "items"
+        ]
+        assert {i["id"] for i in bob_units} == {str(m_bob)}
+
+        # Entity links reference live units only, so the invalidated archive has none.
+        with (
+            patch.object(memory, "submit_async_consolidation", new=AsyncMock()),
+            patch.object(memory, "submit_async_graph_maintenance", new=AsyncMock()),
+        ):
+            await memory.update_memory_unit(bank_id, str(m_alice), state="invalidated", request_context=request_context)
+        archived = (
+            await memory.list_memory_units(
+                bank_id, state="invalidated", entity_id=str(alice), request_context=request_context
+            )
+        )["items"]
+        assert archived == []
+
+        # Malformed entity IDs are rejected up front.
+        with pytest.raises(ValueError, match="not a valid UUID"):
+            await memory.list_memory_units(bank_id, entity_id="not-a-uuid", request_context=request_context)
+
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    @pytest.mark.asyncio
     async def test_recall_excludes_invalidated(self, memory: MemoryEngine, request_context: RequestContext):
         bank_id = f"test-curation-recall-{uuid.uuid4().hex[:8]}"
         await _ensure_bank(memory, bank_id, request_context)
@@ -542,5 +1028,207 @@ class TestGuardsAndListing:
             bank_id, "Anaconda XR7 telescope focal length", request_context=request_context
         )
         assert not _hit(after), "invalidated fact must be excluded from recall"
+
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+
+# ---------------------------------------------------------------------------
+# Causal links (#2864)
+# ---------------------------------------------------------------------------
+
+
+class TestCausalLinkPreservation:
+    """Causal edges are retain-time extraction output: nothing recreates them.
+
+    Graph maintenance only rebuilds temporal/semantic links and consolidation
+    regenerates observations, so any curation path that drops a ``caused_by``
+    edge drops it for good. Edits must leave them alone, and the
+    invalidate/revert round-trip must carry them through the archive.
+    """
+
+    pytestmark = pytest.mark.memory_backend_incompatible
+
+    @pytest.mark.asyncio
+    async def test_edit_preserves_causal_links_and_drops_derived(
+        self, memory: MemoryEngine, request_context: RequestContext
+    ):
+        bank_id = f"test-curation-causal-edit-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(memory, bank_id, request_context)
+
+        pool = await memory._get_pool()
+        async with pool.acquire() as conn:
+            cause = await _insert_memory(conn, memory, bank_id, "Alice lost her job.")
+            effect = await _insert_memory(conn, memory, bank_id, "Alice could not pay rent.")
+            unrelated = await _insert_memory(conn, memory, bank_id, "Alice moved to Berlin.")
+            await _insert_causal_link(conn, bank_id, effect, cause)  # outgoing
+            await _insert_causal_link(conn, bank_id, cause, effect, link_type="causes")  # incoming
+            await _insert_link(conn, bank_id, effect, unrelated)  # temporal, derived
+
+        with (
+            patch.object(memory, "submit_async_consolidation", new=AsyncMock()),
+            patch.object(memory, "submit_async_graph_maintenance", new=AsyncMock()),
+        ):
+            # A context-only edit doesn't touch the proposition at all...
+            await memory.update_memory_unit(
+                bank_id, str(effect), context="Said during the March review.", request_context=request_context
+            )
+            async with pool.acquire() as conn:
+                assert await _causal_links(conn, bank_id) == {
+                    (str(effect), str(cause), "caused_by"),
+                    (str(cause), str(effect), "causes"),
+                }, "context edit must not delete causal links"
+
+            # ...and a text edit corrects the fact without discarding the
+            # extractor's causal assertion (nothing could re-derive it).
+            await memory.update_memory_unit(
+                bank_id, str(effect), text="Alice could not pay her rent.", request_context=request_context
+            )
+
+        async with pool.acquire() as conn:
+            assert await _causal_links(conn, bank_id) == {
+                (str(effect), str(cause), "caused_by"),
+                (str(cause), str(effect), "causes"),
+            }, "text edit must preserve causal links in both directions"
+            temporal = await conn.fetchval(
+                "SELECT COUNT(*) FROM memory_links WHERE link_type = 'temporal' AND from_unit_id = $1", effect
+            )
+            assert temporal == 0, "derived temporal links are still dropped (graph maintenance rebuilds them)"
+
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    @pytest.mark.asyncio
+    async def test_invalidate_snapshots_and_revert_restores(
+        self, memory: MemoryEngine, request_context: RequestContext
+    ):
+        bank_id = f"test-curation-causal-inv-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(memory, bank_id, request_context)
+
+        pool = await memory._get_pool()
+        async with pool.acquire() as conn:
+            cause = await _insert_memory(conn, memory, bank_id, "The deploy pipeline was misconfigured.")
+            effect = await _insert_memory(conn, memory, bank_id, "The release shipped a broken build.")
+            await _insert_causal_link(conn, bank_id, effect, cause, weight=0.75)
+            await _insert_causal_link(conn, bank_id, cause, effect, link_type="enables")
+
+        with (
+            patch.object(memory, "submit_async_consolidation", new=AsyncMock()),
+            patch.object(memory, "submit_async_graph_maintenance", new=AsyncMock()),
+        ):
+            await memory.update_memory_unit(bank_id, str(effect), state="invalidated", request_context=request_context)
+
+            async with pool.acquire() as conn:
+                assert await _causal_links(conn, bank_id) == set(), "invalidation removes edges from the live graph"
+                snapshot = await _archived_causal_links(conn, effect)
+                assert {(d["from_unit_id"], d["to_unit_id"], d["link_type"]) for d in snapshot} == {
+                    (str(effect), str(cause), "caused_by"),
+                    (str(cause), str(effect), "enables"),
+                }, "both directions snapshotted on the archive row"
+                assert [d["weight"] for d in snapshot if d["link_type"] == "caused_by"] == [0.75], "weight preserved"
+
+            await memory.update_memory_unit(bank_id, str(effect), state="valid", request_context=request_context)
+
+        async with pool.acquire() as conn:
+            assert await _causal_links(conn, bank_id) == {
+                (str(effect), str(cause), "caused_by"),
+                (str(cause), str(effect), "enables"),
+            }, "revert restores incoming and outgoing causal links"
+
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    @pytest.mark.asyncio
+    async def test_restore_deferred_until_both_endpoints_live(
+        self, memory: MemoryEngine, request_context: RequestContext
+    ):
+        """With both endpoints archived, whichever reverts last recreates the edge."""
+        bank_id = f"test-curation-causal-both-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(memory, bank_id, request_context)
+
+        pool = await memory._get_pool()
+        async with pool.acquire() as conn:
+            cause = await _insert_memory(conn, memory, bank_id, "The cache was never invalidated.")
+            effect = await _insert_memory(conn, memory, bank_id, "Users saw stale prices.")
+            await _insert_causal_link(conn, bank_id, effect, cause)
+
+        with (
+            patch.object(memory, "submit_async_consolidation", new=AsyncMock()),
+            patch.object(memory, "submit_async_graph_maintenance", new=AsyncMock()),
+        ):
+            await memory.update_memory_unit(bank_id, str(effect), state="invalidated", request_context=request_context)
+            await memory.update_memory_unit(bank_id, str(cause), state="invalidated", request_context=request_context)
+
+            async with pool.acquire() as conn:
+                # The edge is gone from memory_links by the time `cause` is
+                # invalidated, so it can only come from the peer's snapshot.
+                assert len(await _archived_causal_links(conn, cause)) == 1, "descriptor copied from the archived peer"
+
+            await memory.update_memory_unit(bank_id, str(effect), state="valid", request_context=request_context)
+            async with pool.acquire() as conn:
+                assert await _causal_links(conn, bank_id) == set(), "peer still archived: edge stays suspended"
+
+            await memory.update_memory_unit(bank_id, str(cause), state="valid", request_context=request_context)
+
+        async with pool.acquire() as conn:
+            assert await _causal_links(conn, bank_id) == {(str(effect), str(cause), "caused_by")}, (
+                "last endpoint back materializes the edge"
+            )
+
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    @pytest.mark.asyncio
+    async def test_repeated_cycles_do_not_duplicate(self, memory: MemoryEngine, request_context: RequestContext):
+        bank_id = f"test-curation-causal-idem-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(memory, bank_id, request_context)
+
+        pool = await memory._get_pool()
+        async with pool.acquire() as conn:
+            cause = await _insert_memory(conn, memory, bank_id, "The disk filled up.")
+            effect = await _insert_memory(conn, memory, bank_id, "The service stopped accepting writes.")
+            await _insert_causal_link(conn, bank_id, effect, cause)
+
+        with (
+            patch.object(memory, "submit_async_consolidation", new=AsyncMock()),
+            patch.object(memory, "submit_async_graph_maintenance", new=AsyncMock()),
+        ):
+            for _ in range(2):
+                await memory.update_memory_unit(
+                    bank_id, str(effect), state="invalidated", request_context=request_context
+                )
+                await memory.update_memory_unit(bank_id, str(effect), state="valid", request_context=request_context)
+
+        async with pool.acquire() as conn:
+            count = await conn.fetchval(
+                "SELECT COUNT(*) FROM memory_links WHERE bank_id = $1 AND link_type = 'caused_by'", bank_id
+            )
+            assert count == 1, "invalidate/revert cycles are idempotent"
+
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+    @pytest.mark.asyncio
+    async def test_revert_skips_permanently_deleted_peer(self, memory: MemoryEngine, request_context: RequestContext):
+        """A snapshot naming a hard-deleted peer must be dropped, not resurrected as a dangling FK."""
+        bank_id = f"test-curation-causal-gone-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(memory, bank_id, request_context)
+
+        pool = await memory._get_pool()
+        async with pool.acquire() as conn:
+            cause = await _insert_memory(conn, memory, bank_id, "The vendor changed the API contract.")
+            effect = await _insert_memory(conn, memory, bank_id, "Nightly sync failed.")
+            await _insert_causal_link(conn, bank_id, effect, cause)
+
+        with (
+            patch.object(memory, "submit_async_consolidation", new=AsyncMock()),
+            patch.object(memory, "submit_async_graph_maintenance", new=AsyncMock()),
+        ):
+            await memory.update_memory_unit(bank_id, str(effect), state="invalidated", request_context=request_context)
+            async with pool.acquire() as conn:
+                await conn.execute("DELETE FROM memory_units WHERE id = $1", cause)
+
+            result = await memory.update_memory_unit(
+                bank_id, str(effect), state="valid", request_context=request_context
+            )
+
+        assert result["state"] == "valid"
+        async with pool.acquire() as conn:
+            assert await _causal_links(conn, bank_id) == set(), "no edge to a deleted memory"
 
         await memory.delete_bank(bank_id, request_context=request_context)

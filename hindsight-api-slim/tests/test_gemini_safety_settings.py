@@ -106,8 +106,6 @@ def test_gemini_llm_no_safety_settings_is_none():
 @pytest.mark.asyncio
 async def test_call_applies_safety_settings():
     """call() includes safety_settings in GenerateContentConfig when configured."""
-    from google.genai import types as genai_types
-
     provider = _make_gemini_provider(safety_settings=SAMPLE_SAFETY_SETTINGS)
 
     # Build a fake successful response
@@ -206,7 +204,31 @@ async def test_call_with_tools_applies_safety_settings():
     ]
 
     await provider.call_with_tools(
-        messages=[{"role": "user", "content": "hi"}],
+        messages=[
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_test_tool",
+                        "type": "function",
+                        "function": {"name": "test_tool", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_test_tool", "content": '{"ok": true}'},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_test_tool",
+                        "type": "function",
+                        "function": {"name": "test_tool", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_test_tool", "content": '{"ok": true}'},
+        ],
         tools=tools,
         scope="test",
     )
@@ -220,6 +242,71 @@ async def test_call_with_tools_applies_safety_settings():
         s.category.value if hasattr(s.category, "value") else str(s.category) for s in config_arg.safety_settings
     ]
     assert "HARM_CATEGORY_HARASSMENT" in categories
+    contents = call_args.kwargs["contents"]
+    assert contents[-1].parts[0].function_response.name == "test_tool"
+
+    with pytest.raises(ValueError, match="missing results: call_test_tool"):
+        await provider.call_with_tools(
+            messages=[
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_test_tool",
+                            "type": "function",
+                            "function": {"name": "test_tool", "arguments": "{}"},
+                        }
+                    ],
+                },
+            ],
+            tools=tools,
+            scope="test",
+        )
+
+    with pytest.raises(ValueError, match="unknown tool_call_id 'call_unknown'"):
+        await provider.call_with_tools(
+            messages=[
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_test_tool",
+                            "type": "function",
+                            "function": {"name": "test_tool", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_unknown", "content": '{"ok": true}'},
+            ],
+            tools=tools,
+            scope="test",
+        )
+
+    with pytest.raises(ValueError, match="must be unique within its turn"):
+        await provider.call_with_tools(
+            messages=[
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_test_tool",
+                            "type": "function",
+                            "function": {"name": "test_tool", "arguments": "{}"},
+                        },
+                        {
+                            "id": "call_test_tool",
+                            "type": "function",
+                            "function": {"name": "test_tool", "arguments": "{}"},
+                        },
+                    ],
+                },
+            ],
+            tools=tools,
+            scope="test",
+        )
 
 
 # ─── with_config() override ───────────────────────────────────────────────────
@@ -319,8 +406,12 @@ async def test_with_config_resets_after_call():
 # ─── LLMProvider reads safety settings from config ────────────────────────────
 
 
-def test_llm_provider_reads_safety_settings_from_config():
-    """LLMProvider reads llm_gemini_safety_settings from global config for Gemini provider."""
+def test_llm_provider_from_env_reads_safety_settings():
+    """from_env() resolves llm_gemini_safety_settings from the environment.
+
+    The constructor itself is config-free; the env-reading factory supplies the
+    server default (the engine builds do the same from config).
+    """
     import json
 
     from hindsight_api.config import ENV_LLM_GEMINI_SAFETY_SETTINGS, clear_config_cache
@@ -338,12 +429,7 @@ def test_llm_provider_reads_safety_settings_from_config():
             mock_client_cls.return_value = MagicMock()
             from hindsight_api.engine.llm_wrapper import LLMProvider
 
-            provider = LLMProvider(
-                provider="gemini",
-                api_key="fake-key",
-                base_url="",
-                model="gemini-2.5-flash",
-            )
+            provider = LLMProvider.from_env()
 
             assert provider.gemini_safety_settings == SAMPLE_SAFETY_SETTINGS
 

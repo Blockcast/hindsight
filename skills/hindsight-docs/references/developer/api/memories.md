@@ -17,7 +17,24 @@ A **memory unit** is the atomic fact Hindsight extracts and stores. This page co
 
 ## List memory units
 
-List the memory units in a bank. The response includes each unit's `fact_type` (`world` | `experience` | `observation`), `state` (`valid` | `invalidated`), entities, occurred dates, and — for facts a user has edited — an `edited_at` timestamp. Invalidated rows are **included by default** so curation stays auditable; filter with `state=`.
+List the memory units in a bank. The response includes each unit's `fact_type` (`world` | `experience` | `observation`), `state` (`valid` | `invalidated`), metadata, entities, occurred dates, and — for facts a user has edited — an `edited_at` timestamp. Invalidated rows are **included by default** so curation stays auditable; filter with `state=`.
+
+Narrow the results with query parameters: `type=` (fact type), `q=` (full-text search over text and context), `document_id=` (a single source document), and `entity_id=` (memory units linked to a given entity). The `entity_id` filter is an exact reverse lookup over stored entity links — not a text or semantic match — so you can list an entity's evidence (e.g. its observations, with `type=observation`) without scanning every memory. Because entity links exist only for live units, combining `entity_id` with `state=invalidated` returns nothing.
+
+### Time window
+
+`start_date=` and `end_date=` restrict the results to a half-open range `[start, end)`, and `time_field=` chooses which timestamp they apply to:
+
+| `time_field` | Means |
+|---|---|
+| `created_at` (default) | When the memory was ingested |
+| `updated_at` | When it was last written |
+| `mentioned_at` | When the fact was mentioned |
+| `occurred_start` / `occurred_end` | When the fact itself occurred |
+
+`time_field` also becomes the sort order (newest first), and **memories with no value on that column are excluded** — so `total` counts only the memories carrying that timestamp, and can be `0` on a bank that is not empty. Omit all three parameters to keep the default listing, which orders by `mentioned_at` then `created_at` and drops nothing.
+
+This filters, unlike recall's `temporal_window`, which only ranks — use it when you need an exhaustive, time-bounded read rather than the best matches.
 
 ### Python
 
@@ -57,6 +74,8 @@ curl -s "$HINDSIGHT_URL/v1/default/banks/$BANK_ID/memories/list?state=invalidate
 
 ## Fetch a single memory unit
 
+Fetch a memory unit by ID, including its content, metadata, entities, timestamps, tags, and curation state.
+
 ### Python
 
 ```python
@@ -66,7 +85,7 @@ curl -s "$HINDSIGHT_URL/v1/default/banks/$BANK_ID/memories/list?state=invalidate
 ### Node.js
 
 ```javascript
-// Fetch a single memory unit (entities, dates, state).
+// Fetch a single memory unit (metadata, entities, dates, state).
 const memory = await (
     await fetch(`${HINDSIGHT_URL}/v1/default/banks/${BANK_ID}/memories/${memoryId}`)
 ).json();
@@ -136,6 +155,8 @@ Only raw **world** and **experience** facts can be curated. Observations are *de
 
 Correct what the LLM extracted. You can change the **text**, **context**, **occurred dates**, **fact type**, and **entities** — anything the extractor could have gotten wrong. Hindsight re-embeds the fact, drops the observations and links derived from the old version, and re-consolidates, so downstream knowledge reflects the correction. Edited facts are marked with an `edited_at` timestamp (surfaced as an **Edited** badge in the control plane).
 
+Correcting a fact never discards the **cause-and-effect relationships** it takes part in: those come from reading the original source, so an edit (or an invalidate/restore round-trip) keeps them intact rather than dropping links nothing could rebuild.
+
 You don't need to rebuild anything yourself: an edit **automatically recomputes the knowledge graph and links** in the background. The fact's entity associations are re-resolved from the new text/entities, its temporal and semantic links are re-derived, and consolidation re-runs — all triggered by the edit. The PATCH returns as soon as the change is committed; the graph/observation rebuild happens asynchronously right after.
 
 ### Python
@@ -164,7 +185,20 @@ await patchMemory(memoryId, { text: 'The user visited Paris in 2023.', reason: '
 # Section 'edit-memory' not found in api/memories.go
 ```
 
-You can correct the dates, fact type, and entities the same way. For `context`, `occurred_start`, and `occurred_end`, an empty string `""` clears the field and omitting it leaves it unchanged. For `entities`, a list **replaces** the fact's entity set (names are resolved/find-or-created the same way retain does) and `[]` detaches them all; omitting it leaves them unchanged.
+You can correct the dates, fact type, and entities the same way. For `context`, `occurred_start`, and `occurred_end`, an empty string `""` clears the field and omitting it leaves it unchanged. For `entities`, a list **replaces** the fact's entity set and `[]` detaches them all; omitting it leaves them unchanged.
+
+### Resolving entity names
+
+`resolve_entities` controls how the names in `entities` are matched to entities in the bank:
+
+| Value | Behaviour |
+| --- | --- |
+| `true` (default) | What retain does. Each name is resolved against the bank, so a name close to one already there may resolve to that existing entity instead, based on name similarity plus how strongly it co-occurs with the other names you sent. |
+| `false` | The names are taken literally. An existing entity is reused only when its name matches case-insensitively, any other name creates a new entity, and names in the same request are never merged with each other. |
+
+**Pass `false` when you are correcting a fact by hand.** With resolution on, a name that is close to one already in the bank can be matched onto that neighbour rather than the entity you named — `Dr. Waller` onto a `Dr Wall` typo, `Alice Smith` onto `Alice` — and because the edit succeeds normally the substitution is not obvious from the response. Resolution is right for names that came out of extraction, where spelling varies and the bank's existing entity is usually the one meant; it is wrong when you already know which entity you want. The default stays `true` so existing callers are unaffected.
+
+The same flag exists on [retain](./retain#resolve_entities) for the entities you supply there.
 
 ### Python
 
@@ -177,10 +211,13 @@ You can correct the dates, fact type, and entities the same way. For `context`, 
 ```javascript
 // Correct dates, fact type, and entities in one call. "" clears a field;
 // entities replaces the set ([] detaches all); omit to leave unchanged.
+// resolve_entities: false keeps the entity names you wrote from being matched
+// onto a similar entity that already exists.
 await patchMemory(memoryId, {
     occurred_start: '2023-06-01',
     fact_type: 'experience',
     entities: ['Alice', 'Paris'],
+    resolve_entities: false,
 });
 ```
 
@@ -201,7 +238,7 @@ await patchMemory(memoryId, {
 Soft-retire a fact. An invalidated memory:
 
 - **disappears from recall**, consolidation, and the knowledge graph,
-- has its **links pruned** and its **derived observations re-computed** without it,
+- has its **links pruned** and its **derived observations re-computed** without it (cause-and-effect relationships are kept aside and come back if you restore it),
 - **stays in the bank** for audit (visible via the memory and document views), and
 - can be **restored** at any time.
 
@@ -231,7 +268,7 @@ await patchMemory(memoryId, { state: 'invalidated', reason: 'server decommission
 # Section 'invalidate-memory' not found in api/memories.go
 ```
 
-Restoring moves the fact back into the active set and re-consolidates:
+Restoring moves the fact back into the active set, brings back the cause-and-effect relationships it took part in, and re-consolidates:
 
 ### Python
 
@@ -261,7 +298,7 @@ await patchMemory(memoryId, { state: 'valid' });
 Behind the scenes, invalidating **moves** the row out of the active `memory_units` table into a separate archive, so recall and consolidation never need a "skip invalidated" filter — the rows simply aren't there.
 
 > **📝 Documents are the source of truth**
-> 
+>
 A memory is extracted from a document. Editing or invalidating a memory does **not** change the document it came from — that's deliberate: the document stays as an accurate historical record. As a result, **reprocessing a document resets curation** of the facts it produced (extraction runs fresh from the original text). Fix systematic issues at the mission level and reprocess; use edit/invalidate for the residue.
 ### A pruning workflow
 

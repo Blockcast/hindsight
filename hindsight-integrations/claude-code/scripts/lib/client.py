@@ -12,8 +12,6 @@ from pathlib import Path
 from typing import Optional
 
 DEFAULT_TIMEOUT = 15  # seconds
-HEALTH_CHECK_RETRIES = 3
-HEALTH_CHECK_DELAY = 2  # seconds
 
 
 def _plugin_version() -> str:
@@ -83,26 +81,6 @@ class HindsightClient:
                 pass
             raise RuntimeError(f"HTTP {e.code} from {url}: {body_text}") from e
 
-    def health_check(self, timeout: int = 5) -> bool:
-        """Check if the Hindsight server is reachable.
-
-        Mirrors Openclaw's checkExternalApiHealth: retries up to 3 times
-        with 2s delay between attempts.
-        """
-        import time
-
-        for attempt in range(1, HEALTH_CHECK_RETRIES + 1):
-            try:
-                url = f"{self.api_url}/health"
-                req = urllib.request.Request(url, headers=self._headers(), method="GET")
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
-                    if resp.status == 200:
-                        return True
-            except Exception:
-                pass
-            if attempt < HEALTH_CHECK_RETRIES:
-                time.sleep(HEALTH_CHECK_DELAY)
-        return False
 
     def recall(
         self,
@@ -111,6 +89,9 @@ class HindsightClient:
         max_tokens: int = 1024,
         budget: str = "mid",
         types: Optional[list] = None,
+        tags: Optional[list] = None,
+        tags_match: Optional[str] = None,
+        tag_groups: Optional[object] = None,
         timeout: int = 10,
     ) -> dict:
         """Recall memories from a bank.
@@ -126,6 +107,12 @@ class HindsightClient:
             body["budget"] = budget
         if types:
             body["types"] = types
+        if tags:
+            body["tags"] = tags
+        if tags_match:
+            body["tags_match"] = tags_match
+        if tag_groups:
+            body["tag_groups"] = tag_groups
         return self.request("POST", path, body, timeout=timeout)
 
     def retain(

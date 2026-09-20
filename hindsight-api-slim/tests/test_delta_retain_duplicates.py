@@ -10,13 +10,11 @@ Verifies that:
 
 import asyncio
 import logging
-import os
 from datetime import datetime, timezone
 
 import pytest
 import pytest_asyncio
 
-from hindsight_api import RequestContext
 from hindsight_api.engine.task_backend import SyncTaskBackend
 
 logger = logging.getLogger(__name__)
@@ -27,6 +25,9 @@ def _ts():
 
 
 @pytest.mark.asyncio
+# Asserts chunk indexes by selecting from the Postgres `chunks` table, which a store-owned bank
+# leaves empty — its chunks live in the store.
+@pytest.mark.memory_backend_incompatible
 async def test_repeated_upsert_chunks_not_scrambled(memory, request_context):
     """
     Verify that chunks are stored with correct indices matching the
@@ -116,13 +117,11 @@ async def test_delta_detects_unchanged_after_first_retain(memory, request_contex
         )
         assert len(v1_units) > 0
 
-        pool = await memory._get_pool()
-        async with pool.acquire() as conn:
-            v1_count = await conn.fetchval(
-                "SELECT count(*) FROM memory_units WHERE bank_id = $1 AND document_id = $2",
-                bank_id,
-                document_id,
-            )
+        async def _unit_count() -> int:
+            listing = await memory.list_memory_units(bank_id, document_id=document_id, request_context=request_context)
+            return listing["total"]
+
+        v1_count = await _unit_count()
 
         # Second retain — same content, should be detected as unchanged by delta
         v2_units = await memory.retain_async(
@@ -137,12 +136,7 @@ async def test_delta_detects_unchanged_after_first_retain(memory, request_contex
         assert v2_units == [], f"Delta with unchanged content should return empty, got {len(v2_units)} units"
 
         # Memory unit count should not change
-        async with pool.acquire() as conn:
-            v2_count = await conn.fetchval(
-                "SELECT count(*) FROM memory_units WHERE bank_id = $1 AND document_id = $2",
-                bank_id,
-                document_id,
-            )
+        v2_count = await _unit_count()
         assert v2_count == v1_count, f"Memory unit count changed on same-content upsert: {v1_count} -> {v2_count}"
 
         # Third retain — verify stability
@@ -155,12 +149,7 @@ async def test_delta_detects_unchanged_after_first_retain(memory, request_contex
         )
         assert v3_units == [], "Third retain should also detect unchanged"
 
-        async with pool.acquire() as conn:
-            v3_count = await conn.fetchval(
-                "SELECT count(*) FROM memory_units WHERE bank_id = $1 AND document_id = $2",
-                bank_id,
-                document_id,
-            )
+        v3_count = await _unit_count()
         assert v3_count == v1_count, f"Memory unit count changed on third upsert: {v1_count} -> {v3_count}"
 
     finally:
@@ -168,6 +157,10 @@ async def test_delta_detects_unchanged_after_first_retain(memory, request_contex
 
 
 @pytest.mark.asyncio
+# Forces the race by writing `documents.updated_at` directly, as the test itself notes; that row
+# is not what a store-owned bank consults. The race is fenced there by the store's own
+# compare-and-set on the document watermark, covered by test_concurrent_appends_keep_every_turn.
+@pytest.mark.memory_backend_incompatible
 async def test_stale_request_skipped_when_newer_retain_completed(memory, request_context):
     """
     When two retains race on the same document, the one that started earlier
@@ -191,18 +184,19 @@ async def test_stale_request_skipped_when_newer_retain_completed(memory, request
             request_context=request_context,
         )
 
-        pool = await memory._get_pool()
-        async with pool.acquire() as conn:
-            after_newer_count = await conn.fetchval(
-                "SELECT count(*) FROM memory_units WHERE bank_id = $1 AND document_id = $2",
-                bank_id,
-                document_id,
-            )
+        async def _unit_count() -> int:
+            listing = await memory.list_memory_units(bank_id, document_id=document_id, request_context=request_context)
+            return listing["total"]
+
+        after_newer_count = await _unit_count()
         assert after_newer_count > 0, "Should have facts from newer content"
 
         # Simulate the race condition by pushing the document's updated_at into
         # the future. This makes any new retain appear "stale" (its start_time
-        # is before updated_at), as if another request already completed.
+        # is before updated_at), as if another request already completed. This
+        # forces internal store state (a document's updated_at) that the public
+        # API has no way to set, so it stays a direct write on purpose.
+        pool = await memory._get_pool()
         async with pool.acquire() as conn:
             await conn.execute(
                 "UPDATE documents SET updated_at = NOW() + INTERVAL '10 seconds' WHERE id = $1 AND bank_id = $2",
@@ -225,12 +219,7 @@ async def test_stale_request_skipped_when_newer_retain_completed(memory, request
         assert result == [], f"Stale request should return empty, got {result}"
 
         # Memory units should be unchanged (newer content preserved)
-        async with pool.acquire() as conn:
-            final_count = await conn.fetchval(
-                "SELECT count(*) FROM memory_units WHERE bank_id = $1 AND document_id = $2",
-                bank_id,
-                document_id,
-            )
+        final_count = await _unit_count()
         assert final_count == after_newer_count, (
             f"Stale request should not change memory units: {after_newer_count} -> {final_count}"
         )
@@ -273,6 +262,7 @@ async def memory_no_llm(pg0_db_url, embeddings, cross_encoder, query_analyzer):
 
 @pytest.mark.asyncio
 @pytest.mark.flaky(reruns=2, reruns_delay=2)
+@pytest.mark.memory_backend_incompatible
 async def test_concurrent_upserts_no_duplicates(memory_no_llm, request_context):
     """
     Stress test: N concurrent retains of the same document with different content.
@@ -352,12 +342,10 @@ async def test_concurrent_upserts_no_duplicates(memory_no_llm, request_context):
         logger.info(f"Winning version: {winning_version} (out of {num_concurrent} concurrent retains)")
 
         # 2. All memory units should belong to the winning version
-        async with pool.acquire() as conn:
-            units = await conn.fetch(
-                "SELECT text, chunk_id, id::text as unit_id FROM memory_units WHERE bank_id = $1 AND document_id = $2",
-                bank_id,
-                document_id,
-            )
+        listing = await memory_no_llm.list_memory_units(
+            bank_id, document_id=document_id, limit=1000, request_context=request_context
+        )
+        units = listing["items"]
         unit_texts = [r["text"] for r in units]
         assert len(unit_texts) > 0, "Should have at least 1 memory unit"
 
@@ -366,9 +354,7 @@ async def test_concurrent_upserts_no_duplicates(memory_no_llm, request_context):
         # We check for "Person_N" rather than "VERSION_N" because the text
         # splitter may cut mid-text, so later chunks might not start with the prefix.
         winning_person = f"Person_{winning_version}"
-        wrong_version_units = [
-            (r["text"], r["chunk_id"], r["unit_id"]) for r in units if winning_person not in r["text"]
-        ]
+        wrong_version_units = [(r["text"], r["chunk_id"], r["id"]) for r in units if winning_person not in r["text"]]
         assert not wrong_version_units, (
             f"Found {len(wrong_version_units)} memory units NOT from winning version "
             f"{winning_version} (expected '{winning_person}' in every unit). "
@@ -393,6 +379,77 @@ async def test_concurrent_upserts_no_duplicates(memory_no_llm, request_context):
         logger.info(
             f"Concurrent test passed: version {winning_version} won with {len(unit_texts)} memory units, no duplicates"
         )
+
+    finally:
+        await memory_no_llm.delete_bank(bank_id, request_context=request_context)
+
+
+@pytest.mark.asyncio
+async def test_append_mode_preserves_document_metadata_projection(memory_no_llm, request_context):
+    """Append retains should keep item metadata visible through document APIs."""
+    bank_id = f"test_append_metadata_{_ts()}"
+    document_id = "append-metadata-doc"
+
+    try:
+        await memory_no_llm.retain_batch_async(
+            bank_id=bank_id,
+            contents=[
+                {
+                    "content": "first turn from the agent session",
+                    "context": "agent conversation",
+                    "document_id": document_id,
+                    "metadata": {
+                        "source": "hermes",
+                        "platform": "weixin",
+                        "session_id": document_id,
+                        "turn_index": "1",
+                    },
+                    "tags": ["source:hermes", "scope:local-agent", f"session:{document_id}"],
+                    "update_mode": "append",
+                }
+            ],
+            request_context=request_context,
+        )
+
+        await memory_no_llm.retain_batch_async(
+            bank_id=bank_id,
+            contents=[
+                {
+                    "content": "second turn from the agent session",
+                    "context": "agent conversation",
+                    "document_id": document_id,
+                    "metadata": {
+                        "source": "hermes",
+                        "platform": "weixin",
+                        "session_id": document_id,
+                        "turn_index": "2",
+                    },
+                    "tags": ["source:hermes", "scope:local-agent", f"session:{document_id}"],
+                    "update_mode": "append",
+                }
+            ],
+            request_context=request_context,
+        )
+
+        doc = await memory_no_llm.get_document(document_id, bank_id, request_context=request_context)
+        assert doc is not None
+        assert doc["document_metadata"] == {
+            "source": "hermes",
+            "platform": "weixin",
+            "session_id": document_id,
+            "turn_index": "2",
+        }
+        assert doc["retain_params"]["metadata"] == doc["document_metadata"]
+        assert doc["retain_params"]["context"] == "agent conversation"
+
+        listed = await memory_no_llm.list_documents(
+            bank_id,
+            tags=["source:hermes"],
+            request_context=request_context,
+        )
+        listed_doc = next(item for item in listed["items"] if item["id"] == document_id)
+        assert listed_doc["document_metadata"] == doc["document_metadata"]
+        assert listed_doc["retain_params"]["metadata"] == doc["document_metadata"]
 
     finally:
         await memory_no_llm.delete_bank(bank_id, request_context=request_context)

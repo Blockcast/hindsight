@@ -6,6 +6,7 @@ authentication when a TenantExtension is configured.
 """
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
@@ -13,7 +14,24 @@ if TYPE_CHECKING:
     from hindsight_api.engine.memory_engine import BankLlmHealthInfo, Budget
     from hindsight_api.engine.response_models import RecallResult, ReflectResult
     from hindsight_api.engine.search.tags import TagsMatch
+    from hindsight_api.extensions import BankWriteOperation
     from hindsight_api.models import RequestContext
+
+
+@dataclass(frozen=True)
+class BankConfigState:
+    """Resolved bank configuration and its bank-level overrides."""
+
+    config: dict[str, Any]
+    overrides: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class BankTemplateImportWrite:
+    """One bank-write decision reserved for a specific imported resource."""
+
+    operation: "BankWriteOperation"
+    target: str | None = None
 
 
 class MemoryEngineInterface(ABC):
@@ -142,16 +160,22 @@ class MemoryEngineInterface(ABC):
     async def list_banks(
         self,
         *,
+        search_query: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
         request_context: "RequestContext",
-    ) -> list[dict[str, Any]]:
+    ) -> dict[str, Any]:
         """
-        List all memory banks.
+        List memory banks, one page at a time.
 
         Args:
+            search_query: Case-insensitive substring matched against bank ID and name.
+            limit: Maximum number of banks to return (0 returns none).
+            offset: Number of banks to skip.
             request_context: Request context for authentication.
 
         Returns:
-            List of bank info dicts.
+            Dict with ``banks`` (the page), ``total``, ``limit`` and ``offset``.
         """
         ...
 
@@ -161,23 +185,68 @@ class MemoryEngineInterface(ABC):
         bank_id: str,
         *,
         request_context: "RequestContext",
-        create_if_missing: bool = True,
     ) -> dict[str, Any] | None:
         """
-        Get bank profile including disposition and mission.
+        Read bank profile including disposition and mission. Never creates.
 
         Args:
             bank_id: The memory bank ID.
             request_context: Request context for authentication.
-            create_if_missing: If True (default), the bank is auto-created
-                with defaults if it does not exist. Pass False to make this
-                a strict read — returns None if the bank does not exist.
 
         Returns:
             Bank profile dict with bank_id, name, disposition, and mission,
-            or None when create_if_missing=False and the bank does not
-            exist.
+            or None when the bank does not exist.
         """
+        ...
+
+    @abstractmethod
+    async def ensure_bank_profile(
+        self,
+        bank_id: str,
+        *,
+        request_context: "RequestContext",
+    ) -> dict[str, Any]:
+        """
+        Get bank profile, creating the bank with defaults if it does not exist.
+
+        Args:
+            bank_id: The memory bank ID.
+            request_context: Request context for authentication.
+
+        Returns:
+            Bank profile dict with bank_id, name, disposition, and mission.
+        """
+        ...
+
+    @abstractmethod
+    async def get_bank_config(
+        self,
+        bank_id: str,
+        *,
+        request_context: "RequestContext",
+    ) -> BankConfigState:
+        """Return resolved configuration after authenticating and authorizing the read."""
+        ...
+
+    @abstractmethod
+    async def update_bank_config(
+        self,
+        bank_id: str,
+        updates: dict[str, Any],
+        *,
+        request_context: "RequestContext",
+    ) -> BankConfigState:
+        """Create a bank if needed and persist validated configuration overrides."""
+        ...
+
+    @abstractmethod
+    async def reset_bank_config(
+        self,
+        bank_id: str,
+        *,
+        request_context: "RequestContext",
+    ) -> BankConfigState:
+        """Remove all bank configuration overrides after authorization."""
         ...
 
     @abstractmethod
@@ -273,8 +342,13 @@ class MemoryEngineInterface(ABC):
         self,
         bank_id: str,
         *,
-        fact_type: str | None = None,
+        fact_type: str | list[str] | None = None,
         search_query: str | None = None,
+        entity_id: str | None = None,
+        created_before: datetime | None = None,
+        time_field: str | None = None,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
         limit: int = 100,
         offset: int = 0,
         request_context: "RequestContext",
@@ -284,8 +358,16 @@ class MemoryEngineInterface(ABC):
 
         Args:
             bank_id: The memory bank ID.
-            fact_type: Filter by fact type.
+            fact_type: Filter by fact type. A list matches any of them; an empty
+                list is treated as no filter.
             search_query: Full-text search query.
+            entity_id: Filter to memory units linked to this entity ID.
+            created_before: Keep units with ``created_at`` before this instant.
+            time_field: Time axis to filter and order by (see
+                :mod:`hindsight_api.engine.time_filter`). Units with no value on
+                that axis are excluded.
+            start_date: Inclusive lower bound on ``time_field``.
+            end_date: Exclusive upper bound on ``time_field``.
             limit: Maximum results.
             offset: Pagination offset.
             request_context: Request context for authentication.
@@ -330,6 +412,9 @@ class MemoryEngineInterface(ABC):
         search_query: str | None = None,
         tags: list[str] | None = None,
         tags_match: "TagsMatch" = "any_strict",
+        time_field: str | None = None,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
         limit: int = 100,
         offset: int = 0,
         request_context: "RequestContext",
@@ -342,6 +427,10 @@ class MemoryEngineInterface(ABC):
             search_query: Case-insensitive substring filter on document ID.
             tags: Filter by tags.
             tags_match: How to match tags (any, all, any_strict, all_strict).
+            time_field: Time axis to filter and order by — ``created_at`` or
+                ``updated_at`` (see :mod:`hindsight_api.engine.time_filter`).
+            start_date: Inclusive lower bound on ``time_field``.
+            end_date: Exclusive upper bound on ``time_field``.
             limit: Maximum results.
             offset: Pagination offset.
             request_context: Request context for authentication.
@@ -449,6 +538,7 @@ class MemoryEngineInterface(ABC):
         bank_id: str,
         *,
         request_context: "RequestContext",
+        force_refresh: bool = False,
     ) -> dict[str, Any]:
         """
         Get statistics about memory nodes and links for a bank.
@@ -456,6 +546,8 @@ class MemoryEngineInterface(ABC):
         Args:
             bank_id: The memory bank ID.
             request_context: Request context for authentication.
+            force_refresh: Bypass the cached value and recompute (also refreshes
+                the cache for subsequent callers).
 
         Returns:
             Dict with node_counts, link_counts, link_counts_by_fact_type
@@ -475,11 +567,15 @@ class MemoryEngineInterface(ABC):
         Get consolidation freshness for a bank.
 
         Cheap alternative to get_bank_stats when callers only need
-        last_consolidated_at / pending_consolidation / failed_consolidation.
+        last_consolidated_at / last_memory_write_at / pending_consolidation /
+        failed_consolidation.
 
         Returns:
-            Dict with last_consolidated_at (ISO-8601 string or None),
-            pending_consolidation (int), and failed_consolidation (int).
+            Dict with last_consolidated_at and last_memory_write_at (ISO-8601
+            strings or None), pending_consolidation (int), and
+            failed_consolidation (int). last_memory_write_at is the newest write
+            across the bank's memories — a mental model refreshed at or after it
+            cannot be stale, whatever its scope.
         """
         ...
 
@@ -563,12 +659,38 @@ class MemoryEngineInterface(ABC):
         ...
 
     @abstractmethod
+    async def delete_operation(
+        self,
+        bank_id: str,
+        operation_id: str,
+        *,
+        request_context: "RequestContext",
+    ) -> dict[str, Any]:
+        """
+        Delete a terminal async operation record.
+
+        Args:
+            bank_id: The memory bank ID.
+            operation_id: The operation ID to delete.
+            request_context: Request context for authentication.
+
+        Returns:
+            Dict with success status and message.
+
+        Raises:
+            ValueError: If operation not found.
+        """
+        ...
+
+    @abstractmethod
     async def update_bank(
         self,
         bank_id: str,
         *,
         name: str | None = None,
         mission: str | None = None,
+        config_updates: dict[str, Any] | None = None,
+        create_if_missing: bool = True,
         request_context: "RequestContext",
     ) -> dict[str, Any]:
         """
@@ -578,6 +700,9 @@ class MemoryEngineInterface(ABC):
             bank_id: The memory bank ID.
             name: New bank name (optional).
             mission: New mission text (optional, replaces existing).
+            config_updates: Bank configuration overrides to apply with the profile update.
+            create_if_missing: Create a missing bank when True; otherwise raise
+                a 404 operation error.
             request_context: Request context for authentication.
 
         Returns:

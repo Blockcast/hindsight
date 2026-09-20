@@ -4,7 +4,7 @@
  * These tests require a running Hindsight API server.
  */
 
-import { HindsightClient, sdk } from "../src";
+import { HindsightClient, HindsightError, sdk } from "../src";
 
 // Test configuration
 const HINDSIGHT_API_URL = process.env.HINDSIGHT_API_URL || "http://localhost:8888";
@@ -219,22 +219,31 @@ describe("TestEndToEndWorkflow", () => {
 });
 
 describe("TestBankProfile", () => {
-  test("get bank profile", async () => {
+  // The bank profile endpoint was retired: it answers 410. Disposition traits and the
+  // reflect mission are bank configuration and are read from getBankConfig instead.
+  test("the profile endpoint is gone and the config carries its data", async () => {
     const bankId = randomBankId();
 
-    // Create bank with background
     await client.createBank(bankId, {
       name: "Test Agent",
-      background: "I am a helpful assistant for testing.",
+      reflectMission: "I am a helpful assistant for testing.",
     });
 
-    // Get bank profile
-    const profile = await client.getBankProfile(bankId);
+    // Plain try/catch rather than `.rejects`: this file runs under both jest and
+    // Deno's @std/expect shim, and only the matchers used elsewhere here are known
+    // to behave identically in both.
+    let caught: unknown;
+    try {
+      await client.getBankProfile(bankId);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(HindsightError);
+    expect((caught as HindsightError).statusCode).toBe(410);
 
-    expect(profile).not.toBeNull();
-    expect(profile.bank_id).toBe(bankId);
-    expect(profile.name).toBe("Test Agent");
-    expect(profile.background).toBe("I am a helpful assistant for testing.");
+    const { config } = await client.getBankConfig(bankId);
+    expect(config.reflect_mission).toBe("I am a helpful assistant for testing.");
+    expect(config.disposition_skepticism).toBeDefined();
   });
 });
 
@@ -474,6 +483,143 @@ describe("TestMission", () => {
 // properties are frozen. These unit tests are covered by the Jest suite.
 const canSpyOnModules = typeof (globalThis as any).Deno === "undefined";
 
+(canSpyOnModules ? describe : describe.skip)("TestRetainRequestOptions", () => {
+  test("retain threads operationId into the request body", async () => {
+    const operationId = "123e4567-e89b-12d3-a456-426614174000";
+    const spy = jest.spyOn(sdk, "retainMemories").mockResolvedValue({
+      data: { success: true, items_count: 1 },
+    } as any);
+
+    await client.retain(randomBankId(), "test", { async: true, operationId });
+
+    expect(spy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: expect.objectContaining({ operation_id: operationId }),
+      })
+    );
+    spy.mockRestore();
+  });
+
+  test("retainBatch threads operationId into the request body", async () => {
+    const operationId = "123e4567-e89b-12d3-a456-426614174001";
+    const spy = jest.spyOn(sdk, "retainMemories").mockResolvedValue({
+      data: { success: true, items_count: 1 },
+    } as any);
+
+    await client.retainBatch(randomBankId(), [{ content: "test" }], {
+      async: true,
+      operationId,
+    });
+
+    expect(spy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: expect.objectContaining({ operation_id: operationId }),
+      })
+    );
+    spy.mockRestore();
+  });
+
+  test("retainBatch omits operation_id by default", async () => {
+    const spy = jest.spyOn(sdk, "retainMemories").mockResolvedValue({
+      data: { success: true, items_count: 1 },
+    } as any);
+
+    await client.retainBatch(randomBankId(), [{ content: "test" }]);
+
+    const request = spy.mock.calls[0][0] as any;
+    expect(request.body).not.toHaveProperty("operation_id");
+    spy.mockRestore();
+  });
+
+  test("retainBatch omits operation_id for sync and nullish requests", async () => {
+    const spy = jest.spyOn(sdk, "retainMemories").mockResolvedValue({
+      data: { success: true, items_count: 1 },
+    } as any);
+
+    await client.retainBatch(randomBankId(), [{ content: "sync" }], {
+      operationId: "123e4567-e89b-12d3-a456-426614174002",
+    });
+    await client.retainBatch(randomBankId(), [{ content: "null" }], {
+      async: true,
+      operationId: null,
+    } as any);
+
+    for (const [request] of spy.mock.calls) {
+      expect((request as any).body).not.toHaveProperty("operation_id");
+    }
+    spy.mockRestore();
+  });
+
+  test("retain omits operationId from default, sync, and nullish delegation", async () => {
+    const spy = jest.spyOn(client, "retainBatch").mockResolvedValue({
+      success: true,
+      items_count: 1,
+    } as any);
+
+    await client.retain(randomBankId(), "default");
+    await client.retain(randomBankId(), "sync", {
+      operationId: "123e4567-e89b-12d3-a456-426614174003",
+    });
+    await client.retain(randomBankId(), "null", {
+      async: true,
+      operationId: null,
+    } as any);
+
+    for (const call of spy.mock.calls) {
+      expect(call[2]).not.toHaveProperty("operationId");
+    }
+    spy.mockRestore();
+  });
+
+  test("retain warns exactly once when operationId is dropped on a sync request", async () => {
+    const sdkSpy = jest.spyOn(sdk, "retainMemories").mockResolvedValue({
+      data: { success: true, items_count: 1 },
+    } as any);
+    const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+
+    await client.retain(randomBankId(), "test", {
+      operationId: "123e4567-e89b-12d3-a456-426614174004",
+    });
+
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(warnSpy.mock.calls[0][0]).toContain("operationId is ignored for synchronous retain");
+    warnSpy.mockRestore();
+    sdkSpy.mockRestore();
+  });
+
+  test("retainBatch warns when operationId is dropped on a sync request", async () => {
+    const sdkSpy = jest.spyOn(sdk, "retainMemories").mockResolvedValue({
+      data: { success: true, items_count: 1 },
+    } as any);
+    const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+
+    await client.retainBatch(randomBankId(), [{ content: "test" }], {
+      operationId: "123e4567-e89b-12d3-a456-426614174005",
+    });
+
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    warnSpy.mockRestore();
+    sdkSpy.mockRestore();
+  });
+
+  test("retain does not warn for async operationId or default calls", async () => {
+    const sdkSpy = jest.spyOn(sdk, "retainMemories").mockResolvedValue({
+      data: { success: true, items_count: 1 },
+    } as any);
+    const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+
+    await client.retain(randomBankId(), "async", {
+      async: true,
+      operationId: "123e4567-e89b-12d3-a456-426614174006",
+    });
+    await client.retain(randomBankId(), "default");
+
+    expect(warnSpy).not.toHaveBeenCalled();
+    warnSpy.mockRestore();
+    sdkSpy.mockRestore();
+  });
+});
+
 (canSpyOnModules ? describe : describe.skip)("TestAbortSignal", () => {
   test("retain passes abort signal to SDK", async () => {
     const bankId = randomBankId();
@@ -498,6 +644,95 @@ const canSpyOnModules = typeof (globalThis as any).Deno === "undefined";
     await client.recall(bankId, "test", { signal: controller.signal });
 
     expect(spy).toHaveBeenCalledWith(expect.objectContaining({ signal: controller.signal }));
+    spy.mockRestore();
+  });
+
+  test("recall threads preferObservations into request body", async () => {
+    const bankId = randomBankId();
+    const spy = jest.spyOn(sdk, "recallMemories").mockResolvedValue({
+      data: { results: [] },
+    } as any);
+
+    await client.recall(bankId, "test", {
+      types: ["world", "experience", "observation"],
+      preferObservations: true,
+    });
+
+    expect(spy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: expect.objectContaining({ prefer_observations: true }),
+      })
+    );
+    spy.mockRestore();
+  });
+
+  test("recall threads minScores into request body", async () => {
+    const bankId = randomBankId();
+    const spy = jest.spyOn(sdk, "recallMemories").mockResolvedValue({
+      data: { results: [] },
+    } as any);
+
+    await client.recall(bankId, "test", {
+      minScores: { semantic: 0.2, final: 0.5 },
+    });
+
+    expect(spy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: expect.objectContaining({ min_scores: { semantic: 0.2, final: 0.5 } }),
+      })
+    );
+    spy.mockRestore();
+  });
+
+  test("recall omits min_scores when not provided", async () => {
+    const bankId = randomBankId();
+    const spy = jest.spyOn(sdk, "recallMemories").mockResolvedValue({
+      data: { results: [] },
+    } as any);
+
+    await client.recall(bankId, "test");
+
+    expect(spy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: expect.objectContaining({ min_scores: undefined }),
+      })
+    );
+    spy.mockRestore();
+  });
+
+  test("recall threads temporalWindow into request body", async () => {
+    const bankId = randomBankId();
+    const spy = jest.spyOn(sdk, "recallMemories").mockResolvedValue({
+      data: { results: [] },
+    } as any);
+
+    await client.recall(bankId, "test", {
+      temporalWindow: { start: "2023-04-01T00:00:00Z", end: "2023-06-30T23:59:59Z" },
+    });
+
+    expect(spy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: expect.objectContaining({
+          temporal_window: { start: "2023-04-01T00:00:00Z", end: "2023-06-30T23:59:59Z" },
+        }),
+      })
+    );
+    spy.mockRestore();
+  });
+
+  test("recall omits temporal_window when not provided", async () => {
+    const bankId = randomBankId();
+    const spy = jest.spyOn(sdk, "recallMemories").mockResolvedValue({
+      data: { results: [] },
+    } as any);
+
+    await client.recall(bankId, "test");
+
+    expect(spy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: expect.objectContaining({ temporal_window: undefined }),
+      })
+    );
     spy.mockRestore();
   });
 

@@ -37,7 +37,7 @@ func main() {
 	} {
 		client.MemoryAPI.RetainMemories(ctx, mmBankID).
 			RetainRequest(hindsight.RetainRequest{
-				Items: []hindsight.MemoryItem{{Content: content}},
+				Items: []hindsight.MemoryItem{{Content: hindsight.TextContent(content)}},
 			}).Execute()
 	}
 	time.Sleep(2 * time.Second)
@@ -90,11 +90,30 @@ func main() {
 	fmt.Printf("Operation ID: %s\n", result2.GetOperationId())
 	// [/docs:create-mental-model-with-trigger]
 
+	// [docs:create-mental-model-tags-match]
+	// Override how the model's tags filter source memories on refresh.
+	// A tagged model defaults to "all_strict" (a memory must carry EVERY tag);
+	// use "any" when your memories are tagged narrowly (one topic each), so the
+	// refresh reads any memory carrying at least one of the model's tags.
+	result3, _, _ := client.MentalModelsAPI.CreateMentalModel(ctx, mmBankID).
+		CreateMentalModelRequest(hindsight.CreateMentalModelRequest{
+			Name:        "Current Projects",
+			SourceQuery: "Which projects is the user currently working on?",
+			Tags:        []string{"projects", "mental-model"},
+			Trigger: &hindsight.MentalModelTriggerInput{
+				TagsMatch: *hindsight.NewNullableString(hindsight.PtrString("any")),
+			},
+		}).Execute()
+
+	fmt.Printf("Operation ID: %s\n", result3.GetOperationId())
+	// [/docs:create-mental-model-tags-match]
+
 	time.Sleep(5 * time.Second)
 
 	// [docs:list-mental-models]
-	// List all mental models in a bank
-	mentalModels, _, _ := client.MentalModelsAPI.ListMentalModels(ctx, mmBankID).Execute()
+	// List all mental models in a bank. The list returns metadata by default;
+	// Detail("content") adds source_query/content/trigger.
+	mentalModels, _, _ := client.MentalModelsAPI.ListMentalModels(ctx, mmBankID).Detail("content").Execute()
 
 	for _, mm := range mentalModels.GetItems() {
 		fmt.Printf("- %s: %s\n", mm.GetName(), mm.GetSourceQuery())

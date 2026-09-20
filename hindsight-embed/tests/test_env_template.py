@@ -57,6 +57,35 @@ def test_documentation_is_preserved():
     assert "Supported providers:" in text
 
 
+def test_template_documents_macos_cpu_workarounds():
+    """Installed profile templates should expose both supported MPS/XPC workarounds."""
+    text = load_template()
+    assert text is not None
+    assert "# HINDSIGHT_API_EMBEDDINGS_LOCAL_FORCE_CPU=false" in text
+    assert "# HINDSIGHT_API_RERANKER_LOCAL_FORCE_CPU=false" in text
+
+
+def test_load_template_reads_bundled_copy_as_utf8(monkeypatch):
+    raw = "# memory — retained\n".encode("utf-8")
+
+    class BundledTemplate:
+        def is_file(self):
+            return True
+
+        def read_text(self, *, encoding=None):
+            # Mirrors importlib.resources: no encoding means the process locale,
+            # which is a narrow codepage on a legacy Windows install (#3837).
+            return raw.decode(encoding or "ascii")
+
+    class PackageFiles:
+        def joinpath(self, _name):
+            return BundledTemplate()
+
+    monkeypatch.setattr("hindsight_embed.env_template.importlib.resources.files", lambda _package: PackageFiles())
+
+    assert load_template() == "# memory — retained\n"
+
+
 def test_unknown_keys_are_appended():
     text = render_config({"HINDSIGHT_API_LLM_PROVIDER": "openai", "KEY": "value"})
     assert _active_keys(text)["KEY"] == "value"
@@ -76,6 +105,6 @@ def test_bundled_template_matches_repo_root():
     repo_root_example = Path(__file__).resolve().parents[2] / ".env.example"
     if not repo_root_example.is_file():
         return
-    assert bundled == repo_root_example.read_text(), (
+    assert bundled == repo_root_example.read_text(encoding="utf-8"), (
         "hindsight_embed/env.example is out of sync with the repo-root .env.example — re-copy it."
     )

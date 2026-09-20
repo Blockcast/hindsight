@@ -12,6 +12,7 @@ Usage:
 """
 
 import asyncio
+import importlib.util
 import logging
 import os
 import signal
@@ -19,11 +20,18 @@ import socket
 import subprocess
 import sys
 import time
+from contextlib import AbstractAsyncContextManager
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
-from hindsight_api.engine.llm_interface import LLMInterface
+import aiohttp
+
+from hindsight_api._cross_loop import CrossLoopLock
+from hindsight_api.engine.aiohttp_session import per_phase_timeout
+from hindsight_api.engine.llm_interface import LLM_TOOL_CHOICE_AUTO, LLMInterface, LLMToolChoice
 from hindsight_api.engine.response_models import LLMToolCallResult
+
+from ..response_models import LLMCallResult
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +46,11 @@ MODELS_DIR = Path.home() / ".hindsight" / "models"
 # (retain, reflect, consolidation each create their own LLMProvider,
 # but they should all share one llama.cpp server process)
 _shared_server: "LlamaCppServer | None" = None
-_shared_server_lock = asyncio.Lock()
+# CrossLoopLock, not asyncio.Lock: module-level state shared by every event loop in
+# the process. It guards starting and stopping the shared llama.cpp subprocess, which
+# awaits, so it must be held across suspension points — a threading.Lock would block
+# the loop instead of yielding.
+_shared_server_lock = CrossLoopLock()
 
 
 def _find_free_port() -> int:
@@ -46,6 +58,26 @@ def _find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+def _require_llama_cpp() -> None:
+    """Fail fast when the `local-llm` extra is missing.
+
+    Without it, `python -m llama_cpp.server` exits immediately with
+    ModuleNotFoundError, which the caller only ever sees as a connection error
+    against a port nothing listens on. Checked before the model download so a
+    ~3.5 GB fetch is not spent on a server that cannot start (issue #3733).
+    """
+    if importlib.util.find_spec("llama_cpp") is None:
+        raise RuntimeError(
+            "HINDSIGHT_API_LLM_PROVIDER=llamacpp needs the 'local-llm' extra, which is not "
+            "installed (no module named 'llama_cpp').\n"
+            "  • pip install 'hindsight-api-slim[local-llm]'\n"
+            "  • The published Docker image (ghcr.io/vectorize-io/hindsight) deliberately omits "
+            "llama-cpp-python. For Docker, run llama.cpp as a sidecar and point Hindsight at it "
+            "with HINDSIGHT_API_LLM_PROVIDER=openai + HINDSIGHT_API_LLM_BASE_URL: see "
+            "docker/docker-compose/local-llm/ in the repository."
+        )
 
 
 def _download_default_model() -> Path:
@@ -152,6 +184,17 @@ class LlamaCppServer:
             # Prompt cache: reuse KV cache for repeated system prompts
             "--cache",
             "true",
+            # Keep the prompt cache in RAM. llama_cpp.server's other option,
+            # `disk`, is backed by diskcache, which pickles cache entries
+            # (CVE-2025-69872): anyone able to write to the cache directory
+            # gets code execution in this process when an entry is read back.
+            # diskcache has had no release since 5.6.3 in 2023 and no fixed
+            # version exists, so the exposure is permanent if the disk backend
+            # is ever selected. `ram` is already llama_cpp.server's default;
+            # stating it here means a future edit has to opt into the risk
+            # deliberately rather than inherit it by changing a default.
+            "--cache_type",
+            "ram",
         ]
         # Only pass chat_format if explicitly set (most GGUF models have it embedded)
         if self.chat_format:
@@ -180,8 +223,6 @@ class LlamaCppServer:
 
     async def _wait_for_ready(self, timeout: float = 120.0) -> None:
         """Wait for the llama.cpp server to accept connections."""
-        import httpx
-
         start = time.monotonic()
         url = f"http://127.0.0.1:{self.port}/v1/models"
         last_log = start
@@ -197,12 +238,14 @@ class LlamaCppServer:
                 raise RuntimeError(f"llama.cpp server exited with code {self._process.returncode}.\nstderr: {stderr}")
 
             try:
-                async with httpx.AsyncClient() as client:
-                    resp = await client.get(url, timeout=5.0)
-                    if resp.status_code == 200:
-                        logger.info(f"llama.cpp server ready on port {self.port}")
-                        return
-            except (httpx.ConnectError, httpx.TimeoutException, httpx.ConnectTimeout):
+                async with aiohttp.ClientSession(timeout=per_phase_timeout(5.0)) as client:
+                    async with client.get(url) as resp:
+                        if resp.status == 200:
+                            logger.info(f"llama.cpp server ready on port {self.port}")
+                            return
+            except (aiohttp.ClientConnectorError, asyncio.TimeoutError):
+                # Not listening yet, or still loading the model; aiohttp raises its
+                # timeouts as asyncio.TimeoutError subclasses.
                 pass
 
             # Log progress every 15s
@@ -272,13 +315,15 @@ class LlamaCppLLM(LLMInterface):
         api_key: str,
         base_url: str,
         model: str,
-        reasoning_effort: str = "low",
+        reasoning_effort: str | None = None,
+        extra_body: dict[str, Any] | None = None,
         model_path: str | None = None,
         gpu_layers: int = -1,
         context_size: int = 8192,
         chat_format: str | None = None,
         no_grammar: bool = False,
         extra_args: str | None = None,
+        timeout: float | None = None,
         **kwargs: Any,
     ):
         super().__init__(
@@ -287,7 +332,9 @@ class LlamaCppLLM(LLMInterface):
             base_url=base_url or "",
             model=model or DEFAULT_LLAMACPP_MODEL_ALIAS,
             reasoning_effort=reasoning_effort,
+            timeout=timeout,
         )
+        self._extra_body = extra_body
         self._model_path_str = model_path
         self._gpu_layers = gpu_layers
         self._context_size = context_size
@@ -309,13 +356,16 @@ class LlamaCppLLM(LLMInterface):
 
         async with _shared_server_lock:
             if _shared_server is None:
+                # Refuse before downloading gigabytes for a server we cannot run.
+                _require_llama_cpp()
+
                 # Resolve and potentially download the model
                 model_path = _resolve_model_path(self._model_path_str)
                 logger.info(f"Using GGUF model: {model_path}")
 
                 # Start the shared llama.cpp server
                 port = _find_free_port()
-                _shared_server = LlamaCppServer(
+                server = LlamaCppServer(
                     model_path=model_path,
                     port=port,
                     gpu_layers=self._gpu_layers,
@@ -323,7 +373,20 @@ class LlamaCppLLM(LLMInterface):
                     chat_format=self._chat_format,
                     extra_args=self._extra_args,
                 )
-                await _shared_server.start()
+                # Publish only once the process is actually serving. Assigning
+                # first left a dead server installed for the lifetime of the
+                # process: every later call skipped startup and talked to a port
+                # nothing listens on, so the real failure surfaced once and then
+                # masqueraded as endless connection errors (issue #3733).
+                try:
+                    await server.start()
+                except BaseException:
+                    # A start that timed out can leave the subprocess alive and
+                    # holding the model in memory; reap it so a retry does not
+                    # stack another one on top.
+                    await server.stop()
+                    raise
+                _shared_server = server
 
         self._server = _shared_server
 
@@ -335,7 +398,11 @@ class LlamaCppLLM(LLMInterface):
             api_key="llamacpp",
             base_url=self._server.base_url,
             model=self.model,
+            # None (unconfigured) must stay None so the delegate omits the parameter
+            # rather than inventing a level for the local model.
             reasoning_effort=self.reasoning_effort,
+            extra_body=self._extra_body,
+            timeout=self.timeout,
         )
 
         self._initialized = True
@@ -366,8 +433,8 @@ class LlamaCppLLM(LLMInterface):
         max_backoff: float = 60.0,
         skip_validation: bool = False,
         strict_schema: bool = False,
-        return_usage: bool = False,
-    ) -> Any:
+        attempt_context: Callable[[], AbstractAsyncContextManager[None]] | None = None,
+    ) -> LLMCallResult:
         """Delegate call to the OpenAI-compatible API."""
         await self._ensure_initialized()
         return await self._delegate.call(
@@ -381,7 +448,7 @@ class LlamaCppLLM(LLMInterface):
             max_backoff=max_backoff,
             skip_validation=skip_validation,
             strict_schema=strict_schema,
-            return_usage=return_usage,
+            attempt_context=attempt_context,
         )
 
     async def call_with_tools(
@@ -394,7 +461,8 @@ class LlamaCppLLM(LLMInterface):
         max_retries: int = 5,
         initial_backoff: float = 1.0,
         max_backoff: float = 30.0,
-        tool_choice: str | dict[str, Any] = "auto",
+        tool_choice: LLMToolChoice = LLM_TOOL_CHOICE_AUTO,
+        attempt_context: Callable[[], AbstractAsyncContextManager[None]] | None = None,
     ) -> LLMToolCallResult:
         """Delegate tool calls to the OpenAI-compatible API."""
         await self._ensure_initialized()
@@ -408,7 +476,11 @@ class LlamaCppLLM(LLMInterface):
             initial_backoff=initial_backoff,
             max_backoff=max_backoff,
             tool_choice=tool_choice,
+            attempt_context=attempt_context,
         )
+
+    def supports_attempt_scoped_concurrency(self) -> bool:
+        return True
 
     async def cleanup(self) -> None:
         """Stop the shared llama.cpp server."""

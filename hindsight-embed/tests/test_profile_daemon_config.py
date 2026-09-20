@@ -86,9 +86,12 @@ def test_profile_config_is_loaded_for_daemon(temp_home):
     assert profile_config["HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT"] == "0"
     assert profile_config["HINDSIGHT_API_LOG_LEVEL"] == "debug"
 
-    # Verify that idle_timeout simple key is also available for backward compat
-    # (some code checks config.get("idle_timeout"))
-    assert profile_config.get("idle_timeout") == "0"
+    # Keys are returned under their environment-variable names only. The
+    # lowercase aliases this used to also inject ("idle_timeout", "llm_base_url",
+    # ...) are gone: they were a second, hand-maintained list a setting had to
+    # appear in to be seen, which is how HINDSIGHT_API_LLM_BASE_URL went missing
+    # (issue #4094).
+    assert not [key for key in profile_config if key.islower()]
 
 
 def test_load_config_file_uses_correct_profile(temp_home, monkeypatch):
@@ -165,6 +168,38 @@ def test_load_config_file_uses_correct_profile(temp_home, monkeypatch):
     assert os.environ.get("HINDSIGHT_API_LLM_MODEL") == "llama-3.1-70b", "Should load from named profile, not default"
 
 
+def test_load_config_file_reads_utf8_profile(temp_home, monkeypatch):
+    """Profile templates should load independently of the process locale."""
+    import builtins
+    import os
+
+    from hindsight_embed.cli import load_config_file, set_cli_profile_override
+
+    set_cli_profile_override(None)
+    monkeypatch.delenv("HINDSIGHT_EMBED_PROFILE", raising=False)
+    monkeypatch.delenv("HINDSIGHT_API_LLM_PROVIDER", raising=False)
+
+    config_path = temp_home / ".hindsight" / "embed"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        "# memory — retained\nHINDSIGHT_API_LLM_PROVIDER=openai\n",
+        encoding="utf-8",
+    )
+
+    original_open = builtins.open
+
+    def locale_open(file, mode="r", *args, **kwargs):
+        if file == config_path and "b" not in mode and "encoding" not in kwargs:
+            kwargs["encoding"] = "ascii"
+        return original_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", locale_open)
+
+    load_config_file()
+
+    assert os.environ["HINDSIGHT_API_LLM_PROVIDER"] == "openai"
+
+
 def test_get_config_respects_profile(temp_home, monkeypatch):
     """Test that get_config() returns profile-specific values."""
     import os
@@ -220,9 +255,9 @@ def test_get_config_respects_profile(temp_home, monkeypatch):
     config = get_config()
 
     # Should have loaded from production profile, NOT default
-    assert config["llm_provider"] == "anthropic", "Should use profile's provider"
-    assert config["llm_model"] == "claude-sonnet-4-20250514", "Should use profile's model"
-    assert config["llm_api_key"] == "sk-ant-production", "Should use profile's API key"
+    assert config["HINDSIGHT_API_LLM_PROVIDER"] == "anthropic", "Should use profile's provider"
+    assert config["HINDSIGHT_API_LLM_MODEL"] == "claude-sonnet-4-20250514", "Should use profile's model"
+    assert config["HINDSIGHT_API_LLM_API_KEY"] == "sk-ant-production", "Should use profile's API key"
 
 
 def test_profile_env_propagates_arbitrary_hindsight_keys_to_daemon(temp_home, monkeypatch):
@@ -339,6 +374,47 @@ def test_daemon_child_env_var_set_in_daemon_env(temp_home, monkeypatch):
 
     env = captured["env"]
     assert env.get("_HINDSIGHT_DAEMON_CHILD") == "1"
+
+
+def test_daemon_preserves_uv_python_for_nested_uvx(temp_home, monkeypatch):
+    """The API uvx fallback inherits the interpreter selected by the integration."""
+    from unittest.mock import MagicMock, patch
+
+    from hindsight_embed.daemon_embed_manager import DaemonEmbedManager
+
+    monkeypatch.setenv("UV_PYTHON", "3.13")
+    manager = DaemonEmbedManager()
+    captured = {}
+    popen_called = [False]
+
+    def fake_find_api_command(api_version, env=None):
+        captured["find_env"] = env
+        return ["uvx", f"hindsight-api@{api_version}"]
+
+    def fake_popen(cmd, env, **kwargs):
+        captured["popen_env"] = env
+        popen_called[0] = True
+        proc = MagicMock()
+        proc.pid = 12345
+        return proc
+
+    def fake_is_running(profile=""):
+        return popen_called[0]
+
+    with (
+        patch("hindsight_embed.daemon_embed_manager.subprocess.Popen", side_effect=fake_popen),
+        patch("hindsight_embed.daemon_embed_manager.time.sleep"),
+        patch.object(manager, "_clear_port", return_value=True),
+        patch.object(manager, "_find_api_command", side_effect=fake_find_api_command),
+        patch.object(manager, "is_running", side_effect=fake_is_running),
+    ):
+        manager._start_daemon(
+            config={"llm_provider": "openai", "llm_api_key": "sk-x", "llm_model": "gpt-4o-mini"},
+            profile="",
+        )
+
+    assert captured["find_env"]["UV_PYTHON"] == "3.13"
+    assert captured["popen_env"]["UV_PYTHON"] == "3.13"
 
 
 def test_windows_popen_uses_detached_process_flags(temp_home, monkeypatch):
@@ -506,10 +582,10 @@ def test_get_config_does_not_default_llm_model(temp_home, monkeypatch):
 
     config = get_config()
 
-    assert config["llm_provider"] == "gemini"
-    assert config["llm_model"] is None, (
-        "llm_model must be None when env var is unset so the daemon resolves "
-        "the provider default; got a hardcoded fallback instead"
+    assert config["HINDSIGHT_API_LLM_PROVIDER"] == "gemini"
+    assert "HINDSIGHT_API_LLM_MODEL" not in config, (
+        "the model must stay unset when the env var is unset so the daemon "
+        "resolves the provider default; got a hardcoded fallback instead"
     )
 
 
@@ -553,7 +629,7 @@ def test_configure_from_env_accepts_providers_outside_interactive_menu(temp_home
     """Regression test for issue #1360.
 
     `_do_configure_from_env` previously rejected any provider not in the small
-    interactive-menu set (`PROVIDER_API_KEYS` — 5 entries) with "Unknown
+    interactive-menu set (`PROVIDER_API_KEYS`) with "Unknown
     provider". hindsight-api supports ~18 providers (anthropic, claude-code,
     bedrock, openrouter, ...), so the gate blocked valid CI configurations.
     Validation belongs in the daemon, not in the CLI's UX-only menu list.
@@ -573,6 +649,29 @@ def test_configure_from_env_accepts_providers_outside_interactive_menu(temp_home
 
     contents = (config_dir / "embed").read_text()
     assert "HINDSIGHT_API_LLM_PROVIDER=anthropic" in contents
+
+
+def test_configure_from_env_accepts_github_copilot_without_api_key(temp_home, monkeypatch):
+    """GitHub Copilot authenticates through Copilot CLI rather than an LLM API key."""
+    from hindsight_embed import cli
+
+    config_dir = temp_home / ".hindsight"
+    monkeypatch.setattr(cli, "CONFIG_DIR", config_dir)
+    monkeypatch.setattr(cli, "CONFIG_FILE", config_dir / "embed")
+
+    monkeypatch.setenv("HINDSIGHT_API_LLM_PROVIDER", "github-copilot")
+    monkeypatch.setenv("HINDSIGHT_API_LLM_MODEL", "gpt-5.6-terra")
+    monkeypatch.delenv("HINDSIGHT_API_LLM_API_KEY", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "unrelated-openai-key")
+
+    assert cli._has_non_interactive_env() is True
+    assert cli._do_configure_from_env() == 0
+
+    contents = (config_dir / "embed").read_text()
+    assert "HINDSIGHT_API_LLM_PROVIDER=github-copilot" in contents
+    assert "HINDSIGHT_API_LLM_MODEL=gpt-5.6-terra" in contents
+    active_lines = [line for line in contents.splitlines() if line and not line.startswith("#")]
+    assert not any(line.startswith("HINDSIGHT_API_LLM_API_KEY=") for line in active_lines)
 
 
 def _windows_scripts_dir(tmp_path: Path, *, with_pythonw: bool) -> Path:
@@ -665,3 +764,228 @@ def test_posix_daemon_uses_console_entrypoint(temp_home, tmp_path, monkeypatch):
 
     cmd = manager._find_api_command("0.0.0")
     assert cmd == [str(console_bin)]
+
+
+def _base_pythonw(tmp_path: Path) -> Path:
+    """The base interpreter a fake venv's pyvenv.cfg points ``home`` at."""
+    return tmp_path / "base" / "pythonw.exe"
+
+
+def _windows_launcher_venv(tmp_path: Path, *, uv: bool, with_site_packages: bool = True) -> Path:
+    """Fake a Windows venv whose Scripts/pythonw.exe is a launcher, not an interpreter.
+
+    Returns the Scripts dir; the base interpreter is at `_base_pythonw(tmp_path)`.
+    ``uv=True`` writes the ``uv =`` marker that identifies a uv trampoline venv;
+    without it the venv looks like a stdlib one, whose own GUI venvwlauncher must
+    be left alone. ``with_site_packages=False`` omits the venv's import root, so
+    the base interpreter could not import hindsight_api.
+    """
+    scripts_dir = _windows_scripts_dir(tmp_path, with_pythonw=True)
+    if with_site_packages:
+        (tmp_path / "Lib" / "site-packages").mkdir(parents=True)
+    base_pythonw = _base_pythonw(tmp_path)
+    base_pythonw.parent.mkdir()
+    base_pythonw.write_bytes(b"MZ")
+    cfg = f"home = {base_pythonw.parent}\n"
+    if uv:
+        cfg += "uv = 0.12.3\n"
+    (tmp_path / "pyvenv.cfg").write_text(cfg)
+    return scripts_dir
+
+
+def _windows_manager(monkeypatch, scripts_dir: Path):
+    """A DaemonEmbedManager that believes it runs on Windows inside scripts_dir."""
+    from hindsight_embed.daemon_embed_manager import DaemonEmbedManager
+
+    manager = DaemonEmbedManager()
+    monkeypatch.setattr(manager, "_dev_api_command", lambda: None)
+    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.platform.system", lambda: "Windows")
+    monkeypatch.setattr(
+        "hindsight_embed.daemon_embed_manager.sysconfig.get_path",
+        lambda name: str(scripts_dir),
+    )
+    monkeypatch.setattr(
+        "hindsight_embed.daemon_embed_manager.sys.executable",
+        str(scripts_dir / "python.exe"),
+    )
+    return manager
+
+
+# Non-local providers keep _find_api_command past the local-ML check (#2676).
+_EXTERNAL_PROVIDERS = {
+    "HINDSIGHT_API_EMBEDDINGS_PROVIDER": "openai",
+    "HINDSIGHT_API_RERANKER_PROVIDER": "openai",
+}
+
+
+def test_windows_uv_trampoline_resolves_to_base_pythonw(temp_home, tmp_path, monkeypatch):
+    """Regression test for issue #4466.
+
+    A uv venv's Scripts/pythonw.exe is a trampoline that relaunches the base
+    interpreter as the CUI python.exe, popping the console window our detach
+    flags were supposed to prevent — they only ever applied to the trampoline.
+    Launch the base pythonw.exe directly, with the venv's site-packages on
+    PYTHONPATH so hindsight_api is still importable from outside the venv.
+    """
+    scripts_dir = _windows_launcher_venv(tmp_path, uv=True)
+    manager = _windows_manager(monkeypatch, scripts_dir)
+
+    env = dict(_EXTERNAL_PROVIDERS)
+    cmd = manager._find_api_command("0.0.0", env=env)
+
+    assert cmd == [str(_base_pythonw(tmp_path)), "-m", "hindsight_api.main"]
+    assert str(tmp_path / "Lib" / "site-packages") in env["PYTHONPATH"]
+
+
+def test_windows_stdlib_venv_keeps_its_own_pythonw(temp_home, tmp_path, monkeypatch):
+    """A stdlib venv's pythonw.exe already redirects to the base pythonw.
+
+    It is the GUI venvwlauncher, so it never allocates a console. Bypassing it
+    would drop the daemon out of its venv for no gain, so only uv-marked
+    pyvenv.cfg files trigger the #4466 resolution.
+    """
+    scripts_dir = _windows_launcher_venv(tmp_path, uv=False)
+    manager = _windows_manager(monkeypatch, scripts_dir)
+
+    env = dict(_EXTERNAL_PROVIDERS)
+    cmd = manager._find_api_command("0.0.0", env=env)
+
+    assert cmd == [str(scripts_dir / "pythonw.exe"), "-m", "hindsight_api.main"]
+    assert "PYTHONPATH" not in env
+
+
+def test_windows_uv_trampoline_kept_when_site_packages_missing(temp_home, tmp_path, monkeypatch):
+    """Bypassing the trampoline is only safe if we can replace the venv's imports.
+
+    The base interpreter lives outside the venv, so without site-packages on
+    PYTHONPATH it cannot import hindsight_api and the daemon never starts — a
+    worse outcome than the console flash we are trying to remove. Fall back to
+    launching the trampoline unchanged.
+    """
+    scripts_dir = _windows_launcher_venv(tmp_path, uv=True, with_site_packages=False)
+    manager = _windows_manager(monkeypatch, scripts_dir)
+
+    env = dict(_EXTERNAL_PROVIDERS)
+    cmd = manager._find_api_command("0.0.0", env=env)
+
+    assert cmd == [str(scripts_dir / "pythonw.exe"), "-m", "hindsight_api.main"]
+    assert "PYTHONPATH" not in env
+
+
+def _capture_daemon_env(manager, profile: str, config: dict) -> dict[str, str]:
+    """Run `_start_daemon` with Popen stubbed and return the child's environment."""
+    from unittest.mock import MagicMock, patch
+
+    captured: dict[str, dict[str, str]] = {}
+    popen_called = [False]
+
+    def fake_popen(cmd, env, **kwargs):
+        captured["env"] = env
+        popen_called[0] = True
+        proc = MagicMock()
+        proc.pid = 12345
+        return proc
+
+    def fake_is_running(profile=""):
+        return popen_called[0]
+
+    with (
+        patch("hindsight_embed.daemon_embed_manager.subprocess.Popen", side_effect=fake_popen),
+        patch("hindsight_embed.daemon_embed_manager.time.sleep"),
+        patch.object(manager, "_clear_port", return_value=True),
+        patch.object(manager, "_find_api_command", return_value=["hindsight-api"]),
+        patch.object(manager, "is_running", side_effect=fake_is_running),
+    ):
+        manager._start_daemon(config=config, profile=profile)
+
+    return captured["env"]
+
+
+def _write_profile(temp_home: Path, name: str, body: str, port: int = 9878) -> None:
+    profile_dir = temp_home / ".hindsight" / "profiles"
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    (profile_dir / f"{name}.env").write_text(body, encoding="utf-8")
+    (profile_dir / "metadata.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "profiles": {
+                    name: {
+                        "port": port,
+                        "created_at": "2024-01-01T00:00:00+00:00",
+                        "last_used": "2024-01-01T00:00:00+00:00",
+                    }
+                },
+            }
+        )
+    )
+
+
+def test_profile_base_url_reaches_daemon_env(temp_home, monkeypatch):
+    """Regression test for issue #4094.
+
+    A profile that sets HINDSIGHT_API_LLM_BASE_URL alongside KEY/MODEL was
+    reported as having everything applied *except* the base URL, so LLM calls
+    went to api.openai.com and failed with OpenAI's own 401. This walks the
+    real path — `get_config()` -> `_start_daemon` -> the child's environment —
+    rather than testing either half in isolation.
+    """
+    from hindsight_embed.cli import get_config, set_cli_profile_override
+    from hindsight_embed.daemon_embed_manager import DaemonEmbedManager
+
+    base_url = "https://maas-api.example.com/openapi/compatible-mode/v1"
+    _write_profile(
+        temp_home,
+        "hermes",
+        "HINDSIGHT_API_LLM_API_KEY=sk-7c7e0\n"
+        "HINDSIGHT_API_LLM_MODEL=qwen3.8-27b\n"
+        f"HINDSIGHT_API_LLM_BASE_URL={base_url}\n",
+    )
+
+    for key in ("HINDSIGHT_API_LLM_API_KEY", "HINDSIGHT_API_LLM_MODEL", "HINDSIGHT_API_LLM_BASE_URL"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    set_cli_profile_override("hermes")
+    try:
+        config = get_config()
+        assert config["HINDSIGHT_API_LLM_BASE_URL"] == base_url
+        env = _capture_daemon_env(DaemonEmbedManager(), "hermes", config)
+    finally:
+        set_cli_profile_override(None)
+
+    assert env.get("HINDSIGHT_API_LLM_BASE_URL") == base_url
+    assert env.get("HINDSIGHT_API_LLM_MODEL") == "qwen3.8-27b"
+    assert env.get("HINDSIGHT_API_LLM_API_KEY") == "sk-7c7e0"
+
+
+def test_configure_from_env_persists_every_api_var(temp_home, monkeypatch):
+    """Regression test for issue #4094.
+
+    `_do_configure_from_env` wrote a hand-listed subset (provider, model, key),
+    so a base URL — or any other HINDSIGHT_API_* setting — the user exported
+    never reached the profile it generated. HINDSIGHT_EMBED_* is deliberately
+    not persisted: those configure this wrapper for one invocation.
+    """
+    from hindsight_embed import cli
+
+    config_dir = temp_home / ".hindsight"
+    monkeypatch.setattr(cli, "CONFIG_DIR", config_dir)
+    monkeypatch.setattr(cli, "CONFIG_FILE", config_dir / "embed")
+
+    monkeypatch.setenv("HINDSIGHT_API_LLM_PROVIDER", "openai")
+    monkeypatch.setenv("HINDSIGHT_API_LLM_API_KEY", "sk-x")
+    monkeypatch.setenv("HINDSIGHT_API_LLM_BASE_URL", "https://maas-api.example.com/v1")
+    monkeypatch.setenv("HINDSIGHT_API_EMBEDDINGS_PROVIDER", "tei")
+    monkeypatch.setenv("HINDSIGHT_EMBED_API_URL", "http://elsewhere:9999")
+
+    assert cli._do_configure_from_env() == 0
+
+    active = [
+        line.strip()
+        for line in (config_dir / "embed").read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    assert "HINDSIGHT_API_LLM_BASE_URL=https://maas-api.example.com/v1" in active
+    assert "HINDSIGHT_API_EMBEDDINGS_PROVIDER=tei" in active
+    assert not any(line.startswith("HINDSIGHT_EMBED_API_URL=") for line in active)

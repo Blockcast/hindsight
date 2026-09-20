@@ -176,7 +176,7 @@ async def _run() -> None:
         # 2. Create bank
         # ------------------------------------------------------------------
         _log(2, total_steps, f"Creating bank '{bank_id}' ...")
-        profile = await engine.get_bank_profile(bank_id=bank_id, request_context=ctx)
+        profile = await engine.ensure_bank_profile(bank_id=bank_id, request_context=ctx)
         assert profile is not None, "Bank profile should not be None"
         assert profile["bank_id"] == bank_id
         print(f"    -> bank created: {profile['bank_id']}")
@@ -247,10 +247,10 @@ async def _run() -> None:
         # ------------------------------------------------------------------
         _log(7, total_steps, "Listing mental models ...")
         models = await engine.list_mental_models(bank_id=bank_id, request_context=ctx)
-        assert len(models) > 0, "Should have at least one mental model"
-        found = any((m.get("mental_model_id") or m.get("id")) == mm_id for m in models)
+        assert models.total > 0, "Should have at least one mental model"
+        found = any((m.get("mental_model_id") or m.get("id")) == mm_id for m in models.items)
         assert found, f"Mental model {mm_id} not found in list"
-        print(f"    -> found {len(models)} mental model(s)")
+        print(f"    -> found {models.total} mental model(s)")
 
         # ------------------------------------------------------------------
         # 8. Delete bank (cleanup)

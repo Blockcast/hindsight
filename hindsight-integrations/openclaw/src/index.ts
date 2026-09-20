@@ -7,10 +7,15 @@ import type {
   RetainRequest,
 } from "./types.js";
 import { HindsightServer, type Logger } from "@vectorize-io/hindsight-all";
-import { HindsightClient, type HindsightClientOptions } from "@vectorize-io/hindsight-client";
+import {
+  HindsightClient,
+  type HindsightClientOptions,
+  type MinScores,
+} from "@vectorize-io/hindsight-client";
 import { RetainQueue } from "./retain-queue.js";
 import { compileSessionPatterns, matchesSessionPattern } from "./session-patterns.js";
-import { createHash } from "crypto";
+import { parseSessionFile } from "./session-file.js";
+import { createHash, randomUUID } from "crypto";
 import { dirname, join } from "path";
 import * as log from "./logger.js";
 import { configureLogger, setApiLogger, stopLogger } from "./logger.js";
@@ -18,6 +23,38 @@ import { mkdirSync } from "fs";
 import { createRequire } from "module";
 import { homedir } from "os";
 import { createKnowledgeTools, TOOL_NAMES } from "@vectorize-io/hindsight-agent-sdk";
+import {
+  applyConfiguredBankDefaults,
+  hasConfiguredBankDefaults,
+  normalizeDispositionTrait,
+  normalizeEntityLabels,
+  normalizeRetainExtractionMode,
+} from "./bank-defaults.js";
+
+/**
+ * Structured payload for a knowledge tool result.
+ *
+ * The SDK returns the payload only as JSON text in `content[0].text`. OpenClaw's
+ * Code Mode hands a tool result's `details` (and nothing else) to the guest as the
+ * structured value, so `details: {}` made every knowledge tool look empty there
+ * (#4308). Parse the text back into an object; a non-object payload is wrapped and
+ * unparseable text yields `{}` as before.
+ */
+export function knowledgeToolDetails(result: unknown): Record<string, unknown> {
+  const content = (result as { content?: unknown })?.content;
+  const first = Array.isArray(content) ? (content[0] as { text?: unknown } | undefined) : undefined;
+  const text = first?.text;
+  if (typeof text !== "string") return {};
+  try {
+    const parsed: unknown = JSON.parse(text);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+    return { result: parsed };
+  } catch {
+    return {};
+  }
+}
 
 function loadPackageVersion(): string {
   try {
@@ -75,20 +112,32 @@ let usingExternalApi = false; // Track if using external API (skip daemon manage
 
 // Capability detected once per service.start() against `<apiUrl>/version`.
 // `true` when the Hindsight API supports `update_mode: 'append'` (added in
-// 0.5.0 — see vectorize-io/hindsight#932). When false, retain falls back to a
-// per-turn document id so prior turns aren't silently overwritten.
+// 0.5.0 — see vectorize-io/hindsight#932) and stores document text. When false,
+// retain falls back to a per-turn document id so prior turns aren't silently
+// overwritten or rejected by text-disabled deployments.
 let supportsUpdateModeAppend = false;
 let appendCapabilityProbed = false;
 const MIN_VERSION_FOR_UPDATE_MODE_APPEND = "0.5.0";
 
+/** Whether retain is currently using session-scoped documents + `update_mode: 'append'`. */
+export function isAppendModeSupported(): boolean {
+  return supportsUpdateModeAppend;
+}
+
+export type AsyncRetainOperationIdCapability = "supported" | "unsupported" | "unknown";
+let asyncRetainOperationIdCapability: AsyncRetainOperationIdCapability = "unknown";
+const MIN_VERSION_FOR_ASYNC_RETAIN_OPERATION_ID = "0.8.6";
+
 // Store the current plugin config for bank ID derivation
 let currentPluginConfig: PluginConfig | null = null;
+let serviceGeneration = 0;
+let serviceAbortController: AbortController | null = null;
+// External-API hooks can lazy-initialize before the first service.start(). Keep
+// that recall-only lifetime cancellable without enabling pre-start retention.
+const preServiceRecallController = new AbortController();
 
-// Track which banks have had their mission set (to avoid re-setting on every request).
-// Under the old bespoke client we also cached a client instance per bank because the
-// client carried a mutable bankId. HindsightClient takes bankId as a parameter on every
-// call, so no per-bank caching is needed anymore — one module-level client is enough.
-const banksWithMissionSet = new Set<string>();
+// Track which banks have had configured defaults applied (missions + bank config).
+const banksWithDefaultsApplied = new Set<string>();
 
 // In-flight recall deduplication: concurrent recalls for the same bank reuse one promise
 import type { RecallResponse } from "./types.js";
@@ -101,15 +150,22 @@ const inflightRecalls = new Map<string, Promise<RecallResponse>>();
 // at build time; HindsightClient wants Record<string, string>).
 export interface BankScopedClient {
   readonly bankId: string;
-  retain(req: RetainRequest): Promise<void>;
+  retain(
+    req: RetainRequest,
+    capability?: AsyncRetainOperationIdCapability,
+    signal?: globalThis.AbortSignal
+  ): Promise<void>;
   recall(
     req: {
       query: string;
       maxTokens?: number;
       budget?: "low" | "mid" | "high";
       types?: Array<"world" | "experience" | "observation">;
+      preferObservations?: boolean;
+      minScores?: MinScores;
     },
-    timeoutMs?: number
+    timeoutMs?: number,
+    signal?: globalThis.AbortSignal
   ): Promise<RecallResponse>;
   setMissions(opts: BankMissionsUpdate): Promise<void>;
 }
@@ -120,10 +176,10 @@ export interface BankMissionsUpdate {
   observationsMission?: string;
 }
 
-function scopeClient(c: HindsightClient, bankId: string): BankScopedClient {
+export function scopeClient(c: HindsightClient, bankId: string): BankScopedClient {
   return {
     bankId,
-    async retain(req) {
+    async retain(req, capability = asyncRetainOperationIdCapability, signal) {
       await c.retain(bankId, req.content, {
         documentId: req.documentId,
         context: req.context,
@@ -131,28 +187,57 @@ function scopeClient(c: HindsightClient, bankId: string): BankScopedClient {
         tags: req.tags,
         updateMode: req.updateMode,
         async: true,
+        signal,
+        ...(capability === "supported" && req.operationId ? { operationId: req.operationId } : {}),
       });
     },
-    async recall(req, timeoutMs) {
-      const call = c.recall(bankId, req.query, {
-        maxTokens: req.maxTokens,
-        budget: req.budget,
-        types: req.types,
+    async recall(req, timeoutMs, signal) {
+      signal?.throwIfAborted();
+      // Two independent reasons to stop: the caller's service-owned signal (stop
+      // or restart) and this call's own deadline. Compose them so the transport is
+      // cancelled by whichever fires first, while the reason the caller classifies
+      // on survives — a TimeoutError for the deadline, an AbortError for a stop.
+      const deadline = new AbortController();
+      const effective = signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal;
+      let onAbort!: () => void;
+      const cancelled = new Promise<never>((_, reject) => {
+        onAbort = () => reject(effective.reason);
+        effective.addEventListener("abort", onAbort, { once: true });
       });
-      if (!timeoutMs) return call;
-      // The generated client doesn't accept a per-call AbortSignal, so we race
-      // against a TimeoutError here. The before_prompt_build caller already
-      // special-cases `DOMException { name: 'TimeoutError' }` from the old
-      // bespoke client, so we preserve that contract.
-      return Promise.race([
-        call,
-        new Promise<never>((_, reject) =>
-          setTimeout(
-            () => reject(new DOMException(`Recall timed out after ${timeoutMs}ms`, "TimeoutError")),
+      const timer = timeoutMs
+        ? setTimeout(
+            () =>
+              deadline.abort(
+                new DOMException(`Recall timed out after ${timeoutMs}ms`, "TimeoutError")
+              ),
             timeoutMs
           )
-        ),
-      ]);
+        : undefined;
+      try {
+        // A race alone only stopped the hook's wait. Forward cancellation to the
+        // client too, so its HTTP request receives the deadline and service stops.
+        //
+        // The race stays as a backstop for a transport that ignores the signal,
+        // which is not hypothetical: from client 0.10.x recall routes through
+        // `retryOnCapacity`, whose backoff sleeps in a plain setTimeout, so an
+        // abort during a 429/503 wait does not interrupt it. (#4445)
+        const response = await Promise.race([
+          c.recall(bankId, req.query, {
+            maxTokens: req.maxTokens,
+            budget: req.budget,
+            types: req.types,
+            preferObservations: req.preferObservations,
+            minScores: req.minScores,
+            signal: effective,
+          }),
+          cancelled,
+        ]);
+        effective.throwIfAborted();
+        return response;
+      } finally {
+        clearTimeout(timer);
+        effective.removeEventListener("abort", onAbort);
+      }
     },
     async setMissions(opts) {
       // createBank upserts each mission column the request explicitly sets;
@@ -169,34 +254,22 @@ function scopeClient(c: HindsightClient, bankId: string): BankScopedClient {
   };
 }
 
-/**
- * Stamp configured missions onto a bank exactly once per process lifetime.
- * No-op if no mission fields are set in plugin config — this is what lets
- * users manage per-bank missions out-of-band without the plugin clobbering
- * them on every gateway restart.
- */
-async function applyConfiguredMissions(
-  scoped: BankScopedClient,
-  config: PluginConfig
-): Promise<void> {
-  const missions: BankMissionsUpdate = {};
-  if (typeof config.bankMission === "string" && config.bankMission.length > 0) {
-    missions.reflectMission = config.bankMission;
-  }
-  if (typeof config.retainMission === "string" && config.retainMission.length > 0) {
-    missions.retainMission = config.retainMission;
-  }
-  if (typeof config.observationsMission === "string" && config.observationsMission.length > 0) {
-    missions.observationsMission = config.observationsMission;
-  }
-  if (
-    missions.reflectMission === undefined &&
-    missions.retainMission === undefined &&
-    missions.observationsMission === undefined
-  ) {
+async function ensureBankDefaultsApplied(bankId: string, config: PluginConfig): Promise<void> {
+  if (!client || !clientOptions || !hasConfiguredBankDefaults(config)) {
     return;
   }
-  await scoped.setMissions(missions);
+  if (banksWithDefaultsApplied.has(bankId)) {
+    return;
+  }
+  try {
+    await applyConfiguredBankDefaults(client, bankId, config, clientOptions);
+    banksWithDefaultsApplied.add(bankId);
+    debug(`[Hindsight] Applied configured defaults for bank: ${bankId}`);
+  } catch (error) {
+    log.warn(
+      `could not apply bank defaults for ${bankId}: ${error instanceof Error ? error.message : error}`
+    );
+  }
 }
 
 /**
@@ -216,14 +289,6 @@ export function formatHookPerf(
     parts.push(`${k}=${v}`);
   }
   return `perf: ${hook} ${parts.join(" ")}`;
-}
-
-function hasConfiguredMissions(config: PluginConfig): boolean {
-  return (
-    (typeof config.bankMission === "string" && config.bankMission.length > 0) ||
-    (typeof config.retainMission === "string" && config.retainMission.length > 0) ||
-    (typeof config.observationsMission === "string" && config.observationsMission.length > 0)
-  );
 }
 
 /**
@@ -261,60 +326,167 @@ const sessionIdentityBySession = new Map<string, SessionIdentityRecord>();
 const skipHindsightTurnBySession = new Map<string, IdentitySkipReason>();
 const documentSequenceBySession = new Map<string, number>();
 
+// Random token minted once per host process and mixed into fallback (non-append)
+// document ids. `documentSequenceBySession` lives only in memory, so it restarts
+// at 1 on every host restart — and it is FIFO-capped at MAX_TRACKED_SESSIONS, so
+// a busy host can evict a live session's counter and recycle its ids without any
+// restart at all. Either way the replayed id hits an existing server-side
+// document, and retain's default `update_mode: 'replace'` *deletes* that
+// document's memories before reprocessing: months of history collapsed to a
+// single restart cycle's worth of turns. (#3686)
+let documentIdBootToken: string | null = null;
+
+/** Per-process token that keeps fallback document ids unique across restarts. */
+export function getDocumentIdBootToken(): string {
+  if (!documentIdBootToken) {
+    documentIdBootToken = randomUUID().replace(/-/g, "").slice(0, 8);
+  }
+  return documentIdBootToken;
+}
+
 // Cooldown + guard to prevent concurrent reinit attempts
 let lastReinitAttempt = 0;
 let isReinitInProgress = false;
 const REINIT_COOLDOWN_MS = 30_000;
 
-// Retain queue (external API mode only)
+// Retain queue (both external-API and local-daemon mode)
 let retainQueue: RetainQueue | null = null;
 let retainQueueFlushTimer: ReturnType<typeof setInterval> | null = null;
 let isFlushInProgress = false;
 const DEFAULT_FLUSH_INTERVAL_MS = 60_000; // 1 min
 
 /**
+ * Open the JSONL retain queue and start its periodic flush timer.
+ *
+ * Never throws: without the queue a failed retain is dropped exactly as it was
+ * before the queue existed, which is worth far less than taking the whole plugin
+ * down over an unwritable state directory.
+ */
+function initRetainQueue(
+  pluginConfig: PluginConfig,
+  expectedGeneration: number,
+  signal: globalThis.AbortSignal
+): void {
+  // service.start() can run again without an intervening stop() (gateway
+  // reloads); don't leak the previous generation's timer onto the new one.
+  if (retainQueueFlushTimer) {
+    clearInterval(retainQueueFlushTimer);
+    retainQueueFlushTimer = null;
+  }
+  try {
+    const queueDir = pluginConfig.retainQueuePath
+      ? dirname(pluginConfig.retainQueuePath)
+      : join(homedir(), ".openclaw", "data");
+    mkdirSync(queueDir, { recursive: true });
+    const queuePath =
+      pluginConfig.retainQueuePath || join(queueDir, "hindsight-retain-queue.jsonl");
+    const queueFlushInterval = pluginConfig.retainQueueFlushIntervalMs ?? DEFAULT_FLUSH_INTERVAL_MS;
+    const queueMaxAge = pluginConfig.retainQueueMaxAgeMs ?? -1;
+    retainQueue = new RetainQueue({ filePath: queuePath, maxAgeMs: queueMaxAge });
+    const pending = retainQueue.size();
+    if (pending > 0) {
+      log.info(`retain queue: ${pending} items pending from previous session, will flush shortly`);
+    }
+    debug(`[Hindsight] Retain queue initialized: ${queuePath}`);
+
+    // Periodic flush timer
+    if (queueFlushInterval > 0) {
+      retainQueueFlushTimer = setInterval(() => {
+        void flushRetainQueue(undefined, undefined, undefined, expectedGeneration, signal);
+      }, queueFlushInterval);
+      retainQueueFlushTimer.unref?.();
+    }
+  } catch (error) {
+    retainQueue = null;
+    log.warn(`could not initialize retain queue, continuing without it: ${error}`);
+  }
+}
+
+/**
  * Attempt to flush pending retains from the queue.
  * Each item is sent exactly as it would have been originally — same bank, payload, metadata.
  */
-async function flushRetainQueue(): Promise<void> {
-  if (!retainQueue || isFlushInProgress) return;
-  const pending = retainQueue.size();
-  if (pending === 0) return;
+export async function flushRetainQueue(
+  queueOverride?: RetainQueue,
+  clientOverride?: HindsightClient,
+  capabilityOverride?: AsyncRetainOperationIdCapability,
+  expectedGeneration = serviceGeneration,
+  signal: globalThis.AbortSignal | undefined = serviceAbortController?.signal
+): Promise<void> {
+  const activeQueue = queueOverride ?? retainQueue;
+  const activeClient = clientOverride ?? client;
+  if (
+    !activeQueue ||
+    isFlushInProgress ||
+    expectedGeneration !== serviceGeneration ||
+    signal?.aborted
+  )
+    return;
 
   isFlushInProgress = true;
   let flushed = 0;
   let failed = 0;
 
   try {
-    if (!client) return; // no client yet — can't flush
+    // Nothing queued means nothing to be idempotent about, so don't spend a
+    // /version round trip: this runs on a timer *and* after every successful
+    // retain, and probing an empty queue put a request behind every turn. The
+    // capability is re-read here whenever there is actually work to replay,
+    // which is the only moment it changes the outcome.
+    const pending = activeQueue.size();
+    if (pending === 0) return;
+    const capability =
+      capabilityOverride ?? (await refreshQueueOperationIdCapability(expectedGeneration, signal));
+    if (expectedGeneration !== serviceGeneration || signal?.aborted) return;
+    if (capability === "unknown") {
+      // Held back on purpose: a replay without operation_id is the one path that
+      // can duplicate durable memories. Warn rather than debug — if /version
+      // stays unreachable the queue grows without ever draining, and that must
+      // not be silent.
+      log.warn(
+        `retain queue flush deferred (${pending} queued): server operation-id capability unknown`
+      );
+      return;
+    }
+    if (!activeClient) return; // no client yet — can't flush
 
     // Cleanup expired items first
-    retainQueue.cleanup();
+    activeQueue.cleanup();
 
-    const items = retainQueue.peek(50);
-    const flushedIds: string[] = [];
+    const items = activeQueue.peek(50);
     for (const item of items) {
       try {
-        await client.retain(item.bankId, item.content, {
+        if (expectedGeneration !== serviceGeneration || signal?.aborted) return;
+        const operationId =
+          capability === "supported"
+            ? activeQueue.ensureOperationId(item.id, randomUUID())
+            : undefined;
+        await activeClient.retain(item.bankId, item.content, {
           documentId: item.documentId,
           context: item.context,
           metadata: toStringMetadata(item.metadata),
           tags: item.tags,
           updateMode: item.updateMode,
           async: true,
+          signal,
+          ...(operationId ? { operationId } : {}),
         });
 
-        flushedIds.push(item.id);
+        if (expectedGeneration !== serviceGeneration || signal?.aborted) return;
+        // Checkpoint each acknowledgement before the next network await. A
+        // later abort must not replay already-accepted work on legacy servers.
+        activeQueue.remove(item.id);
         flushed++;
       } catch {
+        if (expectedGeneration !== serviceGeneration || signal?.aborted) return;
         // API still down — stop trying this batch
         failed++;
         break;
       }
     }
 
-    if (flushedIds.length > 0) retainQueue.removeMany(flushedIds);
-    const remaining = retainQueue.size();
+    if (expectedGeneration !== serviceGeneration || signal?.aborted) return;
+    const remaining = activeQueue.size();
     if (flushed > 0) {
       log.info(
         `queue flush: ${flushed} queued retains delivered${remaining > 0 ? `, ${remaining} still pending` : ", queue empty"}`
@@ -329,6 +501,42 @@ async function flushRetainQueue(): Promise<void> {
 
 const DEFAULT_RECALL_PROMPT_PREAMBLE =
   "Relevant memories from past conversations (prioritize recent when conflicting). Only use memories that are directly useful to continue this conversation; ignore the rest:";
+
+/**
+ * The messages a retain should work from, for a `session_end` event that carries none.
+ *
+ * OpenClaw's `buildSessionEndHookPayload()` sends `sessionId`, `sessionKey`,
+ * `messageCount`, `durationMs`, `reason`, `sessionFile` and the next session's ids -
+ * no `messages` array, and a `context` holding only ids. The forced flush added for
+ * #1726 therefore ended at its own "no messages" guard on every session close, and the
+ * turns after the last cadence boundary were never retained (#4341).
+ *
+ * The transcript the event points at is the source: one synchronous read, which is what
+ * the shutdown drain's shared 2s budget allows, and extraction still happens
+ * asynchronously in the bank's operation queue. `undefined` when there is no readable
+ * transcript, which leaves the caller's existing guard to skip the flush as before.
+ *
+ * `/new` matters here: OpenClaw emits the previous session's `session_end` lazily, on
+ * the first turn of its successor, so the old messages are gone from the live session
+ * entry by then and the file is the only copy.
+ */
+export function sessionEndMessagesFromTranscript(
+  event: unknown,
+  read: typeof parseSessionFile = parseSessionFile
+): unknown[] | undefined {
+  const payload = (event ?? {}) as Record<string, any>;
+  const sessionFile = typeof payload.sessionFile === "string" ? payload.sessionFile : undefined;
+  if (!sessionFile) return undefined;
+  const agentId = typeof payload.context?.agentId === "string" ? payload.context.agentId : "";
+  try {
+    const messages = read(sessionFile, agentId).messages;
+    return messages.length > 0 ? messages : undefined;
+  } catch {
+    // A missing, truncated or unreadable transcript is not an error worth failing the
+    // session close over; the caller skips the flush exactly as it did before.
+    return undefined;
+  }
+}
 
 export function formatCurrentTimeForRecall(date = new Date()): string {
   const year = date.getUTCFullYear();
@@ -378,19 +586,11 @@ async function lazyReinit(configOverride?: PluginConfig): Promise<void> {
 
     const llmConfig = detectLLMConfig(config);
     clientOptions = buildClientOptions(llmConfig, config, externalApi);
-    banksWithMissionSet.clear();
+    banksWithDefaultsApplied.clear();
     client = new HindsightClient(clientOptions);
 
-    if (hasConfiguredMissions(config) && usesStaticBank(config)) {
-      const bankId = getStaticBankId(config);
-      try {
-        await applyConfiguredMissions(scopeClient(client, bankId), config);
-        banksWithMissionSet.add(bankId);
-      } catch (err) {
-        log.warn(
-          `could not set bank missions for ${bankId}: ${err instanceof Error ? err.message : err}`
-        );
-      }
+    if (usesStaticBank(config)) {
+      await ensureBankDefaultsApplied(getStaticBankId(config), config);
     }
 
     usingExternalApi = true;
@@ -451,20 +651,14 @@ if (typeof global !== "undefined") {
     ): Promise<BankScopedClient | null> => {
       if (!client) return null;
       const config = currentPluginConfig || {};
-      const bankId = usesStaticBank(config) ? getStaticBankId(config) : deriveBankId(ctx, config);
+      // deriveBankId already returns the static bank when dynamicBankId is false,
+      // so the branch that used to stand here was redundant — and it routed around
+      // the agentBankMap lookup for static configs. (#3890)
+      const bankId = deriveBankId(ctx, config);
       const scoped = scopeClient(client, bankId);
 
-      // Stamp configured missions onto this bank on first use.
-      if (hasConfiguredMissions(config) && !banksWithMissionSet.has(bankId)) {
-        try {
-          await applyConfiguredMissions(scoped, config);
-          banksWithMissionSet.add(bankId);
-          debug(`[Hindsight] Set missions for new bank: ${bankId}`);
-        } catch (error) {
-          // Log but don't fail - bank missions are not critical
-          log.warn(`could not set bank missions for ${bankId}: ${error}`);
-        }
-      }
+      // Stamp configured defaults onto this bank on first use (recall or retain).
+      await ensureBankDefaultsApplied(bankId, config);
 
       return scoped;
     },
@@ -500,6 +694,73 @@ function getConfiguredBankId(pluginConfig: PluginConfig): string | undefined {
 
 function usesStaticBank(pluginConfig: PluginConfig): boolean {
   return pluginConfig.dynamicBankId === false;
+}
+
+/**
+ * Normalise the optional `agentBankMap` (agentId -> bankId).
+ *
+ * The value comes from user-edited config, so an entry whose bank is not a
+ * non-empty string is dropped rather than trusted — an empty one would otherwise
+ * route that agent to a bank literally named "". A map left with no usable entry
+ * is treated as unset. (#3890)
+ */
+export function normalizeAgentBankMap(input: unknown): Record<string, string> | undefined {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return undefined;
+
+  const normalized: Record<string, string> = {};
+  const dropped: string[] = [];
+  for (const [agentId, bankId] of Object.entries(input as Record<string, unknown>)) {
+    const trimmedAgentId = agentId.trim();
+    const trimmedBank = typeof bankId === "string" ? bankId.trim() : "";
+    if (!trimmedAgentId || !trimmedBank) {
+      dropped.push(agentId);
+      continue;
+    }
+    // Key on the trimmed id. Storing the raw key would keep an entry that can
+    // never match a resolved agent id — inert rather than wrong, and silent.
+    normalized[trimmedAgentId] = trimmedBank;
+  }
+
+  // Silently dropped config keys have bitten this plugin before (#1443), so say so.
+  if (dropped.length > 0) {
+    log.warn(
+      `agentBankMap: ignoring ${dropped.length} entr${dropped.length === 1 ? "y" : "ies"} with a missing or blank bank id (${dropped.join(", ")})`
+    );
+  }
+
+  return Object.keys(normalized).length > 0 ? normalized : undefined;
+}
+
+/**
+ * The bank an agent is explicitly mapped to, if any.
+ *
+ * `agentBankMap` exists so one gateway can mix topologies: several agents share a
+ * named bank while the rest keep their derived per-agent/channel/user banks
+ * (#3890). The mapped name is used exactly as configured — `bankIdPrefix` is
+ * deliberately not applied, because the operator named this bank themselves.
+ */
+function mappedBankIdForAgent(
+  ctx: PluginHookAgentContext | undefined,
+  pluginConfig: PluginConfig
+): string | undefined {
+  const map = pluginConfig.agentBankMap;
+  if (!map || !ctx) return undefined;
+
+  const resolvedCtx = resolveSessionIdentity(ctx);
+  const agentId =
+    resolvedCtx?.agentId ||
+    (resolvedCtx?.sessionKey ? parseSessionKey(resolvedCtx.sessionKey).agentId : undefined);
+  // Object.hasOwn, not a plain lookup: an agent literally called "toString" or
+  // "constructor" would otherwise inherit a function from the prototype, which is
+  // truthy and is not a bank id.
+  if (!agentId || !Object.hasOwn(map, agentId)) return undefined;
+
+  // Re-check the value instead of trusting the caller to have normalised it: the
+  // backfill CLI builds its PluginConfig straight from openclaw.json and never
+  // passes through normalizeAgentBankMap, so it would otherwise back-fill into a
+  // differently-trimmed bank than the live gateway writes to.
+  const mapped = map[agentId];
+  return typeof mapped === "string" && mapped.trim().length > 0 ? mapped.trim() : undefined;
 }
 
 function getDefaultBankId(pluginConfig: PluginConfig): string {
@@ -577,22 +838,95 @@ export function stripInlineTimestampPrefix(content: string): string {
 }
 
 /**
+ * Provenance marker OpenClaw appends to every injected inbound context header
+ * since 2026.8.1 — e.g. `Conversation info: ⟦openclaw:ctx⟧`. Older hosts label
+ * the same blocks `Conversation info (untrusted metadata):` instead. Both forms
+ * are recognised: the plugin has to keep working against hosts on either side
+ * of that change.
+ */
+const INBOUND_CONTEXT_MARKER = "⟦openclaw:ctx⟧";
+
+/** Matches a header line in either the marker (2026.8.1+) or legacy form. */
+const INBOUND_META_HEADER_RE = new RegExp(
+  `^[^\\n]*(?:${INBOUND_CONTEXT_MARKER}|\\(untrusted metadata\\))[^\\n]*$`
+);
+
+/** True when `line` opens an OpenClaw-injected inbound metadata block. */
+function isInboundMetaHeaderLine(line: string): boolean {
+  return INBOUND_META_HEADER_RE.test(line.trim());
+}
+
+interface InboundMetaBlock {
+  /** Index of the header line's first character. */
+  start: number;
+  /** Index just past the block (header + body), i.e. where normal text resumes. */
+  end: number;
+  /** Parsed body when the block is a ```json fence, otherwise undefined. */
+  json?: unknown;
+}
+
+/**
+ * Locate every OpenClaw-injected inbound metadata block in `text`.
+ *
+ * Mirrors the host's own stripper: a header line is followed either by a
+ * ```json fence (block ends at the closing fence) or by free-form lines that
+ * end at the first blank line. Keying on the header rather than on a fenced
+ * payload is what makes marker-form blocks like `Chat history since last
+ * reply: ⟦openclaw:ctx⟧` strippable too.
+ */
+function findInboundMetaBlocks(text: string): InboundMetaBlock[] {
+  if (!text) return [];
+  const lines = text.split("\n");
+  // Byte offset of the start of each line, plus a terminator past the end.
+  const offsets: number[] = [];
+  let cursor = 0;
+  for (const line of lines) {
+    offsets.push(cursor);
+    cursor += line.length + 1;
+  }
+  offsets.push(cursor);
+
+  const blocks: InboundMetaBlock[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (!isInboundMetaHeaderLine(lines[i])) continue;
+    const start = offsets[i];
+    let end: number;
+    let json: unknown;
+    if (lines[i + 1]?.trim() === "```json") {
+      let close = i + 2;
+      while (close < lines.length && lines[close].trim() !== "```") close++;
+      if (close < lines.length) {
+        try {
+          json = JSON.parse(lines.slice(i + 2, close).join("\n"));
+        } catch {
+          // Leave `json` undefined; the block is still stripped.
+        }
+      }
+      end = offsets[Math.min(close + 1, lines.length)];
+      i = close;
+    } else {
+      let blank = i + 1;
+      while (blank < lines.length && lines[blank].trim() !== "") blank++;
+      end = offsets[Math.min(blank + 1, lines.length)];
+      i = blank;
+    }
+    blocks.push({ start, end, json });
+  }
+  return blocks;
+}
+
+/**
  * Extract sender_id from OpenClaw's injected inbound metadata blocks.
- * Checks both "Conversation info (untrusted metadata)" and "Sender (untrusted metadata)" blocks.
+ * Reads both "Conversation info" and "Sender" blocks, in either the 2026.8.1+
+ * `⟦openclaw:ctx⟧` marker form or the legacy "(untrusted metadata)" form.
  * Returns the first sender_id / id string found, or undefined if none.
  */
 export function extractSenderIdFromText(text: string): string | undefined {
   if (!text) return undefined;
-  const metaBlockRe = /[\w\s]+\(untrusted metadata\)[^\n]*\n```json\n([\s\S]*?)\n```/gi;
-  let match: RegExpExecArray | null;
-  while ((match = metaBlockRe.exec(text)) !== null) {
-    try {
-      const obj = JSON.parse(match[1]);
-      const id = obj?.sender_id ?? obj?.id;
-      if (id && typeof id === "string") return id;
-    } catch {
-      // continue to next block
-    }
+  for (const block of findInboundMetaBlocks(text)) {
+    const obj = block.json as { sender_id?: unknown; id?: unknown } | undefined;
+    const id = obj?.sender_id ?? obj?.id;
+    if (typeof id === "string" && id) return id;
   }
   return undefined;
 }
@@ -602,18 +936,60 @@ export function extractSenderIdFromText(text: string): string | undefined {
  * These blocks are injected by OpenClaw but are noise for memory storage and recall.
  */
 export function stripMetadataEnvelopes(content: string): string {
-  // Strip: ---\n<Label> (untrusted metadata):\n```json\n{...}\n```\n<message>\n---
-  content = content
-    .replace(/^---\n[\w\s]+\(untrusted metadata\)[^\n]*\n```json[\s\S]*?```\n\n?/im, "")
-    .replace(/\n---$/, "");
-  // Strip: <Label> (untrusted metadata):\n```json\n{...}\n```  (without --- wrapper)
-  content = content.replace(/[\w\s]+\(untrusted metadata\)[^\n]*\n```json[\s\S]*?```\n?/gim, "");
+  if (!content) return content;
+  const blocks = findInboundMetaBlocks(content);
+  if (blocks.length > 0) {
+    const parts: string[] = [];
+    let cursor = 0;
+    for (const block of blocks) {
+      parts.push(content.slice(cursor, Math.max(cursor, block.start)));
+      cursor = Math.max(cursor, block.end);
+    }
+    parts.push(content.slice(cursor));
+    content = parts.join("");
+  }
+  // Drop the `---` fences that wrapped the legacy envelope form.
+  content = content.replace(/^---\n/, "").replace(/\n---$/, "");
   return stripRuntimeEnvelope(content).trim();
 }
 
 const RUNTIME_MESSAGE_ID_LINE_RE = /^\[message_id:\s*(?:om|ou|oc)_[A-Za-z0-9_-]+\]$/i;
 const RUNTIME_OPAQUE_ID_LINE_RE = /^(?:om|ou|oc)_[A-Za-z0-9_-]+$/i;
 const RUNTIME_OPAQUE_SENDER_PREFIX_RE = /^\s*(?:om|ou|oc)_[A-Za-z0-9_-]+\s*:\s*/i;
+
+// Opt-in display-name prefix stripping (#3070). Some channels prepend a human
+// display name to the user text ("Alice: today weather?"), which pollutes both
+// the recall query and the retained transcript (the name gets extracted as a
+// fact). No payload field carries the display name, and a generic `Word:`
+// heuristic would eat ordinary user text ("计划: 今天修 retain 污染"), so the
+// pattern is operator-supplied. Unset = byte-identical to the old behaviour.
+// One process-global compiled pattern, armed from getPluginConfig(): the host
+// holds a single hindsight-openclaw config, so every session in the process
+// shares it. Compile per config if that ever stops being true.
+let senderPrefixRe: RegExp | undefined;
+let senderPrefixSource: string | undefined;
+
+/**
+ * Set (or clear) the display-name prefix pattern stripped by
+ * {@link stripRuntimeEnvelope}. The pattern is the name alternation only
+ * (e.g. `Alice|Bob` or `[A-Za-z ]{1,20}`); the anchor, surrounding whitespace
+ * and the `:` separator are supplied here. An invalid regex fails closed:
+ * stripping stays off and nothing throws.
+ */
+export function configureSenderPrefixStripping(pattern: string | undefined): void {
+  if (pattern === senderPrefixSource) return; // no recompile, and no repeat warn
+  senderPrefixSource = pattern;
+  if (!pattern) {
+    senderPrefixRe = undefined;
+    return;
+  }
+  try {
+    senderPrefixRe = new RegExp(`^\\s*(?:${pattern})\\s*:\\s*`);
+  } catch (error) {
+    senderPrefixRe = undefined;
+    log.warn(`ignoring invalid senderPrefixPattern ${JSON.stringify(pattern)}: ${error}`);
+  }
+}
 
 /**
  * Strip inline OpenClaw/Feishu runtime headers that can appear before user text.
@@ -628,7 +1004,8 @@ export function stripRuntimeEnvelope(content: string): string {
     return !RUNTIME_MESSAGE_ID_LINE_RE.test(trimmed) && !RUNTIME_OPAQUE_ID_LINE_RE.test(trimmed);
   });
 
-  return kept.join("\n").replace(RUNTIME_OPAQUE_SENDER_PREFIX_RE, "");
+  const stripped = kept.join("\n").replace(RUNTIME_OPAQUE_SENDER_PREFIX_RE, "");
+  return senderPrefixRe ? stripped.replace(senderPrefixRe, "") : stripped;
 }
 
 /**
@@ -649,7 +1026,10 @@ export function extractRecallQuery(
     /^\s*\(untrusted metadata\)/i,
     /^\s*system:/i,
   ];
-  const isMetadata = (s: string) => METADATA_PATTERNS.some((p) => p.test(s));
+  const isMetadata = (s: string) =>
+    METADATA_PATTERNS.some((p) => p.test(s)) ||
+    // 2026.8.1+ marker form: a leftover header line is metadata, not a query.
+    isInboundMetaHeaderLine(s.split("\n")[0] ?? "");
 
   let recallQuery = rawMessage;
   // Strip sender metadata envelope before any checks
@@ -856,6 +1236,14 @@ export function parseSessionKey(sessionKey: string): ParsedSessionKey {
       channel: "main",
     };
   }
+  // OpenClaw's Control UI creates `agent:<id>:dashboard:<opaque-id>` keys.
+  // Recover only the agent identity: "dashboard" is a session namespace, not
+  // the live message provider used for dynamic bank routing.
+  if (parts.length === 4 && parts[2] === "dashboard") {
+    return {
+      agentId: parts[1],
+    };
+  }
   if (parts.length >= 4 && ["cron", "heartbeat", "subagent"].includes(parts[2])) {
     return {
       agentId: parts[1],
@@ -887,9 +1275,8 @@ export function resolveSessionIdentity(
   const sessionParsed = ctx.sessionKey ? parseSessionKey(ctx.sessionKey) : {};
   const messageProvider = ctx.messageProvider || sessionParsed.provider;
   const channelId = ctx.channelId || sessionParsed.channel;
-  const senderId =
-    ctx.senderId ||
-    (messageProvider === "telegram" ? extractTelegramDirectSenderId(channelId) : undefined);
+  // direct:<id> channel ids carry the user id for any provider (telegram, msteams, …).
+  const senderId = ctx.senderId || extractTelegramDirectSenderId(channelId);
 
   return {
     ...ctx,
@@ -1020,13 +1407,20 @@ export function resolveAndCacheIdentity(options: ResolveAndCacheIdentityOptions)
     options.pluginConfig?.dynamicBankId === false &&
     typeof options.pluginConfig?.bankId === "string" &&
     options.pluginConfig.bankId.length > 0;
+  // A mapped agent is pinned the same way a static bank is: its bank comes from
+  // the map, not from the dispatch surface, so a surface mismatch cannot route
+  // the turn into the wrong bank and must not skip it. (#3890)
+  const mappedBanking =
+    options.pluginConfig !== undefined &&
+    mappedBankIdForAgent(resolvedCtx ?? effectiveCtx, options.pluginConfig) !== undefined;
 
   if (
     sessionProvider &&
     options.dispatchChannel &&
     sessionProvider !== options.dispatchChannel &&
     bankRoutingDependsOnSurface &&
-    !staticBanking
+    !staticBanking &&
+    !mappedBanking
   ) {
     const skipReason = finalSkipReason(
       `dispatch surface ${options.dispatchChannel} does not match session provider ${sessionProvider}`
@@ -1037,9 +1431,11 @@ export function resolveAndCacheIdentity(options: ResolveAndCacheIdentityOptions)
     return { effectiveCtx, resolvedCtx, skipReason };
   }
 
-  cacheSessionIdentity(sessionKey, resolvedCtx);
-
-  const { reason: skipReason } = getIdentitySkipReason(resolvedCtx, options.pluginConfig);
+  const { resolvedCtx: identityCtx, reason: skipReason } = getIdentitySkipReason(
+    resolvedCtx,
+    options.pluginConfig
+  );
+  cacheSessionIdentity(sessionKey, identityCtx);
   if (sessionKey) {
     if (skipReason) {
       setCappedMapValue(skipHindsightTurnBySession, sessionKey, skipReason);
@@ -1048,7 +1444,7 @@ export function resolveAndCacheIdentity(options: ResolveAndCacheIdentityOptions)
     }
   }
 
-  return { effectiveCtx, resolvedCtx, skipReason };
+  return { effectiveCtx, resolvedCtx: identityCtx, skipReason };
 }
 
 export function getIdentitySkipReason(
@@ -1072,7 +1468,11 @@ export function getIdentitySkipReason(
     pluginConfig?.dynamicBankId === false &&
     typeof pluginConfig?.bankId === "string" &&
     pluginConfig.bankId.length > 0;
-  const allowCliSessions = agentBanking || staticBanking;
+  //   - the agent has an explicit agentBankMap entry → the operator named that
+  //     bank for this agent, so its sessions belong there too (#3890)
+  const mappedBanking =
+    pluginConfig !== undefined && mappedBankIdForAgent(resolvedCtx, pluginConfig) !== undefined;
+  const allowCliSessions = agentBanking || staticBanking || mappedBanking;
 
   if (typeof sessionKey === "string") {
     if (/^agent:[^:]+:(cron|heartbeat|subagent):/.test(sessionKey)) {
@@ -1159,6 +1559,15 @@ export function deriveBankId(
   ctx: PluginHookAgentContext | undefined,
   pluginConfig: PluginConfig
 ): string {
+  // An explicit agent -> bank mapping wins over both the static bank and dynamic
+  // derivation, so a gateway can give one group of agents a shared bank while the
+  // rest keep derived ones (#3890). Resolved only when a map is configured, so the
+  // common path is untouched.
+  const mappedBankId = mappedBankIdForAgent(ctx, pluginConfig);
+  if (mappedBankId) {
+    return mappedBankId;
+  }
+
   if (pluginConfig.dynamicBankId === false) {
     return getStaticBankId(pluginConfig);
   }
@@ -1211,19 +1620,131 @@ export function deriveBankId(
   return pluginConfig.bankIdPrefix ? `${pluginConfig.bankIdPrefix}-${baseBankId}` : baseBankId;
 }
 
+function usesUserScopedBanking(pluginConfig: PluginConfig): boolean {
+  if (usesStaticBank(pluginConfig)) {
+    return false;
+  }
+  const granularity = pluginConfig.dynamicBankGranularity?.length
+    ? pluginConfig.dynamicBankGranularity
+    : DEFAULT_DYNAMIC_BANK_GRANULARITY;
+  return granularity.includes("user");
+}
+
+export interface KnowledgeToolBankResolution {
+  bankId: string;
+  resolvedCtx: PluginHookAgentContext | undefined;
+  identityError?: string;
+}
+
+/**
+ * Resolve the Hindsight bank for knowledge tools using the same identity path as
+ * auto-recall/retain. When user-scoped dynamic banking is enabled, unresolved
+ * identity must not silently route to the shared default or anonymous bank.
+ */
+export function resolveBankIdForKnowledgeTools(
+  toolCtx: PluginToolContext,
+  pluginConfig: PluginConfig
+): KnowledgeToolBankResolution {
+  const hookCtx: PluginHookAgentContext = {
+    agentId: toolCtx.agentId,
+    sessionKey: toolCtx.sessionKey,
+    workspaceDir: toolCtx.workspaceDir,
+  };
+
+  // An explicitly mapped agent needs no identity resolution: its bank does not
+  // depend on the sender, so the user-scoped guards below must not reject it. (#3890)
+  const mappedBankId = mappedBankIdForAgent(hookCtx, pluginConfig);
+  if (mappedBankId) {
+    return { bankId: mappedBankId, resolvedCtx: undefined };
+  }
+
+  if (usesStaticBank(pluginConfig)) {
+    return { bankId: getStaticBankId(pluginConfig), resolvedCtx: undefined };
+  }
+
+  const { resolvedCtx, skipReason } = resolveAndCacheIdentity({
+    sessionKey: toolCtx.sessionKey,
+    ctx: hookCtx,
+    pluginConfig,
+  });
+  const { reason: identityReason } = getIdentitySkipReason(resolvedCtx, pluginConfig);
+  const effectiveSkip = skipReason ?? identityReason;
+  const bankId = deriveBankId(resolvedCtx, pluginConfig);
+
+  if (usesUserScopedBanking(pluginConfig)) {
+    const userSegment = resolvedCtx?.senderId || "anonymous";
+    if (effectiveSkip) {
+      return {
+        bankId,
+        resolvedCtx,
+        identityError:
+          `Hindsight knowledge tools skipped: ${formatIdentitySkipReason(effectiveSkip)}. ` +
+          "Knowledge tools use the same per-user memory bank as auto-recall/retain.",
+      };
+    }
+    if (userSegment === "anonymous") {
+      return {
+        bankId,
+        resolvedCtx,
+        identityError:
+          "Hindsight knowledge tools skipped: missing stable sender identity. " +
+          "Knowledge tools use the same per-user memory bank as auto-recall/retain.",
+      };
+    }
+    if (bankId === getDefaultBankId(pluginConfig)) {
+      return {
+        bankId,
+        resolvedCtx,
+        identityError:
+          "Hindsight knowledge tools skipped: could not resolve per-user memory bank. " +
+          "Knowledge tools use the same per-user memory bank as auto-recall/retain.",
+      };
+    }
+  }
+
+  return { bankId, resolvedCtx };
+}
+
+/**
+ * Render the event window a memory carries. `mentioned_at` says when the fact
+ * was stated; `occurred_start`/`occurred_end` say when the event itself
+ * happened, which is what the agent needs to order past events against each
+ * other. Either bound can be absent, so each case gets its own wording rather
+ * than an open-ended range the model has to guess at.
+ */
+function formatOccurredWindow(
+  start: string | null | undefined,
+  end: string | null | undefined
+): string {
+  if (start && end) {
+    return start === end ? ` [occurred: ${start}]` : ` [occurred: ${start} → ${end}]`;
+  }
+  if (start) return ` [occurred from: ${start}]`;
+  if (end) return ` [occurred until: ${end}]`;
+  return "";
+}
+
 export function formatMemories(results: MemoryResult[]): string {
   if (!results || results.length === 0) return "";
   return results
     .map((r) => {
       const type = r.type ? ` [${r.type}]` : "";
       const date = r.mentioned_at ? ` (${r.mentioned_at})` : "";
-      return `- ${r.text}${type}${date}`;
+      const occurred = formatOccurredWindow(r.occurred_start, r.occurred_end);
+      const doc = r.document_id ? ` [doc:${r.document_id}]` : "";
+      return `- ${r.text}${type}${date}${occurred}${doc}`;
     })
     .join("\n\n");
 }
 
 // Providers that authenticate via OAuth or run locally — no API key needed.
-const NO_KEY_REQUIRED_PROVIDERS = new Set(["ollama", "openai-codex", "claude-code"]);
+const NO_KEY_REQUIRED_PROVIDERS = new Set([
+  "ollama",
+  "openai-codex",
+  "claude-code",
+  "cursor",
+  "github-copilot",
+]);
 
 export function detectLLMConfig(pluginConfig?: PluginConfig): {
   provider?: string;
@@ -1292,6 +1813,22 @@ export function detectExternalApi(pluginConfig?: PluginConfig): {
 }
 
 /**
+ * The Hindsight API this plugin is currently talking to, whichever mode it is
+ * in: the configured external API, or the local daemon we spawned ourselves.
+ *
+ * Capability probing must not care which one it is — the embedded daemon serves
+ * the same `/version` endpoint as any other Hindsight API. Treating local-daemon
+ * mode as a special case is precisely what left `supportsUpdateModeAppend` stuck
+ * at `false` there, silently downgrading every retain to a per-turn document id.
+ * (#3686)
+ */
+function getActiveApiEndpoint(): { apiUrl: string | null; apiToken: string | null } {
+  const externalApi = detectExternalApi(currentPluginConfig ?? undefined);
+  if (externalApi.apiUrl) return externalApi;
+  return { apiUrl: hindsightServer?.getBaseUrl() ?? null, apiToken: null };
+}
+
+/**
  * Build HindsightClientOptions for the generated hindsight-client. In
  * external-API mode we use the configured URL/token; in local daemon mode
  * the caller overrides with the daemon's base URL after start().
@@ -1338,69 +1875,192 @@ export function meetsMinimumVersion(actual: string, minimum: string): boolean {
   return true;
 }
 
+export interface HindsightApiCapabilities {
+  version: string;
+  storeDocumentText: boolean;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+export function parseHindsightApiCapabilities(payload: unknown): HindsightApiCapabilities | null {
+  if (!isRecord(payload) || typeof payload.api_version !== "string") {
+    return null;
+  }
+
+  let storeDocumentText = true;
+  if ("features" in payload) {
+    const features = payload.features;
+    storeDocumentText = isRecord(features) && features.store_document_text === true;
+  }
+
+  return {
+    version: payload.api_version,
+    storeDocumentText,
+  };
+}
+
+export function supportsAppendFromCapabilities(
+  capabilities: HindsightApiCapabilities | null
+): boolean {
+  return (
+    capabilities !== null &&
+    capabilities.storeDocumentText &&
+    meetsMinimumVersion(capabilities.version, MIN_VERSION_FOR_UPDATE_MODE_APPEND)
+  );
+}
+
+export function supportsAsyncRetainOperationIdFromCapabilities(
+  capabilities: HindsightApiCapabilities | null
+): boolean {
+  return asyncRetainOperationIdCapabilityFromCapabilities(capabilities) === "supported";
+}
+
+export function asyncRetainOperationIdCapabilityFromCapabilities(
+  capabilities: HindsightApiCapabilities | null
+): AsyncRetainOperationIdCapability {
+  if (capabilities === null) {
+    return "unknown";
+  }
+  const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.exec(capabilities.version);
+  // JavaScript's `$` can match before a final line terminator, so require the
+  // matched text to consume the complete payload as well as canonical digits.
+  if (!match || match[0] !== capabilities.version) {
+    return "unknown";
+  }
+  return meetsMinimumVersion(capabilities.version, MIN_VERSION_FOR_ASYNC_RETAIN_OPERATION_ID)
+    ? "supported"
+    : "unsupported";
+}
+
+/**
+ * Allocate the identity before the first asynchronous request so a failed
+ * acknowledgement and every durable-queue replay refer to the same server operation.
+ */
+export function createAsyncRetainOperationId(): string {
+  return randomUUID();
+}
+
 /**
  * Probe `<apiUrl>/version` once at service.start to learn the running
- * Hindsight API version. Returns `null` (treated as "no append support") if
- * the endpoint is unreachable or returns malformed payload — conservative
+ * Hindsight API capabilities. Returns `null` (treated as "no append support")
+ * if the endpoint is unreachable or returns malformed payload — conservative
  * fallback path is the right call when we can't be sure.
  */
-async function fetchHindsightApiVersion(
+async function fetchHindsightApiCapabilities(
   apiUrl: string,
-  apiToken?: string | null
-): Promise<string | null> {
+  apiToken?: string | null,
+  serviceSignal?: globalThis.AbortSignal
+): Promise<HindsightApiCapabilities | null> {
   const versionUrl = `${apiUrl.replace(/\/$/, "")}/version`;
   try {
     const headers: Record<string, string> = { "User-Agent": USER_AGENT };
     if (apiToken) headers["Authorization"] = `Bearer ${apiToken}`;
+    const timeoutSignal = AbortSignal.timeout(5000);
     const response = await fetch(versionUrl, {
-      signal: AbortSignal.timeout(5000),
+      signal: serviceSignal ? AbortSignal.any([serviceSignal, timeoutSignal]) : timeoutSignal,
       headers,
     });
     if (!response.ok) {
       debug(`[Hindsight] /version returned HTTP ${response.status}; assuming legacy`);
       return null;
     }
-    const data = (await response.json()) as { api_version?: unknown };
-    const v = typeof data.api_version === "string" ? data.api_version : null;
-    if (!v) {
+    const data = await response.json();
+    const capabilities = parseHindsightApiCapabilities(data);
+    if (!capabilities) {
       debug(`[Hindsight] /version payload missing api_version; assuming legacy`);
     }
-    return v;
+    return capabilities;
   } catch (error) {
     debug(`[Hindsight] /version probe failed: ${String(error)}; assuming legacy`);
     return null;
   }
 }
 
+export async function refreshAsyncRetainOperationIdCapability(
+  apiUrl: string,
+  apiToken?: string | null,
+  expectedGeneration = serviceGeneration,
+  signal: globalThis.AbortSignal | undefined = serviceAbortController?.signal
+): Promise<AsyncRetainOperationIdCapability> {
+  const capabilities = await fetchHindsightApiCapabilities(apiUrl, apiToken, signal);
+  const capability = asyncRetainOperationIdCapabilityFromCapabilities(capabilities);
+  if (expectedGeneration !== serviceGeneration || signal?.aborted) return "unknown";
+  asyncRetainOperationIdCapability = capability;
+  return capability;
+}
+
+async function refreshQueueOperationIdCapability(
+  expectedGeneration = serviceGeneration,
+  signal: globalThis.AbortSignal | undefined = serviceAbortController?.signal
+): Promise<AsyncRetainOperationIdCapability> {
+  if (expectedGeneration !== serviceGeneration || signal?.aborted) return "unknown";
+  if (!currentPluginConfig) {
+    asyncRetainOperationIdCapability = "unknown";
+    return "unknown";
+  }
+  const endpoint = getActiveApiEndpoint();
+  if (!endpoint.apiUrl) {
+    asyncRetainOperationIdCapability = "unknown";
+    return "unknown";
+  }
+  return refreshAsyncRetainOperationIdCapability(
+    endpoint.apiUrl,
+    endpoint.apiToken,
+    expectedGeneration,
+    signal
+  );
+}
+
 /**
- * Probe `/version` and update the module-level `supportsUpdateModeAppend`
- * capability flag accordingly. Logs a one-time WARN block when the API is
- * older than 0.5.0 — without `update_mode: 'append'`, every retain on the
- * same session id silently overwrites prior turns server-side.
+ * Probe `/version` and update the module-level append and async-operation-id
+ * capability flags. Logs a one-time WARN block when the append API is
+ * older than 0.5.0 or cannot store document text — without
+ * `update_mode: 'append'`, every retain on the same session id silently
+ * overwrites prior turns server-side, and append itself requires stored
+ * document text.
  *
- * Called from the same code paths as the health check, so capability is
- * always re-evaluated when the plugin (re)connects to the API.
+ * Called wherever the plugin (re)connects to an API — external *and* local
+ * daemon. It used to hang off the `checkExternalApiHealth` call sites only,
+ * which is why local-daemon mode never probed at all and silently retained
+ * with per-turn document ids. (#3686)
  */
-async function detectAppendCapability(apiUrl: string, apiToken?: string | null): Promise<void> {
-  const version = await fetchHindsightApiVersion(apiUrl, apiToken);
-  const supported =
-    version !== null && meetsMinimumVersion(version, MIN_VERSION_FOR_UPDATE_MODE_APPEND);
+async function detectAppendCapability(
+  apiUrl: string,
+  apiToken?: string | null,
+  expectedGeneration = serviceGeneration,
+  signal: globalThis.AbortSignal | undefined = serviceAbortController?.signal
+): Promise<void> {
+  const capabilities = await fetchHindsightApiCapabilities(apiUrl, apiToken, signal);
+  if (expectedGeneration !== serviceGeneration || signal?.aborted) return;
+  const supported = supportsAppendFromCapabilities(capabilities);
+  asyncRetainOperationIdCapability = asyncRetainOperationIdCapabilityFromCapabilities(capabilities);
   const transitionedToUnsupported = supportsUpdateModeAppend && !supported;
   const firstProbe = !appendCapabilityProbed;
   appendCapabilityProbed = true;
   supportsUpdateModeAppend = supported;
-  if (supported) {
-    debug(`[Hindsight] API version ${version} supports update_mode=append`);
+  if (supported && capabilities) {
+    debug(
+      `[Hindsight] API version ${capabilities.version} supports update_mode=append with stored document text`
+    );
     return;
   }
   // Warn on the first probe when unsupported, and on any transition from
   // supported -> unsupported. Stay silent on subsequent re-probes that
   // confirm the same unsupported state.
   if (!firstProbe && !transitionedToUnsupported) return;
+  const version = capabilities?.version ?? null;
+  const reason =
+    capabilities !== null &&
+    meetsMinimumVersion(capabilities.version, MIN_VERSION_FOR_UPDATE_MODE_APPEND) &&
+    !capabilities.storeDocumentText
+      ? `reports version "${capabilities.version}" but has features.store_document_text disabled`
+      : `reports version "${version ?? "unknown"}", which is older than ${MIN_VERSION_FOR_UPDATE_MODE_APPEND}`;
   log.warn(
-    `[Hindsight] ⚠️  API at ${apiUrl} reports version "${version ?? "unknown"}", which is older than ${MIN_VERSION_FOR_UPDATE_MODE_APPEND}. ` +
+    `[Hindsight] ⚠️  API at ${apiUrl} ${reason}. ` +
       `Falling back to per-turn document ids — each retain becomes its own document instead of accumulating into one per-session document. ` +
-      `Upgrade Hindsight to ${MIN_VERSION_FOR_UPDATE_MODE_APPEND} or newer to enable session-scoped retention with update_mode=append.`
+      `Enable document text storage on Hindsight ${MIN_VERSION_FOR_UPDATE_MODE_APPEND} or newer to use session-scoped retention with update_mode=append.`
   );
 }
 
@@ -1458,6 +2118,13 @@ export function normalizeRetainTags(value: unknown): string[] {
 export function getPluginConfig(api: MoltbotPluginAPI): PluginConfig {
   const config = api.config.plugins?.entries?.["hindsight-openclaw"]?.config || {};
 
+  const senderPrefixPattern =
+    typeof config.senderPrefixPattern === "string" && config.senderPrefixPattern.trim().length > 0
+      ? config.senderPrefixPattern.trim()
+      : undefined;
+  // Arm the shared stripper used by every recall/retain text path (#3070).
+  configureSenderPrefixStripping(senderPrefixPattern);
+
   // No default fallback for missions: if the user doesn't set one, the plugin
   // does not stamp anything. This lets per-bank missions written via the API
   // (PATCH /banks/{id}) survive gateway restarts. (#1270)
@@ -1474,6 +2141,17 @@ export function getPluginConfig(api: MoltbotPluginAPI): PluginConfig {
       typeof config.observationsMission === "string" && config.observationsMission.length > 0
         ? config.observationsMission
         : undefined,
+    retainExtractionMode: normalizeRetainExtractionMode(config.retainExtractionMode),
+    enableObservations:
+      typeof config.enableObservations === "boolean" ? config.enableObservations : undefined,
+    enableAutoConsolidation:
+      typeof config.enableAutoConsolidation === "boolean"
+        ? config.enableAutoConsolidation
+        : undefined,
+    dispositionSkepticism: normalizeDispositionTrait(config.dispositionSkepticism),
+    dispositionLiteralism: normalizeDispositionTrait(config.dispositionLiteralism),
+    dispositionEmpathy: normalizeDispositionTrait(config.dispositionEmpathy),
+    entityLabels: normalizeEntityLabels(config.entityLabels),
     embedPort: config.embedPort || 0,
     daemonIdleTimeout: config.daemonIdleTimeout !== undefined ? config.daemonIdleTimeout : 0,
     embedVersion: config.embedVersion || "latest",
@@ -1492,6 +2170,7 @@ export function getPluginConfig(api: MoltbotPluginAPI): PluginConfig {
         ? config.bankId.trim()
         : undefined,
     bankIdPrefix: config.bankIdPrefix,
+    agentBankMap: normalizeAgentBankMap(config.agentBankMap),
     retainTags: normalizeRetainTags(config.retainTags),
     retainSource:
       typeof config.retainSource === "string" && config.retainSource.trim().length > 0
@@ -1522,6 +2201,8 @@ export function getPluginConfig(api: MoltbotPluginAPI): PluginConfig {
     recallBudget: config.recallBudget || "mid",
     recallMaxTokens: config.recallMaxTokens || 1024,
     recallTypes: Array.isArray(config.recallTypes) ? config.recallTypes : ["observation"],
+    preferObservations: config.preferObservations === true, // Default: false — backward compatible
+    recallMinScores: config.recallMinScores,
     recallRoles: Array.isArray(config.recallRoles) ? config.recallRoles : ["user", "assistant"],
     retainEveryNTurns:
       typeof config.retainEveryNTurns === "number" && config.retainEveryNTurns >= 1
@@ -1549,7 +2230,7 @@ export function getPluginConfig(api: MoltbotPluginAPI): PluginConfig {
       typeof config.recallInjectionPosition === "string" &&
       ["prepend", "append", "user"].includes(config.recallInjectionPosition)
         ? (config.recallInjectionPosition as PluginConfig["recallInjectionPosition"])
-        : undefined,
+        : "user",
     recallTimeoutMs:
       typeof config.recallTimeoutMs === "number" && config.recallTimeoutMs >= 1000
         ? config.recallTimeoutMs
@@ -1576,6 +2257,7 @@ export function getPluginConfig(api: MoltbotPluginAPI): PluginConfig {
         ? config.retainQueueFlushIntervalMs
         : undefined,
     enableKnowledgeTools: config.enableKnowledgeTools === true,
+    senderPrefixPattern,
   };
 }
 
@@ -1621,6 +2303,12 @@ export default function (api: MoltbotPluginAPI) {
     api.registerService({
       id: "hindsight-memory",
       async start() {
+        preServiceRecallController.abort();
+        serviceAbortController?.abort();
+        inflightRecalls.clear();
+        const serviceController = new AbortController();
+        serviceAbortController = serviceController;
+        const startGeneration = ++serviceGeneration;
         log.info("service.start invoked");
         debug("[Hindsight] Service start called - beginning heavy initialization...");
 
@@ -1663,51 +2351,25 @@ export default function (api: MoltbotPluginAPI) {
 
         // Detect external API mode
         const externalApi = detectExternalApi(pluginConfig);
+        usingExternalApi = Boolean(externalApi.apiUrl);
 
         // Get API port from config (default: 9077)
         const apiPort = pluginConfig.apiPort || 9077;
+
+        // Both modes get the queue: a local daemon is unreachable while it is
+        // still booting or after it has crashed, and a retain that fails then is
+        // just as lost as one that fails against a remote API. (#3686)
+        initRetainQueue(pluginConfig, startGeneration, serviceController.signal);
 
         if (externalApi.apiUrl) {
           // External API mode - skip local daemon
           usingExternalApi = true;
           debug(`[Hindsight] ✓ Using external API: ${externalApi.apiUrl}`);
 
-          // Initialize retain queue (external API mode only)
-          try {
-            const queueDir = pluginConfig.retainQueuePath
-              ? dirname(pluginConfig.retainQueuePath)
-              : join(homedir(), ".openclaw", "data");
-            mkdirSync(queueDir, { recursive: true });
-            const queuePath =
-              pluginConfig.retainQueuePath || join(queueDir, "hindsight-retain-queue.jsonl");
-            const queueFlushInterval =
-              pluginConfig.retainQueueFlushIntervalMs ?? DEFAULT_FLUSH_INTERVAL_MS;
-            const queueMaxAge = pluginConfig.retainQueueMaxAgeMs ?? -1;
-            retainQueue = new RetainQueue({ filePath: queuePath, maxAgeMs: queueMaxAge });
-            const pending = retainQueue.size();
-            if (pending > 0) {
-              log.info(
-                `retain queue: ${pending} items pending from previous session, will flush shortly`
-              );
-            }
-            debug(`[Hindsight] Retain queue initialized: ${queuePath}`);
-
-            // Periodic flush timer
-            if (queueFlushInterval > 0) {
-              retainQueueFlushTimer = setInterval(flushRetainQueue, queueFlushInterval);
-              retainQueueFlushTimer.unref?.();
-            }
-          } catch (error) {
-            log.warn(`could not initialize retain queue: ${error}`);
-          }
-
           if (externalApi.apiToken) {
             debug("[Hindsight] API token configured");
           }
         } else {
-          debug(
-            `[Hindsight] Daemon idle timeout: ${pluginConfig.daemonIdleTimeout}s (0 = never timeout)`
-          );
           debug(`[Hindsight] API Port: ${apiPort}`);
         }
 
@@ -1724,24 +2386,17 @@ export default function (api: MoltbotPluginAPI) {
               // Initialize client for external API
               debug("[Hindsight] Creating HindsightClient (external API)...");
               clientOptions = buildClientOptions(llmConfig, pluginConfig, externalApi);
-              banksWithMissionSet.clear();
+              banksWithDefaultsApplied.clear();
               client = new HindsightClient(clientOptions);
 
               const defaultBankId = deriveBankId(undefined, pluginConfig);
               debug(`[Hindsight] Default bank: ${defaultBankId}`);
 
-              // Note: Missions are stamped per-bank when dynamic bank IDs are
-              // enabled. For static banks, stamp once here on init.
-              if (hasConfiguredMissions(pluginConfig) && usesStaticBank(pluginConfig)) {
-                debug(`[Hindsight] Setting bank missions...`);
-                try {
-                  await applyConfiguredMissions(scopeClient(client, defaultBankId), pluginConfig);
-                  banksWithMissionSet.add(defaultBankId);
-                } catch (err) {
-                  log.warn(
-                    `could not set bank missions for ${defaultBankId}: ${err instanceof Error ? err.message : err}`
-                  );
-                }
+              // Defaults are stamped per-bank when dynamic bank IDs are enabled.
+              // For static banks, stamp once here on init.
+              if (usesStaticBank(pluginConfig)) {
+                debug(`[Hindsight] Applying configured bank defaults...`);
+                await ensureBankDefaultsApplied(defaultBankId, pluginConfig);
               }
 
               if (!isInitialized) {
@@ -1776,27 +2431,25 @@ export default function (api: MoltbotPluginAPI) {
               debug("[Hindsight] Starting embedded server...");
               await hindsightServer.start();
 
+              // The daemon is a Hindsight API like any other: probe it for the
+              // same capabilities as an external one, or retains here silently
+              // fall back to per-turn document ids. (#3686)
+              await detectAppendCapability(hindsightServer.getBaseUrl());
+
               // Initialize client pointed at the local daemon URL
               debug("[Hindsight] Creating HindsightClient (local daemon)...");
               clientOptions = { baseUrl: hindsightServer.getBaseUrl() };
-              banksWithMissionSet.clear();
+              banksWithDefaultsApplied.clear();
               client = new HindsightClient(clientOptions);
 
               const defaultBankId = deriveBankId(undefined, pluginConfig);
               debug(`[Hindsight] Default bank: ${defaultBankId}`);
 
-              // Note: Missions are stamped per-bank when dynamic bank IDs are
-              // enabled. For static banks, stamp once here on init.
-              if (hasConfiguredMissions(pluginConfig) && usesStaticBank(pluginConfig)) {
-                debug(`[Hindsight] Setting bank missions...`);
-                try {
-                  await applyConfiguredMissions(scopeClient(client, defaultBankId), pluginConfig);
-                  banksWithMissionSet.add(defaultBankId);
-                } catch (err) {
-                  log.warn(
-                    `could not set bank missions for ${defaultBankId}: ${err instanceof Error ? err.message : err}`
-                  );
-                }
+              // Defaults are stamped per-bank when dynamic bank IDs are enabled.
+              // For static banks, stamp once here on init.
+              if (usesStaticBank(pluginConfig)) {
+                debug(`[Hindsight] Applying configured bank defaults...`);
+                await ensureBankDefaultsApplied(defaultBankId, pluginConfig);
               }
 
               if (!isInitialized) {
@@ -1838,7 +2491,7 @@ export default function (api: MoltbotPluginAPI) {
               // Reset state for reinitialization attempt
               client = null;
               clientOptions = null;
-              banksWithMissionSet.clear();
+              banksWithDefaultsApplied.clear();
               isInitialized = false;
             }
           }
@@ -1847,6 +2500,10 @@ export default function (api: MoltbotPluginAPI) {
           if (hindsightServer && isInitialized) {
             const healthy = await hindsightServer.checkHealth();
             if (healthy) {
+              // Same re-probe the external branch does after its health check:
+              // the daemon may have been restarted (SIGUSR1) onto a different
+              // embed version since we last looked. (#3686)
+              await detectAppendCapability(hindsightServer.getBaseUrl());
               debug("[Hindsight] Daemon is healthy");
               return;
             }
@@ -1856,7 +2513,7 @@ export default function (api: MoltbotPluginAPI) {
             hindsightServer = null;
             client = null;
             clientOptions = null;
-            banksWithMissionSet.clear();
+            banksWithDefaultsApplied.clear();
             isInitialized = false;
           }
         }
@@ -1878,22 +2535,12 @@ export default function (api: MoltbotPluginAPI) {
             await detectAppendCapability(externalApi.apiUrl, externalApi.apiToken);
 
             clientOptions = buildClientOptions(llmConfig, reinitPluginConfig, externalApi);
-            banksWithMissionSet.clear();
+            banksWithDefaultsApplied.clear();
             client = new HindsightClient(clientOptions);
             const defaultBankId = deriveBankId(undefined, reinitPluginConfig);
 
-            if (hasConfiguredMissions(reinitPluginConfig) && usesStaticBank(reinitPluginConfig)) {
-              try {
-                await applyConfiguredMissions(
-                  scopeClient(client, defaultBankId),
-                  reinitPluginConfig
-                );
-                banksWithMissionSet.add(defaultBankId);
-              } catch (err) {
-                log.warn(
-                  `could not set bank missions for ${defaultBankId}: ${err instanceof Error ? err.message : err}`
-                );
-              }
+            if (usesStaticBank(reinitPluginConfig)) {
+              await ensureBankDefaultsApplied(defaultBankId, reinitPluginConfig);
             }
 
             isInitialized = true;
@@ -1918,24 +2565,15 @@ export default function (api: MoltbotPluginAPI) {
             });
 
             await hindsightServer.start();
+            await detectAppendCapability(hindsightServer.getBaseUrl());
 
             clientOptions = { baseUrl: hindsightServer.getBaseUrl() };
-            banksWithMissionSet.clear();
+            banksWithDefaultsApplied.clear();
             client = new HindsightClient(clientOptions);
             const defaultBankId = deriveBankId(undefined, reinitPluginConfig);
 
-            if (hasConfiguredMissions(reinitPluginConfig) && usesStaticBank(reinitPluginConfig)) {
-              try {
-                await applyConfiguredMissions(
-                  scopeClient(client, defaultBankId),
-                  reinitPluginConfig
-                );
-                banksWithMissionSet.add(defaultBankId);
-              } catch (err) {
-                log.warn(
-                  `could not set bank missions for ${defaultBankId}: ${err instanceof Error ? err.message : err}`
-                );
-              }
+            if (usesStaticBank(reinitPluginConfig)) {
+              await ensureBankDefaultsApplied(defaultBankId, reinitPluginConfig);
             }
 
             isInitialized = true;
@@ -1946,6 +2584,11 @@ export default function (api: MoltbotPluginAPI) {
 
       async stop() {
         try {
+          serviceGeneration++;
+          preServiceRecallController.abort();
+          serviceAbortController?.abort();
+          serviceAbortController = null;
+          inflightRecalls.clear();
           debug("[Hindsight] Service stopping...");
 
           // Only stop daemon if in local mode
@@ -1972,7 +2615,9 @@ export default function (api: MoltbotPluginAPI) {
 
           client = null;
           clientOptions = null;
-          banksWithMissionSet.clear();
+          asyncRetainOperationIdCapability = "unknown";
+          usingExternalApi = false;
+          banksWithDefaultsApplied.clear();
           isInitialized = false;
 
           stopLogger();
@@ -2052,6 +2697,15 @@ export default function (api: MoltbotPluginAPI) {
     // Auto-recall: Inject relevant memories before agent processes the message
     // Hook signature: (event, ctx) where event has {prompt, messages?} and ctx has agent context
     api.on("before_prompt_build", async (event: any, ctx?: PluginHookAgentContext) => {
+      const recallGeneration = serviceGeneration;
+      const recallController =
+        serviceAbortController ?? (recallGeneration === 0 ? preServiceRecallController : null);
+      const isCurrentRecall = () =>
+        recallController !== null &&
+        (serviceAbortController ?? preServiceRecallController) === recallController &&
+        recallGeneration === serviceGeneration &&
+        !recallController.signal.aborted;
+      if (!isCurrentRecall()) return;
       // Optional perf instrumentation (#1406). Captured here at hook entry so
       // the early-return paths below don't influence the measurement of slow
       // recall calls — perf lines are only emitted on the recall path.
@@ -2183,9 +2837,11 @@ export default function (api: MoltbotPluginAPI) {
         }
 
         await clientGlobal.waitForReady();
+        if (!isCurrentRecall()) return;
 
         // Get client configured for this context's bank (async to handle mission setup)
         const client = await clientGlobal.getClientForContext(resolvedCtxForRecall);
+        if (!isCurrentRecall()) return;
         if (!client) {
           debug("[Hindsight] Client not initialized, skipping auto-recall");
           return;
@@ -2210,15 +2866,25 @@ export default function (api: MoltbotPluginAPI) {
               maxTokens: pluginConfig.recallMaxTokens || 1024,
               budget: pluginConfig.recallBudget,
               types: pluginConfig.recallTypes,
+              preferObservations: pluginConfig.preferObservations,
+              minScores: pluginConfig.recallMinScores,
             },
-            recallTimeoutMs
+            recallTimeoutMs,
+            recallController?.signal
           );
           inflightRecalls.set(recallKey, recallPromise);
-          void recallPromise.catch(() => {}).finally(() => inflightRecalls.delete(recallKey));
+          void recallPromise
+            .catch(() => {})
+            .finally(() => {
+              // An old generation can settle after start() installed a successor.
+              if (inflightRecalls.get(recallKey) === recallPromise)
+                inflightRecalls.delete(recallKey);
+            });
         }
 
         const recallStart = pluginConfig.debugPerfTiming ? Date.now() : 0;
         const response = await recallPromise;
+        if (!isCurrentRecall()) return;
         const recallElapsedMs = pluginConfig.debugPerfTiming ? Date.now() - recallStart : 0;
 
         if (!response.results || response.results.length === 0) {
@@ -2247,7 +2913,8 @@ export default function (api: MoltbotPluginAPI) {
           `[Hindsight] After topK (${pluginConfig.recallTopK ?? "unlimited"}): ${results.length} results injected`
         );
 
-        // Format memories as JSON with all fields from recall
+        // Format memories as a bullet list (text + type + date + occurred window +
+        // [doc:<document_id>], each part present only when the memory carries it)
         const memoriesFormatted = formatMemories(results);
 
         const contextMessage = `<hindsight_memories>
@@ -2271,9 +2938,10 @@ ${memoriesFormatted}
           );
         }
 
-        // Inject recalled memories. Position is configurable to preserve prompt caching
-        // when agents have large static system prompts.
-        const position = pluginConfig.recallInjectionPosition || "prepend";
+        // Keep recalled memories outside the system prompt by default so the
+        // provider can reuse its stable prompt prefix across turns. Users who
+        // need system-level memory context can still opt into prepend or append.
+        const position = pluginConfig.recallInjectionPosition ?? "user";
         switch (position) {
           case "append":
             return { appendSystemContext: contextMessage };
@@ -2289,9 +2957,18 @@ ${memoriesFormatted}
             `[Hindsight] Auto-recall timed out after ${pluginConfig.recallTimeoutMs ?? DEFAULT_RECALL_TIMEOUT_MS}ms, skipping memory injection`
           );
         } else if (error instanceof Error && error.name === "AbortError") {
-          log.warn(
-            `[Hindsight] Auto-recall aborted after ${pluginConfig.recallTimeoutMs ?? DEFAULT_RECALL_TIMEOUT_MS}ms, skipping memory injection`
-          );
+          // An AbortError now has two sources. The deadline is handled above as a
+          // TimeoutError; this branch is reached when the service was stopped or
+          // restarted mid-recall, which is not a timeout — quoting recallTimeoutMs
+          // there reports a deadline that never elapsed, with a number unrelated
+          // to the time actually spent. (#4450)
+          if (recallController?.signal.aborted) {
+            debug("[Hindsight] Auto-recall cancelled: service stopped, skipping memory injection");
+          } else {
+            log.warn(
+              `[Hindsight] Auto-recall aborted after ${pluginConfig.recallTimeoutMs ?? DEFAULT_RECALL_TIMEOUT_MS}ms, skipping memory injection`
+            );
+          }
         } else {
           log.error("auto-recall error", error);
         }
@@ -2311,6 +2988,15 @@ ${memoriesFormatted}
     ): Promise<void> => {
       const force = retainOptions.force === true;
       const hookName = retainOptions.hookName;
+      const retainGeneration = serviceGeneration;
+      const retainController = serviceAbortController;
+      const retainSignal = retainController?.signal;
+      const retainLifecycleIsCurrent = () =>
+        retainController !== null &&
+        serviceAbortController === retainController &&
+        retainGeneration === serviceGeneration &&
+        !retainSignal?.aborted;
+      if (!retainLifecycleIsCurrent()) return;
       // Optional perf instrumentation (#1406). Only emitted when an actual
       // retain RPC fires; the many early-return skip paths are not measured.
       const perfHookStart = pluginConfig.debugPerfTiming ? Date.now() : 0;
@@ -2412,10 +3098,20 @@ ${memoriesFormatted}
           return;
         }
 
-        if (
-          !Array.isArray(event.context?.sessionEntry?.messages ?? event.messages) ||
-          (event.context?.sessionEntry?.messages ?? event.messages ?? []).length === 0
-        ) {
+        // Resolved once: `session_end` carries no transcript, so the forced flush
+        // reads it from the file the event points at (#4341). Without this the guard
+        // below ended every session-close flush before it began.
+        let eventMessages = event.context?.sessionEntry?.messages ?? event.messages;
+        if (force && (!Array.isArray(eventMessages) || eventMessages.length === 0)) {
+          eventMessages = sessionEndMessagesFromTranscript(event);
+          if (Array.isArray(eventMessages)) {
+            debug(
+              `[Hindsight Hook] session_end: read ${eventMessages.length} messages from ${event.sessionFile}`
+            );
+          }
+        }
+
+        if (!Array.isArray(eventMessages) || eventMessages.length === 0) {
           debug("[Hindsight Hook] No messages in event, skipping retention");
           return;
         }
@@ -2427,7 +3123,7 @@ ${memoriesFormatted}
 
         // Chunked retention: skip non-Nth turns and use a sliding window when firing
         const retainEveryN = pluginConfig.retainEveryNTurns ?? 1;
-        const allMessages = event.context?.sessionEntry?.messages ?? event.messages ?? [];
+        const allMessages = eventMessages;
         let messagesToRetain = allMessages;
         let retainFullWindow = false;
 
@@ -2538,14 +3234,25 @@ ${memoriesFormatted}
         }
 
         await clientGlobal.waitForReady();
+        if (!retainLifecycleIsCurrent()) return;
 
         // Get client configured for this context's bank (async to handle mission setup)
         const client = await clientGlobal.getClientForContext(resolvedCtxForRetain);
+        if (!retainLifecycleIsCurrent()) return;
         if (!client) {
           log.warn("client not initialized, skipping retain");
           return;
         }
 
+        // Use the cached capability, and only pay for a /version round trip while
+        // it is still unknown. Probing on every retain would put an extra
+        // request in front of every turn, and the answer changes at most once
+        // per server restart — the queue flush re-probes on its own timer.
+        const retainOperationIdCapability =
+          asyncRetainOperationIdCapability === "unknown"
+            ? await refreshQueueOperationIdCapability(retainGeneration, retainSignal)
+            : asyncRetainOperationIdCapability;
+        if (!retainLifecycleIsCurrent()) return;
         const retainNow = Date.now();
         const retainRequest = buildRetainRequest(
           transcript,
@@ -2560,6 +3267,7 @@ ${memoriesFormatted}
               : undefined,
             tags: inlineRetainTags,
             appendSupported: supportsUpdateModeAppend,
+            operationId: createAsyncRetainOperationId(),
           }
         );
 
@@ -2572,7 +3280,13 @@ ${memoriesFormatted}
         let retainElapsedMs = 0;
         let retainOutcome: "ok" | "queued" | "error" = "error";
         try {
-          await client.retain(retainRequest);
+          // An unknown capability does not hold up the first send: there is
+          // nothing on the server yet for it to duplicate, so omitting the wire
+          // field is exactly today's behaviour. The id is still allocated and
+          // persisted with the request, so a *replay* can be idempotent once the
+          // capability is known — that is where duplicates actually come from.
+          await client.retain(retainRequest, retainOperationIdCapability, retainSignal);
+          if (!retainLifecycleIsCurrent()) return;
           retainElapsedMs = pluginConfig.debugPerfTiming ? Date.now() - retainStart : 0;
           retainOutcome = "ok";
           log.trackRetain(bankId, messageCount);
@@ -2581,12 +3295,15 @@ ${memoriesFormatted}
           );
 
           // After a successful retain, try flushing any queued items
-          if (retainQueue && retainQueue.size() > 0) {
-            flushRetainQueue().catch(() => {});
+          if (retainQueue) {
+            flushRetainQueue(undefined, undefined, undefined, retainGeneration, retainSignal).catch(
+              () => {}
+            );
           }
         } catch (retainError) {
+          if (!retainLifecycleIsCurrent()) return;
           retainElapsedMs = pluginConfig.debugPerfTiming ? Date.now() - retainStart : 0;
-          // Queue the failed retain for later delivery (external API mode only)
+          // Queue the failed retain for later delivery
           if (retainQueue) {
             retainQueue.enqueue(bankId, retainRequest, retainRequest.metadata);
             retainOutcome = "queued";
@@ -2637,17 +3354,32 @@ ${memoriesFormatted}
         })();
         const apiToken = pluginConfig.hindsightApiToken || undefined;
 
-        // Factory: called per session with agent context, returns tools scoped to that bank
+        // Factory: called per session with agent context, returns tools scoped to that bank.
+        // Identity is resolved the same way as auto-recall/retain so PluginToolContext
+        // (which lacks senderId/messageProvider) still routes to the per-user bank.
         const factory = (ctx: PluginToolContext) => {
-          const bankId = deriveBankId(ctx as any, pluginConfig);
-          const tools = createKnowledgeTools({ apiUrl, apiToken, bankId });
+          const resolution = resolveBankIdForKnowledgeTools(ctx, pluginConfig);
+          const tools = createKnowledgeTools({
+            apiUrl,
+            apiToken,
+            bankId: resolution.bankId,
+          });
           return tools.map((t) => ({
             name: t.name,
             label: t.label,
             description: t.description,
             parameters: t.parameters,
             async execute(_id: string, params: Record<string, unknown>) {
-              return { ...(await t.execute(params)), details: {} };
+              if (resolution.identityError) {
+                return {
+                  content: [{ type: "text", text: resolution.identityError }],
+                  details: { error: resolution.identityError },
+                };
+              }
+              const config = currentPluginConfig || pluginConfig;
+              await ensureBankDefaultsApplied(resolution.bankId, config);
+              const result = await t.execute(params);
+              return { ...result, details: knowledgeToolDetails(result) };
             },
           }));
         };
@@ -2720,6 +3452,8 @@ export function buildRetainRequest(
      * prior turns aren't overwritten. Defaults to false (conservative).
      */
     appendSupported?: boolean;
+    /** Stable UUID allocated before the initial asynchronous retain request. */
+    operationId?: string;
   }
 ): RetainRequest {
   const resolvedCtx = resolveSessionIdentity(effectiveCtx);
@@ -2733,9 +3467,13 @@ export function buildRetainRequest(
   // the same id would silently overwrite prior turns (behavior pre-#932), so
   // fall back to per-turn ids there.
   const useSessionScopedDoc = options?.appendSupported === true;
+  // The fallback id carries a per-process boot token because `turnIndex` comes
+  // from an in-memory counter: without it, a host restart replays
+  // `…:turn:000001` onto the previous cycle's document and `update_mode:
+  // 'replace'` deletes what was there. (#3686)
   const documentId = useSessionScopedDoc
     ? documentBase
-    : `${documentBase}:${documentKind}:${String(turnIndex).padStart(6, "0")}`;
+    : `${documentBase}:${documentKind}:${getDocumentIdBootToken()}:${String(turnIndex).padStart(6, "0")}`;
   const provider = effectiveCtx?.messageProvider || parsedSession.provider;
   const channelId = sanitizeChannelId(effectiveCtx?.channelId, provider) || parsedSession.channel;
   const channelType = effectiveCtx?.messageProvider;
@@ -2768,6 +3506,7 @@ export function buildRetainRequest(
       ...(options?.windowTurns !== undefined ? { window_turns: String(options.windowTurns) } : {}),
     },
     tags: mergedTags.length > 0 ? mergedTags : undefined,
+    ...(options?.operationId ? { operationId: options.operationId } : {}),
     updateMode: useSessionScopedDoc ? "append" : undefined,
   };
 }
@@ -2997,46 +3736,33 @@ function buildToolResultBlock(msg: any): any | null {
   return block;
 }
 
-export function countUserTurns(messages: any[]): number {
-  if (!Array.isArray(messages) || messages.length === 0) {
-    return 0;
-  }
-
-  return messages.reduce(
-    (count: number, message: any) => count + (message?.role === "user" ? 1 : 0),
-    0
-  );
-}
-
-export function getRetentionTurnIndex(
-  conversationTurnCount: number,
-  retainEveryN: number
-): number | null {
-  if (conversationTurnCount <= 0 || retainEveryN <= 0) {
-    return null;
-  }
-
-  if (retainEveryN === 1) {
-    return conversationTurnCount;
-  }
-
-  if (conversationTurnCount % retainEveryN !== 0) {
-    return null;
-  }
-
-  return Math.floor(conversationTurnCount / retainEveryN);
-}
-
 export function sliceLastTurnsByUserBoundary(messages: any[], turns: number): any[] {
   if (!Array.isArray(messages) || messages.length === 0 || turns <= 0) {
     return [];
+  }
+
+  // Count only user messages that contain actual text content.
+  // OpenClaw normalizes tool_result blocks into role:"user" messages with a
+  // tool_result content block. Without this filter those synthetic messages
+  // would be counted as real user turns, causing the window to exclude actual
+  // user input from the retained transcript.
+  function hasRealTextContent(msg: any): boolean {
+    if (msg?.role !== "user") return false;
+    const content = msg.content;
+    if (typeof content === "string") return content.trim().length > 0;
+    if (Array.isArray(content)) {
+      return content.some(
+        (b: any) => b?.type === "text" && typeof b?.text === "string" && b.text.trim().length > 0
+      );
+    }
+    return false;
   }
 
   let userTurnsSeen = 0;
   let startIndex = -1;
 
   for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i]?.role === "user") {
+    if (messages[i]?.role === "user" && hasRealTextContent(messages[i])) {
       userTurnsSeen += 1;
       if (userTurnsSeen >= turns) {
         startIndex = i;

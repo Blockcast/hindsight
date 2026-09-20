@@ -5,8 +5,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from hindsight_api.engine.llm_interface import LLM_TOOL_CHOICE_AUTO, LLMToolChoice
 from hindsight_api.engine.providers.openai_compatible_llm import OpenAICompatibleLLM
-
 
 TOOLS = [
     {
@@ -77,6 +77,9 @@ def _make_tool_call_response(tool_name: str = "search_observations") -> MagicMoc
     mock_response.usage.prompt_tokens = 100
     mock_response.usage.completion_tokens = 20
     mock_response.usage.total_tokens = 120
+    # Explicit None: an auto-MagicMock here is truthy, so the reasoning-token
+    # accounting (#2378) would do arithmetic on a MagicMock and crash.
+    mock_response.usage.completion_tokens_details = None
     mock_response.choices[0].finish_reason = "tool_calls"
     mock_response.choices[0].message.content = None
     mock_response.choices[0].message.tool_calls = [mock_tc]
@@ -96,10 +99,26 @@ def test_deepseek_reasoning_models_still_use_reasoning_parameters():
 
 
 @pytest.mark.asyncio
+async def test_reasoning_tool_call_omits_temperature():
+    llm = _make_deepseek_llm("deepseek-v4-pro")
+
+    with patch.object(llm._client.chat.completions, "create", new_callable=AsyncMock) as mock_create:
+        mock_create.return_value = _make_tool_call_response()
+        await llm.call_with_tools(
+            messages=[{"role": "user", "content": "Search observations."}],
+            tools=TOOLS,
+            temperature=0.9,
+            max_retries=0,
+        )
+
+    assert "temperature" not in mock_create.call_args.kwargs
+
+
+@pytest.mark.asyncio
 async def test_deepseek_named_tool_choice_filters_tools_but_omits_tool_choice():
     """DeepSeek rejects required/named tool_choice but accepts a narrowed tools list."""
     llm = _make_deepseek_llm()
-    named_tool_choice = {"type": "function", "function": {"name": "search_observations"}}
+    named_tool_choice = LLMToolChoice.named("search_observations")
 
     with patch.object(llm._client.chat.completions, "create", new_callable=AsyncMock) as mock_create:
         mock_create.return_value = _make_tool_call_response("search_observations")
@@ -131,7 +150,7 @@ async def test_deepseek_auto_tool_choice_is_omitted():
         await llm.call_with_tools(
             messages=[{"role": "user", "content": "Search observations."}],
             tools=TOOLS,
-            tool_choice="auto",
+            tool_choice=LLM_TOOL_CHOICE_AUTO,
             max_retries=0,
         )
 
@@ -165,12 +184,18 @@ async def test_deepseek_tool_history_gets_empty_reasoning_content_fallback():
         await llm.call_with_tools(
             messages=messages,
             tools=TOOLS,
-            tool_choice="auto",
+            tool_choice=LLM_TOOL_CHOICE_AUTO,
             max_retries=0,
         )
 
     sent_messages = mock_create.call_args.kwargs["messages"]
     assert sent_messages[1]["reasoning_content"] == ""
+    assert sent_messages[2] == {
+        "role": "tool",
+        "tool_call_id": "call_deepseek_123",
+        "content": "{}",
+    }
+    assert "name" not in sent_messages[2]
     assert "reasoning_content" not in messages[1]
 
 
@@ -200,7 +225,7 @@ async def test_deepseek_tool_history_preserves_existing_reasoning_content():
         await llm.call_with_tools(
             messages=messages,
             tools=TOOLS,
-            tool_choice="auto",
+            tool_choice=LLM_TOOL_CHOICE_AUTO,
             max_retries=0,
         )
 

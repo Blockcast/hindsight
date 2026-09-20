@@ -17,6 +17,11 @@ DEFAULTS = {
     "recallContextTurns": 1,
     "recallMaxQueryChars": 800,
     "recallRoles": ["user", "assistant"],
+    "recallTags": [],
+    "recallTagsMatch": "any",
+    "recallTagGroups": None,
+    "recallAdditionalBankFilters": {},
+    "recallMinScores": {},
     "recallPromptPreamble": (
         "Relevant memories from past conversations (prioritize recent when "
         "conflicting). Only use memories that are directly useful to continue "
@@ -35,6 +40,7 @@ DEFAULTS = {
     "retainMaxChars": 30000,
     "recallAdditionalBanks": [],
     # Connection
+    "upgradeNotice": True,  # show the superseded-by-coding-agents notice (capped, see lib/upgrade_notice.py)
     "hindsightApiUrl": None,
     "hindsightApiToken": None,
     "apiPort": 9077,
@@ -75,6 +81,10 @@ ENV_OVERRIDES = {
     "HINDSIGHT_RECALL_MAX_TOKENS": ("recallMaxTokens", int),
     "HINDSIGHT_RECALL_MAX_QUERY_CHARS": ("recallMaxQueryChars", int),
     "HINDSIGHT_RECALL_CONTEXT_TURNS": ("recallContextTurns", int),
+    "HINDSIGHT_RECALL_TAGS": ("recallTags", list),
+    "HINDSIGHT_RECALL_TAGS_MATCH": ("recallTagsMatch", str),
+    "HINDSIGHT_RECALL_TAG_GROUPS": ("recallTagGroups", dict),
+    "HINDSIGHT_RECALL_ADDITIONAL_BANK_FILTERS": ("recallAdditionalBankFilters", dict),
     "HINDSIGHT_API_PORT": ("apiPort", int),
     "HINDSIGHT_DAEMON_IDLE_TIMEOUT": ("daemonIdleTimeout", int),
     "HINDSIGHT_REQUEST_TIMEOUT_SECONDS": ("requestTimeoutSeconds", int),
@@ -95,8 +105,20 @@ def _cast_env(value: str, typ):
             return value.lower() in ("true", "1", "yes")
         if typ is int:
             return int(value)
+        if typ is list:
+            parsed = json.loads(value)
+            if isinstance(parsed, list):
+                return parsed
+            return None
+        if typ is dict:
+            parsed = json.loads(value)
+            if isinstance(parsed, (dict, list)):
+                return parsed
+            return None
         return value
     except (ValueError, AttributeError):
+        if typ is list:
+            return [part.strip() for part in value.split(",") if part.strip()]
         return None
 
 

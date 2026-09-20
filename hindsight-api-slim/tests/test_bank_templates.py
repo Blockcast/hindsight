@@ -1,10 +1,15 @@
 """Integration tests for bank template import/export endpoints."""
 
+from datetime import datetime
+from types import SimpleNamespace
+
+import httpx
 import pytest
 import pytest_asyncio
-import httpx
-from datetime import datetime
+
 from hindsight_api.api import create_app
+from hindsight_api.api.http import BankTemplateManifest, validate_bank_template
+from hindsight_api.models import RequestContext
 
 
 @pytest_asyncio.fixture
@@ -67,6 +72,29 @@ def sample_template():
 class TestImportValidation:
     """Test template manifest validation."""
 
+    def test_import_openapi_declares_manifest_request_body(self):
+        """The import operation publishes its manifest body for generated SDKs."""
+        app = create_app(SimpleNamespace(audit_logger=None), initialize_memory=False)
+        operation = app.openapi()["paths"]["/v1/default/banks/{bank_id}/import"]["post"]
+        request_body = operation["requestBody"]
+        assert request_body["required"] is True
+        assert (
+            request_body["content"]["application/json"]["schema"]["$ref"] == "#/components/schemas/BankTemplateManifest"
+        )
+
+    @pytest.mark.asyncio
+    async def test_import_malformed_json_returns_bad_request(self):
+        """Malformed JSON keeps the endpoint's established 400 response."""
+        app = create_app(SimpleNamespace(audit_logger=None), initialize_memory=False)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                "/v1/default/banks/malformed-json/import",
+                content=b'{"bank":',
+                headers={"content-type": "application/json"},
+            )
+        assert resp.status_code == 400
+
     @pytest.mark.asyncio
     async def test_import_dry_run_valid(self, api_client, bank_id, sample_template):
         """dry_run=true with a valid manifest returns what would happen."""
@@ -80,6 +108,17 @@ class TestImportValidation:
         assert data["config_applied"] is True
         assert set(data["mental_models_created"]) == {"test-model-one", "test-model-two"}
         assert set(data["directives_created"]) == {"Be concise", "Use examples"}
+
+    def test_verbatim_extraction_mode_is_valid(self):
+        """verbatim is a valid retain extraction mode in bank manifests."""
+        manifest = BankTemplateManifest.model_validate(
+            {
+                "version": "1",
+                "bank": {"retain_extraction_mode": "verbatim"},
+            }
+        )
+
+        assert validate_bank_template(manifest) == []
 
     @pytest.mark.asyncio
     async def test_import_invalid_version(self, api_client, bank_id):
@@ -481,6 +520,122 @@ class TestImportApply:
         assert data["mental_models_created"] == []
         assert "Dir Only" in data["directives_created"]
 
+    @pytest.mark.asyncio
+    async def test_import_handles_resource_created_before_write(self, api_client, memory, bank_id, monkeypatch):
+        """When a resource is created before the write phase, import updates it safely."""
+        # Create between the classification snapshot and the writes: _ensure_bank_exists
+        # runs inside the authorization context manager, after the snapshot.
+        orig_ensure_bank = memory._ensure_bank_exists
+
+        async def injected_ensure_bank(*args, **kwargs):
+            # Restore first: creating a mental model lazily ensures the bank itself.
+            monkeypatch.setattr(memory, "_ensure_bank_exists", orig_ensure_bank)
+            res = await orig_ensure_bank(*args, **kwargs)
+            await memory.create_directive(
+                bank_id=bank_id,
+                name="Concurrent Directive",
+                content="Initially created concurrently",
+                request_context=RequestContext(),
+            )
+            await memory.create_mental_model(
+                bank_id=bank_id,
+                mental_model_id="concurrent-mm",
+                name="Concurrent MM",
+                source_query="initial query",
+                content="Initial content",
+                request_context=RequestContext(),
+            )
+            return res
+
+        monkeypatch.setattr(memory, "_ensure_bank_exists", injected_ensure_bank)
+
+        resp = await api_client.post(
+            f"/v1/default/banks/{bank_id}/import",
+            json={
+                "version": "1",
+                "mental_models": [
+                    {
+                        "id": "concurrent-mm",
+                        "name": "Updated MM Name",
+                        "source_query": "updated query",
+                    }
+                ],
+                "directives": [
+                    {
+                        "name": "Concurrent Directive",
+                        "content": "Updated directive content",
+                    }
+                ],
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert "concurrent-mm" in data["mental_models_updated"]
+        assert "Concurrent Directive" in data["directives_updated"]
+        assert data["mental_models_created"] == []
+        assert data["directives_created"] == []
+
+    @pytest.mark.asyncio
+    async def test_import_handles_resource_deleted_before_write(self, api_client, memory, bank_id, monkeypatch):
+        """When an existing resource is deleted before the write phase, import creates it safely."""
+        # Pre-create the bank with resources
+        await api_client.put(f"/v1/default/banks/{bank_id}", json={})
+        d = await memory.create_directive(
+            bank_id=bank_id,
+            name="Deleted Directive",
+            content="To be deleted",
+            request_context=RequestContext(),
+        )
+        await memory.create_mental_model(
+            bank_id=bank_id,
+            mental_model_id="deleted-mm",
+            name="Deleted MM",
+            source_query="query",
+            content="content",
+            request_context=RequestContext(),
+        )
+
+        # Delete between the classification snapshot and the writes: _ensure_bank_exists
+        # runs inside the authorization context manager, after the snapshot.
+        orig_ensure_bank = memory._ensure_bank_exists
+
+        async def injected_ensure_bank(*args, **kwargs):
+            monkeypatch.setattr(memory, "_ensure_bank_exists", orig_ensure_bank)
+            res = await orig_ensure_bank(*args, **kwargs)
+            await memory.delete_directive(bank_id=bank_id, directive_id=d["id"], request_context=RequestContext())
+            await memory.delete_mental_model(
+                bank_id=bank_id, mental_model_id="deleted-mm", request_context=RequestContext()
+            )
+            return res
+
+        monkeypatch.setattr(memory, "_ensure_bank_exists", injected_ensure_bank)
+
+        resp = await api_client.post(
+            f"/v1/default/banks/{bank_id}/import",
+            json={
+                "version": "1",
+                "mental_models": [
+                    {
+                        "id": "deleted-mm",
+                        "name": "Recreated MM",
+                        "source_query": "new query",
+                    }
+                ],
+                "directives": [
+                    {
+                        "name": "Deleted Directive",
+                        "content": "Recreated directive content",
+                    }
+                ],
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert "deleted-mm" in data["mental_models_created"]
+        assert "Deleted Directive" in data["directives_created"]
+        assert data["mental_models_updated"] == []
+        assert data["directives_updated"] == []
+
 
 class TestExport:
     """Test bank template export."""
@@ -669,6 +824,82 @@ class TestDefaultBankTemplateEnvVar:
         assert dir_resp.status_code == 200
         names = [d["name"] for d in dir_resp.json()["items"]]
         assert "Default Env Directive" in names
+
+    @pytest.mark.asyncio
+    async def test_import_updates_resources_provisioned_by_default_template(
+        self,
+        api_client,
+        bank_id,
+        _patched_default_template,
+    ):
+        """Import authorization projects default-template resources on a missing bank."""
+        response = await api_client.post(
+            f"/v1/default/banks/{bank_id}/import",
+            json={
+                "version": "1",
+                "mental_models": [
+                    {
+                        "id": "default-env-model",
+                        "name": "Imported Model",
+                        "source_query": "What did the import request?",
+                    }
+                ],
+                "directives": [
+                    {
+                        "name": "Default Env Directive",
+                        "content": "Follow the imported behavior.",
+                        "priority": 9,
+                    }
+                ],
+            },
+        )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["mental_models_updated"] == ["default-env-model"]
+        assert body["mental_models_created"] == []
+        assert body["directives_updated"] == ["Default Env Directive"]
+        assert body["directives_created"] == []
+
+    @pytest.mark.asyncio
+    async def test_import_validates_config_against_projected_default_template(
+        self,
+        api_client,
+        memory,
+        bank_id,
+        monkeypatch,
+    ):
+        """A client config rejected against the projected defaults leaves no bank."""
+        from hindsight_api.config import _get_raw_config
+
+        raw = _get_raw_config()
+        monkeypatch.setattr(
+            raw,
+            "default_bank_template",
+            {
+                "version": "1",
+                "bank": {"retain_chunk_size": raw.retain_max_completion_tokens},
+            },
+        )
+
+        response = await api_client.post(
+            f"/v1/default/banks/{bank_id}/import",
+            json={
+                "version": "1",
+                "bank": {
+                    "retain_strategies": {
+                        "projected-default": {"retain_extraction_mode": "concise"},
+                    }
+                },
+            },
+        )
+
+        assert response.status_code == 400, response.text
+        profile = await memory.get_bank_profile(
+            bank_id,
+            request_context=RequestContext(),
+        )
+        assert profile is None
 
     @pytest.mark.asyncio
     async def test_default_template_overrides_env_config_defaults(

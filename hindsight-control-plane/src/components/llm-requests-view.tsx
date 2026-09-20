@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback } from "react";
 import { useTranslations } from "next-intl";
+import { resolveDateRangePreset } from "@/lib/date-range-preset";
 import { useBank } from "@/lib/bank-context";
 import { client, LLMRequestEntry, LLMRequestStatsBucket } from "@/lib/api";
 import { Button } from "@/components/ui/button";
@@ -24,6 +25,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { RefreshCw, ChevronLeft, ChevronRight } from "lucide-react";
+import { Spinner } from "@/components/ui/spinner";
 import {
   LineChart,
   Line,
@@ -471,7 +473,10 @@ export function TraceDialog({
         <div className="flex-1 min-h-0 grid grid-cols-1 md:grid-cols-[minmax(240px,5fr)_7fr] gap-4">
           <div className="overflow-y-auto md:border-r border-border md:pr-3 space-y-0.5">
             {loading ? (
-              <div className="text-sm text-muted-foreground py-4">{t("chartLoading")}</div>
+              <div className="py-4 flex flex-col items-center gap-2 text-sm text-muted-foreground">
+                <Spinner size="md" />
+                <span>{t("chartLoading")}</span>
+              </div>
             ) : (
               spans.map((s) => (
                 <SpanRow
@@ -731,8 +736,9 @@ function LLMRequestChart({ bankId }: { bankId: string }) {
       <CardContent>
         <div className="h-[140px]">
           {loading ? (
-            <div className="flex items-center justify-center h-full text-muted-foreground text-sm">
-              {t("chartLoading")}
+            <div className="flex flex-col items-center justify-center gap-2 h-full text-muted-foreground text-sm">
+              <Spinner size="md" />
+              <span>{t("chartLoading")}</span>
             </div>
           ) : chartData.length === 0 ? (
             <div className="flex items-center justify-center h-full text-muted-foreground text-sm">
@@ -769,17 +775,6 @@ export function LLMRequestsView() {
   const [selected, setSelected] = useState<LLMRequestEntry | null>(null);
   const [dialogOpen, setDialogOpen] = useState(false);
 
-  const getDateRange = useCallback((range: string): { start_date?: string; end_date?: string } => {
-    if (range === "all") return {};
-    const now = new Date();
-    const start = new Date();
-    if (range === "1h") start.setHours(now.getHours() - 1);
-    else if (range === "1d") start.setDate(now.getDate() - 1);
-    else if (range === "7d") start.setDate(now.getDate() - 7);
-    else if (range === "30d") start.setDate(now.getDate() - 30);
-    return { start_date: start.toISOString() };
-  }, []);
-
   const loadRequests = useCallback(
     async (
       newStatusFilter: string | null = statusFilter,
@@ -792,7 +787,7 @@ export function LLMRequestsView() {
 
       setLoading(true);
       try {
-        const dates = getDateRange(newDateRange);
+        const dates = resolveDateRangePreset(newDateRange);
         const data = await client.listLLMRequests(currentBank, {
           status: newStatusFilter || undefined,
           operation: newOperationFilter || undefined,
@@ -810,7 +805,7 @@ export function LLMRequestsView() {
         setLoading(false);
       }
     },
-    [currentBank, statusFilter, operationFilter, dateRange, offset, grouped, limit, getDateRange]
+    [currentBank, statusFilter, operationFilter, dateRange, offset, grouped, limit]
   );
 
   const handleGroupToggle = () => {

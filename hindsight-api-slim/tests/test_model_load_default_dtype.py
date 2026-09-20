@@ -19,6 +19,10 @@ asserts initialize() leaves it at float32.
 
 import pytest
 
+# The dtype poisoning this covers is torch's, so there is nothing to assert without
+# it, and torch only arrives with the optional local-ml extra.
+pytest.importorskip("torch", reason="covers torch's global default dtype; needs the local-ml extra")
+
 from hindsight_api import MemoryEngine
 from hindsight_api.engine.task_backend import SyncTaskBackend
 
@@ -70,7 +74,6 @@ async def test_global_default_dtype_restored_to_float32_after_init():
             query_analyzer=_NoopQueryAnalyzer(),
             run_migrations=False,
             skip_llm_verification=True,
-            lazy_reranker=False,  # load the cross-encoder eagerly, in the gather
             task_backend=SyncTaskBackend(),
         )
 

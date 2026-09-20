@@ -150,6 +150,7 @@ async def test_graph_q_and_tags_filter_combined(api_client, test_bank_id):
 
 
 @pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
 async def test_graph_document_filter_includes_observations_via_source_memories(
     memory, api_client, test_bank_id, request_context
 ):
@@ -164,7 +165,7 @@ async def test_graph_document_filter_includes_observations_via_source_memories(
     bank_id = test_bank_id
     document_id = f"doc-{uuid.uuid4().hex[:8]}"
 
-    await memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+    await memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
 
     fact_id = uuid.uuid4()
     observation_id = uuid.uuid4()
@@ -273,7 +274,7 @@ async def test_graph_q_filter_empty_results(api_client, test_bank_id):
 
 async def _seed_scoped_observations(memory, bank_id, request_context):
     """Seed observations under scopes [a], [b], [a,b] (x2) and the global scope."""
-    await memory.get_bank_profile(bank_id=bank_id, request_context=request_context)
+    await memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
     rows = [
         (uuid.uuid4(), "obs scope a", ["a"]),
         (uuid.uuid4(), "obs scope b", ["b"]),
@@ -297,6 +298,7 @@ async def _seed_scoped_observations(memory, bank_id, request_context):
 
 
 @pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
 async def test_observation_scopes_enumeration(memory, api_client, test_bank_id, request_context):
     """The scopes endpoint enumerates distinct tag sets (order-normalized) with counts."""
     await _seed_scoped_observations(memory, test_bank_id, request_context)
@@ -313,6 +315,48 @@ async def test_observation_scopes_enumeration(memory, api_client, test_bank_id, 
 
 
 @pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
+async def test_observation_scopes_pagination(memory, api_client, test_bank_id, request_context):
+    """The scopes endpoint pages: each page is capped, total counts every scope."""
+    await _seed_scoped_observations(memory, test_bank_id, request_context)
+
+    first = await api_client.get(
+        f"/v1/default/banks/{test_bank_id}/observations/scopes",
+        params={"limit": 2, "offset": 0},
+    )
+    assert first.status_code == 200
+    first_data = first.json()
+    assert first_data["total"] == 4
+    assert first_data["limit"] == 2
+    assert first_data["offset"] == 0
+    assert len(first_data["scopes"]) == 2
+
+    second = await api_client.get(
+        f"/v1/default/banks/{test_bank_id}/observations/scopes",
+        params={"limit": 2, "offset": 2},
+    )
+    assert second.status_code == 200
+    second_data = second.json()
+    assert second_data["total"] == 4
+    assert second_data["offset"] == 2
+    assert len(second_data["scopes"]) == 2
+
+    # The two pages are disjoint and together enumerate every scope, in one stable order.
+    paged = [tuple(scope["tags"]) for scope in first_data["scopes"] + second_data["scopes"]]
+    assert len(set(paged)) == 4
+
+    # Past the end: no scopes, but total still reports the whole histogram.
+    beyond = await api_client.get(
+        f"/v1/default/banks/{test_bank_id}/observations/scopes",
+        params={"limit": 2, "offset": 10},
+    )
+    assert beyond.status_code == 200
+    assert beyond.json()["scopes"] == []
+    assert beyond.json()["total"] == 4
+
+
+@pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
 async def test_graph_exact_scope_filter(memory, api_client, test_bank_id, request_context):
     """tags_match=exact filters observations to exactly one scope, not supersets."""
     await _seed_scoped_observations(memory, test_bank_id, request_context)
@@ -337,6 +381,7 @@ async def test_graph_exact_scope_filter(memory, api_client, test_bank_id, reques
 
 
 @pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
 async def test_graph_exact_global_scope_filter(memory, api_client, test_bank_id, request_context):
     """tags_match=exact with no tags is the global scope: untagged observations only."""
     await _seed_scoped_observations(memory, test_bank_id, request_context)

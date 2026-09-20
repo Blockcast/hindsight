@@ -27,6 +27,10 @@ def setup_test_env():
         "HINDSIGHT_API_LLM_BEDROCK_SERVICE_TIER",
         "HINDSIGHT_API_LLM_GEMINI_SERVICE_TIER",
         "HINDSIGHT_API_SEMANTIC_MIN_SIMILARITY",
+        "HINDSIGHT_API_GRAPH_SEED_MIN_SIMILARITY",
+        "HINDSIGHT_API_TEMPORAL_SEMANTIC_MIN_SIMILARITY",
+        "HINDSIGHT_API_SEMANTIC_LINK_MIN_SIMILARITY",
+        "HINDSIGHT_API_CONSOLIDATION_DEDUP_THRESHOLD",
         "HINDSIGHT_API_DATABASE_URL",
         "HINDSIGHT_API_MIGRATION_DATABASE_URL",
     ]
@@ -122,6 +126,107 @@ def test_retain_structured_chunk_size_reads_from_env():
     assert config.retain_structured_chunk_size == 9000
 
 
+def test_fail_on_extraction_errors_defaults_to_false(monkeypatch):
+    """Silent-success behavior is preserved by default (issue #2700)."""
+    from hindsight_api.config import ENV_FAIL_ON_EXTRACTION_ERRORS, HindsightConfig
+
+    monkeypatch.delenv(ENV_FAIL_ON_EXTRACTION_ERRORS, raising=False)
+    monkeypatch.setenv("HINDSIGHT_API_LLM_PROVIDER", "mock")
+
+    config = HindsightConfig.from_env()
+
+    assert config.fail_on_extraction_errors is False
+
+
+def test_fail_on_extraction_errors_reads_true_from_env(monkeypatch):
+    """The opt-in escape hatch parses truthy values from the environment."""
+    from hindsight_api.config import ENV_FAIL_ON_EXTRACTION_ERRORS, HindsightConfig
+
+    monkeypatch.setenv(ENV_FAIL_ON_EXTRACTION_ERRORS, "true")
+    monkeypatch.setenv("HINDSIGHT_API_LLM_PROVIDER", "mock")
+
+    config = HindsightConfig.from_env()
+
+    assert config.fail_on_extraction_errors is True
+
+
+def test_entity_intrabatch_merge_similarity_defaults_to_half(monkeypatch):
+    """In-batch entity dedup merge cutoff defaults to 0.5 (issue #3107)."""
+    from hindsight_api.config import ENV_ENTITY_INTRABATCH_MERGE_SIMILARITY, HindsightConfig
+
+    monkeypatch.delenv(ENV_ENTITY_INTRABATCH_MERGE_SIMILARITY, raising=False)
+    monkeypatch.setenv("HINDSIGHT_API_LLM_PROVIDER", "mock")
+
+    assert HindsightConfig.from_env().entity_intrabatch_merge_similarity == 0.5
+
+
+def test_entity_intrabatch_merge_similarity_reads_from_env(monkeypatch):
+    from hindsight_api.config import ENV_ENTITY_INTRABATCH_MERGE_SIMILARITY, HindsightConfig
+
+    monkeypatch.setenv(ENV_ENTITY_INTRABATCH_MERGE_SIMILARITY, "0.8")
+    monkeypatch.setenv("HINDSIGHT_API_LLM_PROVIDER", "mock")
+
+    assert HindsightConfig.from_env().entity_intrabatch_merge_similarity == 0.8
+
+
+def test_entity_intrabatch_merge_similarity_rejects_out_of_range(monkeypatch):
+    """Must be in (0, 1] — a merge cutoff, same guard as the recall threshold."""
+    from hindsight_api.config import ENV_ENTITY_INTRABATCH_MERGE_SIMILARITY, HindsightConfig
+
+    monkeypatch.setenv("HINDSIGHT_API_LLM_PROVIDER", "mock")
+    for bad in ("0", "1.5", "-0.1"):
+        monkeypatch.setenv(ENV_ENTITY_INTRABATCH_MERGE_SIMILARITY, bad)
+        with pytest.raises(ValueError, match="entity_intrabatch_merge_similarity"):
+            HindsightConfig.from_env()
+
+
+def test_llm_ollama_num_ctx_defaults_to_none(monkeypatch):
+    """Unset Ollama num_ctx override lets Ollama use its model/server default."""
+    from hindsight_api.config import ENV_LLM_OLLAMA_NUM_CTX, HindsightConfig
+
+    monkeypatch.delenv(ENV_LLM_OLLAMA_NUM_CTX, raising=False)
+    monkeypatch.setenv("HINDSIGHT_API_LLM_PROVIDER", "mock")
+
+    config = HindsightConfig.from_env()
+
+    assert config.llm_ollama_num_ctx is None
+
+
+def test_llm_ollama_num_ctx_keeps_direct_construction_default():
+    """Direct HindsightConfig construction should not require the new field."""
+    from dataclasses import fields
+
+    from hindsight_api.config import HindsightConfig
+
+    config_field = next(item for item in fields(HindsightConfig) if item.name == "llm_ollama_num_ctx")
+
+    assert config_field.default is None
+    assert config_field.kw_only
+
+
+def test_llm_ollama_num_ctx_reads_positive_int(monkeypatch):
+    """The native Ollama context override is parsed as a positive integer."""
+    from hindsight_api.config import ENV_LLM_OLLAMA_NUM_CTX, HindsightConfig
+
+    monkeypatch.setenv(ENV_LLM_OLLAMA_NUM_CTX, "65536")
+    monkeypatch.setenv("HINDSIGHT_API_LLM_PROVIDER", "mock")
+
+    config = HindsightConfig.from_env()
+
+    assert config.llm_ollama_num_ctx == 65536
+
+
+def test_llm_ollama_num_ctx_rejects_non_positive_values(monkeypatch):
+    """Zero would be accepted by neither Ollama nor downstream range logic."""
+    from hindsight_api.config import ENV_LLM_OLLAMA_NUM_CTX, HindsightConfig
+
+    monkeypatch.setenv(ENV_LLM_OLLAMA_NUM_CTX, "0")
+    monkeypatch.setenv("HINDSIGHT_API_LLM_PROVIDER", "mock")
+
+    with pytest.raises(ValueError, match=ENV_LLM_OLLAMA_NUM_CTX):
+        HindsightConfig.from_env()
+
+
 def test_retain_structured_chunk_size_can_be_less_than_chunk_size():
     """Structured-chunk cap can be smaller than the retain chunk target."""
     from hindsight_api.config import HindsightConfig
@@ -156,23 +261,74 @@ def test_retain_strategy_structured_chunk_size_validation():
     assert resolved.retain_structured_chunk_size == 2000
 
 
-def test_semantic_min_similarity_reads_from_env():
-    """Semantic retrieval min similarity can be configured at the server level."""
-    from hindsight_api.config import HindsightConfig
+def test_embedding_similarity_threshold_defaults_are_backward_compatible(monkeypatch):
+    """Unset threshold settings preserve the five existing operating points."""
+    from hindsight_api.config import (
+        ENV_CONSOLIDATION_DEDUP_THRESHOLD,
+        ENV_GRAPH_SEED_MIN_SIMILARITY,
+        ENV_SEMANTIC_LINK_MIN_SIMILARITY,
+        ENV_SEMANTIC_MIN_SIMILARITY,
+        ENV_TEMPORAL_SEMANTIC_MIN_SIMILARITY,
+        HindsightConfig,
+    )
 
-    os.environ["HINDSIGHT_API_SEMANTIC_MIN_SIMILARITY"] = "0.58"
+    for env_name in (
+        ENV_SEMANTIC_MIN_SIMILARITY,
+        ENV_GRAPH_SEED_MIN_SIMILARITY,
+        ENV_TEMPORAL_SEMANTIC_MIN_SIMILARITY,
+        ENV_SEMANTIC_LINK_MIN_SIMILARITY,
+        ENV_CONSOLIDATION_DEDUP_THRESHOLD,
+    ):
+        monkeypatch.delenv(env_name, raising=False)
 
     config = HindsightConfig.from_env()
-    assert config.semantic_min_similarity == 0.58
+
+    assert config.semantic_min_similarity == 0.3
+    assert config.graph_seed_min_similarity == 0.3
+    assert config.temporal_semantic_min_similarity == 0.1
+    assert config.semantic_link_min_similarity == 0.7
+    assert config.consolidation_dedup_threshold == 0.97
 
 
-def test_semantic_min_similarity_must_be_between_zero_and_one():
-    """Invalid semantic min similarity fails fast during configuration loading."""
+@pytest.mark.parametrize(
+    ("env_name", "field_name", "value"),
+    [
+        ("HINDSIGHT_API_SEMANTIC_MIN_SIMILARITY", "semantic_min_similarity", 0.58),
+        ("HINDSIGHT_API_GRAPH_SEED_MIN_SIMILARITY", "graph_seed_min_similarity", 0.41),
+        ("HINDSIGHT_API_TEMPORAL_SEMANTIC_MIN_SIMILARITY", "temporal_semantic_min_similarity", 0.22),
+        ("HINDSIGHT_API_SEMANTIC_LINK_MIN_SIMILARITY", "semantic_link_min_similarity", 0.81),
+    ],
+)
+def test_embedding_similarity_thresholds_read_from_env(env_name: str, field_name: str, value: float):
+    """Each configurable similarity gate has an independent environment setting."""
     from hindsight_api.config import HindsightConfig
 
-    os.environ["HINDSIGHT_API_SEMANTIC_MIN_SIMILARITY"] = "1.5"
+    os.environ[env_name] = str(value)
 
-    with pytest.raises(ValueError, match="semantic_min_similarity"):
+    config = HindsightConfig.from_env()
+
+    assert getattr(config, field_name) == value
+
+
+@pytest.mark.parametrize(
+    ("env_name", "field_name"),
+    [
+        ("HINDSIGHT_API_SEMANTIC_MIN_SIMILARITY", "semantic_min_similarity"),
+        ("HINDSIGHT_API_GRAPH_SEED_MIN_SIMILARITY", "graph_seed_min_similarity"),
+        ("HINDSIGHT_API_TEMPORAL_SEMANTIC_MIN_SIMILARITY", "temporal_semantic_min_similarity"),
+        ("HINDSIGHT_API_SEMANTIC_LINK_MIN_SIMILARITY", "semantic_link_min_similarity"),
+    ],
+)
+@pytest.mark.parametrize("invalid_value", ["-0.01", "1.01"])
+def test_embedding_similarity_thresholds_must_be_between_zero_and_one(
+    env_name: str, field_name: str, invalid_value: str
+):
+    """All embedding-dependent gates fail fast outside the supported range."""
+    from hindsight_api.config import HindsightConfig
+
+    os.environ[env_name] = invalid_value
+
+    with pytest.raises(ValueError, match=field_name):
         HindsightConfig.from_env()
 
 
@@ -422,6 +578,46 @@ def test_pg_search_bm25_columns_apply_tokenizer():
     assert pg_search_bm25_columns("id", ("text",), "edge_ngram(2, 5)") == "id, (text::pdb.edge_ngram(2,5))"
 
 
+def test_pg_search_function_schema_defaults_to_paradedb(monkeypatch):
+    from hindsight_api.config import HindsightConfig
+
+    monkeypatch.delenv("HINDSIGHT_API_TEXT_SEARCH_EXTENSION_PG_SEARCH_FUNCTION_SCHEMA", raising=False)
+    monkeypatch.setenv("HINDSIGHT_API_LLM_PROVIDER", "mock")
+
+    config = HindsightConfig.from_env()
+    assert config.text_search_extension_pg_search_function_schema == "paradedb"
+
+    # Empty string or whitespace also falls back to paradedb
+    monkeypatch.setenv("HINDSIGHT_API_TEXT_SEARCH_EXTENSION_PG_SEARCH_FUNCTION_SCHEMA", "")
+    config = HindsightConfig.from_env()
+    assert config.text_search_extension_pg_search_function_schema == "paradedb"
+
+    monkeypatch.setenv("HINDSIGHT_API_TEXT_SEARCH_EXTENSION_PG_SEARCH_FUNCTION_SCHEMA", "   ")
+    config = HindsightConfig.from_env()
+    assert config.text_search_extension_pg_search_function_schema == "paradedb"
+
+
+def test_pg_search_function_schema_loaded_from_env(monkeypatch):
+    from hindsight_api.config import HindsightConfig
+
+    monkeypatch.setenv("HINDSIGHT_API_TEXT_SEARCH_EXTENSION_PG_SEARCH_FUNCTION_SCHEMA", "PgSearch")
+    monkeypatch.setenv("HINDSIGHT_API_LLM_PROVIDER", "mock")
+
+    config = HindsightConfig.from_env()
+    assert config.text_search_extension_pg_search_function_schema == "pgsearch"
+
+
+@pytest.mark.parametrize("bad_schema", ["pgsearch;DROP TABLE", "123schema", "pg-search", "pg search"])
+def test_pg_search_function_schema_rejects_invalid_identifiers(monkeypatch, bad_schema):
+    from hindsight_api.config import HindsightConfig
+
+    monkeypatch.setenv("HINDSIGHT_API_TEXT_SEARCH_EXTENSION_PG_SEARCH_FUNCTION_SCHEMA", bad_schema)
+    monkeypatch.setenv("HINDSIGHT_API_LLM_PROVIDER", "mock")
+
+    with pytest.raises(ValueError, match="Invalid text_search_extension_pg_search_function_schema"):
+        HindsightConfig.from_env()
+
+
 def test_llm_output_language_defaults_to_none(monkeypatch):
     from hindsight_api.config import HindsightConfig
 
@@ -477,6 +673,7 @@ def test_markitdown_ocr_does_not_fall_back_to_main_llm_config(monkeypatch):
     assert config.file_parser_markitdown_ocr_base_url is None
     assert config.file_parser_markitdown_ocr_model is None
     assert config.file_parser_markitdown_ocr_prompt == DEFAULT_FILE_PARSER_MARKITDOWN_OCR_PROMPT
+    assert config.file_parser_markitdown_ocr_default_headers is None
 
 
 def test_markitdown_ocr_uses_explicit_config(monkeypatch):
@@ -487,6 +684,10 @@ def test_markitdown_ocr_uses_explicit_config(monkeypatch):
     monkeypatch.setenv("HINDSIGHT_API_FILE_PARSER_MARKITDOWN_OCR_BASE_URL", "https://parser.example/v1")
     monkeypatch.setenv("HINDSIGHT_API_FILE_PARSER_MARKITDOWN_OCR_MODEL", "parser-vision-model")
     monkeypatch.setenv("HINDSIGHT_API_FILE_PARSER_MARKITDOWN_OCR_PROMPT", "Extract this document exactly.")
+    monkeypatch.setenv(
+        "HINDSIGHT_API_FILE_PARSER_MARKITDOWN_OCR_DEFAULT_HEADERS",
+        '{"X-Component-Id":"hindsight-ocr"}',
+    )
     monkeypatch.setenv("HINDSIGHT_API_LLM_PROVIDER", "mock")
     monkeypatch.setenv("HINDSIGHT_API_LLM_API_KEY", "main-key")
     monkeypatch.setenv("HINDSIGHT_API_LLM_BASE_URL", "https://main.example/v1")
@@ -498,16 +699,27 @@ def test_markitdown_ocr_uses_explicit_config(monkeypatch):
     assert config.file_parser_markitdown_ocr_base_url == "https://parser.example/v1"
     assert config.file_parser_markitdown_ocr_model == "parser-vision-model"
     assert config.file_parser_markitdown_ocr_prompt == "Extract this document exactly."
+    assert config.file_parser_markitdown_ocr_default_headers == {"X-Component-Id": "hindsight-ocr"}
 
 
-def test_llm_reasoning_effort_defaults_to_low(monkeypatch):
+def test_llm_reasoning_effort_unset_stays_none(monkeypatch):
+    """Unset must stay None all the way down: no provider sends a level nobody set.
+
+    Baking "low" in here made every HINDSIGHT_API_*_REASONING_EFFORT variable
+    indistinguishable from the default one layer down, so a configured value could be
+    silently discarded (issue #3449) while an unconfigured one was still transmitted.
+    """
     from hindsight_api.config import HindsightConfig
+    from hindsight_api.engine.providers.mock_llm import MockLLM
 
     monkeypatch.delenv("HINDSIGHT_API_LLM_REASONING_EFFORT", raising=False)
     monkeypatch.setenv("HINDSIGHT_API_LLM_PROVIDER", "mock")
 
     config = HindsightConfig.from_env()
-    assert config.llm_reasoning_effort == "low"
+    assert config.llm_reasoning_effort is None
+
+    llm = MockLLM(provider="mock", api_key="", base_url="", model="mock", reasoning_effort=None)
+    assert llm.reasoning_effort is None
 
 
 def test_llm_reasoning_effort_loaded_from_env(monkeypatch):
@@ -706,3 +918,102 @@ def test_gemini_service_tier_empty_env_is_unset(monkeypatch):
 
     config = HindsightConfig.from_env()
     assert config.llm_gemini_service_tier is None
+
+
+def test_operation_retention_defaults(monkeypatch):
+    from hindsight_api.config import (
+        ENV_OPERATION_CLEANUP_BATCH_SIZE,
+        ENV_OPERATION_RETENTION_DAYS,
+        HindsightConfig,
+    )
+
+    monkeypatch.delenv(ENV_OPERATION_RETENTION_DAYS, raising=False)
+    monkeypatch.delenv(ENV_OPERATION_CLEANUP_BATCH_SIZE, raising=False)
+    monkeypatch.setenv("HINDSIGHT_API_LLM_PROVIDER", "mock")
+
+    config = HindsightConfig.from_env()
+
+    assert config.operation_retention_days == 0
+    assert config.operation_cleanup_batch_size == 1000
+    assert "operation_retention_days" in HindsightConfig.get_static_fields()
+    assert "operation_cleanup_batch_size" in HindsightConfig.get_static_fields()
+
+
+def test_operation_retention_env_overrides(monkeypatch):
+    from hindsight_api.config import (
+        ENV_OPERATION_CLEANUP_BATCH_SIZE,
+        ENV_OPERATION_RETENTION_DAYS,
+        HindsightConfig,
+    )
+
+    monkeypatch.setenv(ENV_OPERATION_RETENTION_DAYS, "0")
+    monkeypatch.setenv(ENV_OPERATION_CLEANUP_BATCH_SIZE, "37")
+    monkeypatch.setenv("HINDSIGHT_API_LLM_PROVIDER", "mock")
+
+    config = HindsightConfig.from_env()
+
+    assert config.operation_retention_days == 0
+    assert config.operation_cleanup_batch_size == 37
+
+
+@pytest.mark.parametrize("raw", ["-1", "not-an-int"])
+def test_operation_retention_rejects_invalid_values(monkeypatch, raw):
+    from hindsight_api.config import ENV_OPERATION_RETENTION_DAYS, HindsightConfig
+
+    monkeypatch.setenv(ENV_OPERATION_RETENTION_DAYS, raw)
+    monkeypatch.setenv("HINDSIGHT_API_LLM_PROVIDER", "mock")
+
+    with pytest.raises(ValueError, match=ENV_OPERATION_RETENTION_DAYS):
+        HindsightConfig.from_env()
+
+
+@pytest.mark.parametrize("raw", ["0", "-1", "not-an-int"])
+def test_operation_cleanup_batch_size_requires_positive_integer(monkeypatch, raw):
+    from hindsight_api.config import ENV_OPERATION_CLEANUP_BATCH_SIZE, HindsightConfig
+
+    monkeypatch.setenv(ENV_OPERATION_CLEANUP_BATCH_SIZE, raw)
+    monkeypatch.setenv("HINDSIGHT_API_LLM_PROVIDER", "mock")
+
+    with pytest.raises(ValueError, match=ENV_OPERATION_CLEANUP_BATCH_SIZE):
+        HindsightConfig.from_env()
+
+
+# --- Worker per-type slot reservations: RESERVED_SLOTS (floor) + deprecated _MAX_SLOTS alias ---
+
+
+def test_worker_reserved_slots_parse(monkeypatch):
+    """RESERVED_SLOTS sets the reservation floor for an operation type."""
+    from hindsight_api.config import HindsightConfig
+
+    monkeypatch.setenv("HINDSIGHT_API_LLM_PROVIDER", "mock")
+    monkeypatch.setenv("HINDSIGHT_API_WORKER_RETAIN_RESERVED_SLOTS", "2")
+
+    config = HindsightConfig.from_env()
+
+    assert config.worker_slot_reservations["retain"] == 2
+
+
+def test_worker_legacy_max_slots_is_deprecated_alias_for_reserved(monkeypatch, caplog):
+    """The legacy _MAX_SLOTS env var maps to the reservation floor and warns."""
+    from hindsight_api.config import HindsightConfig
+
+    monkeypatch.setenv("HINDSIGHT_API_LLM_PROVIDER", "mock")
+    monkeypatch.setenv("HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS", "3")
+
+    with caplog.at_level(logging.WARNING):
+        config = HindsightConfig.from_env()
+
+    assert config.worker_slot_reservations["consolidation"] == 3
+    assert any("HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS" in r.message for r in caplog.records)
+
+
+def test_worker_reserved_and_legacy_both_set_is_rejected(monkeypatch):
+    """Setting both RESERVED_SLOTS and the deprecated _MAX_SLOTS alias is ambiguous."""
+    from hindsight_api.config import HindsightConfig
+
+    monkeypatch.setenv("HINDSIGHT_API_LLM_PROVIDER", "mock")
+    monkeypatch.setenv("HINDSIGHT_API_WORKER_RETAIN_RESERVED_SLOTS", "2")
+    monkeypatch.setenv("HINDSIGHT_API_WORKER_RETAIN_MAX_SLOTS", "2")
+
+    with pytest.raises(ValueError, match="RESERVED_SLOTS"):
+        HindsightConfig.from_env()

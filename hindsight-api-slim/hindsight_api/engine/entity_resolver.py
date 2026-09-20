@@ -6,13 +6,17 @@ to disambiguate entities across memory units.
 """
 
 import asyncio
+import heapq
 import json
 import logging
+import math
+import re
 from collections import defaultdict
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from difflib import SequenceMatcher
-from typing import Any, Final
+from typing import Any, Final, cast
 
 from .db_utils import acquire_with_retry
 from .memory_engine import fq_table
@@ -25,6 +29,7 @@ from .retain.entity_labels import (
 from .retain.entity_labels import (
     parse_entity_labels as _parse_entity_labels,
 )
+from .retain.types import ResolvedEntity
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +41,316 @@ class _EntityToCreate:
     idx: int
     name: str
     event_date: datetime | None
+    # Label entities (from entity_labels config) are never fuzzy-merged in-batch — their
+    # canonical names are user-defined (e.g. "use:use-001") and must stay distinct (GH-1558).
+    # Also stored on the row as entities.entity_kind so label rows stay out of the
+    # partial trigram index (#3208).
+    is_label: bool = False
+    # False when the caller wrote this name literally: it is created as spelled and never
+    # merged with a same-batch near-duplicate (#3479).
+    resolve: bool = True
+
+
+@dataclass
+class _SimilarNamePair:
+    """A pair of in-batch new-entity names judged similar enough to be the same entity."""
+
+    name_a: str
+    name_b: str
+
+
+# The in-batch dedup pass is O(N^2) over the batch's *new* names. It is sub-millisecond for a
+# normal retain (a handful of new entities) but scales quadratically — measured on the retain hot
+# path: ~0.8ms at 100 names, ~5ms at 250, ~22ms at 500, ~81ms at 1000. So skip it past this many
+# unique new names and log rather than silently degrade; the cap sits well above any realistic
+# single-retain new-entity count while bounding the tail.
+_INTRABATCH_MAX_NAMES = 250
+
+# Trigram similarity at which two names are the same words in some order, differing only in case,
+# punctuation or decoration — pg_trgm builds its trigrams per word, so identical sets means the
+# separators are all that differ. Name evidence that strong stands on its own.
+_IDENTICAL_TRIGRAMS: Final[float] = 1.0
+
+# A pg_trgm "word" is a maximal run of alphanumerics (Unicode letters/digits, underscore excluded);
+# everything else (space, punctuation, emoji) is a separator. This is why decoration variants like
+# "Wren <emoji>" collapse to the same trigram set.
+_TRGM_WORD = re.compile(r"[^\W_]+", re.UNICODE)
+
+
+def _trigram_set(text: str) -> set[str]:
+    """Trigrams of ``text`` the way PostgreSQL pg_trgm generates them: lowercase, split into words,
+    pad each word with two leading + one trailing blank, and take every 3-char window."""
+    trigrams: set[str] = set()
+    for word in _TRGM_WORD.findall(text.lower()):
+        padded = f"  {word} "
+        for i in range(len(padded) - 2):
+            trigrams.add(padded[i : i + 3])
+    return trigrams
+
+
+def _trigram_set_similarity(ta: set[str], tb: set[str]) -> float:
+    """Jaccard index of two already-computed trigram sets.
+
+    Split out from ``trigram_similarity`` so callers that compare one name against many
+    (the candidate scoring loop, the O(N^2) in-batch pass) build each set once instead of
+    once per comparison — the loop runs up to ``entity_resolution_max_candidates`` times per
+    mention on the retain hot path (GH-3211).
+    """
+    intersection = len(ta & tb)
+    union = len(ta) + len(tb) - intersection
+    return intersection / union if union else 0.0
+
+
+def trigram_similarity(a: str, b: str) -> float:
+    """pg_trgm ``similarity(a, b)`` computed in-memory — the Jaccard index of the trigram sets.
+
+    Public because two subsystems share it: entity resolution here, and fuzzy tag matching in
+    ``search.tag_resolution``. One notion of "similar name" for both, so a change to it is a
+    deliberate change to both — see ``tests/test_entity_intrabatch_clustering.py``, which pins
+    the values against Postgres.
+
+    Verified byte-for-byte against Postgres pg_trgm across emoji / accent / CJK / hyphen /
+    apostrophe cases (issue #3107), so the merge cutoff calibrated on pg_trgm transfers exactly.
+    Doing it in Python keeps the in-batch dedup off the retain transaction's DB connection and makes
+    it backend-agnostic (Postgres, Oracle, and the pg_trgm-absent "full" fallback all behave alike).
+    """
+    return _trigram_set_similarity(_trigram_set(a), _trigram_set(b))
+
+
+# Sequence ratio at/above which two *words* count as the same word. Calibrated on the pair this
+# exists to reject — "John Smith" vs "Jane Smith", where john/jane is 0.50 — against the legitimate
+# word-level differences below it: são/sao 0.67, waler/wall 0.67, arbor/arbour 0.91. Abbreviations
+# (corp/corporation, 0.53) are admitted by the prefix rule instead, not by lowering this.
+_MIN_TOKEN_SIMILARITY: Final[float] = 0.6
+
+
+def _tokens_match(a: str, b: str) -> bool:
+    """Whether two words are plausibly the same word — equal, an abbreviation of, or a near-miss."""
+    return a == b or a.startswith(b) or b.startswith(a) or SequenceMatcher(None, a, b).ratio() >= _MIN_TOKEN_SIMILARITY
+
+
+def _tokens_are_compatible(a: str, b: str) -> bool:
+    """Whether two multi-word names agree word by word.
+
+    Whole-name similarity lets one long shared word drown out a completely different short one:
+    "John Smith" and "Jane Smith" are 0.47 by trigram and 0.80 by sequence ratio, so two people who
+    share a surname and a workplace scored as one entity. Every word of the shorter name has to find
+    a counterpart in the longer one — the same floor the whole name already faces, applied where the
+    evidence actually is.
+
+    Single-word names are exempt, and deliberately: with one token the whole-name check *is* the
+    token check, and imposing this on top would reject real variants that have no long shared word
+    to hide behind ("Nick"/"Nicolas" is 0.55).
+    """
+    ta, tb = _TRGM_WORD.findall(a.lower()), _TRGM_WORD.findall(b.lower())
+    if len(ta) < 2 and len(tb) < 2:
+        return True
+    short, rest = (ta, tb) if len(ta) <= len(tb) else (tb, ta)
+    return all(any(_tokens_match(word, other) for other in rest) for word in short)
+
+
+@dataclass
+class _CooccurrenceIndex:
+    """Co-occurrence facts the scoring pass needs, built once per resolution batch."""
+
+    # entity_id -> lowercased names of the entities it co-occurs with (named ones only).
+    by_entity: dict[str, set[str]] = field(default_factory=dict)
+    # lowercased entity name -> how many distinct entities it co-occurs with.
+    degree_by_name: dict[str, int] = field(default_factory=dict)
+
+
+def _build_cooccurrence_index(rows: list[Any], id_to_name: dict[str, str]) -> _CooccurrenceIndex:
+    """Index co-occurrence rows by entity, and count each named entity's degree.
+
+    ``rows`` must cover the full neighbourhood of every id in ``id_to_name`` for the degrees
+    to be exact — every caller fetches with ``entity_id_1 = ANY(...) OR entity_id_2 = ANY(...)``
+    over exactly those ids (or over the whole bank), so they are. Degree is counted over *all*
+    partners, including ones outside ``id_to_name``: it measures how indiscriminate an entity
+    is, which is the whole point of the weighting in ``_cooccurrence_weight``.
+    """
+    index = _CooccurrenceIndex()
+    neighbours: dict[str, set[str]] = defaultdict(set)
+    for row in rows:
+        eid1, eid2 = row["entity_id_1"], row["entity_id_2"]
+        neighbours[eid1].add(eid2)
+        neighbours[eid2].add(eid1)
+        index.by_entity.setdefault(eid1, set())
+        index.by_entity.setdefault(eid2, set())
+        if eid2 in id_to_name:
+            index.by_entity[eid1].add(id_to_name[eid2])
+        if eid1 in id_to_name:
+            index.by_entity[eid2].add(id_to_name[eid1])
+    for entity_id, name in id_to_name.items():
+        # Same name from two ids can only happen mid-merge; keep the larger degree.
+        index.degree_by_name[name] = max(index.degree_by_name.get(name, 0), len(neighbours[entity_id]))
+    return index
+
+
+def _cooccurrence_weight(degree: int) -> float:
+    """How much one shared co-occurrence partner is worth, damped by how common it is.
+
+    "This name turns up next to the same entities as the candidate" is only evidence when
+    those entities are selective. A hub like ``user`` co-occurs with nearly everything in a
+    mature bank, so an unweighted overlap handed it the same vote as a rare partner — enough,
+    on its own, to merge a new person's facts onto an unrelated entity (#3751). Inverse square
+    root: a partner seen with one other entity keeps its full vote, one seen with 100 is worth
+    0.1, one seen with 1500 is worth 0.026.
+    """
+    return 1.0 / math.sqrt(max(degree, 1))
+
+
+@dataclass(frozen=True, slots=True)
+class _PrefixIndexed:
+    """One name's trigram set, prepared for the prefix-filtering join.
+
+    ``prefix`` is the leading slice of the trigrams sorted rarest-first — the only tokens the
+    join indexes or probes on. ``input_index`` is the name's position in the caller's list, kept
+    so emitted pairs read in input order however the join happened to reach them.
+    """
+
+    size: int
+    prefix: list[str]
+    trigrams: set[str]
+    name: str
+    input_index: int
+
+
+def _find_intrabatch_similar_pairs(names: list[str], threshold: float) -> list[_SimilarNamePair]:
+    """Every pair of ``names`` whose in-memory trigram similarity meets ``threshold``.
+
+    Exactly the pairs the old O(N^2) double loop found — same Jaccard, same cutoff — reached by a
+    prefix-filtering set-similarity join rather than by comparing every pair. Sort each name's
+    trigrams rarest-first and index only the leading ``|A| - ceil(threshold * |A|) + 1`` of them:
+    two sets sharing none of those tokens cannot overlap enough to clear ``threshold``, so only
+    the pairs that survive the probe are verified. Each name's prefix is cut from its own size,
+    which is what makes the pruning lossless: a qualifying pair needs an overlap of at least
+    ``ceil(threshold * max(|A|, |B|))``, and the shorter set's prefix — cut for its own smaller
+    size — is longer than that bound demands, so the pair cannot slip past both prefixes.
+
+    On a batch of distinct names at the default 0.5 cutoff that verifies ~5% of the pairs: 3.9x
+    faster than the double loop at the ``_INTRABATCH_MAX_NAMES`` cap of 250, 8x at 1000 — see
+    ``benchmarks/micro/entity_resolver_bench.py``. Measured against the shape retain actually
+    produces (9,525 per-document name batches harvested from the LoCoMo and LongMemEval corpora,
+    median 58 distinct names, p95 156): 2.5x over the whole corpus, but the win is all in the
+    tail. Under ~50 names the index costs more than it saves — 0.55x at the smallest sizes,
+    which is 40 microseconds on a batch that takes 0.05ms either way — and half of real batches
+    are that small. A size threshold would buy back tens of microseconds on the median batch at
+    the price of a second code path, so there isn't one.
+
+    The pruning buys nothing when the names really are all alike — 250 names of the shape
+    "Acme Corporation Subsidiary 0001" probe into every bucket and pay the index on top of the
+    full quadratic verification, ~1.2x slower than the double loop. That worst case is ~29ms at
+    the cap, which is why there is one code path here instead of a size or shape heuristic — but
+    it is also why the cap should not be raised on the strength of the distinct-name numbers
+    alone: the same shape at 500 names costs ~156ms of un-yielded CPU.
+
+    ``threshold`` is validated to ``0 < t <= 1`` (``entity_intrabatch_merge_similarity``), so a
+    name with no trigrams at all — no word characters, e.g. "!!!" — can never reach it and is
+    left out of the join entirely.
+    """
+    if len(names) < 2:
+        return []
+
+    trigrams = [_trigram_set(n) for n in names]
+
+    # How common each trigram is in this batch. Sorting each set by it puts the tokens that
+    # discriminate best up front, which is what keeps the indexed prefixes small.
+    freq: dict[str, int] = {}
+    for t in trigrams:
+        for tri in t:
+            freq[tri] = freq.get(tri, 0) + 1
+
+    indexed: list[_PrefixIndexed] = []
+    for input_index, (t, name) in enumerate(zip(trigrams, names)):
+        if not t:
+            continue
+        ordered = sorted(t, key=lambda tri: (freq[tri], tri))
+        prefix_len = len(ordered) - math.ceil(threshold * len(ordered)) + 1
+        indexed.append(
+            _PrefixIndexed(
+                size=len(ordered),
+                prefix=ordered[:prefix_len],
+                trigrams=t,
+                name=name,
+                input_index=input_index,
+            )
+        )
+
+    # Shortest set first — not for correctness (the prefixes are lossless in any order) but so
+    # that a probe only ever meets sets no larger than itself, which is what gives the size
+    # filter below something to reject. Ties break on input order, keeping the walk deterministic.
+    indexed.sort(key=lambda e: (e.size, e.input_index))
+
+    postings: dict[str, list[int]] = {}
+    pairs: list[_SimilarNamePair] = []
+    for position, entry in enumerate(indexed):
+        candidates: set[int] = set()
+        for tri in entry.prefix:
+            candidates.update(postings.get(tri, ()))
+
+        # |b| >= threshold * |a| is implied by the Jaccard cutoff (the intersection can never
+        # exceed the smaller set), and rejects a candidate without touching its trigrams.
+        min_size = threshold * entry.size
+        for other_position in candidates:
+            other = indexed[other_position]
+            if other.size < min_size:
+                continue
+            intersection = len(entry.trigrams & other.trigrams)
+            union = entry.size + other.size - intersection
+            if union and (intersection / union) >= threshold:
+                first, second = (entry, other) if entry.input_index < other.input_index else (other, entry)
+                pairs.append(_SimilarNamePair(name_a=first.name, name_b=second.name))
+
+        for tri in entry.prefix:
+            postings.setdefault(tri, []).append(position)
+
+    return pairs
+
+
+def _cluster_new_entity_names(
+    rep_by_lower: dict[str, str],
+    count_by_lower: dict[str, int],
+    pairs: list[_SimilarNamePair],
+) -> dict[str, str]:
+    """Union-find the similar-name pairs into clusters and pick one canonical name each.
+
+    Args:
+        rep_by_lower: lowercase name -> a representative original-case spelling of it.
+        count_by_lower: lowercase name -> how many mentions carry it (for canonical choice).
+        pairs: name pairs judged similar (order/case irrelevant; compared lowercased).
+
+    Returns:
+        lowercase name -> canonical original-case name for its cluster. Singletons map to
+        themselves, so the caller can look up every member uniformly.
+    """
+    parent: dict[str, str] = {nl: nl for nl in rep_by_lower}
+
+    def find(x: str) -> str:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]  # path halving
+            x = parent[x]
+        return x
+
+    for pair in pairs:
+        a, b = pair.name_a.lower(), pair.name_b.lower()
+        if a in parent and b in parent:
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+
+    clusters: dict[str, list[str]] = {}
+    for nl in rep_by_lower:
+        clusters.setdefault(find(nl), []).append(nl)
+
+    canonical_by_member: dict[str, str] = {}
+    for members in clusters.values():
+        # Canonical = most-mentioned, then shortest, then lexicographically smallest — a
+        # deterministic pick that prefers the plainest spelling in the cluster.
+        canonical_lower = min(members, key=lambda nl: (-count_by_lower[nl], len(rep_by_lower[nl]), rep_by_lower[nl]))
+        canonical_name = rep_by_lower[canonical_lower]
+        for nl in members:
+            canonical_by_member[nl] = canonical_name
+    return canonical_by_member
 
 
 @dataclass
@@ -75,9 +390,25 @@ def _later_date(a: datetime | None, b: datetime | None) -> datetime | None:
     return a if a > b else b
 
 
+def _canonical_cooccurrence_pairs(entity_list: list[str]) -> Iterator[tuple[str, str]]:
+    """Yield each distinct pair of ``entity_list`` as ``(a, b)`` with ``a < b``.
+
+    Canonical ordering matches the entity_cooccurrences PK and check constraint.
+    The pair is ordered into fresh locals rather than by swapping the loop
+    variables: ``entity_id_1`` is the outer iterate, so swapping it would leak
+    into the remaining inner iterations and build later pairs off the wrong
+    element.
+    """
+    for i, entity_id_1 in enumerate(entity_list):
+        for entity_id_2 in entity_list[i + 1 :]:
+            if entity_id_1 == entity_id_2:
+                continue
+            yield (entity_id_1, entity_id_2) if entity_id_1 < entity_id_2 else (entity_id_2, entity_id_1)
+
+
 @dataclass
 class _CooccurrencePair:
-    """A (entity_id_1, entity_id_2) pair observed in a retain batch (for post-txn flush)."""
+    """A (entity_id_1, entity_id_2) pair observed in a retain batch (for the post-commit flush)."""
 
     entity_id_1: str
     entity_id_2: str
@@ -92,6 +423,32 @@ class _CooccurrencePair:
 _nlp = None
 
 
+# Candidates scored between cooperative yields to the event loop. Scoring is
+# synchronous CPU (one SequenceMatcher per candidate, ~50µs), so a batch with a
+# large candidate set would otherwise hold the loop thread for minutes — health
+# probes time out and the orchestrator kills the worker mid-op (GH-3211).
+# 256 candidates ≈ 13ms of work between yields.
+_SCORING_YIELD_EVERY: Final = 256
+
+
+def _cheap_rank_key(entity_text_lower: str, candidate: tuple[Any, str, Any, datetime | None, int | None]) -> tuple:
+    """Ordering key (not a multi-value return) approximating match quality cheaply.
+
+    Used only to truncate oversized candidate sets: the fuzzy strategies already
+    cap and pre-rank in SQL by real similarity, so this is the backstop for sets
+    built without a score (the "full" strategy's substring matching). Ranks an
+    exact match first, then a close name length, then a well-established entity —
+    all O(1) per candidate, unlike the SequenceMatcher pass it protects.
+    """
+    name_lower = candidate[1].lower()
+    return (
+        0 if name_lower == entity_text_lower else 1,
+        abs(len(name_lower) - len(entity_text_lower)),
+        -(candidate[4] or 0),
+        candidate[1],
+    )
+
+
 class EntityResolver:
     """
     Resolves entities to canonical IDs with disambiguation.
@@ -102,6 +459,9 @@ class EntityResolver:
         pool: Any,
         entity_lookup: str = "full",
         entity_resolution_batch_size: int = 100,
+        intrabatch_merge_similarity: float = 0.5,
+        entity_resolution_max_candidates: int = 200,
+        merge_min_similarity: float = 0.3,
     ):
         """
         Initialize entity resolver.
@@ -113,12 +473,28 @@ class EntityResolver:
                 similar candidates per entity name (much faster for large banks).
             entity_resolution_batch_size: Number of unique entity names to include
                 in each pg_trgm candidate lookup query.
+            intrabatch_merge_similarity: pg_trgm similarity at/above which two new
+                names created by the same retain are merged into one entity.
+            entity_resolution_max_candidates: Max candidates scored per entity
+                mention. Every candidate costs synchronous string comparison on
+                the event-loop thread — a trigram set, and for those that clear
+                the floor a word-level check and a SequenceMatcher pass — so an
+                unbounded candidate set turns one resolution batch into minutes
+                of event-loop-blocking CPU (GH-3211).
+            merge_min_similarity: Minimum pg_trgm similarity with an EXISTING
+                entity before that entity may be reused for a name, regardless of
+                what the other scoring signals say (#3751).
         """
         self.pool = pool
         self.entity_lookup = entity_lookup
         if entity_resolution_batch_size < 1:
             raise ValueError("entity_resolution_batch_size must be >= 1")
         self.entity_resolution_batch_size = entity_resolution_batch_size
+        self._intrabatch_merge_similarity = intrabatch_merge_similarity
+        self._merge_min_similarity = merge_min_similarity
+        if entity_resolution_max_candidates < 1:
+            raise ValueError("entity_resolution_max_candidates must be >= 1")
+        self.entity_resolution_max_candidates = entity_resolution_max_candidates
         self._pg_trgm_checked = False
         # Backend-specific operations — accessed via pool.ops (Django pattern).
         self._ops = pool.ops if pool is not None else None
@@ -222,6 +598,19 @@ class EntityResolver:
         """Split values into fixed-size batches."""
         return [values[i : i + size] for i in range(0, len(values), size)]
 
+    @staticmethod
+    def _label_texts(entity_texts: list[str], taxonomy_lookup: set[str] | None, labels_cfg) -> set[str]:
+        """Subset of entity_texts that are label entities (resolved by exact match only).
+
+        Only gate on the config, not on the lookup set: text/map groups have no
+        fixed vocabulary, so a config with only those groups builds an EMPTY
+        lookup — its labels are classified by key prefix inside
+        ``is_label_entity``, and gating on the set would miss them entirely.
+        """
+        if not labels_cfg:
+            return set()
+        return {t for t in entity_texts if _is_label_entity(t, labels_cfg, taxonomy_lookup or set())}
+
     async def resolve_entities_batch(
         self,
         bank_id: str,
@@ -230,7 +619,7 @@ class EntityResolver:
         unit_event_date,
         conn=None,
         entity_labels: list | None = None,
-    ) -> list[str]:
+    ) -> list[ResolvedEntity]:
         """
         Resolve multiple entities in batch (MUCH faster than sequential).
 
@@ -244,8 +633,22 @@ class EntityResolver:
             unit_event_date: When this unit was created
             conn: Optional connection to use (if None, acquires from pool)
 
+        Each mention may carry ``"resolve": False`` to opt out of resolution. The
+        default, True, treats a name as a *guess* at which entity is meant, so
+        existing entities that are similar enough to be merged onto at all (see
+        ``merge_min_similarity``) are scored on name similarity + co-occurrence +
+        recency and the best above threshold is reused. False takes the name
+        literally: an existing entity is reused only when its canonical name
+        matches case-insensitively, any other name creates its own entity, and it
+        is never merged with a same-batch near-duplicate. Callers who authored the
+        names deliberately want False (#3479) — resolution would otherwise let
+        what the graph already believes outscore, and silently discard, their
+        correction. It is per mention because retain resolves caller-supplied and
+        extracted names in one batch, and only the caller's half is authoritative.
+
         Returns:
-            List of entity IDs in same order as input
+            Resolved entity identities (id + stored canonical name) in the same
+            order as input.
         """
         if not entities_data:
             return []
@@ -271,7 +674,26 @@ class EntityResolver:
         unit_event_date,
         taxonomy_lookup: set[str] | None = None,
         labels_cfg=None,
-    ) -> list[str]:
+    ) -> list[ResolvedEntity]:
+        # `entities_data and` matters: an empty batch must fall through to the normal strategy
+        # dispatch (which the pg_trgm auto-detection hangs off), not take the shortcut vacuously.
+        if entities_data and not any(e.get("resolve", True) for e in entities_data):
+            # Nothing in this batch resolves, so the trigram/UTL_MATCH probe and the
+            # co-occurrence fetch would both be dead work. _resolve_from_candidates routes every
+            # mention straight to its find-or-create path, which matches on LOWER(canonical_name)
+            # equality. A *mixed* batch still probes — the per-mention check below skips the
+            # literal names when scoring, which costs a little wasted lookup but keeps the
+            # common all-resolving case on one code path.
+            return await self._resolve_from_candidates(
+                conn,
+                bank_id,
+                entities_data,
+                unit_event_date,
+                all_candidates={},
+                cooccurrence_map={},
+                taxonomy_lookup=taxonomy_lookup,
+                labels_cfg=labels_cfg,
+            )
         if self.entity_lookup == "trigram":
             # Route to backend-specific fuzzy strategy.
             # Non-PG backends (Oracle) use UTL_MATCH instead of pg_trgm.
@@ -311,7 +733,7 @@ class EntityResolver:
         unit_event_date,
         taxonomy_lookup: set[str] | None = None,
         labels_cfg=None,
-    ) -> list[str]:
+    ) -> list[ResolvedEntity]:
         """Original strategy: load all bank entities then match in Python."""
         # Query ALL candidates for this bank
         all_entities = await conn.fetch(
@@ -339,19 +761,9 @@ class EntityResolver:
         )
 
         # Build co-occurrence map: entity_id -> set of co-occurring entity names (lowercase)
-        cooccurrence_map: dict[str, set[str]] = {}
-        for row in all_cooccurrences:
-            eid1, eid2 = row["entity_id_1"], row["entity_id_2"]
-            # Add both directions
-            if eid1 not in cooccurrence_map:
-                cooccurrence_map[eid1] = set()
-            if eid2 not in cooccurrence_map:
-                cooccurrence_map[eid2] = set()
-            # Map to canonical names for comparison with nearby_entities
-            if eid2 in entity_id_to_name:
-                cooccurrence_map[eid1].add(entity_id_to_name[eid2])
-            if eid1 in entity_id_to_name:
-                cooccurrence_map[eid2].add(entity_id_to_name[eid1])
+        cooccurrences = _build_cooccurrence_index(all_cooccurrences, entity_id_to_name)
+        cooccurrence_map = cooccurrences.by_entity
+        cooccurrence_degrees = cooccurrences.degree_by_name
 
         # Build candidate map for each entity text
         all_candidates = {}  # Maps entity_text -> list of candidates
@@ -385,6 +797,7 @@ class EntityResolver:
             cooccurrence_map,
             taxonomy_lookup,
             labels_cfg,
+            cooccurrence_degrees,
         )
 
     async def _resolve_entities_batch_trigram(
@@ -395,7 +808,7 @@ class EntityResolver:
         unit_event_date,
         taxonomy_lookup: set[str] | None = None,
         labels_cfg=None,
-    ) -> list[str]:
+    ) -> list[ResolvedEntity]:
         """
         Trigram strategy: fetch only similar candidates per entity name using pg_trgm.
 
@@ -405,40 +818,78 @@ class EntityResolver:
         """
         entity_texts = list(set(e["text"] for e in entities_data))
 
-        # Fetch candidates for unique entity texts in bounded batches.
+        # Label entities resolve by exact match only (their canonical names are
+        # user-defined and must not be fuzzy-merged). Probing them via the trigram
+        # index only returns similar-but-distinct label values that are always
+        # discarded, and that wasted work grows with the number of values a label
+        # accumulates. Resolve label texts with an exact lookup on the unique
+        # (bank_id, LOWER(canonical_name)) index and only fuzzy-match the rest.
+        label_set = self._label_texts(entity_texts, taxonomy_lookup, labels_cfg)
+        label_texts = [t for t in entity_texts if t in label_set]
+        fuzzy_texts = [t for t in entity_texts if t not in label_set]
+
+        rows = []
+
+        # Exact, index-only lookup for label texts.
+        for entity_text_batch in self._chunked(label_texts, self.entity_resolution_batch_size):
+            rows.extend(
+                await conn.fetch(
+                    f"""
+                    SELECT e.id, e.canonical_name, e.metadata, e.last_seen, e.mention_count,
+                           q.query_text
+                    FROM unnest($2::text[]) AS q(query_text)
+                    JOIN {fq_table("entities")} e ON (
+                        e.bank_id = $1
+                        AND LOWER(e.canonical_name) = LOWER(q.query_text)
+                    )
+                    """,
+                    bank_id,
+                    entity_text_batch,
+                )
+            )
+
+        # Fetch candidates for the remaining texts in bounded batches.
         # Uses the GIN trigram index on LOWER(canonical_name) for case-insensitive
         # similarity lookup. Previous version also had LIKE '%...' substring fallbacks,
         # but those forced full sequential scans of the entities table and caused
-        # TimeoutErrors on banks with 10k+ entities. Lowering the similarity threshold
-        # to 0.15 (from default 0.3) catches most substring relationships while
-        # staying fully index-based.
-        await conn.execute("SET pg_trgm.similarity_threshold = 0.15")
-        try:
-            rows = []
-            for entity_text_batch in self._chunked(entity_texts, self.entity_resolution_batch_size):
-                rows.extend(
-                    await conn.fetch(
-                        f"""
-                        SELECT DISTINCT ON (e.id)
-                            e.id, e.canonical_name, e.metadata, e.last_seen, e.mention_count,
-                            q.query_text
-                        FROM unnest($2::text[]) AS q(query_text)
-                        JOIN {fq_table("entities")} e ON (
-                            e.bank_id = $1
-                            AND LOWER(e.canonical_name) % LOWER(q.query_text)
-                        )
-                        """,
-                        bank_id,
-                        entity_text_batch,
-                    )
+        # TimeoutErrors on banks with 10k+ entities. The pg_trgm similarity threshold
+        # that governs the `%` operator is applied once at pool-connection setup
+        # (HINDSIGHT_API_ENTITY_TRGM_SIMILARITY_THRESHOLD), so it is not toggled here.
+        # ``entity_kind != 'label'`` matches the predicate of the partial trigram
+        # index (label rows are exact-match-only, so they can never be a
+        # legitimate fuzzy result — without the filter they only inflate the
+        # candidate set and get discarded in the bitmap recheck, #3208). The
+        # clause must textually match the index predicate for the planner to
+        # choose the partial index, so it stays inside the LATERAL's WHERE
+        # alongside the `%` operator rather than moving out to the outer join.
+        #
+        # The LATERAL keeps only the best `max_candidates` per query text: on a bank
+        # with many near-identical names a single probe can otherwise return
+        # thousands of rows, and every one of them costs a SequenceMatcher call in
+        # _resolve_from_candidates (GH-3211). Ranking by pg_trgm similarity — which
+        # the index scan computes anyway — keeps the truncation at the noise end.
+        for entity_text_batch in self._chunked(fuzzy_texts, self.entity_resolution_batch_size):
+            rows.extend(
+                await conn.fetch(
+                    f"""
+                    SELECT c.id, c.canonical_name, c.metadata, c.last_seen, c.mention_count,
+                           q.query_text
+                    FROM unnest($2::text[]) AS q(query_text)
+                    CROSS JOIN LATERAL (
+                        SELECT e.id, e.canonical_name, e.metadata, e.last_seen, e.mention_count
+                        FROM {fq_table("entities")} e
+                        WHERE e.bank_id = $1
+                          AND e.entity_kind != 'label'
+                          AND LOWER(e.canonical_name) % LOWER(q.query_text)
+                        ORDER BY similarity(LOWER(e.canonical_name), LOWER(q.query_text)) DESC, e.id
+                        LIMIT $3
+                    ) c
+                    """,
+                    bank_id,
+                    entity_text_batch,
+                    self.entity_resolution_max_candidates,
                 )
-        finally:
-            # asyncpg returns connections to the pool with session state intact,
-            # so the lowered threshold would leak to future borrowers without RESET.
-            try:
-                await conn.execute("RESET pg_trgm.similarity_threshold")
-            except Exception:
-                logger.warning("Failed to reset pg_trgm similarity threshold after candidate lookup", exc_info=True)
+            )
 
         # Group candidates by query_text
         all_candidates: dict[str, list] = {t: [] for t in entity_texts}
@@ -452,6 +903,7 @@ class EntityResolver:
 
         # Fetch co-occurrences only for the candidate entities (not all bank entities)
         cooccurrence_map: dict[str, set[str]] = {}
+        cooccurrence_degrees: dict[str, int] = {}
         if candidate_ids:
             candidate_id_list = list(candidate_ids)
             cooc_rows = await conn.fetch(
@@ -469,16 +921,9 @@ class EntityResolver:
                 for cands in all_candidates.values()
                 for row in [{"id": c[0], "canonical_name": c[1]} for c in cands]
             }
-            for row in cooc_rows:
-                eid1, eid2 = row["entity_id_1"], row["entity_id_2"]
-                if eid1 not in cooccurrence_map:
-                    cooccurrence_map[eid1] = set()
-                if eid2 not in cooccurrence_map:
-                    cooccurrence_map[eid2] = set()
-                if eid2 in id_to_name:
-                    cooccurrence_map[eid1].add(id_to_name[eid2])
-                if eid1 in id_to_name:
-                    cooccurrence_map[eid2].add(id_to_name[eid1])
+            cooccurrences = _build_cooccurrence_index(cooc_rows, id_to_name)
+            cooccurrence_map = cooccurrences.by_entity
+            cooccurrence_degrees = cooccurrences.degree_by_name
 
         return await self._resolve_from_candidates(
             conn,
@@ -489,6 +934,7 @@ class EntityResolver:
             cooccurrence_map,
             taxonomy_lookup,
             labels_cfg,
+            cooccurrence_degrees,
         )
 
     async def _resolve_entities_batch_oracle_fuzzy(
@@ -499,7 +945,7 @@ class EntityResolver:
         unit_event_date: datetime | None,
         taxonomy_lookup: set[str] | None = None,
         labels_cfg=None,
-    ) -> list[str]:
+    ) -> list[ResolvedEntity]:
         """
         Oracle strategy: fetch similar candidates using UTL_MATCH.JARO_WINKLER_SIMILARITY.
 
@@ -511,6 +957,14 @@ class EntityResolver:
         entity_texts = list(set(e["text"] for e in entities_data))
         entities_table = fq_table("entities")
 
+        # Label entities resolve by exact match only, so the fuzzy Jaro-Winkler
+        # join only returns similar-but-distinct label values that are always
+        # discarded. Resolve label texts with an exact lookup on the unique
+        # (bank_id, LOWER(canonical_name)) index and only fuzzy-match the rest.
+        label_set = self._label_texts(entity_texts, taxonomy_lookup, labels_cfg)
+        label_texts = [t for t in entity_texts if t in label_set]
+        fuzzy_texts = [t for t in entity_texts if t not in label_set]
+
         try:
             # Batch entity texts into bounded sub-queries using JSON_TABLE to
             # expand the list into rows. UTL_MATCH.JARO_WINKLER_SIMILARITY
@@ -518,7 +972,7 @@ class EntityResolver:
             # Bounded batches mirror the PG trigram path so very wide retain
             # batches don't time out a single JOIN on large banks.
             rows = []
-            for entity_text_batch in self._chunked(entity_texts, self.entity_resolution_batch_size):
+            for entity_text_batch in self._chunked(label_texts, self.entity_resolution_batch_size):
                 rows.extend(
                     await conn.fetch(
                         f"""
@@ -527,11 +981,44 @@ class EntityResolver:
                         FROM JSON_TABLE($2, '$[*]' COLUMNS (query_text VARCHAR2(4000) PATH '$')) q
                         JOIN {entities_table} e ON (
                             e.bank_id = $1
-                            AND UTL_MATCH.JARO_WINKLER_SIMILARITY(LOWER(e.canonical_name), LOWER(q.query_text)) > 70
+                            AND LOWER(e.canonical_name) = LOWER(q.query_text)
                         )
                         """,
                         bank_id,
                         json.dumps(entity_text_batch),
+                    )
+                )
+            # Only the best `max_candidates` per query text are returned: each
+            # candidate costs a synchronous SequenceMatcher call downstream, so an
+            # unbounded fuzzy match set blocks the event loop for minutes
+            # (GH-3211). Ranking by the same Jaro-Winkler score the join already
+            # computes keeps the truncation at the noise end.
+            for entity_text_batch in self._chunked(fuzzy_texts, self.entity_resolution_batch_size):
+                rows.extend(
+                    await conn.fetch(
+                        f"""
+                        SELECT id, canonical_name, metadata, last_seen, mention_count, query_text
+                        FROM (
+                            SELECT e.id, e.canonical_name, e.metadata, e.last_seen, e.mention_count,
+                                   q.query_text,
+                                   ROW_NUMBER() OVER (
+                                       PARTITION BY q.query_text
+                                       ORDER BY UTL_MATCH.JARO_WINKLER_SIMILARITY(
+                                           LOWER(e.canonical_name), LOWER(q.query_text)
+                                       ) DESC, e.id
+                                   ) AS rn
+                            FROM JSON_TABLE($2, '$[*]' COLUMNS (query_text VARCHAR2(4000) PATH '$')) q
+                            JOIN {entities_table} e ON (
+                                e.bank_id = $1
+                                AND e.entity_kind != 'label'
+                                AND UTL_MATCH.JARO_WINKLER_SIMILARITY(LOWER(e.canonical_name), LOWER(q.query_text)) > 70
+                            )
+                        )
+                        WHERE rn <= $3
+                        """,
+                        bank_id,
+                        json.dumps(entity_text_batch),
+                        self.entity_resolution_max_candidates,
                     )
                 )
         except Exception as e:
@@ -558,6 +1045,7 @@ class EntityResolver:
 
         # Fetch co-occurrences only for the candidate entities (not all bank entities)
         cooccurrence_map: dict[str, set[str]] = {}
+        cooccurrence_degrees: dict[str, int] = {}
         if candidate_ids:
             candidate_id_list = list(candidate_ids)
             cooc_rows = await conn.fetch(
@@ -575,16 +1063,9 @@ class EntityResolver:
                 for cands in all_candidates.values()
                 for row in [{"id": c[0], "canonical_name": c[1]} for c in cands]
             }
-            for row in cooc_rows:
-                eid1, eid2 = row["entity_id_1"], row["entity_id_2"]
-                if eid1 not in cooccurrence_map:
-                    cooccurrence_map[eid1] = set()
-                if eid2 not in cooccurrence_map:
-                    cooccurrence_map[eid2] = set()
-                if eid2 in id_to_name:
-                    cooccurrence_map[eid1].add(id_to_name[eid2])
-                if eid1 in id_to_name:
-                    cooccurrence_map[eid2].add(id_to_name[eid1])
+            cooccurrences = _build_cooccurrence_index(cooc_rows, id_to_name)
+            cooccurrence_map = cooccurrences.by_entity
+            cooccurrence_degrees = cooccurrences.degree_by_name
 
         return await self._resolve_from_candidates(
             conn,
@@ -595,7 +1076,40 @@ class EntityResolver:
             cooccurrence_map,
             taxonomy_lookup,
             labels_cfg,
+            cooccurrence_degrees,
         )
+
+    def _intrabatch_canonical_map(self, entities_to_create: list[_EntityToCreate]) -> dict[str, str]:
+        """Map each non-label new name (lowercased) to its cluster's canonical spelling.
+
+        Uses in-memory trigram similarity (``trigram_similarity``, verified equal to Postgres
+        pg_trgm), so it is backend-agnostic — no DB round-trip on the retain hot path, and it runs
+        identically on PostgreSQL, Oracle, and the pg_trgm-absent "full" fallback. Label entities
+        are excluded so distinct label values stay separate (GH-1558).
+        """
+        rep_by_lower: dict[str, str] = {}
+        count_by_lower: dict[str, int] = {}
+        for e in entities_to_create:
+            if e.is_label or not e.resolve:
+                continue
+            name_lower = e.name.lower()
+            rep_by_lower.setdefault(name_lower, e.name)
+            count_by_lower[name_lower] = count_by_lower.get(name_lower, 0) + 1
+
+        if len(rep_by_lower) < 2:
+            return {}  # nothing to compare
+        if len(rep_by_lower) > _INTRABATCH_MAX_NAMES:
+            logger.warning(
+                "Skipping in-batch entity dedup: %d unique new names exceeds the %d cap "
+                "(O(N^2) trigram comparison); same-batch surface variants may not be merged.",
+                len(rep_by_lower),
+                _INTRABATCH_MAX_NAMES,
+            )
+            return {}
+        pairs = _find_intrabatch_similar_pairs(list(rep_by_lower.values()), self._intrabatch_merge_similarity)
+        if not pairs:
+            return {}
+        return _cluster_new_entity_names(rep_by_lower, count_by_lower, pairs)
 
     async def _resolve_from_candidates(
         self,
@@ -607,95 +1121,211 @@ class EntityResolver:
         cooccurrence_map: dict[str, set[str]],
         taxonomy_lookup: set[str] | None = None,
         labels_cfg=None,
-    ) -> list[str]:
-        """Shared scoring + upsert logic used by both lookup strategies."""
+        cooccurrence_degrees: dict[str, int] | None = None,
+    ) -> list[ResolvedEntity]:
+        """Shared scoring + upsert logic used by every lookup strategy.
 
-        # Resolve each entity using pre-fetched candidates
-        entity_ids = [None] * len(entities_data)
+        A mention carrying ``"resolve": False`` skips the scoring entirely and takes the
+        find-or-create path below, which matches an existing row on ``LOWER(canonical_name)``
+        equality and inserts one otherwise.
+        """
+
+        # Resolve each entity using pre-fetched candidates. A slot stays None
+        # only if find-or-create fails to produce a row for a mention (a DB
+        # inconsistency); it surfaces as a clear error at the reassert boundary
+        # rather than a silent NOT NULL violation deeper in Phase 2.
+        resolved: list[ResolvedEntity | None] = [None] * len(entities_data)
         entities_to_update: list[_EntityStat] = []
         entities_to_create: list[_EntityToCreate] = []
 
+        # One trigram set per distinct candidate name for the whole batch. Mentions in a batch
+        # draw on heavily overlapping candidate lists, so the same canonical name was otherwise
+        # re-trigrammed once per mention that saw it. Filled lazily: a candidate the scoring
+        # loop never reaches (a label row, or a mention that resolves before scoring) costs
+        # nothing, and nothing is computed ahead of the yield points below (GH-3211).
+        candidate_trigram_map: dict[str, set[str]] = {}
+        # Candidates scored since the last yield, counted across mentions so a
+        # batch of many small candidate sets yields as often as one large set.
+        scored_since_yield = 0
+
         for idx, entity_data in enumerate(entities_data):
             entity_text = entity_data["text"]
+            entity_text_lower = entity_text.lower()
             nearby_entities = entity_data.get("nearby_entities", [])
             # Use per-entity date if available, otherwise fall back to batch-level date
             entity_event_date = entity_data.get("event_date", unit_event_date)
 
+            # Per mention, not per batch: retain resolves the caller's entities and the
+            # extractor's in one pass, and only the caller's are meant literally (#3479).
+            resolve = entity_data.get("resolve", True)
             candidates = all_candidates.get(entity_text, [])
+
+            # Backstop truncation for candidate sets that were not capped at the
+            # source (the "full" strategy matches substrings in Python). The fuzzy
+            # strategies already return at most this many rows per query text, so
+            # this is normally a no-op.
+            if len(candidates) > self.entity_resolution_max_candidates:
+                logger.debug(
+                    "Truncating %d candidates to %d for entity text %r",
+                    len(candidates),
+                    self.entity_resolution_max_candidates,
+                    entity_text,
+                )
+                entity_text_lower_for_rank = entity_text.lower()
+                candidates = heapq.nsmallest(
+                    self.entity_resolution_max_candidates,
+                    candidates,
+                    key=lambda c: _cheap_rank_key(entity_text_lower_for_rank, c),
+                )
 
             # Label entities (from entity_labels config) use exact matching only.
             # Their canonical names are user-defined (e.g., "use:use-001"),
             # so fuzzy resolution must NOT merge distinct label values that
-            # happen to be textually similar (GH-1558).
-            is_label = bool(
-                labels_cfg and taxonomy_lookup and _is_label_entity(entity_text, labels_cfg, taxonomy_lookup)
-            )
+            # happen to be textually similar (GH-1558). Don't gate on the
+            # lookup set — it is empty for text/map-only configs, whose labels
+            # classify by key prefix (see _label_texts).
+            is_label = bool(labels_cfg and _is_label_entity(entity_text, labels_cfg, taxonomy_lookup or set()))
 
-            if not candidates:
-                # Will create new entity
-                entities_to_create.append(_EntityToCreate(idx=idx, name=entity_text, event_date=entity_event_date))
+            if not resolve or not candidates:
+                # Nothing to score against — or the caller named the entity literally, so
+                # similarity must not get a vote. Either way the find-or-create pass below
+                # reuses an identically-named row and otherwise inserts this exact name.
+                entities_to_create.append(
+                    _EntityToCreate(
+                        idx=idx, name=entity_text, event_date=entity_event_date, is_label=is_label, resolve=resolve
+                    )
+                )
                 continue
 
             if is_label:
                 # Exact case-insensitive match only for label entities
-                exact_match = None
-                entity_text_lower = entity_text.lower()
+                exact_match: ResolvedEntity | None = None
                 for candidate_id, canonical_name, metadata, last_seen, mention_count in candidates:
                     if canonical_name.lower() == entity_text_lower:
-                        exact_match = candidate_id
+                        exact_match = ResolvedEntity(
+                            entity_id=candidate_id, canonical_name=canonical_name, entity_kind="label"
+                        )
                         break
                 if exact_match:
-                    entity_ids[idx] = exact_match
-                    entities_to_update.append(_EntityStat(entity_id=exact_match, event_date=entity_event_date))
+                    resolved[idx] = exact_match
+                    entities_to_update.append(
+                        _EntityStat(entity_id=exact_match.entity_id, event_date=entity_event_date)
+                    )
                 else:
-                    entities_to_create.append(_EntityToCreate(idx=idx, name=entity_text, event_date=entity_event_date))
+                    entities_to_create.append(
+                        _EntityToCreate(idx=idx, name=entity_text, event_date=entity_event_date, is_label=True)
+                    )
                 continue
 
             # Score candidates
-            best_candidate = None
+            best_candidate: ResolvedEntity | None = None
             best_score = 0.0
 
             nearby_entity_set = {e["text"].lower() for e in nearby_entities if e["text"] != entity_text}
+            mention_trigrams = _trigram_set(entity_text_lower)
+            # Weight each nearby name by how selective it is, once per mention rather than
+            # once per candidate. Only the numerator is weighted: dividing by the weights too
+            # would normalise the damping straight back out whenever the hub is the *only*
+            # nearby name, which is the exact case that needs damping. With every degree at 1
+            # (nothing known) this is arithmetically the old overlap-count fraction.
+            degrees = cooccurrence_degrees or {}
+            nearby_weights = {name: _cooccurrence_weight(degrees.get(name, 1)) for name in nearby_entity_set}
 
             for candidate_id, canonical_name, metadata, last_seen, mention_count in candidates:
-                score = 0.0
+                # Hand the loop back periodically so /health (and every other task
+                # on this worker) still gets scheduled while a wide batch scores.
+                # Counted before the label skip below, so a candidate list that is
+                # entirely labels still yields — the skip runs _is_label_entity per
+                # row, which is cheap but not free.
+                scored_since_yield += 1
+                if scored_since_yield >= _SCORING_YIELD_EVERY:
+                    scored_since_yield = 0
+                    await asyncio.sleep(0)
 
-                # 1. Name similarity (0-0.5)
-                name_similarity = SequenceMatcher(None, entity_text.lower(), canonical_name.lower()).ratio()
-                score += name_similarity * 0.5
+                # A label row can never be a fuzzy-match target (#1558): the
+                # trigram/UTL_MATCH probes exclude them in SQL via entity_kind,
+                # but the "full" fallback strategy loads every bank entity, so
+                # a textually-close label value could still outscore the 0.6
+                # threshold here (e.g. "topic empathy" vs "topic:empathy").
+                if labels_cfg and _is_label_entity(canonical_name, labels_cfg, taxonomy_lookup or set()):
+                    continue
 
-                # 2. Co-occurring entities (0-0.3)
-                if nearby_entity_set:
-                    co_entities = cooccurrence_map.get(candidate_id, set())
-                    overlap = len(nearby_entity_set & co_entities)
-                    co_entity_score = overlap / len(nearby_entity_set)
-                    score += co_entity_score * 0.3
+                # The trigram probe admits candidates at a deliberately loose recall
+                # threshold (0.15), and the signals below can total 0.5 on their own — so
+                # without a floor here a name merely *considered* similar could be merged
+                # onto purely because the bank had seen it recently next to the same
+                # entities (#3751). The two measures disagree most on short names, where a
+                # coincidental shared run inflates the sequence ratio: "Tigran"/"Iran" is
+                # 0.80 by SequenceMatcher but 0.20 by trigram, higher than "Alice"/"Alice
+                # Chen" (0.67) on the metric that decides and far lower on the one that
+                # ranks them correctly. Gate on trigram, and leave the score above the gate
+                # alone: SequenceMatcher stays load-bearing for typo variants that arrive
+                # with no co-occurrence context at all ("Dr Waler" -> "Dr Wall").
+                canonical_lower = canonical_name.lower()
+                candidate_trigrams = candidate_trigram_map.get(canonical_name)
+                if candidate_trigrams is None:
+                    candidate_trigrams = _trigram_set(canonical_name)
+                    candidate_trigram_map[canonical_name] = candidate_trigrams
+                name_trigram_similarity = _trigram_set_similarity(mention_trigrams, candidate_trigrams)
+                if name_trigram_similarity < self._merge_min_similarity:
+                    continue
 
-                # 3. Temporal proximity (0-0.2)
-                if last_seen and entity_event_date:
-                    # Normalize timezone awareness for comparison
-                    event_date_utc = (
-                        entity_event_date if entity_event_date.tzinfo else entity_event_date.replace(tzinfo=UTC)
-                    )
-                    last_seen_utc = last_seen if last_seen.tzinfo else last_seen.replace(tzinfo=UTC)
-                    days_diff = abs((event_date_utc - last_seen_utc).total_seconds() / 86400)
-                    if days_diff < 7:
-                        temporal_score = max(0, 1.0 - (days_diff / 7))
-                        score += temporal_score * 0.2
+                # ...and word by word, since whole-name similarity lets one long shared word drown
+                # out a completely different short one (see _tokens_are_compatible).
+                if not _tokens_are_compatible(entity_text_lower, canonical_lower):
+                    continue
+
+                if name_trigram_similarity >= _IDENTICAL_TRIGRAMS:
+                    # Identical trigram sets: the same words, differing only in case, punctuation or
+                    # decoration ("Wren 🎵" / "Wren", "GPT-4" / "GPT 4"). The in-batch pass already
+                    # unifies names like these on the name alone and at a *lower* bar (0.5), so
+                    # requiring history here made two forms one entity or two depending only on
+                    # whether they arrived in the same retain — #3107 fixed that half only.
+                    score = 1.0
+                else:
+                    score = 0.0
+
+                    # 1. Name similarity (0-0.5)
+                    name_similarity = SequenceMatcher(None, entity_text_lower, canonical_lower).ratio()
+                    score += name_similarity * 0.5
+
+                    # 2. Co-occurring entities (0-0.3), each weighted by how selective it is
+                    if nearby_entity_set:
+                        co_entities = cooccurrence_map.get(candidate_id, set())
+                        matched_weight = sum(nearby_weights[name] for name in nearby_entity_set & co_entities)
+                        score += (matched_weight / len(nearby_entity_set)) * 0.3
+
+                    # 3. Temporal proximity (0-0.2)
+                    if last_seen and entity_event_date:
+                        # Normalize timezone awareness for comparison
+                        event_date_utc = (
+                            entity_event_date if entity_event_date.tzinfo else entity_event_date.replace(tzinfo=UTC)
+                        )
+                        last_seen_utc = last_seen if last_seen.tzinfo else last_seen.replace(tzinfo=UTC)
+                        days_diff = abs((event_date_utc - last_seen_utc).total_seconds() / 86400)
+                        if days_diff < 7:
+                            temporal_score = max(0, 1.0 - (days_diff / 7))
+                            score += temporal_score * 0.2
 
                 if score > best_score:
                     best_score = score
-                    best_candidate = candidate_id
+                    best_candidate = ResolvedEntity(entity_id=candidate_id, canonical_name=canonical_name)
 
-            # Apply unified threshold
+            # Apply unified threshold, inclusively and on a rounded score. The weights are
+            # decimal fractions binary floating point cannot represent exactly, so a score
+            # *of* 0.6 used to land on either side of a strict `>` depending only on which
+            # signals produced it: 0.4 name + 0.2 recency sums to 0.6000000000000001 and
+            # merged, while 0.3 name + 0.3 co-occurrence sums to 0.6 and did not. Rounding
+            # makes equal scores compare equal; `>=` keeps the verdict the common
+            # composition already got, so nothing that merges today stops merging here.
             threshold = 0.6
 
-            if best_score > threshold:
-                entity_ids[idx] = best_candidate
-                entities_to_update.append(_EntityStat(entity_id=best_candidate, event_date=entity_event_date))
+            if round(best_score, 6) >= threshold and best_candidate is not None:
+                resolved[idx] = best_candidate
+                entities_to_update.append(_EntityStat(entity_id=best_candidate.entity_id, event_date=entity_event_date))
             else:
                 entities_to_create.append(
-                    _EntityToCreate(idx=idx, name=entity_data["text"], event_date=entity_event_date)
+                    _EntityToCreate(idx=idx, name=entity_data["text"], event_date=entity_event_date, is_label=is_label)
                 )
 
         # Existing entities: IDs already known from the candidate SELECT above.
@@ -707,24 +1337,48 @@ class EntityResolver:
         # ON CONFLICT DO NOTHING returns nothing for rows that conflicted; we handle
         # that rare case with a fallback SELECT.
         if entities_to_create:
-            # Group by lowercase name — deduplicate within the batch.
+            # Fuzzy-cluster the NON-label names about to be created so same-batch surface
+            # variants (case/emoji/suffix/typo of one name) collapse to a single entity. Without
+            # this, resolution only compares against already-persisted rows, so the first sighting
+            # of each variant in a batch always creates a distinct entity (issue #3107). Labels are
+            # excluded and keep exact grouping, and so are names the caller wrote literally:
+            # "Alice" and "Alice Smith" listed side by side are two entities because they were
+            # written as two (#3479).
+            canonical_by_member = self._intrabatch_canonical_map(entities_to_create)
+
             @dataclass
             class _NameGroup:
                 name: str
                 event_date: datetime | None
+                is_label: bool
                 indices: list[int] = field(default_factory=list)
 
             groups: dict[str, _NameGroup] = {}
             for e in entities_to_create:
-                name_lower = e.name.lower()
-                if name_lower not in groups:
-                    groups[name_lower] = _NameGroup(name=e.name, event_date=e.event_date)
-                groups[name_lower].indices.append(e.idx)
+                # Non-label variants fold into their cluster's canonical name; everything else
+                # (labels, singletons) keys on itself, preserving the prior exact-match behavior.
+                canonical = canonical_by_member.get(e.name.lower(), e.name)
+                key = canonical.lower()
+                group = groups.get(key)
+                if group is None:
+                    # Labels key on themselves and the dedup pass only clusters
+                    # non-label names, so the first member's is_label holds for
+                    # every member of the group.
+                    group = _NameGroup(name=canonical, event_date=e.event_date, is_label=e.is_label)
+                    groups[key] = group
+                elif e.event_date is not None and (group.event_date is None or e.event_date < group.event_date):
+                    # Keep the earliest event_date across the cluster ("first seen").
+                    group.event_date = e.event_date
+                group.indices.append(e.idx)
 
             # Sort by lowercase name for deterministic ordering.
             sorted_groups = sorted(groups.items())
             entity_names = [g.name for _, g in sorted_groups]
             entity_dates = [g.event_date for _, g in sorted_groups]
+            entity_kinds = ["label" if g.is_label else "regular" for _, g in sorted_groups]
+            # Stored canonical name per lowercase key, so a resurrected parent
+            # keeps the name it was created/matched with rather than a fallback.
+            canonical_by_name = {name_lower: g.name for name_lower, g in sorted_groups}
 
             # INSERT ... ON CONFLICT DO NOTHING — no row lock on already-existing entities.
             # mention_count starts at 0 here; flush_pending_stats() is the sole source of
@@ -737,6 +1391,7 @@ class EntityResolver:
                 bank_id,
                 entity_names,
                 entity_dates,
+                entity_kinds,
             )
 
             # Fallback SELECT for names that conflicted (another worker won the race).
@@ -759,11 +1414,14 @@ class EntityResolver:
                 )
                 for row in existing_rows:
                     id_by_name[row["name_lower"]] = row["id"]
+                    canonical_by_name[row["name_lower"]] = row["canonical_name"]
                     # Also index by Python's lower() of the original input name so the
                     # assignment loop (which uses Python-lowercased keys) finds it even
                     # when Python and the database produce different lowercase strings.
                     if "input_name" in row:
-                        id_by_name[row["input_name"].lower()] = row["id"]
+                        input_name_lower = row["input_name"].lower()
+                        id_by_name[input_name_lower] = row["id"]
+                        canonical_by_name[input_name_lower] = row["canonical_name"]
 
             # Assign entity IDs back and queue one stat per original mention so that
             # flush_pending_stats() increments mention_count by the true mention count,
@@ -771,251 +1429,74 @@ class EntityResolver:
             for name_lower, g in sorted_groups:
                 entity_id = id_by_name.get(name_lower)
                 if entity_id:
+                    canonical_name = canonical_by_name.get(name_lower, g.name)
+                    kind = "label" if g.is_label else "regular"
                     for original_idx in g.indices:
-                        entity_ids[original_idx] = entity_id
-                        pending.append(_EntityStat(entity_id=entity_id, event_date=g.event_date))
+                        resolved[original_idx] = ResolvedEntity(
+                            entity_id=entity_id, canonical_name=canonical_name, entity_kind=kind
+                        )
+                        pending.append(_EntityStat(entity_id=str(entity_id), event_date=g.event_date))
 
         # Accumulate into the resolver's pending list; the orchestrator flushes
-        # these with await entity_resolver.flush_pending_stats() after the txn.
+        # these with await entity_resolver.flush_pending_stats() after the transaction.
         key = self._task_key()
         self._pending_stats.setdefault(key, []).extend(pending)
 
-        return entity_ids
+        missing = [i for i, entity in enumerate(resolved) if entity is None]
+        if missing:
+            raise RuntimeError(
+                f"Entity resolution produced no row for {len(missing)} mention(s) "
+                f"(indices {missing[:5]}); refusing to link units to a missing parent."
+            )
+        return cast(list[ResolvedEntity], resolved)
 
-    async def resolve_entity(
+    async def reassert_entities_batch(
         self,
         bank_id: str,
-        entity_text: str,
-        context: str,
-        nearby_entities: list[dict],
-        unit_event_date,
-    ) -> str:
-        """
-        Resolve an entity to a canonical entity ID.
-
-        Args:
-            bank_id: bank ID (entities are scoped to agents)
-            entity_text: Entity text ("Alice", "Google", etc.)
-            context: Context where entity appears
-            nearby_entities: Other entities in the same unit
-            unit_event_date: When this unit was created
-
-        Returns:
-            Entity ID (creates new entity if needed)
-        """
-        async with acquire_with_retry(self.pool) as conn:
-            # Find candidate entities with similar name
-            candidates = await conn.fetch(
-                f"""
-                SELECT id, canonical_name, metadata, last_seen
-                FROM {fq_table("entities")}
-                WHERE bank_id = $1
-                  AND (
-                    canonical_name ILIKE $2
-                    OR canonical_name ILIKE $3
-                    OR $2 ILIKE canonical_name || '%%'
-                  )
-                ORDER BY mention_count DESC
-                """,
-                bank_id,
-                entity_text,
-                f"%{entity_text}%",
-            )
-
-            if not candidates:
-                # New entity - create it
-                return await self._create_entity(conn, bank_id, entity_text, unit_event_date)
-
-            # Score candidates based on:
-            # 1. Name similarity
-            # 2. Context overlap (TODO: could use embeddings)
-            # 3. Co-occurring entities
-            # 4. Temporal proximity
-
-            best_candidate = None
-            best_score = 0.0
-
-            nearby_entity_set = {e["text"].lower() for e in nearby_entities if e["text"] != entity_text}
-
-            for row in candidates:
-                candidate_id = row["id"]
-                canonical_name = row["canonical_name"]
-                last_seen = row["last_seen"]
-                score = 0.0
-
-                # 1. Name similarity (0-1)
-                name_similarity = SequenceMatcher(None, entity_text.lower(), canonical_name.lower()).ratio()
-                score += name_similarity * 0.5
-
-                # 2. Co-occurring entities (0-0.5)
-                # Get entities that co-occurred with this candidate before
-                # Use the materialized co-occurrence cache for fast lookup
-                co_entity_rows = await conn.fetch(
-                    f"""
-                    SELECT e.canonical_name, ec.cooccurrence_count
-                    FROM {fq_table("entity_cooccurrences")} ec
-                    JOIN {fq_table("entities")} e ON (
-                        CASE
-                            WHEN ec.entity_id_1 = $1 THEN ec.entity_id_2
-                            WHEN ec.entity_id_2 = $1 THEN ec.entity_id_1
-                        END = e.id
-                    )
-                    WHERE ec.entity_id_1 = $1 OR ec.entity_id_2 = $1
-                    """,
-                    candidate_id,
-                )
-                co_entities = {r["canonical_name"].lower() for r in co_entity_rows}
-
-                # Check overlap with nearby entities
-                overlap = len(nearby_entity_set & co_entities)
-                if nearby_entity_set:
-                    co_entity_score = overlap / len(nearby_entity_set)
-                    score += co_entity_score * 0.3
-
-                # 3. Temporal proximity (0-0.2)
-                if last_seen:
-                    # Normalize both to UTC-aware to avoid naive/aware mismatch
-                    # (Oracle returns naive datetimes from fromisoformat)
-                    _evt = unit_event_date if unit_event_date.tzinfo else unit_event_date.replace(tzinfo=UTC)
-                    _seen = last_seen if last_seen.tzinfo else last_seen.replace(tzinfo=UTC)
-                    days_diff = abs((_evt - _seen).total_seconds() / 86400)
-                    if days_diff < 7:  # Within a week
-                        temporal_score = max(0, 1.0 - (days_diff / 7))
-                        score += temporal_score * 0.2
-
-                if score > best_score:
-                    best_score = score
-                    best_candidate = candidate_id
-
-            # Threshold for considering it the same entity
-            threshold = 0.6
-
-            if best_score > threshold:
-                # Update entity
-                await conn.execute(
-                    f"""
-                    UPDATE {fq_table("entities")}
-                    SET mention_count = mention_count + 1,
-                        last_seen = $1
-                    WHERE id = $2
-                    """,
-                    unit_event_date,
-                    best_candidate,
-                )
-                return best_candidate
-            else:
-                # Not confident - create new entity
-                return await self._create_entity(conn, bank_id, entity_text, unit_event_date)
-
-    async def _create_entity(
-        self,
+        resolved_entities: list[ResolvedEntity],
         conn,
-        bank_id: str,
-        entity_text: str,
-        event_date,
-    ) -> str:
+    ) -> None:
+        """Lock (and, if pruned, re-create) resolved parents before linking units.
+
+        Phase-1 resolution and the Phase-2 ``unit_entities`` insert run on
+        different transactions. In the gap, ``prune_orphan_entities`` can delete
+        a just-resolved parent — it legitimately has no ``unit_entities`` row
+        yet — and the Phase-2 FK insert then fails, dropping the whole batch as
+        non-retryable (silent memory loss, #2662).
+
+        Called on the Phase-2 connection immediately before
+        ``link_units_to_entities_batch``, this locks the parents that still
+        exist (so the pruner blocks until we commit) and re-inserts any that
+        already vanished, in one round-trip. An entity referenced by a live unit
+        is by definition not an orphan, so resurrecting it is correct.
         """
-        Create a new entity or get existing one if it already exists.
+        # Deduplicate by id and lock in a stable order so concurrent reasserts
+        # acquire row locks consistently (same convention as bulk_insert_links).
+        seen: set[str] = set()
+        unique: list[ResolvedEntity] = []
+        for entity in sorted(resolved_entities, key=lambda e: e.entity_id):
+            if entity.entity_id in seen:
+                continue
+            seen.add(entity.entity_id)
+            unique.append(entity)
 
-        Uses INSERT ... ON CONFLICT to handle race conditions where
-        two concurrent transactions try to create the same entity.
+        if not unique:
+            return
 
-        Args:
-            conn: Database connection
-            bank_id: bank ID
-            entity_text: Entity text
-            event_date: When first seen
-
-        Returns:
-            Entity ID
-        """
-        entity_id = await conn.fetchval(
-            f"""
-            INSERT INTO {fq_table("entities")} (bank_id, canonical_name, first_seen, last_seen, mention_count)
-            VALUES ($1, $2, COALESCE($3, now()), COALESCE($4, now()), 1)
-            ON CONFLICT (bank_id, LOWER(canonical_name))
-            DO UPDATE SET
-                mention_count = {fq_table("entities")}.mention_count + 1,
-                last_seen = EXCLUDED.last_seen
-            RETURNING id
-            """,
+        await self._ops.bulk_reassert_entities(
+            conn,
+            fq_table("entities"),
             bank_id,
-            entity_text,
-            event_date,
-            event_date,
-        )
-        return entity_id
-
-    async def link_unit_to_entity(self, unit_id: str, entity_id: str):
-        """
-        Link a memory unit to an entity.
-        Also updates co-occurrence cache with other entities in the same unit.
-
-        Args:
-            unit_id: Memory unit ID
-            entity_id: Entity ID
-        """
-        async with acquire_with_retry(self.pool) as conn:
-            # Insert unit-entity link
-            await conn.execute(
-                f"""
-                INSERT INTO {fq_table("unit_entities")} (unit_id, entity_id)
-                VALUES ($1, $2)
-                ON CONFLICT DO NOTHING
-                """,
-                unit_id,
-                entity_id,
-            )
-
-            # Update co-occurrence cache: find other entities in this unit
-            rows = await conn.fetch(
-                f"""
-                SELECT entity_id
-                FROM {fq_table("unit_entities")}
-                WHERE unit_id = $1 AND entity_id != $2
-                """,
-                unit_id,
-                entity_id,
-            )
-
-            other_entities = [row["entity_id"] for row in rows]
-
-            # Update co-occurrences for each pair
-            for other_entity_id in other_entities:
-                await self._update_cooccurrence(conn, entity_id, other_entity_id)
-
-    async def _update_cooccurrence(self, conn, entity_id_1: str, entity_id_2: str):
-        """
-        Update the co-occurrence cache for two entities.
-
-        Uses CHECK constraint ordering (entity_id_1 < entity_id_2) to avoid duplicates.
-
-        Args:
-            conn: Database connection
-            entity_id_1: First entity ID
-            entity_id_2: Second entity ID
-        """
-        # Ensure consistent ordering (smaller UUID first)
-        if entity_id_1 > entity_id_2:
-            entity_id_1, entity_id_2 = entity_id_2, entity_id_1
-
-        await conn.execute(
-            f"""
-            INSERT INTO {fq_table("entity_cooccurrences")} (entity_id_1, entity_id_2, cooccurrence_count, last_cooccurred)
-            VALUES ($1, $2, 1, NOW())
-            ON CONFLICT (entity_id_1, entity_id_2)
-            DO UPDATE SET
-                cooccurrence_count = {fq_table("entity_cooccurrences")}.cooccurrence_count + 1,
-                last_cooccurred = NOW()
-            """,
-            entity_id_1,
-            entity_id_2,
+            [entity.entity_id for entity in unique],
+            [entity.canonical_name for entity in unique],
+            [entity.entity_kind for entity in unique],
         )
 
     async def link_units_to_entities_batch(
         self,
         unit_entity_pairs: list[tuple[str, str]] | list[tuple[str, str, datetime | None]],
         conn=None,
+        bank_id: str | None = None,
     ):
         """
         Link multiple memory units to entities in batch (MUCH faster than sequential).
@@ -1043,23 +1524,73 @@ class EntityResolver:
 
         if conn is None:
             async with acquire_with_retry(self.pool) as conn:
-                return await self._link_units_to_entities_batch_impl(conn, normalized)
+                return await self._link_units_to_entities_batch_impl(conn, normalized, bank_id)
         else:
-            return await self._link_units_to_entities_batch_impl(conn, normalized)
+            return await self._link_units_to_entities_batch_impl(conn, normalized, bank_id)
 
-    async def _link_units_to_entities_batch_impl(self, conn, unit_entity_pairs: list[tuple[str, str, datetime | None]]):
+    async def record_unit_entity_postings(
+        self,
+        unit_entity_pairs: list[tuple[str, str]] | list[tuple[str, str, datetime | None]],
+        bank_id: str | None = None,
+        store_write: bool = True,
+    ):
+        """Store-owned variant of :meth:`link_units_to_entities_batch` that touches NO
+        Postgres connection.
+
+        For a memories store that OWNS its memory rows (an external backend), the unit→entity
+        posting is recorded by the store — ``record_unit_entities`` ignores the ``conn`` — and
+        the co-occurrence update only accumulates in memory for the post-transaction flush.
+        Neither needs a database transaction, so the retain orchestrator can run the posting in
+        its connection-free store phase and never hold the data-plane connection across the
+        object-store write. NOT for the Postgres store, whose posting is a real ``unit_entities``
+        INSERT that requires the connection.
+
+        ``store_write=False`` skips the store-side posting and does ONLY the co-occurrence
+        accumulation. The caller uses this when it has already attached entity ids to the memories
+        as part of the same write (a single deferred write with entities inline, instead of
+        write-then-reattach) — so the store row is already correct and a second store write would
+        be redundant. Co-occurrence still runs: it references only ``entities`` and is needed by the
+        entity-graph endpoint and resolution's disambiguation signal regardless of who wrote the row.
+        """
+        if not unit_entity_pairs:
+            return
+
+        normalized: list[tuple[str, str, datetime | None]] = [
+            (t[0], t[1], t[2] if len(t) >= 3 else None)  # type: ignore[misc]
+            for t in unit_entity_pairs
+        ]
+        return await self._link_units_to_entities_batch_impl(None, normalized, bank_id, store_write=store_write)
+
+    async def _link_units_to_entities_batch_impl(
+        self,
+        conn,
+        unit_entity_pairs: list[tuple[str, str, datetime | None]],
+        bank_id: str | None = None,
+        store_write: bool = True,
+    ):
         # Sorted bulk insert to prevent deadlocks from inconsistent lock ordering
         # across concurrent transactions on the unit_entities unique index.
         sorted_pairs = sorted(unit_entity_pairs, key=lambda t: (t[0], t[1]))
         unit_ids = [p[0] for p in sorted_pairs]
         entity_ids = [p[1] for p in sorted_pairs]
 
-        await self._ops.bulk_insert_unit_entities(
-            conn,
-            fq_table("unit_entities"),
-            unit_ids,
-            entity_ids,
-        )
+        # The unit→entity posting belongs to whoever stores the memory, so the
+        # memories store records it. Co-occurrence below is separate and unaffected:
+        # it references only `entities`, which stays in Postgres either way, and is
+        # read by the entity-graph endpoint and by resolution's disambiguation signal.
+        # `store_write=False` means the caller already wrote the postings inline with the
+        # memories, so we skip the (redundant) second store write and keep only co-occurrence.
+        from .memories import get_memories
+
+        if store_write:
+            await get_memories().record_unit_entities(
+                conn=conn,
+                ops=self._ops,
+                fq_table=fq_table,
+                bank_id=bank_id,
+                unit_ids=unit_ids,
+                entity_ids=entity_ids,
+            )
 
         # Build maps keyed by unit_id:
         #   unit_to_entities: entity set per unit (for the co-occurrence cross-product)
@@ -1083,20 +1614,12 @@ class EntityResolver:
         for unit_id, entity_ids in unit_to_entities.items():
             entity_list = list(entity_ids)
             event_date = unit_event_date.get(unit_id)
-            for i, entity_id_1 in enumerate(entity_list):
-                for entity_id_2 in entity_list[i + 1 :]:
-                    if entity_id_1 == entity_id_2:
-                        continue
-                    # Canonical ordering (entity_id_1 < entity_id_2) matches the
-                    # entity_cooccurrences PK and check constraint.
-                    if entity_id_1 > entity_id_2:
-                        entity_id_1, entity_id_2 = entity_id_2, entity_id_1
-                    key = (entity_id_1, entity_id_2)
-                    prev = cooccurrence_pairs.get(key, _SENTINEL_MISSING)
-                    if prev is _SENTINEL_MISSING:
-                        cooccurrence_pairs[key] = event_date
-                    else:
-                        cooccurrence_pairs[key] = _later_date(prev, event_date)
+            for key in _canonical_cooccurrence_pairs(entity_list):
+                prev = cooccurrence_pairs.get(key, _SENTINEL_MISSING)
+                if prev is _SENTINEL_MISSING:
+                    cooccurrence_pairs[key] = event_date
+                else:
+                    cooccurrence_pairs[key] = _later_date(prev, event_date)
 
         # Accumulate co-occurrence pairs for post-transaction flush.
         # The actual INSERT/UPDATE is deferred to flush_pending_stats() to avoid
@@ -1108,58 +1631,3 @@ class EntityResolver:
                 _CooccurrencePair(entity_id_1=e1, entity_id_2=e2, event_date=ed)
                 for (e1, e2), ed in cooccurrence_pairs.items()
             )
-
-    async def get_units_by_entity(self, entity_id: str, limit: int = 100) -> list[str]:
-        """
-        Get all units that mention an entity.
-
-        Args:
-            entity_id: Entity ID
-            limit: Max results
-
-        Returns:
-            List of unit IDs
-        """
-        async with acquire_with_retry(self.pool) as conn:
-            rows = await conn.fetch(
-                f"""
-                SELECT unit_id
-                FROM {fq_table("unit_entities")}
-                WHERE entity_id = $1
-                ORDER BY unit_id
-                LIMIT $2
-                """,
-                entity_id,
-                limit,
-            )
-            return [row["unit_id"] for row in rows]
-
-    async def get_entity_by_text(
-        self,
-        bank_id: str,
-        entity_text: str,
-    ) -> str | None:
-        """
-        Find an entity by text (for query resolution).
-
-        Args:
-            bank_id: bank ID
-            entity_text: Entity text to search for
-
-        Returns:
-            Entity ID if found, None otherwise
-        """
-        async with acquire_with_retry(self.pool) as conn:
-            row = await conn.fetchrow(
-                f"""
-                SELECT id FROM {fq_table("entities")}
-                WHERE bank_id = $1
-                  AND canonical_name ILIKE $2
-                ORDER BY mention_count DESC
-                LIMIT 1
-                """,
-                bank_id,
-                entity_text,
-            )
-
-            return row["id"] if row else None

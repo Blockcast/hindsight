@@ -34,6 +34,7 @@ interface PluginConfig {
   autoRetain?: boolean;
   seedBankEnabled?: boolean;
   seedBankWebhookUrl?: string;
+  enabledAgentIds?: string[];
 }
 
 interface AgentCreatedPayload {
@@ -203,6 +204,12 @@ async function resolveApiKey(
   return resolved ?? undefined;
 }
 
+function isAgentEnabled(config: PluginConfig, agentId: string | undefined | null): boolean {
+  const allowlist = config.enabledAgentIds;
+  if (!allowlist || allowlist.length === 0) return true;
+  return !!agentId && allowlist.includes(agentId);
+}
+
 const plugin = definePlugin({
   async setup(ctx) {
     ctx.logger.info("Hindsight memory plugin starting");
@@ -277,6 +284,7 @@ const plugin = definePlugin({
       const config = await getConfig(ctx);
       const { agentId, runId, issueId } = payload;
       const companyId = event.companyId;
+      if (!isAgentEnabled(config, agentId)) return;
       if (!issueId || !companyId) return;
 
       let issue;
@@ -399,6 +407,14 @@ const plugin = definePlugin({
         return;
       }
 
+      if (!isAgentEnabled(config, bankAgentId)) {
+        ctx.logger.debug("Skipping retain — agent not in enabled list", {
+          commentId,
+          agentId: bankAgentId,
+        });
+        return;
+      }
+
       try {
         const apiKey = await resolveApiKey(ctx, config);
         const client = new HindsightClient(config.hindsightApiUrl, apiKey);
@@ -429,6 +445,8 @@ const plugin = definePlugin({
     // ---------------------------------------------------------------------------
     ctx.events.on("agent.run.finished", async (event) => {
       const payload = event.payload as RunFinishedPayload;
+      const config = await getConfig(ctx);
+      if (!isAgentEnabled(config, payload?.agentId)) return;
       ctx.logger.debug(
         "agent.run.finished received (no-op; retention handled by issue.comment.created)",
         { runId: payload?.runId }

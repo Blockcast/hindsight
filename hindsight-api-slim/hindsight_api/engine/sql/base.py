@@ -7,6 +7,25 @@ Business logic calls these methods instead of embedding raw SQL fragments.
 from abc import ABC, abstractmethod
 
 
+def bm25_score_gate(bm25_min_score: float) -> str:
+    """Return the comparison a BM25 arm applies to its relevance score.
+
+    Two different jobs share one number. With no caller floor (the default,
+    ``0.0``) the gate is structural — ``> 0`` keeps only genuine term matches on
+    backends whose operator ranks every document instead of pre-filtering. With a
+    caller floor (recall's ``min_scores.keyword``) the gate becomes that floor,
+    **inclusive**, matching the documented contract and the semantic arm's
+    ``>= min_similarity``. A positive floor subsumes the structural gate, so the
+    two never need to be applied together.
+    """
+    if bm25_min_score <= 0:
+        return "> 0"
+    # `!r` (shortest round-tripping repr), not `:g` — `:g` truncates to 6
+    # significant digits, so a caller echoing a `scores.keyword` value back as a
+    # floor could get a literal that rounds up past its own row and drops it.
+    return f">= {bm25_min_score!r}"
+
+
 class SQLDialect(ABC):
     """SQL dialect interface for portable query construction.
 
@@ -300,19 +319,6 @@ class SQLDialect(ABC):
         """FOR UPDATE SKIP LOCKED clause (same on both PG and Oracle)."""
         ...
 
-    @abstractmethod
-    def advisory_lock(self, id_param: str) -> str:
-        """Advisory lock expression.
-
-        Args:
-            id_param: Parameter placeholder for the lock ID.
-
-        Returns:
-            PG: "pg_try_advisory_lock($1)"
-            Oracle: "SELECT ... FOR UPDATE NOWAIT" equivalent.
-        """
-        ...
-
     # -- UUID generation -------------------------------------------------
 
     @abstractmethod
@@ -387,7 +393,8 @@ class SQLDialect(ABC):
             fact_type: Fact type literal (inlined, not parameterized).
             embedding_param: Parameter placeholder for query embedding.
             bank_id_param: Parameter placeholder for bank_id.
-            fetch_limit: Max rows to fetch (over-fetched for HNSW approximation).
+            fetch_limit: Max rows the arm returns. Its ANN candidate list must be at
+                least this wide or the scan cannot fill it — see PostgresMemories.search.
             min_similarity: Minimum cosine similarity to include.
             tags_clause: Optional WHERE clause fragment for tag filtering.
             groups_clause: Optional WHERE clause fragment for tag group filtering.
@@ -411,6 +418,9 @@ class SQLDialect(ABC):
         text_search_extension: str = "native",
         bm25_language: str = "english",
         bm25_min_score: float = 0.0,
+        pg_search_function_schema: str = "paradedb",
+        pg_search_tokenizer: str = "",
+        max_query_terms: int = 0,
         extra_where: str = "",
     ) -> str:
         """Build a BM25/full-text search subquery arm.
@@ -430,14 +440,25 @@ class SQLDialect(ABC):
             arm_index: Index of this arm in the UNION ALL (used by Oracle for
                        unique SCORE labels).
             text_search_extension: Full-text search backend ("native", "vchord",
-                                   "pg_textsearch", "pgroonga"). Only relevant for PostgreSQL.
+                                   "pg_textsearch", "pgroonga", "pg_search"). Only relevant for PostgreSQL.
             bm25_language: PostgreSQL text search dictionary used by the native
                            backend (e.g. "english", "french"). Ignored by other backends.
-            bm25_min_score: Minimum BM25 relevance score a row must exceed to be
-                            returned. Gates out non-matching rows on backends whose
-                            operator (e.g. VectorChord) ranks every document instead
-                            of pre-filtering to query-term matches. Backends that
-                            already apply a boolean match gate ignore this.
+            bm25_min_score: Inclusive minimum BM25 relevance score a row must
+                            reach to be returned (recall's ``min_scores.keyword``,
+                            or the ``bm25_min_score`` config default). Every
+                            backend must honour it. At the ``0.0`` default it
+                            degrades to a structural ``> 0`` match gate, which
+                            matters for backends whose operator (e.g. VectorChord)
+                            ranks every document instead of pre-filtering to
+                            query-term matches; backends with their own boolean
+                            match gate (`@@`, `&@~`, `@@@`) need no extra
+                            predicate at that default.
+            pg_search_function_schema: Schema containing pg_search functions (e.g. "paradedb",
+                                       "pgsearch"). Only used by the pg_search backend.
+            pg_search_tokenizer: Normalized tokenizer the pg_search index was built with
+                                 (``""`` = ParadeDB default). When set, the query is
+                                 tokenized in SQL and searched as its distinct word terms.
+            max_query_terms: Cap on those pg_search terms (0 = uncapped).
             extra_where: Optional additional WHERE clause fragment (e.g. time range filter).
         """
         ...
@@ -449,6 +470,7 @@ class SQLDialect(ABC):
         query_text: str,
         *,
         text_search_extension: str = "native",
+        max_query_terms: int | None = None,
     ) -> str:
         """Prepare the text parameter value for BM25 search.
 
@@ -459,6 +481,8 @@ class SQLDialect(ABC):
             tokens: Tokenized query words.
             query_text: Original query text.
             text_search_extension: Full-text search backend variant.
+            max_query_terms: Optional backend-specific token cap. 0 or None
+                leaves query terms uncapped.
 
         Returns:
             Prepared text string to bind as the BM25 text parameter.

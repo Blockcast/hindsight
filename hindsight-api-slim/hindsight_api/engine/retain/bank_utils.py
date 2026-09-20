@@ -2,19 +2,26 @@
 bank profile utilities for disposition and mission management.
 """
 
+import asyncio
 import json
 import logging
+import unicodedata
 import uuid
 from dataclasses import dataclass
-from typing import TypedDict
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, TypedDict
 
 from pydantic import BaseModel, Field
 
-from ..._vector_index import index_using_clause, uses_per_bank_vector_indexes
+from ..._vector_index import index_using_clause, per_bank_indexes_are_eager, uses_per_bank_vector_indexes
 from ...config import get_config
-from ..db_utils import acquire_with_retry
+from ..db_utils import acquire_with_retry, retry_with_backoff
 from ..memory_engine import fq_table, get_current_schema
 from ..response_models import DispositionTraits
+
+if TYPE_CHECKING:
+    from ..db.base import DatabaseConnection
+    from ..db.ops import DataAccessOps
 
 logger = logging.getLogger(__name__)
 
@@ -44,21 +51,42 @@ def _vector_index_clause() -> str | None:
     return index_using_clause(ext)
 
 
-async def create_bank_vector_indexes(conn, bank_id: str, internal_id: str, ops=None) -> None:
+async def create_bank_vector_indexes(
+    conn: "DatabaseConnection", bank_id: str, internal_id: str, *, ops: "DataAccessOps"
+) -> None:
     """Create per-(bank, fact_type) partial vector indexes for a newly created bank.
+
+    Only does anything when the size threshold is off — the default — where a
+    bank is entitled to its indexes from the moment it exists and building them
+    here is instant, because the bank is empty. That is the behaviour that
+    predates the threshold, and keeping it means the default deployment never
+    submits a ``vector_index_maintenance`` operation and never pays a coverage
+    check on a write.
+
+    With ``HINDSIGHT_API_VECTOR_INDEX_MIN_ROWS`` set, a fresh bank has not earned
+    anything yet, so this is a no-op and the maintenance operation builds an
+    index CONCURRENTLY if and when the bank grows into one — which also keeps
+    CREATE INDEX's ShareLock on the shared memory_units table off the write path.
 
     Respects the HINDSIGHT_API_VECTOR_EXTENSION config to use the appropriate
     index type (HNSW for pgvector, DiskANN for pgvectorscale, vchordrq for vchord).
 
     AlloyDB ScaNN uses global vector indexes with filtered vector search; it
     cannot safely create per-bank indexes at bank-creation time because new
-    banks have no embedding rows.
+    banks have no embedding rows. On Oracle 23ai this is likewise a no-op —
+    Oracle uses a single global vector index created during migrations, and does
+    not support partial (WHERE-clause) vector indexes.
+
     bank_id is escaped for SQL literal safety (apostrophes doubled).
 
-    On Oracle 23ai, this is a no-op — Oracle uses a single global vector index
-    created during migrations. Partial indexes (WHERE clause) are not supported
-    for Oracle vector indexes.
+    ``ops`` is required rather than defaulting to None: it is only dereferenced
+    in the eager branch, so a caller that forgot it used to work fine until the
+    threshold happened to be off, and then failed on an AttributeError from
+    inside bank creation.
     """
+    if not per_bank_indexes_are_eager():
+        return
+
     index_clause = _vector_index_clause()
     if index_clause is None:
         logger.debug("Skipping per-bank vector indexes for configured backend")
@@ -74,7 +102,7 @@ async def create_bank_vector_indexes(conn, bank_id: str, internal_id: str, ops=N
     )
 
 
-async def drop_bank_vector_indexes(conn, internal_id: str, ops=None) -> None:
+async def drop_bank_vector_indexes(conn: "DatabaseConnection", internal_id: str, *, ops: "DataAccessOps") -> None:
     """Drop per-(bank, fact_type) partial vector indexes for a bank being deleted.
 
     Called before the bank row is deleted so internal_id is still known.
@@ -139,6 +167,51 @@ async def get_bank_profile(pool, bank_id: str) -> BankProfile:
     return result.profile
 
 
+async def bank_exists_on_conn(conn: "DatabaseConnection", bank_id: str) -> bool:
+    """Existence probe for a bank row on a caller-supplied connection.
+
+    Deliberately narrower than ``get_bank_profile_if_exists_on_conn``: callers on
+    the lazy-create hot path only need to know whether the row is there, so this
+    selects a constant instead of reading and JSON-decoding the disposition.
+    """
+    return await conn.fetchval(f"SELECT 1 FROM {fq_table('banks')} WHERE bank_id = $1", bank_id) is not None
+
+
+async def bank_exists(pool, bank_id: str) -> bool:
+    """Dedicated-connection variant of ``bank_exists_on_conn``.
+
+    A bare SELECT with no surrounding transaction — this is the read-only fast
+    path taken by every write to an already-existing bank, so it must not pay
+    for a BEGIN/COMMIT round trip.
+    """
+    async with acquire_with_retry(pool) as conn:
+        return await bank_exists_on_conn(conn, bank_id)
+
+
+async def get_bank_profile_if_exists_on_conn(conn: "DatabaseConnection", bank_id: str) -> BankProfile | None:
+    """Get bank profile (name, disposition + mission) on conn without auto-creating.
+
+    Returns None if the bank does not exist.
+    """
+    row = await conn.fetchrow(
+        f"""
+        SELECT name, disposition, mission
+        FROM {fq_table("banks")} WHERE bank_id = $1
+        """,
+        bank_id,
+    )
+    if not row:
+        return None
+    disposition_data = row["disposition"]
+    if isinstance(disposition_data, str):
+        disposition_data = json.loads(disposition_data)
+    return BankProfile(
+        name=row["name"],
+        disposition=DispositionTraits(**disposition_data),
+        mission=row["mission"] or "",
+    )
+
+
 async def get_bank_profile_if_exists(pool, bank_id: str) -> BankProfile | None:
     """
     Get bank profile (name, disposition + mission) without auto-creating.
@@ -154,85 +227,70 @@ async def get_bank_profile_if_exists(pool, bank_id: str) -> BankProfile | None:
     Returns:
         BankProfile if the bank exists, otherwise None.
     """
-    async with acquire_with_retry(pool) as conn:
-        row = await conn.fetchrow(
-            f"""
-            SELECT name, disposition, mission
-            FROM {fq_table("banks")} WHERE bank_id = $1
-            """,
-            bank_id,
-        )
-        if not row:
-            return None
-        disposition_data = row["disposition"]
-        if isinstance(disposition_data, str):
-            disposition_data = json.loads(disposition_data)
-        return BankProfile(
-            name=row["name"],
-            disposition=DispositionTraits(**disposition_data),
-            mission=row["mission"] or "",
-        )
+    # Cached per process (see engine/bank_info_cache): on a hit this takes no pooled connection at
+    # all, which is what lets a store-owned retain -- one that writes nothing to Postgres -- run
+    # without touching the pool. A miss reads exactly as before.
+    from .. import bank_info_cache
 
+    async def _load() -> dict:
+        async with acquire_with_retry(pool) as conn:
+            profile = await get_bank_profile_if_exists_on_conn(conn, bank_id)
+        # "The bank does not exist" has to be representable as a cached value, or every miss for a
+        # missing bank re-reads it. `BankProfile` is a TypedDict, so the only thing that has to be
+        # unpacked is `disposition`, which is a pydantic model the cache would otherwise hand back
+        # by reference and let a caller mutate for every other holder of the entry.
+        if profile is None:
+            return {}
+        return {**profile, "disposition": profile["disposition"].model_dump()}
 
-async def get_or_create_bank_profile(pool, bank_id: str) -> BankProfileResult:
-    """
-    Get bank profile, auto-creating with defaults if it doesn't exist.
-
-    Same as get_bank_profile, but also reports whether the bank was freshly
-    created on this call (``BankProfileResult.created``). Used by the memory
-    engine to apply the HINDSIGHT_API_DEFAULT_BANK_TEMPLATE hook on first bank
-    creation.
-
-    Acquires its own connection. When the caller already holds a connection and
-    wants the bank row to share its transaction (so the lazy bank-create commits
-    or rolls back atomically with the caller's write), use
-    ``get_or_create_bank_profile_on_conn`` instead.
-    """
-    async with acquire_with_retry(pool) as conn:
-        return await get_or_create_bank_profile_on_conn(conn, bank_id, ops=pool.ops)
-
-
-async def get_or_create_bank_profile_on_conn(conn, bank_id: str, *, ops) -> BankProfileResult:
-    """
-    Connection-bound variant of ``get_or_create_bank_profile``.
-
-    Runs the SELECT, the ``INSERT ... ON CONFLICT DO NOTHING`` and the per-bank
-    vector index creation on the caller-supplied ``conn``. When ``conn`` is
-    inside an open transaction, the lazy bank-create therefore commits (or rolls
-    back) atomically with whatever bank-scoped write the caller performs on the
-    same connection — closing the window where a freshly-created bank could
-    outlive a write that ultimately failed.
-
-    ``ops`` is the backend's dialect ops object (``backend.ops``), needed for
-    per-bank vector index DDL.
-    """
-    # Try to get existing bank
-    row = await conn.fetchrow(
-        f"""
-        SELECT name, disposition, mission
-        FROM {fq_table("banks")} WHERE bank_id = $1
-        """,
-        bank_id,
+    row = await bank_info_cache.get_or_load(bank_id, "profile", _load)
+    if not row:
+        return None
+    return BankProfile(
+        name=row["name"],
+        disposition=DispositionTraits(**row["disposition"]),
+        mission=row["mission"] or "",
     )
 
-    if row:
-        # asyncpg returns JSONB as a string, so parse it
-        disposition_data = row["disposition"]
-        if isinstance(disposition_data, str):
-            disposition_data = json.loads(disposition_data)
 
-        return BankProfileResult(
-            profile=BankProfile(
-                name=row["name"],
-                disposition=DispositionTraits(**disposition_data),
-                mission=row["mission"] or "",
-            ),
-            created=False,
+# Bytes, not characters: storage keys percent-encode the bank id (up to 3x per UTF-8 byte), so
+# 192 bytes is at most 576 encoded bytes, under S3's 1,024-byte key limit with room for the
+# tenant, the prefix and the file name, while still fitting 64 CJK characters (#4391).
+BANK_ID_MAX_BYTES = 192
+
+
+def validate_new_bank_id(bank_id: str) -> None:
+    """Reject a bank id that must not be created. Existing banks are never re-checked."""
+    from hindsight_api.extensions import OperationValidationError
+
+    if not bank_id:
+        raise OperationValidationError("Bank id must not be empty", status_code=400)
+    if len(bank_id.encode("utf-8")) > BANK_ID_MAX_BYTES:
+        raise OperationValidationError(
+            f"Bank id is too long: at most {BANK_ID_MAX_BYTES} bytes of UTF-8 are allowed", status_code=400
         )
+    if any(unicodedata.category(ch) == "Cc" for ch in bank_id):
+        raise OperationValidationError("Bank id must not contain control characters", status_code=400)
 
-    # Bank doesn't exist, create with defaults.
-    # Generate internal_id here so we control the value and can use it
-    # immediately for vector index creation without a RETURNING round-trip.
+
+async def create_bank_row_on_conn(conn: "DatabaseConnection", bank_id: str, *, ops: "DataAccessOps") -> bool:
+    """Idempotently insert a default bank row and its vector indexes on conn.
+
+    Uses ``INSERT ... ON CONFLICT (bank_id) DO NOTHING RETURNING bank_id``.
+    Returns True if the bank was freshly inserted on this call, False if it already existed.
+
+    The ``created`` flag drives one-time side effects (per-bank vector indexes
+    here, the default-bank-template hook in the caller), so it has to be exact on
+    both dialects. It is: the Oracle layer strips RETURNING from ON CONFLICT DO
+    NOTHING, but ``fetchval`` compensates — it returns the first bind argument on
+    a successful insert and None when it suppresses ORA-00001 (see
+    ``db/oracle.py``). Use ``fetchval`` here, not ``fetchrow``, which has no such
+    compensation and would report every fresh Oracle insert as an existing row.
+    """
+    # internal_id is minted here rather than defaulted server-side so its value is
+    # known without a RETURNING round-trip: the index names derive from it, both
+    # for the eager create below and for the maintenance operation when a
+    # threshold is set.
     internal_id = uuid.uuid4()
     inserted = await conn.fetchval(
         f"""
@@ -250,8 +308,87 @@ async def get_or_create_bank_profile_on_conn(conn, bank_id: str, *, ops) -> Bank
 
     created = inserted is not None
     if created:
-        # Fresh insert — create per-bank vector indexes (instant on empty bank)
+        # Fresh insert — create per-bank vector indexes (instant on an empty
+        # bank). A no-op unless the size threshold is off; see
+        # create_bank_vector_indexes.
         await create_bank_vector_indexes(conn, bank_id, str(internal_id), ops=ops)
+
+    return created
+
+
+async def create_bank_if_missing(pool, bank_id: str) -> bool:
+    """Dedicated-connection variant of ``create_bank_row_on_conn``.
+
+    Returns True if freshly created on this call, False if it already existed.
+    """
+
+    # Retried as a whole transaction. With the size threshold off (the default)
+    # a fresh bank builds its per-(bank, fact_type) partial vector indexes with a
+    # plain CREATE INDEX — it must, since this runs inside the bank-create tx and
+    # CONCURRENTLY cannot — and that CREATE takes a ShareLock on the shared
+    # memory_units table, which can deadlock with concurrent writers. Even with
+    # no DDL to issue, the lazy create can lose a deadlock (40P01 / ORA-00060) to
+    # a concurrent writer touching the same bank row. The body is idempotent
+    # (INSERT ... ON CONFLICT DO NOTHING + CREATE INDEX IF NOT EXISTS), so
+    # retrying the whole tx stays correct and cheap.
+    async def _create() -> bool:
+        async with acquire_with_retry(pool) as conn:
+            async with conn.transaction():
+                return await create_bank_row_on_conn(conn, bank_id, ops=pool.ops)
+
+    return await retry_with_backoff(_create)
+
+
+async def get_or_create_bank_profile(pool, bank_id: str) -> BankProfileResult:
+    """
+    Get bank profile, auto-creating with defaults if it doesn't exist.
+
+    Same as get_bank_profile, but also reports whether the bank was freshly
+    created on this call (``BankProfileResult.created``). Used by the memory
+    engine to apply the HINDSIGHT_API_DEFAULT_BANK_TEMPLATE hook on first bank
+    creation.
+
+    Acquires its own connection. When the caller already holds a connection and
+    wants the bank row to share its transaction (so the lazy bank-create commits
+    or rolls back atomically with the caller's write), use
+    ``get_or_create_bank_profile_on_conn`` instead.
+    """
+
+    # Retried as a whole transaction — see the deadlock note on
+    # ``create_bank_if_missing``; the body is idempotent, so retrying is safe.
+    async def _create() -> BankProfileResult:
+        async with acquire_with_retry(pool) as conn:
+            async with conn.transaction():
+                return await get_or_create_bank_profile_on_conn(conn, bank_id, ops=pool.ops)
+
+    return await retry_with_backoff(_create)
+
+
+async def get_or_create_bank_profile_on_conn(
+    conn: "DatabaseConnection", bank_id: str, *, ops: "DataAccessOps"
+) -> BankProfileResult:
+    """
+    Connection-bound variant of ``get_or_create_bank_profile``.
+
+    Runs the SELECT, the ``INSERT ... ON CONFLICT DO NOTHING`` and the per-bank
+    vector index creation on the caller-supplied ``conn``. When ``conn`` is
+    inside an open transaction, the lazy bank-create therefore commits (or rolls
+    back) atomically with whatever bank-scoped write the caller performs on the
+    same connection — closing the window where a freshly-created bank could
+    outlive a write that ultimately failed.
+
+    ``ops`` is the backend's dialect ops object (``backend.ops``), needed for
+    per-bank vector index DDL.
+    """
+    profile = await get_bank_profile_if_exists_on_conn(conn, bank_id)
+    if profile is not None:
+        return BankProfileResult(
+            profile=profile,
+            created=False,
+        )
+
+    # Bank doesn't exist, create with defaults.
+    created = await create_bank_row_on_conn(conn, bank_id, ops=ops)
 
     return BankProfileResult(
         profile=BankProfile(name=bank_id, disposition=DispositionTraits(**DEFAULT_DISPOSITION), mission=""),
@@ -283,6 +420,11 @@ async def update_bank_disposition(pool, bank_id: str, disposition: dict[str, int
             json.dumps(disposition),
         )
 
+    # The profile row just changed; the next read must not serve the entry loaded before it.
+    from .. import bank_info_cache
+
+    await bank_info_cache.invalidate(bank_id, "profile")
+
 
 async def set_bank_mission(pool, bank_id: str, mission: str) -> None:
     """
@@ -307,6 +449,11 @@ async def set_bank_mission(pool, bank_id: str, mission: str) -> None:
             bank_id,
             mission,
         )
+
+    # The profile row just changed; the next read must not serve the entry loaded before it.
+    from .. import bank_info_cache
+
+    await bank_info_cache.invalidate(bank_id, "profile")
 
 
 async def merge_bank_mission(pool, llm_config, bank_id: str, new_info: str) -> dict:
@@ -345,6 +492,11 @@ async def merge_bank_mission(pool, llm_config, bank_id: str, new_info: str) -> d
             merged_mission,
         )
 
+    # The profile row just changed; the next read must not serve the entry loaded before it.
+    from .. import bank_info_cache
+
+    await bank_info_cache.invalidate(bank_id, "profile")
+
     return {"mission": merged_mission}
 
 
@@ -379,9 +531,10 @@ Merged mission:"""
     try:
         messages = [{"role": "user", "content": prompt}]
 
-        content = await llm_config.call(
+        call_result = await llm_config.call(
             messages=messages, scope="bank_mission", temperature=0.3, max_completion_tokens=8192
         )
+        content = call_result.content
 
         logger.info(f"LLM response for mission merge (first 500 chars): {content[:500]}")
 
@@ -401,19 +554,56 @@ Merged mission:"""
         return {"mission": merged}
 
 
-async def list_banks(pool) -> list:
+# Sort floor for banks that have never been written to and carry no created_at.
+_UNIX_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+
+
+def _as_utc(ts: datetime | None) -> datetime | None:
+    """Normalize a DB timestamp to an aware UTC datetime so values stay comparable."""
+    if ts is None:
+        return None
+    return ts if ts.tzinfo is not None else ts.replace(tzinfo=UTC)
+
+
+async def list_banks(pool, *, search_query: str | None = None) -> list:
     """
-    List all banks in the system with summary stats.
+    List banks with summary stats, optionally narrowed by a search string.
+
+    ``last_document_at`` is document *ingestion* time (when a document first
+    landed), while ``last_write_at`` is the last time anything was written to
+    the bank — a document re-retained/appended to, or a fact stored. Appending
+    to a long-lived document does not move ``last_document_at``, which is why
+    the two differ and why UIs showing "last write" must use ``last_write_at``.
+
+    ``fact_count`` comes back 0 here and is filled per page by
+    :func:`apply_sql_fact_counts` (and, for banks whose memories live outside SQL,
+    :func:`apply_store_fact_counts`). Counting every bank's facts in this query meant
+    aggregating all of ``memory_units`` to render one page of banks, which is what made a
+    365-bank list time out (#4468). The write watermark still has to be read for every bank,
+    since it orders the list — but as one index entry per bank off an index that already
+    exists, not a GROUP BY over the whole table. Measured on 365 banks / 1.8M facts: 131 ms
+    to 6 ms, and no longer growing with the number of facts in the system.
 
     Args:
         pool: Database connection pool
+        search_query: Case-insensitive substring matched against bank ID and name
 
     Returns:
-        List of dicts with bank info and stats (document_count, fact_count, last_event_at)
+        List of dicts with bank info and stats (fact_count, last_document_at, last_write_at),
+        most recently written bank first.
     """
     banks_table = fq_table("banks")
     docs_table = fq_table("documents")
     mu_table = fq_table("memory_units")
+
+    # Spelled out as UPPER(...) LIKE UPPER(...) rather than ILIKE: the Oracle
+    # rewriter only recognizes ILIKE on an unqualified column, and these are
+    # alias-qualified.
+    where_clause = ""
+    params: list[str] = []
+    if search_query:
+        where_clause = "WHERE (UPPER(b.bank_id) LIKE UPPER($1) OR UPPER(COALESCE(b.name, '')) LIKE UPPER($2))"
+        params = [f"%{search_query}%", f"%{search_query}%"]
 
     async with acquire_with_retry(pool) as conn:
         rows = await conn.fetch(
@@ -421,42 +611,198 @@ async def list_banks(pool) -> list:
             SELECT
                 b.bank_id, b.name, b.disposition, b.mission,
                 b.created_at, b.updated_at,
-                COALESCE(m.fact_count, 0) AS fact_count,
-                d.last_document_at
+                d.last_document_at,
+                d.last_document_write_at,
+                -- Per bank, off `idx_memory_units_bank_updated_at`: one index entry read instead of
+                -- the GROUP BY over all of memory_units this replaced. `updated_at`, not
+                -- `created_at`, because that index is the one that exists — and it is the right
+                -- column anyway: this feeds `last_write_at` only, and every write to a fact bumps
+                -- `updated_at`, so the watermark is the same or newer, which is what "last written"
+                -- means. The documents half stays a GROUP BY: correlating it would be random reads
+                -- over the same rows, since this query lists every bank before paging, and
+                -- `last_document_at` must stay ingestion time (frozen when a document is rewritten).
+                (SELECT MAX(m.updated_at) FROM {mu_table} m WHERE m.bank_id = b.bank_id) AS last_fact_at
             FROM {banks_table} b
             LEFT JOIN (
-                SELECT bank_id, MAX(created_at) AS last_document_at
+                SELECT bank_id,
+                       MAX(created_at) AS last_document_at,
+                       MAX(updated_at) AS last_document_write_at
                 FROM {docs_table}
                 GROUP BY bank_id
             ) d ON d.bank_id = b.bank_id
-            LEFT JOIN (
-                SELECT bank_id, COUNT(*) AS fact_count
-                FROM {mu_table}
-                GROUP BY bank_id
-            ) m ON m.bank_id = b.bank_id
-            ORDER BY d.last_document_at DESC NULLS LAST, b.updated_at DESC
-            """
+            {where_clause}
+            ORDER BY b.bank_id
+            """,
+            *params,
         )
 
         result = []
+        # Banks are ordered by last write in Python rather than SQL: GREATEST() has
+        # different NULL semantics on PostgreSQL vs Oracle, and the bank list is small.
+        sort_keys: dict[str, datetime] = {}
+
         for row in rows:
             disposition_data = row["disposition"]
             if isinstance(disposition_data, str):
                 disposition_data = json.loads(disposition_data)
 
-            last_doc = row["last_document_at"]
+            last_doc = _as_utc(row["last_document_at"])
+            created_at = _as_utc(row["created_at"])
+            updated_at = _as_utc(row["updated_at"])
+            # Last write = newest of "a document was (re-)retained" and "a fact was stored".
+            # Appending to an existing document only bumps documents.updated_at, and facts
+            # written outside a retain (consolidation, curation, import) only bump memory_units.
+            write_times = [t for t in (_as_utc(row["last_document_write_at"]), _as_utc(row["last_fact_at"])) if t]
+            last_write = max(write_times) if write_times else None
 
+            sort_keys[row["bank_id"]] = last_write or created_at or _UNIX_EPOCH
             result.append(
                 {
                     "bank_id": row["bank_id"],
                     "name": row["name"],
                     "disposition": disposition_data,
                     "mission": row["mission"] or "",
-                    "created_at": row["created_at"].isoformat() if row["created_at"] else None,
-                    "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None,
-                    "fact_count": row["fact_count"],
+                    "created_at": created_at.isoformat() if created_at else None,
+                    "updated_at": updated_at.isoformat() if updated_at else None,
+                    # Filled per page by apply_sql_fact_counts / apply_store_fact_counts: counting
+                    # every bank's facts here is what made this query scan all of memory_units.
+                    "fact_count": 0,
                     "last_document_at": last_doc.isoformat() if last_doc else None,
+                    "last_write_at": last_write.isoformat() if last_write else None,
                 }
             )
 
-        return result
+    # Banks whose memories live outside SQL have no `documents` / `memory_units` rows for the joins
+    # above to take a MAX over, so their `last_write_at` came back NULL and they sorted as if never
+    # written. The store can answer it, and the Counters RPC is BATCHED — every such bank costs one
+    # call in total — so it is done BEFORE the sort. Doing it in the page-level overlay instead
+    # would fix the field but leave the order wrong, and inconsistent across pages, which is worse
+    # than uniformly wrong.
+    #
+    # Outside the connection block on purpose: these are network calls to another service and
+    # nothing below needs `conn`. Holding a pooled connection across them is what starves the pool
+    # under load, and the retain path enforces the same rule everywhere else.
+    await _apply_store_last_write(result, sort_keys)
+
+    result.sort(key=lambda bank: sort_keys[bank["bank_id"]], reverse=True)
+    return result
+
+
+async def _apply_store_last_write(banks: list[dict], sort_keys: "dict[str, datetime]") -> None:
+    """Fill `last_write_at` (and the sort key) from the store, for banks SQL cannot answer for.
+
+    One batched call for all of them. A bank the store has no time for is left exactly as it was —
+    absent means "unknown", never "the epoch", so an un-folded bank keeps whatever ordering it had
+    rather than being pushed to the bottom on a guess.
+    """
+    from ..memories import get_memories
+
+    store = get_memories()
+    external = [b for b in banks if store.store_owned_for(b["bank_id"])]
+    if not external:
+        return
+    ids = [b["bank_id"] for b in external]
+    # Asked for separately, because they are different questions: `last_document_at` is INGESTION
+    # time and must not move when an existing document is re-retained, while `last_write_at` must.
+    # Reporting one under both names looked harmless and is not — it makes a rewrite read as a new
+    # document.
+    #
+    # Gathered, not awaited in sequence: they are independent round trips to the same service, and
+    # `return_exceptions` keeps one failing from discarding the other's answer — a list that sorts
+    # correctly but shows no ingestion time is better than one that does neither.
+    # The try wraps the gather because building its arguments already calls into the store: a store
+    # that does not implement these raises AttributeError right here, before `return_exceptions` can
+    # see anything. They are optional — the interface defaults return `{}` — so a store without them
+    # must leave the list rendering, not break it.
+    try:
+        times_r, doc_times_r = await asyncio.gather(
+            store.last_write_at_many(bank_ids=ids),
+            store.last_document_at_many(bank_ids=ids),
+            return_exceptions=True,
+        )
+    except Exception as e:  # noqa: BLE001 - ordering is a nicety; the list itself must still render
+        logger.warning(f"Store cannot report write times for {len(external)} bank(s): {e}")
+        return
+    if isinstance(times_r, BaseException):
+        logger.warning(f"Could not read last_write_at from the store for {len(external)} bank(s): {times_r}")
+        times = {}
+    else:
+        times = times_r
+    if isinstance(doc_times_r, BaseException):
+        logger.warning(f"Could not read last_document_at from the store for {len(external)} bank(s): {doc_times_r}")
+        doc_times = {}
+    else:
+        doc_times = doc_times_r
+    if not times and not doc_times:
+        return
+    for bank in external:
+        doc_when = doc_times.get(bank["bank_id"])
+        if doc_when is not None:
+            bank["last_document_at"] = doc_when.isoformat()
+    for bank in external:
+        when = times.get(bank["bank_id"])
+        if when is None:
+            continue
+        bank["last_write_at"] = when.isoformat()
+        sort_keys[bank["bank_id"]] = when
+
+
+async def apply_store_fact_counts(banks: list[dict]) -> None:
+    """Replace ``fact_count`` in-place for banks that keep their memories outside SQL.
+
+    Those banks leave the ``memory_units`` join empty, so the count has to come from the store.
+    Still page-scoped rather than system-wide, but ONE batched call for that page instead of a
+    round trip per bank: asking per bank made the page cost a network hop each, and on dev a
+    108-bank page took ~8s end-to-end, almost all of it those hops — most against banks with
+    nothing in them. :meth:`count_memories_many` is the same question asked once.
+
+    ``strong=True``, deliberately. The per-bank call this replaces reads the un-folded tail, so
+    anything weaker would fold a change in what a just-written bank REPORTS into what was meant to
+    be a change in how long it takes. The batched read applies the tail without opening a snapshot,
+    so a page of N banks still cannot admit N banks and evict whatever was warm.
+
+    A bank the store has no count for reports zero, per the interface's contract that absent means
+    nothing to count — so one bank cannot fail the page.
+
+    No connection is held across this: it is a network call to another service and nothing here
+    needs one. Holding a pooled connection across the per-bank loop was the other half of the cost
+    under load, and is the rule :func:`_apply_store_last_write` already follows.
+    """
+    from ..memories import get_memories
+
+    store = get_memories()
+    external = [bank for bank in banks if store.store_owned_for(bank["bank_id"])]
+    if not external:
+        return
+
+    counts = await store.count_memories_many(bank_ids=[bank["bank_id"] for bank in external], strong=True)
+    for bank in external:
+        bank["fact_count"] = sum(counts.get(bank["bank_id"], {}).values())
+
+
+async def apply_sql_fact_counts(pool, banks: list[dict]) -> None:
+    """Fill ``fact_count`` from ``memory_units``, for the page of banks actually returned.
+
+    :func:`list_banks` used to count every bank in one GROUP BY over the whole table, so
+    listing 365 banks aggregated millions of rows whatever the page size (#4468). Scoped to
+    the page the count is a bounded index range per bank instead.
+
+    Banks whose memories live outside SQL have no rows here and stay at 0;
+    :func:`apply_store_fact_counts` runs after this one and overwrites them with the store's
+    live count.
+    """
+    if not banks:
+        return
+    async with acquire_with_retry(pool) as conn:
+        rows = await conn.fetch(
+            f"""
+            SELECT bank_id, COUNT(*) AS fact_count
+            FROM {fq_table("memory_units")}
+            WHERE bank_id = ANY($1)
+            GROUP BY bank_id
+            """,
+            [bank["bank_id"] for bank in banks],
+        )
+    counts = {row["bank_id"]: row["fact_count"] for row in rows}
+    for bank in banks:
+        bank["fact_count"] = counts.get(bank["bank_id"], 0)

@@ -34,6 +34,12 @@ Banks are completely isolated from each other — memories stored in one bank ar
 
 You don't need to pre-create a bank. Hindsight will automatically create it with default settings when you first use it.
 
+Only *writes* create a bank — retaining, updating its profile, changing its config. **Reads of a
+bank that does not exist return `404`**, so a typo'd, renamed or deleted `bank_id` is reported
+rather than answered with empty results. That matters if you are monitoring a bank: `GET .../stats`
+on a missing bank fails loudly instead of returning zeroed counters that look like a healthy,
+empty bank.
+
 :::tip Prerequisites
 Make sure you've completed the [Quick Start](./quickstart) to install the client and start the server.
 :::
@@ -79,6 +85,8 @@ Controls how aggressively facts are extracted:
 | `concise` *(default)* | Selective — only facts worth remembering long-term |
 | `verbose` | Captures more detail per fact; slower and uses more tokens |
 | `custom` | Write your own extraction rules via `retain_custom_instructions` |
+| `verbatim` | Stores each chunk's original text as one memory; the LLM extracts metadata such as entities and dates |
+| `chunks` | Stores each chunk as one memory without an LLM call; only caller-provided entities are available |
 
 ### retain_custom_instructions
 
@@ -135,10 +143,10 @@ Each entry in `entity_labels` is a **label group** — one classification dimens
 |-------|---------|-------------|
 | `key` | — | Label group identifier. Becomes the prefix in `key:value` entities (or `key:field:value` for `"map"`). |
 | `description` | `""` | Shown to the LLM to guide label assignment. |
-| `type` | `"value"` | `"value"` → pick one enum value; `"multi-values"` → pick multiple; `"text"` → free-form string; `"map"` → structured group with named fields. |
-| `values` | `[]` | Allowed values for `"value"` and `"multi-values"` types. Ignored for `"text"` and `"map"`. |
-| `fields` | `{}` | Field definitions for `"map"` types. Each field is itself typed (`"text"`, `"value"`, `"multi-values"`, or nested `"map"`). Ignored for non-map types. |
-| `optional` | `true` | When `true` the LLM may skip the label if not applicable. When `false` the LLM must always assign a value. Has no effect on `"multi-values"` groups (always optional). |
+| `type` | `"value"` | `"value"` → pick one enum value; `"multi-values"` → pick multiple; `"text"` → free-form string; `"multi-text"` → any number of free-form strings; `"map"` → structured group with named fields. |
+| `values` | `[]` | Allowed values for `"value"` and `"multi-values"` types. Ignored for `"text"`, `"multi-text"` and `"map"`. |
+| `fields` | `{}` | Field definitions for `"map"` types. Each field is itself typed (`"text"`, `"multi-text"`, `"value"`, `"multi-values"`, or nested `"map"`). Ignored for non-map types. |
+| `optional` | `true` | When `true` the LLM may skip the label if not applicable. When `false` the LLM must always assign a value. Has no effect on `"multi-values"` or `"multi-text"` groups (always optional). |
 | `tag` | `false` | When `true`, extracted `key:value` labels are also written as tags on the memory unit, enabling filtering via `tags`/`tags_match` in recall/reflect. |
 
 **Enum groups** (`type: "value"` or `type: "multi-values"`): the LLM picks from the predefined `values` list; anything outside the list is silently dropped. Vocabulary stays stable and graph links stay tight. Use `"multi-values"` when a fact can belong to several values at once.
@@ -155,7 +163,20 @@ Each entry in `entity_labels` is a **label group** — one classification dimens
 }
 ```
 
-**Map groups** (`type: "map"`): defines a structured entity type with named fields. Each field is itself typed (`"text"`, `"value"`, `"multi-values"`, or nested `"map"`) so you can describe rich entities like a person with name, role, and organization. Each extracted field is stored as a flat `key:field:value` entity string (e.g. `person:name:Alice`), reusing the existing entity storage with no schema changes — so map fields participate in the knowledge graph and retrieval the same way single-value labels do.
+**Open-vocabulary groups** (`type: "multi-text"`): like `"text"`, but the LLM writes a *list* of strings instead of one — so a single fact can carry several values that nobody enumerated in the bank config. Use it when the interesting values only exist in the content: the names a thing is known by (canonical name plus abbreviations, acronyms and alternative spellings), ticket references a fact cites, product codes or SKUs. Each value becomes its own `key:value` entity, and with `tag: true` each is written as a tag, so a bank can derive a classification from content and then filter on it at recall without the caller supplying the vocabulary.
+
+```json
+{
+  "key": "name",
+  "description": "Every name the subject of this fact is known by — canonical name plus abbreviations, acronyms, short forms and alternative spellings.",
+  "type": "multi-text",
+  "tag": true
+}
+```
+
+Retaining *"We deploy services to a Kubernetes cluster on EKS — the team usually just says k8s, or kube"* yields the entities and tags `name:kubernetes`, `name:k8s` and `name:kube`, so `{"tags": ["name:k8s"], "tags_match": "any_strict"}` finds the fact. A `"text"` group would keep only one of the three.
+
+**Map groups** (`type: "map"`): defines a structured entity type with named fields. Each field is itself typed (`"text"`, `"multi-text"`, `"value"`, `"multi-values"`, or nested `"map"`) so you can describe rich entities like a person with name, role, and organization. Each extracted field is stored as a flat `key:field:value` entity string (e.g. `person:name:Alice`), reusing the existing entity storage with no schema changes — so map fields participate in the knowledge graph and retrieval the same way single-value labels do.
 
 ```json
 {
@@ -169,6 +190,8 @@ Each entry in `entity_labels` is a **label group** — one classification dimens
   }
 }
 ```
+
+**How label entities resolve.** Regular entities resolve fuzzily so close name variants merge ("Alice" / "Alice Chen"). Label entities are different: their canonical names are user-defined, so two similar-looking values (`use:use-001` / `use:use-002`) must stay distinct. They therefore resolve by **exact match only** and are stored with `entity_kind = "label"`, which keeps them out of fuzzy name matching entirely — a free-text label group accumulating thousands of similar values doesn't slow down resolution of the bank's regular entities. The classification is fixed when the entity is first stored; removing a label group later doesn't reclassify its existing entities.
 
 ### entities_allow_free_form
 
@@ -282,7 +305,7 @@ An allowlist of MCP tool names that are enabled for this bank. When set, only th
 ["recall", "reflect"]
 ```
 
-Available tool names: `retain`, `recall`, `reflect`, `list_banks`, `create_bank`, `list_mental_models`, `get_mental_model`, `create_mental_model`, `update_mental_model`, `delete_mental_model`, `refresh_mental_model`, `list_directives`, `create_directive`, `delete_directive`, `list_memories`, `get_memory`, `list_documents`, `get_document`, `delete_document`, `list_operations`, `get_operation`, `cancel_operation`, `list_tags`, `get_bank`, `get_bank_stats`, `update_bank`, `delete_bank`, `clear_memories`.
+Available tool names: `retain`, `recall`, `reflect`, `list_banks`, `create_bank`, `list_mental_models`, `get_mental_model`, `create_mental_model`, `update_mental_model`, `delete_mental_model`, `refresh_mental_model`, `list_directives`, `create_directive`, `delete_directive`, `list_memories`, `get_memory`, `list_documents`, `get_document`, `delete_document`, `list_operations`, `get_operation`, `cancel_operation`, `list_tags`, `get_bank`, `get_bank_stats`, `update_bank`, `delete_bank`, `clear_memories`, `get_knowledge_base_tree`, `search_knowledge_base`, `get_knowledge_page`, `create_knowledge_folder`, `create_knowledge_page`, `update_knowledge_node`, `delete_knowledge_node`.
 
 ### llm_gemini_safety_settings
 
@@ -358,6 +381,86 @@ See the [Memory Defense guide](../memory-defense/index.md) for usage examples.
 
 ---
 
+## Previewing Prompts
+
+A mission only means something once you can see the prompt it lands in. `POST /v1/default/banks/{bank_id}/prompts/preview` renders the exact messages `retain`, `consolidation` or `reflect` would send for a bank — no LLM call, no reads, nothing stored.
+
+The operation is the whole request. Everything that shapes the prompt is read from the bank — its resolved config, profile and directives — and the runtime data an operation would be given is a fixed bracketed placeholder:
+
+```bash
+curl -X POST "$HINDSIGHT_URL/v1/default/banks/my-bank/prompts/preview" \
+  -H "Content-Type: application/json" \
+  -d '{"operation": "retain"}'
+```
+
+For `retain`, add `"strategy": "<name>"` to render under one of the bank's named retain strategies. Omit it and the bank's `retain_default_strategy` applies — exactly as it does for a retain that names none — so what you see is what retain would send. The response echoes the strategy that applied in `strategy`, and lists the bank's strategy names in `strategies` so a picker needs no second call.
+
+There is deliberately nothing to override. A preview answers "what does this bank send"; letting a caller pass its own mission or sample text only moves that question somewhere the bank cannot answer it. To try a candidate value, save it and look again — the response says which settings are editable.
+
+The response carries the messages in send order, each broken into the blocks it is built from:
+
+```json
+{
+  "messages": [
+    {
+      "role": "system",
+      "blocks": [
+        {
+          "text": "Extract SIGNIFICANT facts from text...",
+          "source": "builtin",
+          "field": "retain_extraction_mode",
+          "section": "",
+          "heading": "Selectivity",
+          "active": true,
+          "value": "concise",
+          "kind": "choice",
+          "choices": ["concise", "verbose", "verbatim", "chunks", "custom"],
+          "editable": true
+        },
+        {
+          "text": "",
+          "source": "config",
+          "field": "retain_custom_instructions",
+          "section": "",
+          "heading": "",
+          "active": false,
+          "kind": "text",
+          "editable": true
+        }
+      ]
+    },
+    { "role": "user", "blocks": [] }
+  ],
+  "response_schema": { "type": "object", "properties": { "facts": {} } }
+}
+```
+
+- **`messages`** — the request, system first, exactly as the model receives it.
+- **`blocks`** — the **active** blocks of a message concatenate back to its text exactly: nothing dropped, duplicated or reordered. `source` says what produced each: `config` for a setting you can change, `builtin` for Hindsight's own wording. The runtime data an operation is given is not a block — it is a hole in the text, marked inline with `«…»`.
+- **Inactive blocks** (`active: false`) have no text. They mark a setting that is switched off, at the point where it *would* land — so a mission you have not written yet is still visible where it would go.
+- **Identifying a block** — whichever of these applies, in order: `field` is the config field behind it; `section` is a slug for a part no single field owns (`bank_identity`, `disposition`, `directives`); `heading` is the section heading the prompt text itself carries there. All three are machine values. The response carries **no display copy** — what a block is called, and what turning a switched-off one on would do, is for the client to say in the language it is running in.
+- **`editable`** — false for server-level fields such as `llm_output_language`, which shape the prompt but cannot be overridden per bank.
+
+**Both messages are returned on purpose.** For `retain` and `consolidation` the mission travels in the *user* message, not the system prompt: keeping the system prompt identical for every bank lets one provider-side prompt cache serve them all, which is a large cost saving on high-volume ingestion. Only `reflect` puts its mission in the system prompt.
+
+### When there is no prompt
+
+`chunks` extraction mode stores each chunk verbatim and never calls an LLM. There is no prompt to show, so `messages` is empty and `skipped_reason` explains why:
+
+```json
+{
+  "operation": "retain",
+  "messages": [],
+  "skipped_reason": "Chunks mode stores each chunk verbatim as its own memory and never calls an LLM, ..."
+}
+```
+
+In the Control Plane, each Mission field on the bank **Configuration** tab has a **Preview prompt** button, and each block's setting can be edited there and saved to the bank.
+
+:::tip
+[Dry-run extraction](/developer/api/memories) is the paid counterpart: it spends a real LLM call to show what the same configuration actually *extracts*. It resolves its config the same way, strategy included, so the two agree. The Control Plane pairs them in one prompt tester.
+:::
+
 ## Updating Configuration
 
 Bank configuration fields (retain mission, extraction mode, observations mission, etc.) are managed via a **separate config API**, not the `create_bank` call. This lets you change operational settings independently from the bank's identity and disposition.
@@ -427,7 +530,7 @@ You can also update configuration directly from the [Control Plane UI](/) — na
 
 ## Directives
 
-Directives are hard rules that the agent must follow during [reflect](./reflect) operations. Unlike disposition traits which influence *how* the agent reasons, directives are explicit instructions that are *always* enforced.
+Directives are hard rules that the agent must follow during [reflect](./reflect) operations. Unlike disposition traits which influence *how* the agent reasons, directives are explicit instructions that are enforced whenever they are in scope (see [Directive Scope and Tags](#directive-scope-and-tags)).
 
 :::info
 Directives only affect the `reflect` operation. They are injected into prompts and the agent is required to comply with them in all responses.
@@ -441,6 +544,15 @@ Use directives for rules that must never be violated:
 - **Privacy rules**: "Never share personal data with third parties"
 - **Domain constraints**: "Prefer conservative investment recommendations"
 - **Behavioral guardrails**: "Always cite sources when making claims"
+
+### Directive Scope and Tags
+
+Directives can carry `tags`, and those tags scope **when** a directive is applied during `reflect` — mirroring how tags scope memories:
+
+- **Untagged directives always apply**, on every `reflect`.
+- **Tagged directives apply only when the `reflect` request includes matching tags** (using the request's `tags_match` mode). A `reflect` call with no tags applies only the untagged directives.
+
+To apply **every** active directive regardless of tags, set `apply_all_directives: true` on the `reflect` request. This ignores tag scope for directives (untagged and tagged alike are enforced) and is useful when an operator keeps tagged directives for organization but wants all of them enforced on an untagged reflection.
 
 ### Creating Directives
 
@@ -521,28 +633,128 @@ Use directives for rules that must never be violated:
 
 ---
 
-## Document export & import
+## Bank transfer (export & import)
+
+Move a bank — or just its documents — between banks and instances **without re-running the LLM**. One archive format, one pair of endpoints, and three flags that decide what travels:
+
+| Flag | Default | What it carries |
+|------|---------|-----------------|
+| `include_data` | `true` | Documents, raw chunks, extracted facts, consolidated observations, entities and links, attachments **and their bytes**, the curation archive of invalidated facts, the operations log, the maintenance queues — and what the bank synthesized from all of it: mental models, their refresh history, and the knowledge-page tree over them. |
+| `include_bank_config` | `true` | How the bank is set up: its config overrides, directives, and webhooks. |
+| `include_history` | `false` | `audit_log` and `llm_requests`. |
+
+Mental models and knowledge pages count as **data**, not configuration. A mental model is a reading of the bank's facts and cites them by id in its `based_on` evidence, so carrying it without them would restore a synthesis whose grounding resolves to nothing. Their refresh history follows them for the same reason.
+
+Embeddings and database ids are never carried: facts are re-embedded with the *target* bank's model and entities are re-resolved against it, so an archive moves cleanly to an instance configured with a different embedding model, vector extension, or text-search backend.
+
+Webhooks travel with `include_bank_config`. When copying a bank whose webhooks point at a per-bank consumer, export with `include_bank_config=false`, or delete them on the copy.
+
+### Export
+
+`POST /v1/default/banks/{bank_id}/transfer/export` — runs as a **background operation** (a whole-bank export loads every unit and compresses a large archive). Returns `202` with an `operation_id`; poll the bank's operations endpoint, then download the archive from the `download_url` in `result_metadata`.
+
+```bash
+# Whole bank, memories + config, no history
+curl -X POST -H "Authorization: Bearer $API_KEY" \
+  "$HINDSIGHT_URL/v1/default/banks/my-bank/transfer/export"
+
+# Just the memories
+curl -X POST -H "Authorization: Bearer $API_KEY" \
+  "$HINDSIGHT_URL/v1/default/banks/my-bank/transfer/export?include_bank_config=false"
+
+# Specific documents (a document subset carries no bank-level sections)
+curl -X POST -H "Authorization: Bearer $API_KEY" \
+  "$HINDSIGHT_URL/v1/default/banks/my-bank/transfer/export?document_id=doc-1&document_id=doc-2"
+```
+
+### Import
+
+`POST /v1/default/banks/{bank_id}/transfer/import` — multipart upload (`file` = the ZIP), also a background operation.
+
+| Mode | Behaviour |
+|------|-----------|
+| `restore` (default) | Writes a whole bank into `target_bank_id`, which **must not already exist**. This is how a bank is moved to another instance, or copied under a new id. |
+| `merge` | Folds the archive's documents into `{bank_id}`. `document_conflict` decides what happens to document ids that already exist: `skip` (default), `replace`, `new-id`. |
+
+```bash
+# Restore a bank under a new id
+curl -H "Authorization: Bearer $API_KEY" -F "file=@my-bank.zip" \
+  "$HINDSIGHT_URL/v1/default/banks/my-bank/transfer/import?target_bank_id=my-bank-copy"
+
+# Merge an archive's documents into an existing bank
+curl -H "Authorization: Bearer $API_KEY" -F "file=@my-bank.zip" \
+  "$HINDSIGHT_URL/v1/default/banks/other-bank/transfer/import?mode=merge&document_conflict=replace"
+```
+
+The include flags apply here too, and can only narrow: they restore a subset of what the archive holds, never more.
+
+In `restore` mode the operation is recorded against `{bank_id}` — the bank in the URL — because the target bank does not exist yet. Poll that bank's operations endpoint for status and the per-component counts.
+
+A restore carries the operations log as history, not as work: anything still in flight when the bank was exported is left behind, so a copied bank never re-runs the original's queued retains or re-fires its webhooks. In-flight work belongs to the bank that was exported — and a clone runs *inside* one such operation, so carrying them would put the clone's own unfinished record in the copy.
+
+### Clone a bank
+
+`POST /v1/default/banks/{bank_id}/clone` — copy a bank into a new one in a single call, without handling an archive yourself. This is the export and import above run back to back on this instance: nothing is re-extracted and no LLM is called, so the clone's facts are exactly the source's, re-embedded with the same model.
+
+```bash
+curl -X POST -H "Authorization: Bearer $API_KEY" \
+  "$HINDSIGHT_URL/v1/default/banks/agent-42/clone?target_bank_id=agent-43"
+# -> {"operation_id": "…", "status": "pending"}
+```
+
+| Query param | Default | Description |
+|-------------|---------|-------------|
+| `target_bank_id` | — | Required. The bank to create; it must not already exist. |
+| `include_data` | `true` | Copy the memories, everything backing them, and the mental models and knowledge pages synthesized from them. |
+| `include_bank_config` | `true` | Copy the bank's config overrides, directives and webhooks. |
+| `include_history` | `false` | Copy `audit_log` and `llm_requests`. |
+
+The clone is independent from the moment it is made: later retains, consolidation and edits on either bank leave the other alone.
+
+The operation is recorded against the **source** bank, because the target does not exist yet — poll the source's operations endpoint for status and the per-component counts.
+
+:::warning A clone inherits the source's webhooks
+Webhooks are part of a bank's configuration, so a clone made with the default flags will call the source's webhook endpoints. Pass `include_bank_config=false`, or delete them on the clone, when they point at a per-bank consumer.
+:::
+
+### Document export & import (superseded)
+
+The endpoints below still work exactly as documented and are unchanged; new integrations should use `/transfer/export` and `/transfer/import` above, which carry the same document archives plus the bank's own configuration.
 
 Move documents — and the facts already extracted from them — between banks **without re-running the LLM**. Useful for testing a different embedding model, or copying data between banks/instances without paying for re-extraction. The archive carries documents, raw chunks, and extracted facts (entities by canonical name, causal links) — but **no embeddings or database ids**. On import, facts are re-embedded with the *target* bank's model and entities/links are recomputed against it, so imported documents are integrated with whatever already exists there.
 
 ### Export documents
 
-`GET /v1/default/banks/{bank_id}/document-transfer` — synchronous; streams a ZIP archive.
+`POST /v1/default/banks/{bank_id}/document-transfer/export` — runs as a **background operation** (a whole-bank export loads every unit and compresses a large archive, which on a big bank could exhaust memory and pin a connection). It returns `202` with an `operation_id`; poll the bank's operations endpoint, then download the archive from the `download_url` in `result_metadata`.
 
 ```bash
-# whole bank
-curl -H "Authorization: Bearer $API_KEY" \
-  "$HINDSIGHT_URL/v1/default/banks/my-bank/document-transfer" -o my-bank.zip
+# 1. Submit the export (whole bank; add ?document_id=… to scope it)
+curl -X POST -H "Authorization: Bearer $API_KEY" \
+  "$HINDSIGHT_URL/v1/default/banks/my-bank/document-transfer/export"
+# -> {"operation_id": "…", "status": "pending"}
 
-# specific documents, including consolidated observations
+# 2. Poll until completed
 curl -H "Authorization: Bearer $API_KEY" \
-  "$HINDSIGHT_URL/v1/default/banks/my-bank/document-transfer?document_id=doc-1&include_observations=true" -o subset.zip
+  "$HINDSIGHT_URL/v1/default/banks/my-bank/operations/$OPERATION_ID"
+# -> {"status":"completed","result_metadata":{
+#      "download_url":"/v1/default/files/download/banks/my-bank/exports/…/transfer.zip",
+#      "storage_key":"banks/my-bank/exports/…/transfer.zip","byte_size":12345,"filename":"my-bank-documents.zip"}}
+
+# 3. Download the archive
+curl -H "Authorization: Bearer $API_KEY" \
+  "$HINDSIGHT_URL$DOWNLOAD_URL" -o my-bank.zip
 ```
 
 | Query param | Description |
 |-------------|-------------|
 | `document_id` | Repeatable. Export only these documents; omit for the whole bank. |
 | `include_observations` | Also export consolidated observations (default `false`). Only valid for a **whole-bank** export — combining it with `document_id` returns `400`. |
+
+:::note The synchronous `GET …/document-transfer` was removed
+It loaded the entire bank into memory and held a database connection for the full request, which could take down the shared API on large banks. It now returns `410` pointing here. Use the async flow above. The download route (`GET /v1/default/files/download/{key}`) authorizes the caller against the bank the archive belongs to.
+:::
+
+The archive lives as long as its export **operation record** — indefinitely by default, or until the operation is pruned when `HINDSIGHT_API_OPERATION_RETENTION_DAYS` is set (the archive is deleted in step with the row). Deleting the operation removes the archive immediately.
 
 ### Import documents
 
@@ -582,7 +794,7 @@ Both endpoints are gated by server-level flags (default `true`). A disabled endp
 
 | Variable | Gates |
 |----------|-------|
-| `HINDSIGHT_API_ENABLE_DOCUMENT_EXPORT_API` | `GET …/document-transfer` |
+| `HINDSIGHT_API_ENABLE_DOCUMENT_EXPORT_API` | `POST …/document-transfer/export` and `GET …/files/download/{key}` |
 | `HINDSIGHT_API_ENABLE_DOCUMENT_IMPORT_API` | `POST …/document-transfer` |
 
 ## Migrating a bank to a new instance

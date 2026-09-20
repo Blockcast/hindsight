@@ -8,6 +8,7 @@ exhausting the connection pool.
 
 import asyncio
 import logging
+import threading
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -61,7 +62,13 @@ class ConnectionBudgetManager:
         """
         self.default_budget = default_budget
         self._operations: dict[str, OperationBudget] = {}
-        self._lock = asyncio.Lock()
+        # A threading.Lock, not an asyncio.Lock. This manager is a process-wide
+        # singleton (`_default_manager`), so with several event loops in one process
+        # an asyncio.Lock binds to whichever loop first waits on it and every other
+        # loop then fails with "<Lock> is bound to a different event loop". Both
+        # critical sections below are await-free dict work, so a plain lock is never
+        # held across a suspension point and cannot block a loop.
+        self._lock = threading.Lock()
 
     @asynccontextmanager
     async def operation(
@@ -83,7 +90,7 @@ class ConnectionBudgetManager:
         op_id = operation_id or f"op-{uuid.uuid4().hex[:12]}"
         budget = max_connections or self.default_budget
 
-        async with self._lock:
+        with self._lock:
             if op_id in self._operations:
                 raise ValueError(f"Operation {op_id} already exists")
             self._operations[op_id] = OperationBudget(op_id, budget)
@@ -91,7 +98,7 @@ class ConnectionBudgetManager:
         try:
             yield BudgetedOperation(self, op_id)
         finally:
-            async with self._lock:
+            with self._lock:
                 self._operations.pop(op_id, None)
 
     def _get_budget(self, operation_id: str) -> OperationBudget:
@@ -163,35 +170,6 @@ class BudgetedOperation:
             BudgetedPool that limits connections to this operation's budget
         """
         return BudgetedPool(pool, self)
-
-    async def acquire_many(
-        self,
-        pool: Any,
-        count: int,
-    ) -> AsyncIterator[list[Any]]:
-        """
-        Acquire multiple connections within the budget.
-
-        Note: This acquires connections sequentially to respect the budget.
-        For parallel acquisition, use multiple acquire() calls with asyncio.gather().
-        This method is intended for use with raw asyncpg pools only, not DatabaseBackend.
-
-        Args:
-            pool: asyncpg connection pool (raw pool only)
-            count: Number of connections to acquire
-
-        Yields:
-            List of database connections
-        """
-        connections = []
-        try:
-            for _ in range(count):
-                conn = await pool.acquire()
-                connections.append(conn)
-            yield connections
-        finally:
-            for conn in connections:
-                await pool.release(conn)
 
 
 # Global default manager instance

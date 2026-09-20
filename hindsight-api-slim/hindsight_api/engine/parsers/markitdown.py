@@ -1,16 +1,39 @@
 """Markitdown parser implementation."""
 
 import asyncio
+import importlib.util
 import logging
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from hindsight_api.config import DEFAULT_FILE_PARSER_MARKITDOWN_OCR_PROMPT
 
 from .base import FileParser
 
+if TYPE_CHECKING:
+    from markitdown import MarkItDown, StreamInfo
+
 logger = logging.getLogger(__name__)
+
+# Extensions whose markitdown converters decode the raw bytes as text. markitdown
+# samples only the first chunk for charset detection, so a UTF-8 file with a long
+# ASCII-only prefix is mis-detected as ASCII; the JSON/ipynb converter then crashes
+# decoding the first multibyte byte. Passing an explicit UTF-8 hint when the bytes
+# are valid UTF-8 sidesteps the faulty detection without affecting other encodings.
+_TEXT_EXTENSIONS = {
+    ".json",
+    ".jsonl",
+    ".ipynb",
+    ".txt",
+    ".text",
+    ".md",
+    ".markdown",
+    ".csv",
+    ".html",
+    ".htm",
+}
 
 
 @dataclass(frozen=True)
@@ -21,6 +44,30 @@ class MarkitdownOcrOptions:
     llm_client: object
     llm_model: str
     llm_prompt: str
+
+
+def _validate_ocr_config(*, api_key: str | None, base_url: str | None, model: str | None) -> None:
+    """Raise if OCR is enabled without the settings it needs.
+
+    Split out of the client construction so it can run at parser construction time
+    (i.e. at startup) while the SDK import stays lazy.
+    """
+    if not model or not model.strip():
+        raise ValueError(
+            "Markitdown OCR is enabled but no model is configured. "
+            "Set HINDSIGHT_API_FILE_PARSER_MARKITDOWN_OCR_MODEL to an OpenAI-compatible OCR/vision model "
+            "with image-input support."
+        )
+    if not api_key:
+        raise ValueError(
+            "Markitdown OCR is enabled but no API key is configured. "
+            "Set HINDSIGHT_API_FILE_PARSER_MARKITDOWN_OCR_API_KEY."
+        )
+    if not base_url or not base_url.strip():
+        raise ValueError(
+            "Markitdown OCR is enabled but no base URL is configured. "
+            "Set HINDSIGHT_API_FILE_PARSER_MARKITDOWN_OCR_BASE_URL to an OpenAI-compatible OCR/vision endpoint."
+        )
 
 
 class MarkitdownParser(FileParser):
@@ -50,31 +97,56 @@ class MarkitdownParser(FileParser):
         ocr_base_url: str | None = None,
         ocr_model: str | None = None,
         ocr_prompt: str | None = None,
+        ocr_default_headers: dict[str, str] | None = None,
     ):
-        """Initialize markitdown parser."""
-        # Lazy import to avoid requiring markitdown for all users
-        try:
-            from markitdown import MarkItDown
-        except ImportError as e:
-            raise ImportError(
-                "markitdown package is required for file parsing. Install with: pip install markitdown"
-            ) from e
+        """Initialize markitdown parser.
 
-        self._ocr_enabled = ocr_enabled
+        The ``markitdown`` package itself is NOT imported here -- only checked for.
+        ``MemoryEngine.initialize()`` constructs this parser eagerly at startup, so
+        importing markitdown (which pulls in bs4 -> lxml) cost ~400ms of every server
+        start even when no file was ever converted.
+
+        ``find_spec`` answers "is it installed?" without executing the package, so
+        registration keeps raising ImportError at exactly the same point as before
+        while the import itself is deferred to the first ``convert()`` call.
+        """
+        if importlib.util.find_spec("markitdown") is None:
+            raise ImportError("markitdown package is required for file parsing. Install with: pip install markitdown")
+
         if ocr_enabled:
-            ocr_options = self._build_ocr_options(
-                api_key=ocr_api_key,
-                base_url=ocr_base_url,
-                model=ocr_model,
-                prompt=ocr_prompt,
-            )
-            self._markitdown = MarkItDown(
-                llm_client=ocr_options.llm_client,
-                llm_model=ocr_options.llm_model,
-                llm_prompt=ocr_options.llm_prompt,
-            )
-        else:
-            self._markitdown = MarkItDown()
+            # Validated here, not in _get_markitdown(): these are string checks with
+            # no import cost, and a misconfigured OCR deployment should refuse to
+            # start rather than boot clean and fail on the first image a user
+            # uploads. Deferring the markitdown/openai *imports* is what keeps them
+            # off the startup path (see above); the configuration check does not
+            # need to move with them.
+            _validate_ocr_config(api_key=ocr_api_key, base_url=ocr_base_url, model=ocr_model)
+
+        self._markitdown: "MarkItDown | None" = None
+        self._ocr_enabled = ocr_enabled
+        self._ocr_kwargs = dict(
+            api_key=ocr_api_key,
+            base_url=ocr_base_url,
+            model=ocr_model,
+            prompt=ocr_prompt,
+            default_headers=ocr_default_headers,
+        )
+
+    def _get_markitdown(self) -> "MarkItDown":
+        """Build the MarkItDown instance on first use (see __init__ for why)."""
+        if self._markitdown is None:
+            from markitdown import MarkItDown
+
+            if self._ocr_enabled:
+                ocr_options = self._build_ocr_options(**self._ocr_kwargs)
+                self._markitdown = MarkItDown(
+                    llm_client=ocr_options.llm_client,
+                    llm_model=ocr_options.llm_model,
+                    llm_prompt=ocr_options.llm_prompt,
+                )
+            else:
+                self._markitdown = MarkItDown()
+        return self._markitdown
 
     def _build_ocr_options(
         self,
@@ -83,32 +155,33 @@ class MarkitdownParser(FileParser):
         base_url: str | None,
         model: str | None,
         prompt: str | None,
+        default_headers: dict[str, str] | None,
     ) -> MarkitdownOcrOptions:
-        """Build MarkItDown options for OpenAI-compatible image OCR."""
-        if not model or not model.strip():
-            raise ValueError(
-                "Markitdown OCR is enabled but no model is configured. "
-                "Set HINDSIGHT_API_FILE_PARSER_MARKITDOWN_OCR_MODEL to an OpenAI-compatible OCR/vision model "
-                "with image-input support."
-            )
-        if not api_key:
-            raise ValueError(
-                "Markitdown OCR is enabled but no API key is configured. "
-                "Set HINDSIGHT_API_FILE_PARSER_MARKITDOWN_OCR_API_KEY."
-            )
-        if not base_url or not base_url.strip():
-            raise ValueError(
-                "Markitdown OCR is enabled but no base URL is configured. "
-                "Set HINDSIGHT_API_FILE_PARSER_MARKITDOWN_OCR_BASE_URL to an OpenAI-compatible OCR/vision endpoint."
-            )
+        """Build MarkItDown options for OpenAI-compatible image OCR.
+
+        The configuration was already checked in ``__init__``; what is left here is
+        the part that genuinely has to be deferred — importing the OpenAI SDK and
+        constructing the client.
+        """
+        assert model is not None and base_url is not None  # guaranteed by _validate_ocr_config
 
         try:
             from openai import OpenAI
         except ImportError as e:
             raise RuntimeError("openai package is required when Markitdown OCR is enabled.") from e
 
+        client_kwargs: dict[str, object] = {
+            "api_key": api_key,
+            "base_url": base_url.strip(),
+        }
+        if default_headers:
+            client_kwargs["default_headers"] = default_headers
+
         return MarkitdownOcrOptions(
-            llm_client=OpenAI(api_key=api_key, base_url=base_url.strip()),
+            # Sync client on purpose: markitdown's image captioning calls
+            # client.chat.completions.create() synchronously and has no async API.
+            # It only ever runs inside convert()'s executor thread, never on the loop.
+            llm_client=OpenAI(**client_kwargs),
             llm_model=model.strip(),
             llm_prompt=prompt or DEFAULT_FILE_PARSER_MARKITDOWN_OCR_PROMPT,
         )
@@ -134,8 +207,9 @@ class MarkitdownParser(FileParser):
             tmp_path = tmp.name
 
         try:
-            # Parse using markitdown
-            result = self._markitdown.convert(tmp_path)
+            # Parse using markitdown, passing an explicit charset hint for text
+            # files to avoid markitdown's sample-based (and crash-prone) detection.
+            result = self._get_markitdown().convert(tmp_path, stream_info=self._utf8_stream_info(file_data, filename))
 
             if not result or not result.text_content:
                 raise RuntimeError(f"No content extracted from '{filename}'")
@@ -152,6 +226,27 @@ class MarkitdownParser(FileParser):
                 Path(tmp_path).unlink()
             except Exception:
                 pass
+
+    @staticmethod
+    def _utf8_stream_info(file_data: bytes, filename: str) -> "StreamInfo | None":
+        """Return a UTF-8 charset hint for text files that decode cleanly as UTF-8.
+
+        Returns None for binary files or non-UTF-8 text so markitdown falls back
+        to its own detection.
+        """
+        if Path(filename).suffix.lower() not in _TEXT_EXTENSIONS:
+            return None
+        try:
+            # file_data may arrive as a non-``bytes`` buffer (e.g. a memoryview or
+            # a native/Rust-backed buffer object) that has no ``.decode``; coerce
+            # through the buffer protocol before the UTF-8 probe. The ``tmp.write``
+            # in the caller already relies only on the same buffer protocol.
+            bytes(file_data).decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+        from markitdown import StreamInfo
+
+        return StreamInfo(charset="utf-8")
 
     @staticmethod
     def _is_image_file(filename: str) -> bool:

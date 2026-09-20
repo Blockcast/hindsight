@@ -7,7 +7,6 @@ import { useBank } from "@/lib/bank-context";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
-  Loader2,
   Calendar,
   Users,
   FileText,
@@ -16,12 +15,22 @@ import {
   History,
   RotateCcw,
   Pencil,
+  Braces,
 } from "lucide-react";
+import { Spinner } from "@/components/ui/spinner";
+import {
+  AttachmentStrip,
+  InlineAttachmentText,
+  type RetainedAttachment,
+} from "@/components/ui/inline-attachment-text";
 import { TagList } from "@/components/ui/tag-list";
 import { Button } from "@/components/ui/button";
 import { ObservationHistoryView, type HistoryEntry } from "@/components/observation-history-view";
 import { InvalidateMemoryDialog } from "@/components/invalidate-memory-dialog";
 import { EditMemoryForm, type EditMemoryFields } from "@/components/edit-memory-form";
+import { EntityChip, MetadataChip } from "@/components/ui/facet-chip";
+import { HarnessLogo } from "@/components/ui/harness-logo";
+import { documentHarness, resolveHarnessLogo } from "@/lib/harness-logo";
 
 interface SourceMemory {
   id: string;
@@ -45,6 +54,11 @@ interface MemoryDetail {
   document_id: string | null;
   chunk_id: string | null;
   tags: string[];
+  /** Attachments behind this fact, resolved from the chunk it came from. */
+  attachments?: RetainedAttachment[];
+  // Copied from the source document at retain time — carries `harness`, so the
+  // coding agent behind a fact is known without loading the document.
+  metadata: Record<string, unknown> | null;
   observation_scopes: string | string[][] | null;
   state?: "valid" | "invalidated";
   invalidation_reason?: string | null;
@@ -68,6 +82,7 @@ export function MemoryDetailModal({
   onChanged,
 }: MemoryDetailModalProps) {
   const t = useTranslations("memoryDetailModal");
+  const tCommon = useTranslations("common");
   const tCuration = useTranslations("memoryDetailPanel");
   const { currentBank } = useBank();
   const [memory, setMemory] = useState<MemoryDetail | null>(null);
@@ -152,6 +167,9 @@ export function MemoryDetailModal({
         occurredEnd: fields.occurredEnd,
         factType: fields.factType,
         entities: fields.entities,
+        // A person editing the entity list here is naming the entity they mean, so the
+        // correction must not be re-resolved onto a similar existing one (#3479).
+        resolveEntities: false,
       });
       const data = await client.getMemory(memory.id, currentBank);
       setMemory(data);
@@ -240,6 +258,8 @@ export function MemoryDetailModal({
   };
 
   const isObservation = memory?.type === "observation";
+  const memoryHarness = documentHarness(memory?.metadata, memory?.tags);
+  const documentMetadata = Object.entries(document?.retain_params?.metadata ?? {});
 
   return (
     <>
@@ -251,7 +271,7 @@ export function MemoryDetailModal({
 
           {loading ? (
             <div className="flex items-center justify-center py-20">
-              <Loader2 className="w-8 h-8 animate-spin text-muted-foreground" />
+              <Spinner size="lg" variant="jump" />
             </div>
           ) : error ? (
             <div className="flex items-center justify-center py-20">
@@ -288,6 +308,14 @@ export function MemoryDetailModal({
                         {t("sectionText")}
                       </div>
                       <p className="text-sm text-foreground leading-relaxed">{memory.text}</p>
+                      {/* The fact's text says "[image: image/png]" where an
+                          attachment was — a content hash is not knowledge — so
+                          what the model actually looked at is shown here. */}
+                      <AttachmentStrip
+                        bankId={currentBank ?? ""}
+                        attachments={memory.attachments}
+                        className="mt-3"
+                      />
                     </div>
 
                     {/* Dates */}
@@ -333,12 +361,7 @@ export function MemoryDetailModal({
                         </div>
                         <div className="flex flex-wrap gap-1.5">
                           {memory.entities.map((entity, idx) => (
-                            <span
-                              key={idx}
-                              className="px-2 py-0.5 bg-primary/10 text-primary rounded text-xs"
-                            >
-                              {entity}
-                            </span>
+                            <EntityChip key={idx} entity={entity} />
                           ))}
                         </div>
                       </div>
@@ -447,7 +470,7 @@ export function MemoryDetailModal({
                   <TabsContent value="history" className="mt-0">
                     {loadingHistory ? (
                       <div className="flex items-center justify-center py-12">
-                        <Loader2 className="w-6 h-6 animate-spin text-muted-foreground" />
+                        <Spinner size="md" variant="jump" />
                       </div>
                     ) : history && history.length > 0 ? (
                       <ObservationHistoryView
@@ -536,6 +559,14 @@ export function MemoryDetailModal({
                             )}
                           </div>
                           <p className="text-sm text-foreground leading-relaxed">{memory.text}</p>
+                          {/* The fact's text says "[image: image/png]" where an
+                              attachment was — a content hash is not knowledge —
+                              so what the model actually looked at is shown here. */}
+                          <AttachmentStrip
+                            bankId={currentBank ?? ""}
+                            attachments={memory.attachments}
+                            className="mt-3"
+                          />
                         </div>
 
                         {/* Curation: invalidate / restore (raw facts only) */}
@@ -641,12 +672,7 @@ export function MemoryDetailModal({
                             </div>
                             <div className="flex flex-wrap gap-1.5">
                               {memory.entities.map((entity, idx) => (
-                                <span
-                                  key={idx}
-                                  className="px-2 py-0.5 bg-primary/10 text-primary rounded text-xs"
-                                >
-                                  {entity}
-                                </span>
+                                <EntityChip key={idx} entity={entity} />
                               ))}
                             </div>
                           </div>
@@ -692,7 +718,7 @@ export function MemoryDetailModal({
                   <TabsContent value="chunk" className="mt-0 space-y-4">
                     {loadingChunk ? (
                       <div className="flex items-center justify-center py-12">
-                        <Loader2 className="w-6 h-6 animate-spin text-muted-foreground" />
+                        <Spinner size="md" variant="jump" />
                       </div>
                     ) : chunk ? (
                       <>
@@ -721,9 +747,12 @@ export function MemoryDetailModal({
                               {t("sectionChunkText")}
                             </div>
                             <div className="p-4 bg-muted rounded-lg border border-border max-h-[300px] overflow-y-auto">
-                              <pre className="text-sm whitespace-pre-wrap font-mono text-foreground">
-                                {chunk.chunk_text}
-                              </pre>
+                              <InlineAttachmentText
+                                text={chunk.chunk_text}
+                                bankId={currentBank ?? ""}
+                                attachments={chunk.attachments}
+                                className="text-sm whitespace-pre-wrap font-mono text-foreground"
+                              />
                             </div>
                           </div>
                         )}
@@ -747,7 +776,7 @@ export function MemoryDetailModal({
                   <TabsContent value="document" className="mt-0 space-y-4">
                     {loadingDocument ? (
                       <div className="flex items-center justify-center py-12">
-                        <Loader2 className="w-6 h-6 animate-spin text-muted-foreground" />
+                        <Spinner size="md" variant="jump" />
                       </div>
                     ) : document ? (
                       <>
@@ -788,9 +817,12 @@ export function MemoryDetailModal({
                                 {t("sectionOriginalText")}
                               </div>
                               <div className="p-4 bg-muted rounded-lg border border-border max-h-[300px] overflow-y-auto">
-                                <pre className="text-sm whitespace-pre-wrap font-mono text-foreground">
-                                  {document.original_text}
-                                </pre>
+                                <InlineAttachmentText
+                                  text={document.original_text}
+                                  bankId={currentBank ?? ""}
+                                  attachments={document.attachments}
+                                  className="text-sm whitespace-pre-wrap font-mono text-foreground"
+                                />
                               </div>
                             </div>
                           </>
@@ -799,6 +831,43 @@ export function MemoryDetailModal({
                         {document.tags && document.tags.length > 0 && (
                           <div className="p-3 bg-muted rounded-lg">
                             <TagList tags={document.tags} showLabel />
+                          </div>
+                        )}
+
+                        {/* The document's own metadata, shown whole — this tab
+                            is where you come to see what the fact was extracted
+                            from. `retain_params` is where the detail response
+                            nests it; the list response calls it
+                            `document_metadata`. */}
+                        {documentMetadata.length > 0 && (
+                          <div className="p-3 bg-muted rounded-lg">
+                            <div className="text-xs font-bold text-muted-foreground uppercase mb-2 flex items-center gap-1">
+                              <Braces className="w-3 h-3" />
+                              {t("sectionMetadata")}
+                            </div>
+                            <div className="flex flex-wrap gap-1.5">
+                              {documentMetadata.map(([key, value]) => (
+                                <MetadataChip key={key} entryKey={key} value={String(value)} />
+                              ))}
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Which coding agent wrote the source document. Read
+                            off the memory rather than the document: retain
+                            copies the document's metadata onto every unit, so
+                            the value is the same and needs no second lookup. */}
+                        {memoryHarness && (
+                          <div className="p-3 bg-muted rounded-lg">
+                            <div className="text-xs font-bold text-muted-foreground uppercase mb-1">
+                              {tCommon("harness")}
+                            </div>
+                            <span className="inline-flex items-center gap-1.5">
+                              <HarnessLogo harness={memoryHarness} />
+                              <span className="text-sm text-foreground">
+                                {resolveHarnessLogo(memoryHarness)?.label ?? memoryHarness}
+                              </span>
+                            </span>
                           </div>
                         )}
 

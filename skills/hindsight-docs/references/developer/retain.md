@@ -67,10 +67,7 @@ The split is decided by **who is speaking**, not by grammar. A first-person stat
 - Agent's own log — "I patched the auth bug" → **experience** (the agent did it).
 - A user talking to the agent — "I bought a Tesla" → **world** (a fact about the *user*, not the agent).
 
-Two things steer this correctly:
-
-- **Set a human-readable bank `name`** (the agent's name). It identifies who "the agent" is. If left unset it defaults to the `bank_id`; a `bank_id` that is a routing key (e.g. `my-agent::channel-456::user-789`) is not a usable speaker name, so give the bank a real name.
-- **Describe the speaker in each item's `context`** when retaining transcripts or third-party content. For a chat log, a context like *"Customer Maria is speaking"* ensures her first-person statements are stored as `world` facts about Maria rather than mistaken for the agent's own experiences. The `context` takes precedence over the bank name when the two disagree.
+**Describe the speaker in each item's `context`** to steer this correctly. When retaining transcripts or third-party content, a context like *"Customer Maria is speaking"* ensures her first-person statements are stored as `world` facts about Maria rather than mistaken for the agent's own experiences. For the agent's own logs, a context like *"The assistant is speaking"* attributes its first-person statements to the agent as `experience` facts.
 
 **Note:** Observations are consolidated automatically in the background after `retain()` operations complete. This consolidation process synthesizes patterns from new facts into the bank's knowledge base.
 
@@ -89,11 +86,14 @@ Hindsight automatically identifies and tracks **entities** — the people, organ
 
 ### Entity Resolution
 
-The same entity mentioned different ways gets unified:
+The same entity mentioned different ways gets unified through **fuzzy name matching**, reinforced by co-occurrence and temporal proximity:
 - "Alice" + "Alice Chen" + "Alice C." → one person
-- "Bob" + "Robert Chen" → one person (nickname resolution)
+
+Because resolution keys off name similarity, close variants merge automatically. Names that do not resemble each other (a nickname and an unrelated formal name, for example) are not unified on the name alone, though shared co-occurring entities can still link them.
 
 **Why it matters:** You can ask "What do I know about Alice?" and get everything, even if she was mentioned as "Alice Chen" in some conversations.
+
+Resolution is a judgement call, so it can go the other way too: on a bank with a lot of history, a short new name that resembles an existing entity — and that turns up alongside entities the existing one is already associated with — can be absorbed into it instead of becoming its own entity. If you see facts about a new person attached to an unrelated entity, [How entity resolution decides](configuration.md#how-entity-resolution-decides) explains what is being compared and which setting makes matching stricter.
 
 ### Context-Aware Disambiguation
 
@@ -102,6 +102,8 @@ If "Alice" appears with "Google" and "Stanford" multiple times, a new "Alice" me
 ### Entity Labels
 
 You can define a controlled vocabulary of `key:value` classification labels (e.g. `pedagogy:scaffolding`, `engagement:active`) that are extracted at retain time and stored as entities. Because labels become entities, they automatically link related memories in the knowledge graph and improve both semantic and keyword retrieval. Labels can optionally also write to the memory unit's tags, enabling standard tag-based filtering during recall and reflect.
+
+Unlike regular entities, label entities never merge by name similarity — distinct label values must stay distinct, so they resolve by exact match only and are excluded from fuzzy name matching altogether.
 
 See [entity_labels in the bank config](api/memory-banks.md#entity-labels) for full configuration details.
 
@@ -177,6 +179,88 @@ See [Retain API](./api/retain) for code examples and [Recall API](./api/recall) 
 
 ---
 
+## Images and Files in Your Content
+
+A lot of what a document actually says lives in its pictures: the screenshot of
+the button an instruction refers to, the diagram holding an escalation path, the
+chart that *is* the data. `content` accepts an ordered list of blocks so those sit
+where they belong, instead of being summarised into a caption beforehand:
+
+```json
+{
+  "content": [
+    {"type": "text",  "text": "To reset the VPN, click the button shown:"},
+    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "..."}},
+    {"type": "text",  "text": "...then reconnect."}
+  ]
+}
+```
+
+A plain string still works exactly as before — nothing about text-only retain
+changes.
+
+The point is **position**. Extraction sends the text and the pictures together,
+in order, so the model reads the screenshot beside the sentence that introduces
+it. "Click the button shown below" is meaningless on its own; next to the
+picture it becomes a fact that names the button.
+
+### What comes back
+
+Facts read naturally — `[image: image/png]` marks where an attachment was, never
+a content hash — and each memory carries the attachments **it was drawn from**,
+with a URL you can fetch:
+
+```json
+{
+  "text": "The escalation path for a stuck sync begins by contacting Tier 3 Platform.",
+  "attachments": [
+    {"id": "c414cd0e204d", "kind": "image", "media_type": "image/png",
+     "url": "/v1/default/banks/my-bank/attachments/c414cd0e204d"}
+  ]
+}
+```
+
+Facts that came from the prose have no `attachments`, even when the same document
+is full of pictures. So an attachment shown next to a memory means the model
+looked at it to produce that memory — it is evidence, not decoration.
+
+### What to expect from charts and tables
+
+An attachment carrying structured data is transcribed rather than summarised:
+each row, bar or labelled value becomes its own fact, carrying its label, its
+figure, and how it is drawn. A chart therefore produces many more memories than a
+screenshot does — that is deliberate, since a summary of a twenty-bar chart keeps
+three values and silently drops seventeen, and later questions ask about the ones
+it dropped.
+
+Very dense pages are still sampled rather than exhausted: a single extraction pass
+over an infographic listing a hundred entries will capture a large share of them,
+not all of them.
+
+### Requirements
+
+- A model that can read images. By default that is the bank's retain model, but
+  it does not have to be: `HINDSIGHT_API_VLM_MODEL` names a **vision slot** used
+  only for the chunks that actually carry an attachment, leaving every text-only
+  chunk on the retain LLM. So a bank whose documents are mostly prose can keep a
+  cheap text model and pay for vision only where there is something to look at.
+- If that model cannot read images — or if Hindsight cannot tell, which is the
+  case for gateway backends serving mixed catalogues — the retain is refused
+  with `422` rather than dropping the attachment silently. See
+  [`HINDSIGHT_API_LLM_VISION`](configuration.md#llm-configuration).
+- Batch retain (`HINDSIGHT_API_RETAIN_BATCH_ENABLED`) cannot carry attachments,
+  and also refuses with `422`.
+
+This is different from [`POST /files/retain`](configuration.md#file-conversion),
+which converts a whole file to markdown as its **own** document. That is still the
+right tool for a scanned report you want parsed — but it separates the file from
+the prose that referred to it, which is exactly what inline attachments avoid.
+
+For storage, size limits and accepted media types, see
+[Inline attachments in retain](configuration.md#inline-attachments-in-retain).
+
+---
+
 ## What You Get
 
 After `retain()` completes:
@@ -200,7 +284,7 @@ e.g. Always include technical decisions, API design choices, and architectural t
      Ignore meeting logistics, greetings, and social exchanges.
 ```
 
-The mission is injected into the extraction prompt alongside the built-in rules — it steers the LLM without replacing the extraction logic. It works with any extraction mode (`concise`, `verbose`, `custom`).
+The mission is injected into the extraction prompt alongside the built-in rules — it steers the LLM without replacing the extraction logic. It works with the LLM-based extraction modes (`concise`, `verbose`, `verbatim`, `custom`) and is ignored in `chunks` mode.
 
 For finer control, you can also change the **extraction mode**:
 
@@ -209,8 +293,31 @@ For finer control, you can also change the **extraction mode**:
 | `concise` *(default)* | General-purpose — selective, fast |
 | `verbose` | When you need richer facts with full context and relationships |
 | `custom` | When you want to write your own extraction rules entirely |
+| `verbatim` | When you need the original chunk text preserved, with LLM-extracted metadata such as entities and dates |
+| `chunks` | When you want to store chunks as-is with no LLM call or extracted metadata |
 
-Set `retain_mission` and `retain_extraction_mode` via the [bank config API](api/memory-banks.md#retain-configuration) or the [`HINDSIGHT_API_RETAIN_MISSION`](configuration.md#retain) environment variable.
+Set `retain_mission` and `retain_extraction_mode` via the [bank config API](api/memory-banks.md#retain-configuration), or with the [`HINDSIGHT_API_RETAIN_MISSION`](configuration.md#retain) and [`HINDSIGHT_API_RETAIN_EXTRACTION_MODE`](configuration.md#retain) environment variables.
+
+### When a mission excludes everything in a document
+
+A mission narrows what becomes a memory — and content that produces no facts produces no memories at all. The document itself is still stored, but `recall` and `reflect` search memories, so a document with zero memories cannot be found by either. Tightening a mission therefore trades away retrieval of the raw source, not just fact creation.
+
+This is a normal outcome, not an error: the retain succeeds and the operation is reported as completed. Two signals tell you it happened:
+
+| Where | What to look for |
+|-------|------------------|
+| [`retain.completed` webhook](api/webhooks.md#retaincompleted) | `data.memory_unit_count: 0` |
+| [Metrics](monitoring.md#retain-metrics) | `hindsight.retain.documents.total{outcome="no_facts"}` |
+
+You can also audit after the fact: `GET /documents` returns `memory_unit_count` per document, so filtering for `0` lists everything currently unreachable.
+
+Extraction is not fully deterministic — a borderline document can yield facts on one run and none on the next. Treat a zero as "this document needs another pass" rather than as a permanent verdict.
+
+To recover a document, widen the mission and reprocess it — the stored text is re-extracted, and no re-upload is needed:
+
+```
+POST /v1/default/banks/{bank_id}/documents/{document_id}/reprocess
+```
 
 ---
 

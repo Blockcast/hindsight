@@ -3,7 +3,7 @@ Memory Engine - Core implementation of the memory system.
 
 This package contains all the implementation details of the memory engine:
 - MemoryEngine: Main class for memory operations
-- Utility modules: embedding_utils, link_utils, think_utils, bank_utils
+- Utility modules: embedding_utils, link_utils, bank_utils
 - Supporting modules: embeddings, cross_encoder, entity_resolver, etc.
 """
 
@@ -21,9 +21,7 @@ from .memory_engine import (
 from .response_models import MemoryFact, RecallResult, ReflectResult
 from .search.trace import (
     EntryPoint,
-    LinkInfo,
     NodeVisit,
-    PruningDecision,
     QueryInfo,
     SearchPhaseMetrics,
     SearchSummary,
@@ -47,8 +45,6 @@ __all__ = [
     "EntryPoint",
     "NodeVisit",
     "WeightComponents",
-    "LinkInfo",
-    "PruningDecision",
     "SearchSummary",
     "SearchPhaseMetrics",
     "LLMConfig",

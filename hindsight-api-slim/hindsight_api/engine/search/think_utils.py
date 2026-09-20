@@ -5,6 +5,7 @@ Think operation utilities for formulating answers based on agent and world facts
 import logging
 from datetime import datetime
 
+from ...config import get_config
 from ..response_models import DispositionTraits, MemoryFact
 
 logger = logging.getLogger(__name__)
@@ -74,31 +75,6 @@ def format_facts_for_prompt(facts: list[MemoryFact]) -> str:
         formatted.append(fact_obj)
 
     return json.dumps(formatted, indent=2, ensure_ascii=False)
-
-
-def format_entity_summaries_for_prompt(entities: dict) -> str:
-    """Format entity summaries for inclusion in the reflect prompt.
-
-    Args:
-        entities: Dict mapping entity name to EntityState objects
-
-    Returns:
-        Formatted string with entity summaries, or empty string if no summaries
-    """
-    if not entities:
-        return ""
-
-    summaries = []
-    for name, state in entities.items():
-        # Get summary from observations (summary is stored as single observation)
-        if state.observations:
-            summary_text = state.observations[0].text
-            summaries.append(f"## {name}\n{summary_text}")
-
-    if not summaries:
-        return ""
-
-    return "\n\n".join(summaries)
 
 
 def build_think_prompt(
@@ -248,11 +224,12 @@ async def reflect(
     system_message = get_system_message(disposition)
 
     # Call LLM
-    answer_text = await llm_config.call(
+    call_result = await llm_config.call(
         messages=[{"role": "system", "content": system_message}, {"role": "user", "content": prompt}],
         scope="memory_think",
-        temperature=0.9,
+        temperature=get_config().llm_temperature_reflect,
         max_completion_tokens=1000,
     )
+    answer_text = call_result.content
 
     return answer_text.strip()

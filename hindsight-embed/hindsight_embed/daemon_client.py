@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 
 from .daemon_embed_manager import DaemonEmbedManager
-from .profile_manager import ProfileManager, resolve_active_profile
+from .profile_manager import resolve_active_profile
 
 logger = logging.getLogger(__name__)
 
@@ -23,23 +23,6 @@ CLI_INSTALL_DIRS = [
     Path.home() / ".hindsight" / "bin",  # Alternative location
 ]
 CLI_INSTALLER_URL = "https://hindsight.vectorize.io/get-cli"
-
-
-def get_daemon_port(profile: str | None = None) -> int:
-    """Get daemon port for a profile.
-
-    Args:
-        profile: Profile name (None = resolve from priority).
-
-    Returns:
-        Port number for daemon.
-    """
-    if profile is None:
-        profile = resolve_active_profile()
-
-    pm = ProfileManager()
-    paths = pm.resolve_profile_paths(profile)
-    return paths.port
 
 
 def get_daemon_url(profile: str | None = None) -> str:
@@ -61,8 +44,10 @@ def ensure_daemon_running(config: dict, profile: str | None = None, extra_args: 
     Ensure daemon is running, starting it if needed.
 
     Args:
-        config: Configuration dict with LLM settings (accepts both simple keys
-                like "llm_api_key" and env var format like "HINDSIGHT_API_LLM_API_KEY").
+        config: Overrides for the daemon, keyed by environment variable name
+                ("HINDSIGHT_API_LLM_API_KEY", ...). Every HINDSIGHT_* key is
+                forwarded to the daemon process; the profile's own .env is
+                merged underneath it.
         profile: Profile name (None = resolve from priority).
         extra_args: Extra CLI arguments to pass to hindsight-api (e.g. ["--offline"]).
 

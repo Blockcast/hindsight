@@ -19,8 +19,49 @@ Webhooks are registered per memory bank and fire automatically when matching eve
 A delivery is considered failed if your endpoint returns a non-2xx status code or does not respond within the configured timeout (default 30 seconds). After 6 failed attempts, the delivery is marked as permanently failed and no further retries are made.
 
 > **ℹ️ At-least-once delivery**
-> 
+>
 Webhook delivery tasks are queued in the same database transaction as the primary operation (e.g. the retain or consolidation write). This means if the server crashes after committing but before sending, the delivery task survives and will be retried. As a result, **your endpoint may receive the same event more than once** — use the `operation_id` field to deduplicate if needed.
+## Verifying Deliveries
+
+When a webhook is registered with a secret, every delivery carries an HMAC-SHA256 signature of the exact request body. Verify it before trusting a payload — the URL alone is not proof the request came from Hindsight.
+
+| Header | Value | Notes |
+|--------|-------|-------|
+| `X-Hindsight-Event` | The event type, e.g. `retain.completed` | Always sent |
+| `X-Hindsight-Signature` | `sha256=<hex>` over the raw body | Sent when a secret is configured |
+| `X-Hub-Signature-256` | Identical to `X-Hindsight-Signature` | The conventional name for this construction, so GitHub-style receivers verify out of the box |
+| `X-Hindsight-Signature-V2` | `t=<unix_seconds>,v1=<hex>` over `<t>.<raw body>` | Timestamped variant — use this if you want replay protection |
+
+`X-Hindsight-Signature` and `X-Hub-Signature-256` always carry the same value: same secret, same algorithm, same bytes. Verify whichever one your framework already understands; there is no reason to check both.
+
+> **⚠️ Prefer the timestamped signature**
+>
+`X-Hindsight-Signature` / `X-Hub-Signature-256` sign the body and nothing else, so they say *this payload came from Hindsight* but not *this payload is fresh*. A delivery captured off the wire stays verifiable forever. `X-Hindsight-Signature-V2` binds the payload to the time it was signed — check that `t` is within a tolerance you choose (five minutes is a common default) and reject anything older. The timestamp is inside the signed string, so it cannot be edited without breaking the MAC. It is re-signed on every retry attempt, so a delivery that is retried hours later still arrives with a fresh `t`.
+```python
+
+TOLERANCE_SECONDS = 300
+
+def verify(secret: str, body: bytes, header: str) -> bool:
+    """Verify an X-Hindsight-Signature-V2 header against the raw request body."""
+    parts = dict(p.split("=", 1) for p in header.split(","))
+    timestamp, received = parts["t"], parts["v1"]
+
+    if abs(time.time() - int(timestamp)) > TOLERANCE_SECONDS:
+        return False  # too old (or too far in the future) — treat as a replay
+
+    expected = hmac.new(
+        secret.encode(), f"{timestamp}.".encode() + body, hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(expected, received)
+```
+
+Two things to get right in any language:
+
+- **Sign the raw bytes.** Re-serializing the parsed JSON changes whitespace and key order, and the signature will not match. Read the body before your framework decodes it.
+- **Compare in constant time** (`hmac.compare_digest`, `crypto.timingSafeEqual`, …), never with `==`.
+
+Custom headers set on a webhook's `http_config` cannot override `X-Hindsight-Event` or any signature header, so a receiver can trust those values whatever else is configured.
+
 ## Event Types
 
 ### `consolidation.completed`
@@ -73,7 +114,8 @@ Fired once per document after a retain operation completes (both synchronous and
   "timestamp": "2026-03-04T12:00:01Z",
   "data": {
     "document_id": "doc-abc123",
-    "tags": ["meeting", "q1-2026"]
+    "tags": ["meeting", "q1-2026"],
+    "memory_unit_count": 12
   }
 }
 ```
@@ -84,11 +126,13 @@ Fired once per document after a retain operation completes (both synchronous and
 |-------|------|-------------|
 | `document_id` | `string \| null` | The document ID if one was provided in the retain request |
 | `tags` | `string[] \| null` | Document-level tags applied during retain |
+| `memory_unit_count` | `number \| null` | Memory units the document owns after this retain. `null` when the request carried no `document_id`. |
 
 **Notes:**
 - For async retain (`async: true`), `operation_id` matches the `operation_id` returned by the retain API.
 - For sync retain, `operation_id` is a generated identifier for tracing purposes.
 - One event is fired per content item in the retain request.
+- `memory_unit_count: 0` means fact extraction returned nothing for the document. The retain still succeeded and the text is stored, but `recall` and `reflect` search memories — so the document is not retrievable until it is [reprocessed](../retain.md#when-a-mission-excludes-everything-in-a-document). Watch this field to catch a retain mission that excludes more than intended.
 
 ---
 
@@ -129,4 +173,3 @@ Fired when a bank's [Memory Defense](../memory-defense/index.md) policy acts on 
 
 **Notes:**
 - A `redact` event means the secret was scrubbed and the redacted memory was still stored. A `block` event means the item was dropped; if every item in the retain request is blocked, the retain call returns `422`.
-

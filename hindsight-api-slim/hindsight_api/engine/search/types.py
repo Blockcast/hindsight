@@ -22,10 +22,25 @@ class GraphRetrievalTimings:
     pattern_count: int = 0  # Number of patterns executed
     fusion: float = 0.0  # Time for RRF fusion
     fetch: float = 0.0  # Time to fetch memory unit details
-    seeds_time: float = 0.0  # Time to find semantic seeds (if fallback used)
+    seeds_time: float = 0.0  # Time spent selecting semantic graph seeds
     result_count: int = 0  # Number of results returned
     # Detailed per-hop timing: list of {hop, exec_time, uncached, load_time, edges_loaded, total_time}
     hop_details: list[dict] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class GraphRetrieval:
+    """What one graph-retrieval strategy returned, plus how long it took getting there.
+
+    ``timings`` is diagnostics only — every caller but the perf path discards it,
+    and it is ``None`` when instrumentation is off. Pairing it with the results in
+    a bare tuple meant the interesting half was always the one you had to remember
+    came first; a strategy that returned them the other way round would type-check
+    identically against ``tuple[list, X | None]`` at every implementation.
+    """
+
+    results: list["RetrievalResult"]
+    timings: "GraphRetrievalTimings | None" = None
 
 
 @dataclass
@@ -49,6 +64,40 @@ class RetrievalResult:
     tags: list[str] | None = None  # Visibility scope tags
     metadata: dict[str, str] | None = None  # User-provided metadata
     proof_count: int | None = None  # Number of supporting memories (observations only)
+
+    # Entity postings the backend already resolved for this unit, if any.
+    # ``None`` means "this backend does not carry entity ids on the result" (the default
+    # store, which resolves them later via ``entity_map_for_units``); a list — possibly
+    # empty — means the backend already resolved the unit->entity posting inline, so
+    # recall can build the entity map directly instead of re-fetching the memories.
+    #
+    # CONTRACT: a backend that populates this for an OBSERVATION MUST include the
+    # entities it inherits from its source memories, not only any it carries directly.
+    # Recall builds the entity map straight from this list and does NOT resolve
+    # observation-from-source inheritance itself (the default store, which leaves this
+    # ``None``, resolves that inheritance inside ``entity_map_for_units`` instead). A
+    # backend that owns its index and resolves the inheritance at write time — so the
+    # stored record's entity ids are already the complete set — satisfies this; one that
+    # only stores direct postings must leave this ``None`` for observations.
+    entity_ids: list[str] | None = None
+
+    # The memories an OBSERVATION was consolidated from, if the backend carried them.
+    # ``None`` means "not carried" (the default store, and every non-observation result);
+    # a list — possibly empty — means the backend resolved it inline.
+    #
+    # Recall needs this twice for an observation it is about to return: ``prefer_observations``
+    # drops the raw facts an observation supersedes, and ``include_chunks`` walks the sources for
+    # their chunk ids. Both used to re-fetch the observation to read one field off a record the
+    # hydration had already fetched and thrown away. A store that leaves this ``None`` keeps the
+    # re-fetch, so the two paths stay interchangeable rather than one being an approximation.
+    source_memory_ids: list[str] | None = None
+
+    # Short ids of the attachments this fact was drawn from, if the backend carried them.
+    # ``None`` means "not carried" (the default store, which reads them back from
+    # ``memory_units.attachment_ids`` when the response is rendered); a list — possibly
+    # empty — means the backend returned them on the row, so the read surface resolves
+    # them without asking the store again.
+    attachment_ids: list[str] | None = None
 
     # Retrieval-specific scores (only one will be set depending on retrieval method)
     similarity: float | None = None  # Semantic retrieval
@@ -83,6 +132,20 @@ class RetrievalResult:
 
 
 @dataclass
+class ArmScores:
+    """Raw per-strategy retrieval scores for a single doc, aggregated across arms.
+
+    Fusion keeps only the first-seen RetrievalResult per doc, so its per-arm score
+    fields reflect just one arm. This captures each arm's raw score for the same doc
+    so the recall response can report them (and ``min_scores`` can filter on them).
+    ``None`` means the doc was not surfaced by that arm.
+    """
+
+    semantic: float | None = None  # cosine similarity from the semantic arm
+    keyword: float | None = None  # BM25 / full-text score from the keyword arm
+
+
+@dataclass
 class MergedCandidate:
     """
     Candidate after RRF merge of multiple retrieval results.
@@ -97,6 +160,7 @@ class MergedCandidate:
     rrf_score: float
     rrf_rank: int = 0
     source_ranks: dict[str, int] = field(default_factory=dict)  # method_name -> rank
+    arm_scores: "ArmScores" = field(default_factory=lambda: ArmScores())  # raw per-strategy scores
 
     @property
     def id(self) -> str:
@@ -123,6 +187,7 @@ class ScoredResult:
     rrf_normalized: float = 0.0
     recency: float = 0.5
     temporal: float = 0.5
+    proof_norm: float = 0.5  # log-normalized proof count (neutral 0.5); drives proof_count_boost
 
     # Final combined score
     combined_score: float = 0.0
@@ -158,6 +223,7 @@ class ScoredResult:
             "chunk_id": self.retrieval.chunk_id,
             "tags": self.retrieval.tags,
             "metadata": self.retrieval.metadata,
+            "attachment_ids": self.retrieval.attachment_ids,
             "semantic_similarity": self.retrieval.similarity,
             "bm25_score": self.retrieval.bm25_score,
         }
@@ -179,6 +245,7 @@ class ScoredResult:
         result["rrf_normalized"] = self.rrf_normalized
         result["temporal"] = self.temporal
         result["recency"] = self.recency
+        result["proof_norm"] = self.proof_norm
         result["combined_score"] = self.combined_score
         result["weight"] = self.weight
         result["activation"] = self.weight  # Legacy field

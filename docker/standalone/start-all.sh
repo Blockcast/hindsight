@@ -79,12 +79,130 @@ check_pg0_writable() {
     echo "   • Recommended — use a Docker named volume (auto-owned by the container):"
     echo "       -v hindsight-data:/home/hindsight/.pg0"
     echo ""
-    echo "   • Or keep the host path and run as your host user, chowning it to match:"
-    echo "       sudo chown -R \$(id -u):\$(id -g) <host-directory>"
-    echo "       docker run --user \$(id -u):\$(id -g) -e HOME=/home/hindsight ..."
+    echo "   • Or keep the host path and chown it to the container user (UID 1000):"
+    echo "       sudo chown -R 1000:1000 <host-directory>"
+    echo ""
+    echo "   Do NOT use --user to run as a different UID: the image only defines"
+    echo "   UID 1000, and any other UID has no /etc/passwd entry, which crashes"
+    echo "   startup with \"getpwuid(): uid not found\"."
     echo ""
     echo "   See https://github.com/vectorize-io/hindsight/issues/1483"
     return 1
+}
+
+# =============================================================================
+# API startup wait (#3733)
+#
+# This wrapper kills the container when the API has not answered /health in
+# time. That wait is a separate timer from the API's own initialization cap
+# (HINDSIGHT_API_MODEL_INIT_TIMEOUT) — the knob the docs point at when a
+# first-time model download legitimately needs longer. Raising only the
+# documented knob used to have no effect in Docker: the wrapper still killed
+# the container at its own default, so the download restarted from scratch on
+# every boot. Follow the API's cap when it is the longer of the two.
+# =============================================================================
+DEFAULT_API_STARTUP_WAIT_SECONDS=300
+API_STARTUP_WAIT_GRACE_SECONDS=30
+
+resolve_api_startup_wait_seconds() {
+    # An explicit wrapper setting always wins.
+    if [ -n "${HINDSIGHT_API_STARTUP_WAIT_SECONDS:-}" ]; then
+        echo "${HINDSIGHT_API_STARTUP_WAIT_SECONDS}"
+        return 0
+    fi
+
+    # The API reads its cap as a float, so tolerate values like "7200.0".
+    local model_init="${HINDSIGHT_API_MODEL_INIT_TIMEOUT:-}"
+    model_init="${model_init%%.*}"
+    if [[ "$model_init" =~ ^[0-9]+$ ]] && [ "$model_init" -gt "$DEFAULT_API_STARTUP_WAIT_SECONDS" ]; then
+        # Grace period so the API surfaces its own timeout error before the
+        # wrapper gives up on it.
+        echo "$((model_init + API_STARTUP_WAIT_GRACE_SECONDS))"
+        return 0
+    fi
+
+    echo "$DEFAULT_API_STARTUP_WAIT_SECONDS"
+}
+
+# =============================================================================
+# HTTP readiness probe
+#
+# The implementation is hindsight_api.http_probe, not Python embedded here: it
+# needs to be linted, type-checked and unit-tested, and the parity rules it
+# encodes (notably that `curl -sf` does NOT follow redirects) are too easy to
+# get subtly wrong to leave in a shell string. See that module's docstring.
+#
+# Every image that probes anything ships the API package, so `python3 -m` finds
+# it. It is held to stdlib-only imports by a test - see its docstring. cp-only
+# has no Python at all and probes nothing.
+# =============================================================================
+http_probe() {
+    local url="$1"
+    local timeout_seconds="${2:-5}"
+
+    python3 -m hindsight_api.http_probe "$url" "$timeout_seconds"
+}
+
+# A probe that cannot run at all would silently degrade into "never ready", so
+# check once, up front, where it can still say why.
+require_http_probe_runtime() {
+    if ! python3 -c "import hindsight_api.http_probe" >/dev/null 2>&1; then
+        echo "❌ HTTP readiness probes need python3 with hindsight_api.http_probe importable."
+        exit 1
+    fi
+}
+
+# =============================================================================
+# Control Plane loopback bind (#1926)
+#
+# Next.js standalone uses HOSTNAME both to bind and as the origin its next-intl
+# locale rewrite is checked against. Next normalizes 127.0.0.1 -> localhost on
+# one side of that comparison but keeps the literal on the other, so a literal
+# loopback address makes every locale rewrite look cross-origin and leak out
+# instead of being applied internally. The control plane then binds correctly,
+# answers /health and serves the whole REST API — while 307ing every page to
+# itself. Nothing else shows a symptom, which is what makes it expensive.
+#
+# Passing `localhost` fixes it, but substituting it alone is not safe: it
+# resolves through /etc/hosts, and Docker's generated hosts file maps
+# `::1 localhost`, so a bare substitution silently moves a requested IPv4 bind
+# onto IPv6. Pinning Node's DNS result order keeps the family the operator
+# asked for, so the effective bind is unchanged and only the spelling differs.
+#
+# Measured on 0.10.0 (Next 16.3.5), CP-only containers, one variable at a time:
+#
+#   HINDSIGHT_CP_HOSTNAME    bind        GET /dashboard
+#   127.0.0.1                127.0.0.1   307 -> itself (loop)
+#   ::1                      ::1         500
+#   localhost                ::1         200   <- family changed
+#   localhost + ipv4first    127.0.0.1   200
+#   localhost + ipv6first    ::1         200
+#
+# Upgrading Next is not the fix: #1928 pinned 16.2.5 for this, #1934 reverted
+# the pin after re-diagnosing and deferred the loopback case. 16.3.5 still loops.
+#
+# Sets CP_HOSTNAME (the value to bind with) and may append to NODE_OPTIONS.
+# =============================================================================
+resolve_cp_hostname() {
+    local requested="$1"
+    local family
+
+    CP_HOSTNAME="$requested"
+
+    case "$requested" in
+        127.0.0.1)      family="ipv4first" ;;
+        ::1|"[::1]")    family="ipv6first" ;;
+        *)              return 0 ;;
+    esac
+
+    CP_HOSTNAME="localhost"
+    NODE_OPTIONS="${NODE_OPTIONS:+${NODE_OPTIONS} }--dns-result-order=${family}"
+    export NODE_OPTIONS
+
+    echo "ℹ️  HINDSIGHT_CP_HOSTNAME=${requested} binds correctly but makes the control"
+    echo "   plane redirect every page to itself, so it is being bound as 'localhost'"
+    echo "   with --dns-result-order=${family}. Same address, same family, working UI."
+    echo "   See https://github.com/vectorize-io/hindsight/issues/1926"
 }
 
 if [ "${HINDSIGHT_START_ALL_SOURCE_ONLY:-false}" = "true" ]; then
@@ -106,6 +224,7 @@ ENABLE_CP="${HINDSIGHT_ENABLE_CP:-true}"
 # This wait loop ensures dependencies are ready before starting.
 # =============================================================================
 if [ "${HINDSIGHT_WAIT_FOR_DEPS:-false}" = "true" ]; then
+    require_http_probe_runtime
     LLM_BASE_URL="${HINDSIGHT_API_LLM_BASE_URL:-http://host.docker.internal:1234/v1}"
     MAX_RETRIES="${HINDSIGHT_RETRY_MAX:-0}"  # 0 = infinite
     RETRY_INTERVAL="${HINDSIGHT_RETRY_INTERVAL:-10}"
@@ -130,7 +249,7 @@ if [ "${HINDSIGHT_WAIT_FOR_DEPS:-false}" = "true" ]; then
     }
 
     check_llm() {
-        curl -sf "${LLM_BASE_URL}/models" --connect-timeout 5 &>/dev/null
+        http_probe "${LLM_BASE_URL}/models" 5 &>/dev/null
     }
 
     echo "⏳ Waiting for dependencies to be ready..."
@@ -226,9 +345,10 @@ PIDS=()
 
 # Start API if enabled
 if [ "$ENABLE_API" = "true" ]; then
+    require_http_probe_runtime
     cd /app/api
     API_HEALTH_URL="${HINDSIGHT_API_HEALTH_URL:-http://localhost:${HINDSIGHT_API_PORT:-8888}/health}"
-    API_STARTUP_WAIT_SECONDS="${HINDSIGHT_API_STARTUP_WAIT_SECONDS:-300}"
+    API_STARTUP_WAIT_SECONDS="$(resolve_api_startup_wait_seconds)"
 
     # Run API directly - Python's PYTHONUNBUFFERED=1 handles output buffering
     hindsight-api &
@@ -242,7 +362,7 @@ if [ "$ENABLE_API" = "true" ]; then
             wait "$API_PID"
             exit $?
         fi
-        if curl -sf "$API_HEALTH_URL" &>/dev/null; then
+        if http_probe "$API_HEALTH_URL" 5 &>/dev/null; then
             api_ready=true
             break
         fi
@@ -251,6 +371,9 @@ if [ "$ENABLE_API" = "true" ]; then
 
     if [ "$api_ready" != "true" ]; then
         echo "❌ API did not become healthy within ${API_STARTUP_WAIT_SECONDS}s"
+        echo "   If a legitimate first-time model download needs longer, raise"
+        echo "   HINDSIGHT_API_MODEL_INIT_TIMEOUT (this wait follows it) or set"
+        echo "   HINDSIGHT_API_STARTUP_WAIT_SECONDS to override this wait directly."
         exit 1
     fi
 else
@@ -261,7 +384,8 @@ fi
 if [ "$ENABLE_CP" = "true" ]; then
     echo "🎛️  Starting Control Plane..."
     cd /app/control-plane
-    export HOSTNAME="${HINDSIGHT_CP_HOSTNAME:-0.0.0.0}"
+    resolve_cp_hostname "${HINDSIGHT_CP_HOSTNAME:-0.0.0.0}"
+    export HOSTNAME="$CP_HOSTNAME"
     PORT="${HINDSIGHT_CP_PORT:-9999}" node server.js &
     CP_PID=$!
     PIDS+=($CP_PID)

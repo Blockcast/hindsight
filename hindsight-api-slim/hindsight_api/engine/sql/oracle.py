@@ -5,7 +5,7 @@ vector distance (VECTOR_DISTANCE), full-text search (Oracle Text), and
 other non-portable patterns.
 """
 
-from .base import SQLDialect
+from .base import SQLDialect, bm25_score_gate
 
 
 class OracleDialect(SQLDialect):
@@ -203,10 +203,6 @@ class OracleDialect(SQLDialect):
     def for_update_skip_locked(self) -> str:
         return "FOR UPDATE SKIP LOCKED"
 
-    def advisory_lock(self, id_param: str) -> str:
-        # Oracle doesn't have advisory locks. Use SELECT FOR UPDATE NOWAIT on a lock row.
-        return "SELECT 1 FROM dual FOR UPDATE NOWAIT"
-
     # -- UUID generation -------------------------------------------------
 
     def generate_uuid(self) -> str:
@@ -273,6 +269,9 @@ class OracleDialect(SQLDialect):
         text_search_extension: str = "native",
         bm25_language: str = "english",
         bm25_min_score: float = 0.0,
+        pg_search_function_schema: str = "paradedb",
+        pg_search_tokenizer: str = "",
+        max_query_terms: int = 0,
         extra_where: str = "",
     ) -> str:
         # Oracle Text: CONTAINS() / SCORE() with the CTXSYS.CONTEXT index.
@@ -287,9 +286,10 @@ class OracleDialect(SQLDialect):
             f" FROM {table}"
             f" WHERE bank_id = {bank_id_param}"
             f"   AND fact_type = '{fact_type}'"
-            # CONTAINS already gates to genuine matches; the configurable floor
-            # (default 0) keeps the threshold semantics uniform across backends.
-            f"   AND CONTAINS(text, {text_param}, {label}) > {bm25_min_score:g}"
+            # CONTAINS already gates to genuine matches, so at the 0.0 default the
+            # gate is the structural `> 0`; a caller's `min_scores.keyword` floor
+            # replaces it with an inclusive `>=`, uniform across backends.
+            f"   AND CONTAINS(text, {text_param}, {label}) {bm25_score_gate(bm25_min_score)}"
             f"   {tags_clause}"
             f"   {groups_clause}"
             f"   {extra_where}"
@@ -303,6 +303,7 @@ class OracleDialect(SQLDialect):
         query_text: str,
         *,
         text_search_extension: str = "native",
+        max_query_terms: int | None = None,
     ) -> str:
         # Oracle Text: filter tokens with special chars, escape reserved words
         # with curly braces (e.g. "about" → "{about}"), and join with OR.

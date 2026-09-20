@@ -51,7 +51,7 @@ if (!fact) {
 const memoryId = fact.id;
 
 // [docs:get-memory]
-// Fetch a single memory unit (entities, dates, state).
+// Fetch a single memory unit (metadata, entities, dates, state).
 const memory = await (
     await fetch(`${HINDSIGHT_URL}/v1/default/banks/${BANK_ID}/memories/${memoryId}`)
 ).json();
@@ -68,10 +68,13 @@ await patchMemory(memoryId, { text: 'The user visited Paris in 2023.', reason: '
 // [docs:edit-memory-fields]
 // Correct dates, fact type, and entities in one call. "" clears a field;
 // entities replaces the set ([] detaches all); omit to leave unchanged.
+// resolve_entities: false keeps the entity names you wrote from being matched
+// onto a similar entity that already exists.
 await patchMemory(memoryId, {
     occurred_start: '2023-06-01',
     fact_type: 'experience',
     entities: ['Alice', 'Paris'],
+    resolve_entities: false,
 });
 // [/docs:edit-memory-fields]
 

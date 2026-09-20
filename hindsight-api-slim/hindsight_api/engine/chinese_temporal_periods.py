@@ -109,27 +109,40 @@ def extract_chinese_period(query: str, reference_date: datetime) -> DateRange | 
             end.replace(hour=23, minute=59, second=59, microsecond=999999),
         )
 
-    def subtract_months(months: int) -> datetime:
-        month_index = reference_date.month - months - 1
-        year = reference_date.year + month_index // 12
-        month = month_index % 12 + 1
-        day = min(reference_date.day, calendar.monthrange(year, month)[1])
-        return reference_date.replace(year=year, month=month, day=day)
+    def safe_constraint(start: datetime | None, end: datetime | None) -> DateRange | NoTemporalConstraintSentinel:
+        if start is None or end is None:
+            return NO_TEMPORAL_CONSTRAINT
+        return constraint(start, end)
+
+    def subtract_months(months: int) -> datetime | None:
+        return add_months(reference_date, -months)
 
     def month_end(year: int, month: int) -> datetime:
         return datetime(year, month, calendar.monthrange(year, month)[1])
 
-    def add_months(base_date: datetime, months: int) -> datetime:
+    def add_months(base_date: datetime, months: int) -> datetime | None:
         month_index = base_date.month + months - 1
         year = base_date.year + month_index // 12
+        if year < datetime.min.year or year > datetime.max.year:
+            return None
         month = month_index % 12 + 1
         day = min(base_date.day, calendar.monthrange(year, month)[1])
         return base_date.replace(year=year, month=month, day=day)
 
-    def add_years(base_date: datetime, years: int) -> datetime:
+    def add_years(base_date: datetime, years: int) -> datetime | None:
         year = base_date.year + years
+        if year < datetime.min.year or year > datetime.max.year:
+            return None
         day = min(base_date.day, calendar.monthrange(year, base_date.month)[1])
         return base_date.replace(year=year, day=day)
+
+    def add_days(base_date: datetime | None, days: int) -> datetime | None:
+        if base_date is None:
+            return None
+        try:
+            return base_date + timedelta(days=days)
+        except OverflowError:
+            return None
 
     def has_chinese_temporal_context(match: re.Match[str]) -> bool:
         if match.end() >= len(query):
@@ -358,7 +371,7 @@ def extract_chinese_period(query: str, reference_date: datetime) -> DateRange | 
         sat = start + timedelta(days=5)
         return constraint(sat, sat + timedelta(days=1))
 
-    def relative_month_start(period: str | None) -> datetime:
+    def relative_month_start(period: str | None) -> datetime | None:
         return add_months(reference_date.replace(day=1), relative_period_offset(period))
 
     def exact_day_constraint(year: int, month_text: str, day_text: str) -> DateRange | None:
@@ -403,6 +416,8 @@ def extract_chinese_period(query: str, reference_date: datetime) -> DateRange | 
         if day is None:
             return None
         start = relative_month_start(period)
+        if start is None:
+            return None
         if day > calendar.monthrange(start.year, start.month)[1]:
             return None
         return datetime(start.year, start.month, day)
@@ -438,6 +453,11 @@ def extract_chinese_period(query: str, reference_date: datetime) -> DateRange | 
             return NO_TEMPORAL_CONSTRAINT
         return constraint(start, reference_date)
 
+    def safe_since_constraint(start: datetime | None) -> DateRange | NoTemporalConstraintSentinel:
+        if start is None:
+            return NO_TEMPORAL_CONSTRAINT
+        return since_constraint(start)
+
     def since_from_period(
         period: DateRange | None,
     ) -> DateRange | NoTemporalConstraintSentinel | None:
@@ -450,24 +470,24 @@ def extract_chinese_period(query: str, reference_date: datetime) -> DateRange | 
             return None
         return since_constraint(day)
 
-    def relative_offset_datetime(amount: int, unit: str, direction: int) -> datetime:
+    def relative_offset_datetime(amount: int, unit: str, direction: int) -> datetime | None:
         if unit in ("天", "日"):
-            return reference_date + timedelta(days=direction * amount)
+            return add_days(reference_date, direction * amount)
         if unit in ("周", "星期", "礼拜"):
-            return reference_date + timedelta(weeks=direction * amount)
+            return add_days(reference_date, direction * amount * 7)
         if unit == "月":
             return add_months(reference_date, direction * amount)
         return add_years(reference_date, direction * amount)
 
-    def point_constraint_at_offset(amount: int, unit: str, direction: int) -> DateRange:
+    def point_constraint_at_offset(amount: int, unit: str, direction: int) -> DateRange | NoTemporalConstraintSentinel:
         d = relative_offset_datetime(amount, unit, direction)
-        return constraint(d, d)
+        return safe_constraint(d, d)
 
-    def window_to_reference(amount: int, unit: str) -> DateRange:
-        return constraint(relative_offset_datetime(amount, unit, -1), reference_date)
+    def window_to_reference(amount: int, unit: str) -> DateRange | NoTemporalConstraintSentinel:
+        return safe_constraint(relative_offset_datetime(amount, unit, -1), reference_date)
 
-    def window_from_reference(amount: int, unit: str) -> DateRange:
-        return constraint(reference_date, relative_offset_datetime(amount, unit, 1))
+    def window_from_reference(amount: int, unit: str) -> DateRange | NoTemporalConstraintSentinel:
+        return safe_constraint(reference_date, relative_offset_datetime(amount, unit, 1))
 
     # Chinese rule guide
     #
@@ -596,6 +616,8 @@ def extract_chinese_period(query: str, reference_date: datetime) -> DateRange | 
     if relative_month_range_match:
         first = relative_month_start(relative_month_range_match.group(1))
         second = relative_month_start(relative_month_range_match.group(2))
+        if first is None or second is None:
+            return NO_TEMPORAL_CONSTRAINT
         start = min(first, second)
         end = max(first, second)
         return constraint(start, month_end(end.year, end.month))
@@ -781,8 +803,8 @@ def extract_chinese_period(query: str, reference_date: datetime) -> DateRange | 
     if relative_year_fixed_day_since_match:
         year = relative_year_number(relative_year_fixed_day_since_match.group(1))
         base = add_years(reference_date, year - reference_date.year)
-        d = base + timedelta(days=fixed_day_offset(relative_year_fixed_day_since_match.group(2)))
-        return since_constraint(d)
+        d = add_days(base, fixed_day_offset(relative_year_fixed_day_since_match.group(2)))
+        return safe_since_constraint(d)
 
     fixed_day_since_match = chinese_search(
         rf"(大大后天|大后天|后天|明天|明日|今天|今日|本日|当日|当天|昨天|昨日|大大前天|大前天|前天)"
@@ -799,7 +821,7 @@ def extract_chinese_period(query: str, reference_date: datetime) -> DateRange | 
         amount = parse_chinese_number(exact_relative_since_match.group(1))
         unit = exact_relative_since_match.group(2)
         if amount is not None:
-            return since_constraint(relative_offset_datetime(amount, unit, -1))
+            return safe_since_constraint(relative_offset_datetime(amount, unit, -1))
 
     weekend_since_match = chinese_search(
         rf"(?<![上下大小每个各隔])"
@@ -819,7 +841,7 @@ def extract_chinese_period(query: str, reference_date: datetime) -> DateRange | 
         rf"(?<![上下大小])(上上|大上|上|这|本|当|下下|大下|下){_CHINESE_OPTIONAL_PERIOD_MARKER}月{chinese_since_suffix_pattern}"
     )
     if month_since_match:
-        return since_constraint(relative_month_start(month_since_match.group(1)))
+        return safe_since_constraint(relative_month_start(month_since_match.group(1)))
 
     absolute_year_month_since_match = chinese_search(
         rf"({chinese_year_pattern})\s*年\s*({chinese_month_pattern})\s*月{chinese_since_suffix_pattern}"
@@ -899,8 +921,8 @@ def extract_chinese_period(query: str, reference_date: datetime) -> DateRange | 
     if relative_year_daypart_since_match:
         year = relative_year_number(relative_year_daypart_since_match.group(1))
         base = add_years(reference_date, year - reference_date.year)
-        d = base + timedelta(days=daypart_day_offset(relative_year_daypart_since_match.group(2)))
-        return since_constraint(d)
+        d = add_days(base, daypart_day_offset(relative_year_daypart_since_match.group(2)))
+        return safe_since_constraint(d)
 
     daypart_since_match = chinese_search(
         rf"(昨晚|昨夜|前晚|前夜|今晚|今早|今晨|明早|明晚|明夜){chinese_since_suffix_pattern}"
@@ -915,17 +937,17 @@ def extract_chinese_period(query: str, reference_date: datetime) -> DateRange | 
     if relative_year_daypart_match:
         year = relative_year_number(relative_year_daypart_match.group(1))
         base = add_years(reference_date, year - reference_date.year)
-        d = base + timedelta(days=daypart_day_offset(relative_year_daypart_match.group(2)))
-        return constraint(d, d)
+        d = add_days(base, daypart_day_offset(relative_year_daypart_match.group(2)))
+        return safe_constraint(d, d)
 
     # Day-part abbreviations still resolve only to date granularity.
     if chinese_search(r"昨晚|昨夜"):
-        d = reference_date + timedelta(days=daypart_day_offset("昨晚"))
-        return constraint(d, d)
+        d = add_days(reference_date, daypart_day_offset("昨晚"))
+        return safe_constraint(d, d)
 
     if chinese_search(r"前晚|前夜"):
-        d = reference_date + timedelta(days=daypart_day_offset("前晚"))
-        return constraint(d, d)
+        d = add_days(reference_date, daypart_day_offset("前晚"))
+        return safe_constraint(d, d)
 
     if chinese_search(r"今晚|今早|今晨"):
         return constraint(reference_date, reference_date)
@@ -941,8 +963,8 @@ def extract_chinese_period(query: str, reference_date: datetime) -> DateRange | 
     if relative_year_fixed_day_match:
         year = relative_year_number(relative_year_fixed_day_match.group(1))
         base = add_years(reference_date, year - reference_date.year)
-        d = base + timedelta(days=fixed_day_offset(relative_year_fixed_day_match.group(2)))
-        return constraint(d, d)
+        d = add_days(base, fixed_day_offset(relative_year_fixed_day_match.group(2)))
+        return safe_constraint(d, d)
 
     if chinese_search(r"昨天|昨日"):
         d = reference_date - timedelta(days=1)
@@ -1015,7 +1037,7 @@ def extract_chinese_period(query: str, reference_date: datetime) -> DateRange | 
 
     if chinese_search(r"一年半前"):
         d = subtract_months(18)
-        return constraint(d, d)
+        return safe_constraint(d, d)
 
     if chinese_search(r"([一二两三四五六七八九十]+)年半前"):
         match = chinese_search(r"([一二两三四五六七八九十]+)年半前")
@@ -1023,15 +1045,15 @@ def extract_chinese_period(query: str, reference_date: datetime) -> DateRange | 
             years = parse_chinese_number(match.group(1))
             if years is not None:
                 d = subtract_months(years * 12 + 6)
-                return constraint(d, d)
+                return safe_constraint(d, d)
 
     if chinese_search(r"([0-9]+|[一二两三四五六七八九十]+)个?半月前"):
         match = chinese_search(r"([0-9]+|[一二两三四五六七八九十]+)个?半月前")
         if match is not None:
             months = parse_chinese_number(match.group(1))
             if months is not None:
-                d = subtract_months(months) - timedelta(days=15)
-                return constraint(d, d)
+                d = add_days(subtract_months(months), -15)
+                return safe_constraint(d, d)
 
     if chinese_search(r"半个?月前"):
         d = reference_date - timedelta(days=15)
@@ -1039,7 +1061,7 @@ def extract_chinese_period(query: str, reference_date: datetime) -> DateRange | 
 
     if chinese_search(r"半年前"):
         d = subtract_months(6)
-        return constraint(d, d)
+        return safe_constraint(d, d)
 
     future_year_half_match = chinese_search(
         rf"([0-9]+|[{_CHINESE_NUMERAL_CHARS}]+)年半{chinese_relative_future_suffix_pattern}"
@@ -1048,7 +1070,7 @@ def extract_chinese_period(query: str, reference_date: datetime) -> DateRange | 
         years = parse_chinese_number(future_year_half_match.group(1))
         if years is not None:
             d = add_months(reference_date, years * 12 + 6)
-            return constraint(d, d)
+            return safe_constraint(d, d)
 
     future_half_month_match = chinese_search(
         rf"([0-9]+|[{_CHINESE_NUMERAL_CHARS}]+)个?半月{chinese_relative_future_suffix_pattern}"
@@ -1056,8 +1078,8 @@ def extract_chinese_period(query: str, reference_date: datetime) -> DateRange | 
     if future_half_month_match:
         months = parse_chinese_number(future_half_month_match.group(1))
         if months is not None:
-            d = add_months(reference_date, months) + timedelta(days=15)
-            return constraint(d, d)
+            d = add_days(add_months(reference_date, months), 15)
+            return safe_constraint(d, d)
 
     if chinese_search(rf"半个?月{chinese_relative_future_suffix_pattern}"):
         d = reference_date + timedelta(days=15)
@@ -1065,7 +1087,7 @@ def extract_chinese_period(query: str, reference_date: datetime) -> DateRange | 
 
     if chinese_search(rf"半年{chinese_relative_future_suffix_pattern}"):
         d = add_months(reference_date, 6)
-        return constraint(d, d)
+        return safe_constraint(d, d)
 
     adjacent_fuzzy_future_match = chinese_search(
         r"(?<![一二三四五六七八九十百千万零\d后])"
@@ -1085,7 +1107,7 @@ def extract_chinese_period(query: str, reference_date: datetime) -> DateRange | 
             end_amount = parse_chinese_number(amount_text[-1])
         unit = adjacent_fuzzy_future_match.group(2)
         if start_amount is not None and end_amount is not None:
-            return constraint(
+            return safe_constraint(
                 relative_offset_datetime(start_amount, unit, 1),
                 relative_offset_datetime(end_amount, unit, 1),
             )
@@ -1093,7 +1115,7 @@ def extract_chinese_period(query: str, reference_date: datetime) -> DateRange | 
     few_future_match = chinese_search(rf"[几数]个?(天|日|周|星期|礼拜|月|年){chinese_relative_future_suffix_pattern}")
     if few_future_match:
         unit = few_future_match.group(1)
-        return constraint(relative_offset_datetime(2, unit, 1), relative_offset_datetime(5, unit, 1))
+        return safe_constraint(relative_offset_datetime(2, unit, 1), relative_offset_datetime(5, unit, 1))
 
     exact_future_match = chinese_search(
         rf"(?<![{_CHINESE_NUMERAL_PREFIX_CHARS}])([0-9]+|[{_CHINESE_NUMERAL_CHARS}]+)个?(天|日|周|星期|礼拜|月|年){chinese_relative_future_suffix_pattern}"
@@ -1113,7 +1135,7 @@ def extract_chinese_period(query: str, reference_date: datetime) -> DateRange | 
         second_amount = parse_chinese_number(adjacent_fuzzy_past_match.group(2))
         unit = adjacent_fuzzy_past_match.group(3)
         if first_amount is not None and second_amount is not None and second_amount == first_amount + 1:
-            return constraint(
+            return safe_constraint(
                 relative_offset_datetime(second_amount, unit, -1),
                 relative_offset_datetime(first_amount, unit, -1),
             )
@@ -1144,7 +1166,7 @@ def extract_chinese_period(query: str, reference_date: datetime) -> DateRange | 
         return constraint(reference_date - timedelta(days=150), reference_date - timedelta(days=60))
 
     if chinese_search(r"一两年前|[两二]三年前|三两年前"):
-        return constraint(add_years(reference_date, -3), add_years(reference_date, -1))
+        return safe_constraint(add_years(reference_date, -3), add_years(reference_date, -1))
 
     rolling_this_adjacent_match = chinese_search(
         r"这(一两|[两二]三|三两|三四|四五|五六|六七|七八|八九|九十)个?(天|日|周|星期|礼拜|月|年)"
@@ -1154,7 +1176,7 @@ def extract_chinese_period(query: str, reference_date: datetime) -> DateRange | 
         end_amount = 3 if amount_text in ("一两", "三两") else parse_chinese_number(amount_text[-1])
         unit = rolling_this_adjacent_match.group(2)
         if end_amount is not None:
-            return constraint(relative_offset_datetime(end_amount, unit, -1), reference_date)
+            return safe_constraint(relative_offset_datetime(end_amount, unit, -1), reference_date)
 
     rolling_this_count_match = chinese_search(rf"这([0-9]+|[{_CHINESE_NUMERAL_CHARS}]+)个?(天|日|周|星期|礼拜|月|年)")
     if rolling_this_count_match:
@@ -1191,7 +1213,7 @@ def extract_chinese_period(query: str, reference_date: datetime) -> DateRange | 
         end_amount = 3 if amount_text in ("一两", "三两") else parse_chinese_number(amount_text[-1])
         unit = rolling_past_adjacent_match.group(3)
         if end_amount is not None:
-            return constraint(relative_offset_datetime(end_amount, unit, -1), reference_date)
+            return safe_constraint(relative_offset_datetime(end_amount, unit, -1), reference_date)
 
     rolling_past_few_match = chinese_search(r"(过去|近|最近)几个?(天|日|周|星期|礼拜|月|年)")
     if rolling_past_few_match:
@@ -1212,14 +1234,14 @@ def extract_chinese_period(query: str, reference_date: datetime) -> DateRange | 
         unit = rolling_past_half_match.group(2)
         if unit == "月":
             return constraint(reference_date - timedelta(days=15), reference_date)
-        return constraint(subtract_months(6), reference_date)
+        return safe_constraint(subtract_months(6), reference_date)
 
     within_half_match = chinese_search(r"半个?(月|年)(?:以内|之内|内)")
     if within_half_match:
         unit = within_half_match.group(1)
         if unit == "月":
             return constraint(reference_date - timedelta(days=15), reference_date)
-        return constraint(subtract_months(6), reference_date)
+        return safe_constraint(subtract_months(6), reference_date)
 
     within_count_match = chinese_search(
         rf"([0-9]+|[{_CHINESE_NUMERAL_CHARS}]+)(个?)(天|日|周|星期|礼拜|月|年)(?:以内|之内|内)"
@@ -1282,7 +1304,7 @@ def extract_chinese_period(query: str, reference_date: datetime) -> DateRange | 
         unit = rolling_future_half_match.group(2)
         if unit == "月":
             return constraint(reference_date, reference_date + timedelta(days=15))
-        return constraint(reference_date, add_months(reference_date, 6))
+        return safe_constraint(reference_date, add_months(reference_date, 6))
 
     absolute_year_quarter_since_match = chinese_search(
         rf"({chinese_year_pattern})\s*年\s*(第?[一二三四1-4])季(?:度)?{chinese_since_suffix_pattern}"
@@ -1419,6 +1441,8 @@ def extract_chinese_period(query: str, reference_date: datetime) -> DateRange | 
     )
     if next_month_phase_since_match:
         start = add_months(reference_date.replace(day=1), 1)
+        if start is None:
+            return NO_TEMPORAL_CONSTRAINT
         return since_from_period(month_phase_period(start.year, start.month, next_month_phase_since_match.group(1)))
 
     second_next_month_phase_since_match = chinese_search(
@@ -1427,6 +1451,8 @@ def extract_chinese_period(query: str, reference_date: datetime) -> DateRange | 
     )
     if second_next_month_phase_since_match:
         start = add_months(reference_date.replace(day=1), 2)
+        if start is None:
+            return NO_TEMPORAL_CONSTRAINT
         return since_from_period(
             month_phase_period(start.year, start.month, second_next_month_phase_since_match.group(2))
         )
@@ -1445,7 +1471,10 @@ def extract_chinese_period(query: str, reference_date: datetime) -> DateRange | 
         rf"({chinese_month_phase_pattern}){chinese_since_suffix_pattern}"
     )
     if second_previous_month_phase_since_match:
-        start = subtract_months(2).replace(day=1)
+        start = subtract_months(2)
+        if start is None:
+            return NO_TEMPORAL_CONSTRAINT
+        start = start.replace(day=1)
         return since_from_period(
             month_phase_period(start.year, start.month, second_previous_month_phase_since_match.group(2))
         )
@@ -1570,6 +1599,8 @@ def extract_chinese_period(query: str, reference_date: datetime) -> DateRange | 
     )
     if next_month_phase_match:
         start = add_months(reference_date.replace(day=1), 1)
+        if start is None:
+            return NO_TEMPORAL_CONSTRAINT
         return month_phase_period(start.year, start.month, next_month_phase_match.group(1))
 
     second_next_month_phase_match = chinese_search(
@@ -1577,6 +1608,8 @@ def extract_chinese_period(query: str, reference_date: datetime) -> DateRange | 
     )
     if second_next_month_phase_match:
         start = add_months(reference_date.replace(day=1), 2)
+        if start is None:
+            return NO_TEMPORAL_CONSTRAINT
         return month_phase_period(start.year, start.month, second_next_month_phase_match.group(2))
 
     previous_month_phase_match = chinese_search(
@@ -1591,7 +1624,10 @@ def extract_chinese_period(query: str, reference_date: datetime) -> DateRange | 
         rf"(?<![上大])(上上|大上){_CHINESE_OPTIONAL_PERIOD_MARKER}月份?\s*({chinese_month_phase_pattern})"
     )
     if second_previous_month_phase_match:
-        start = subtract_months(2).replace(day=1)
+        start = subtract_months(2)
+        if start is None:
+            return NO_TEMPORAL_CONSTRAINT
+        start = start.replace(day=1)
         return month_phase_period(start.year, start.month, second_previous_month_phase_match.group(2))
 
     bare_specific_month_phase_match = chinese_search(
@@ -1669,10 +1705,13 @@ def extract_chinese_period(query: str, reference_date: datetime) -> DateRange | 
         return constraint(sat, sat + timedelta(days=1))
 
     if chinese_search(rf"上{_CHINESE_OPTIONAL_PERIOD_MARKER}(周|星期|礼拜)末"):
-        days_since_sat = (reference_date.weekday() + 2) % 7
-        if days_since_sat == 0:
-            days_since_sat = 7
-        sat = reference_date - timedelta(days=days_since_sat)
+        # Anchor to last week's Monday like every sibling rule above, rather
+        # than stepping back to the most recent Saturday. Stepping back lands on
+        # the weekend in progress when asked on a Sunday, which makes 上周末
+        # return the same window as 这周末 and leaves the weekend the user meant
+        # unreachable -- 上上周末 is already a week further back.
+        start = reference_date - timedelta(days=reference_date.weekday() + 7)
+        sat = start + timedelta(days=5)
         return constraint(sat, sat + timedelta(days=1))
 
     if chinese_search(r"(?<!每)(?<!个)(?<!各)(?<!隔)周末"):
@@ -1710,10 +1749,14 @@ def extract_chinese_period(query: str, reference_date: datetime) -> DateRange | 
         rf"(?<![下大])(下下|大下){_CHINESE_OPTIONAL_PERIOD_MARKER}月(?!{chinese_month_boundary_suffix_pattern})"
     ):
         start = add_months(reference_date.replace(day=1), 2)
+        if start is None:
+            return NO_TEMPORAL_CONSTRAINT
         return constraint(start, month_end(start.year, start.month))
 
     if chinese_search(rf"(?<![下大])下{_CHINESE_OPTIONAL_PERIOD_MARKER}月(?!{chinese_month_boundary_suffix_pattern})"):
         start = add_months(reference_date.replace(day=1), 1)
+        if start is None:
+            return NO_TEMPORAL_CONSTRAINT
         return constraint(start, month_end(start.year, start.month))
 
     if chinese_search(rf"(下一个年度|下一年度|下年度|下一年|明年)(?!{chinese_boundary_suffix_pattern})"):
@@ -1743,7 +1786,10 @@ def extract_chinese_period(query: str, reference_date: datetime) -> DateRange | 
     if chinese_search(
         rf"(?<![上大])(上上|大上){_CHINESE_OPTIONAL_PERIOD_MARKER}月(?!{chinese_month_boundary_suffix_pattern})"
     ):
-        start = subtract_months(2).replace(day=1)
+        start = subtract_months(2)
+        if start is None:
+            return NO_TEMPORAL_CONSTRAINT
+        start = start.replace(day=1)
         return constraint(start, month_end(start.year, start.month))
 
     if chinese_search(rf"前一个?(周|星期|礼拜)(?!{chinese_boundary_suffix_pattern})"):

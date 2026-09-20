@@ -23,6 +23,7 @@ import asyncio
 import json
 import logging
 import uuid
+from collections import OrderedDict
 from collections.abc import Callable, Iterable
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
@@ -34,6 +35,21 @@ from pydantic import BaseModel
 from .db_utils import acquire_with_retry
 
 logger = logging.getLogger(__name__)
+
+
+def _llm_requests_persistable() -> bool:
+    """Whether the ``llm_requests`` table exists on the active backend.
+
+    ``llm_requests`` is PostgreSQL-only: its migration is ``run_for_dialect(pg=...)``
+    with the Oracle slot intentionally absent, and MaintenanceLoop skips its
+    retention sweep on Oracle for the same reason. On Oracle the table does not
+    exist, so best-effort trace writes must be skipped rather than attempted —
+    otherwise every LLM call fires an INSERT that fails with ORA-00903 and spams
+    the error log. Mirrors the ``_is_oracle()`` gate in MaintenanceLoop.start.
+    """
+    from .schema import _is_oracle
+
+    return not _is_oracle()
 
 
 # ── bank/operation attribution (carried across the async call chain) ──────────
@@ -74,6 +90,91 @@ _request_ctx: ContextVar[dict[str, Any] | None] = ContextVar("hindsight_llm_requ
 # engine code around a specific LLM call; merged into the row's metadata on top
 # of the operation-level LLMTraceContext.metadata.
 _call_metadata_ctx: ContextVar[dict[str, Any] | None] = ContextVar("hindsight_llm_call_metadata_ctx", default=None)
+
+
+@dataclass
+class LLMResponseUsage:
+    """Provider-reported token usage for the in-flight LLM call.
+
+    Stashed by provider implementations as soon as a response is received —
+    *before* local JSON parsing / schema validation, which may still fail. The
+    wrapper reads it to attach real token counts to an error trace when the
+    provider call itself succeeded but the structured output couldn't be parsed
+    or validated (providers charge for those tokens regardless). See #2387.
+    """
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cached_tokens: int = 0
+
+
+# Per-call provider usage, set by providers right after a response is received.
+_response_usage_ctx: ContextVar[LLMResponseUsage | None] = ContextVar("hindsight_llm_response_usage_ctx", default=None)
+
+
+def set_response_usage(usage: LLMResponseUsage | None) -> Token:
+    """Bind provider-reported usage for the current call. Returns a reset token."""
+    return _response_usage_ctx.set(usage)
+
+
+def stash_response_usage(usage: LLMResponseUsage | None) -> None:
+    """Record provider-reported usage so an error trace can attach it later.
+
+    Called by provider implementations once a response (with usage) is in hand,
+    before parsing/validation that may raise. Overwrites any prior value from an
+    earlier retry attempt so the last attempt's usage wins.
+    """
+    _response_usage_ctx.set(usage)
+
+
+def reset_response_usage(token: Token) -> None:
+    """Unwind a binding made by :func:`set_response_usage`."""
+    _response_usage_ctx.reset(token)
+
+
+def current_response_usage() -> LLMResponseUsage | None:
+    """Return the active call's provider-reported usage, or None."""
+    return _response_usage_ctx.get()
+
+
+@dataclass
+class LLMQueueWait:
+    """Accumulator for time a call spent waiting on LLM concurrency permits."""
+
+    seconds: float = 0.0
+
+
+# Optional per-call sink for permit wait time, bound by a caller that wants to
+# report it. Unset by default, which makes record_queue_wait a no-op.
+_queue_wait_ctx: ContextVar[LLMQueueWait | None] = ContextVar("hindsight_llm_queue_wait_ctx", default=None)
+
+
+def set_queue_wait_sink(sink: LLMQueueWait | None) -> Token:
+    """Collect permit wait time for calls made under this context. Returns a reset token.
+
+    Without a sink, ``duration`` for an LLM call conflates two very different things:
+    time queued behind a concurrency permit and time the request was actually in
+    flight. That ambiguity sent issue #3881 chasing the provider. The worker path has
+    the ``.queued`` stage breadcrumb for this, but ``set_stage`` is a no-op outside a
+    worker task, so a synchronous HTTP request had no signal at all.
+    """
+    return _queue_wait_ctx.set(sink)
+
+
+def reset_queue_wait_sink(token: Token) -> None:
+    """Unwind a binding made by :func:`set_queue_wait_sink`."""
+    _queue_wait_ctx.reset(token)
+
+
+def record_queue_wait(seconds: float) -> None:
+    """Add permit wait time to the active sink. No-op when no caller bound one.
+
+    Accumulates rather than overwrites: a provider that owns its retry loop
+    re-acquires permits per attempt, and the caller wants the total.
+    """
+    sink = _queue_wait_ctx.get()
+    if sink is not None:
+        sink.seconds += seconds
 
 
 def set_trace_context(ctx: LLMTraceContext | None) -> Token:
@@ -330,10 +431,40 @@ class LLMTraceRecorder:
         # post-operation UPDATE (otherwise the UPDATE could race ahead of the
         # INSERTs it patches — but it must not block on unrelated operations).
         self._pending: dict[str | None, set[asyncio.Task]] = {}
+        # Trace ids that have actually produced a row. `_pending` cannot answer this: it is
+        # emptied as writes complete, so an absent entry means "nothing in flight", not "nothing
+        # was ever written". Without the distinction, `attach_memory_ids` issues an UPDATE for
+        # every operation that created memories -- including a retain in an extraction mode that
+        # makes no LLM call at all, where it matches zero rows and its only effect is to take a
+        # pooled connection per sub-batch. Bounded, and only ever holds ids: a trace id is ~36
+        # bytes and this is capped, so it cannot grow with traffic.
+        self._rows_written: OrderedDict[str, None] = OrderedDict()
+
+    def _writable(self) -> Any | None:
+        """Return the pool to write through, or None if writing isn't possible.
+
+        Covers the two lifecycle windows in which best-effort trace writes must
+        be skipped rather than attempted: before the backend pool is created
+        (``initialize()`` verifies the LLM before the DB is up) and during/after
+        shutdown. Writes already in flight need no handling — the pools close
+        gracefully, waiting for their connections to be released.
+        """
+        pool = self._pool_getter()
+        if pool is None:
+            return None
+        # Backends declare readiness explicitly; a raw pool (some callers pass
+        # one directly) has no lifecycle flag and is assumed usable.
+        from .db.base import DatabaseBackend
+
+        if isinstance(pool, DatabaseBackend) and not pool.is_ready:
+            return None
+        return pool
 
     def is_enabled(self, scope: str) -> bool:
         """Whether tracing is active for the given call scope."""
         if not self._enabled:
+            return False
+        if not _llm_requests_persistable():
             return False
         if self._allowed_scopes is not None:
             return scope in self._allowed_scopes
@@ -418,6 +549,18 @@ class LLMTraceRecorder:
         key = record.trace_id
         self._pending.setdefault(key, set()).add(task)
         task.add_done_callback(lambda t, k=key: self._discard_pending(k, t))
+        if key:
+            self._mark_rows_written(key)
+
+    _ROWS_WRITTEN_MAX = 4096
+
+    def _mark_rows_written(self, trace_id: str) -> None:
+        self._rows_written[trace_id] = None
+        self._rows_written.move_to_end(trace_id)
+        while len(self._rows_written) > self._ROWS_WRITTEN_MAX:
+            # Evicting the oldest can only cause a MISSED patch on a very long-lived trace, never
+            # a wrong one -- and the patch is best-effort metadata either way.
+            self._rows_written.popitem(last=False)
 
     def _discard_pending(self, key: str | None, task: asyncio.Task) -> None:
         bucket = self._pending.get(key)
@@ -428,7 +571,7 @@ class LLMTraceRecorder:
 
     async def _safe_write(self, record: LLMRequestRecord) -> None:
         """Write a trace row. Errors are logged, never raised."""
-        pool = self._pool_getter()
+        pool = self._writable()
         if pool is None:
             logger.debug("LLM trace skipped: pool not available")
             return
@@ -501,7 +644,7 @@ class LLMTraceRecorder:
         ids are snapshotted synchronously here because the caller may reset the
         context immediately after.
         """
-        if not self._enabled or trace_ctx is None or not trace_ctx.trace_id:
+        if not self._enabled or not _llm_requests_persistable() or trace_ctx is None or not trace_ctx.trace_id:
             return
         created_ids = list(dict.fromkeys([*(created or []), *trace_ctx.created_memory_ids]))
         source_ids = list(dict.fromkeys([*(source or []), *trace_ctx.source_memory_ids]))
@@ -511,6 +654,11 @@ class LLMTraceRecorder:
         if source_ids:
             patch["source_memory_ids"] = source_ids
         if not patch:
+            return
+        # Nothing was traced, so there is no row to patch. This is the ordinary case for an
+        # extraction mode that calls no LLM: memories are created, so `patch` is non-empty, but
+        # the UPDATE would match zero rows.
+        if trace_ctx.trace_id not in self._rows_written:
             return
         try:
             asyncio.create_task(self._attach_memory_ids(trace_ctx.bank_id, trace_ctx.trace_id, patch))
@@ -523,8 +671,9 @@ class LLMTraceRecorder:
         # so the UPDATE patches rows that already exist rather than racing ahead
         # of them (without blocking on unrelated operations' pending writes).
         await self._flush_pending(trace_id)
-        pool = self._pool_getter()
+        pool = self._writable()
         if pool is None:
+            logger.debug("LLM trace memory_id attach skipped: pool not available")
             return
         try:
             schema = self._schema_getter()

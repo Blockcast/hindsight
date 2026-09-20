@@ -55,18 +55,37 @@ const result2 = await client.createMentalModel(
     BANK_ID,
     'Project Status',
     'What is the current project status?',
-    { trigger: { refreshAfterConsolidation: true } },
+    { trigger: { refreshCron: '0 3 * * *' } },
 );
 
-// This mental model will automatically refresh when observations are updated
+// This mental model checks daily at 03:00 UTC and refreshes when scoped memories changed
 console.log(`Operation ID: ${result2.operation_id}`);
 // [/docs:create-mental-model-with-trigger]
+
+// [docs:create-mental-model-tags-match]
+// Override how the model's tags filter source memories on refresh.
+// A tagged model defaults to 'all_strict' (a memory must carry EVERY tag);
+// use 'any' when your memories are tagged narrowly (one topic each), so the
+// refresh reads any memory carrying at least one of the model's tags.
+const result3 = await client.createMentalModel(
+    BANK_ID,
+    'Current Projects',
+    'Which projects is the user currently working on?',
+    {
+        tags: ['projects', 'mental-model'],
+        trigger: { tagsMatch: 'any' },
+    },
+);
+
+console.log(`Operation ID: ${result3.operation_id}`);
+// [/docs:create-mental-model-tags-match]
 
 await new Promise(r => setTimeout(r, 5000));
 
 // [docs:list-mental-models]
-// List all mental models in a bank
-const mentalModels = await client.listMentalModels(BANK_ID);
+// List all mental models in a bank. The list returns metadata by default;
+// detail: "content" adds source_query/content/trigger.
+const mentalModels = await client.listMentalModels(BANK_ID, { detail: "content" });
 
 for (const mm of mentalModels.items) {
     console.log(`- ${mm.name}: ${mm.source_query}`);

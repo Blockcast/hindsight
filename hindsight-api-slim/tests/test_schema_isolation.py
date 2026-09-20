@@ -226,6 +226,7 @@ class TestSchemaIsolation:
         assert not errors, f"Schema context isolation errors: {errors}"
 
     @pytest.mark.asyncio
+    @pytest.mark.memory_backend_incompatible
     async def test_list_memories_respects_schema(self, memory, pg0_db_url):
         """
         list_memory_units should only return memories from the current schema.
@@ -253,6 +254,17 @@ class TestSchemaIsolation:
         conn = await asyncpg.connect(pg0_db_url)
         try:
             for schema in schemas:
+                # The bank row goes in per schema too: list_memory_units 404s for a bank
+                # nobody created (#4175), and "created" is per tenant schema — which is
+                # part of what this test is about.
+                await conn.execute(
+                    f"""
+                    INSERT INTO "{schema}".banks (bank_id, name, disposition, mission, internal_id)
+                    VALUES ($1, $1, '{{"skepticism": 3, "literalism": 3, "empathy": 3}}'::jsonb, '', gen_random_uuid())
+                    ON CONFLICT (bank_id) DO NOTHING
+                    """,
+                    bank_id,
+                )
                 await conn.execute(
                     f"""
                     INSERT INTO "{schema}".memory_units (bank_id, text, event_date, fact_type)

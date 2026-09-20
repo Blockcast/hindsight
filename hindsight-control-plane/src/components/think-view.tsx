@@ -6,6 +6,8 @@ import { client } from "@/lib/api";
 import { useBank } from "@/lib/bank-context";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Switch } from "@/components/ui/switch";
+import { DisclosureButton, Hint, Row, Section, Segmented } from "@/components/form-layout";
 import {
   Select,
   SelectContent,
@@ -13,7 +15,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Checkbox } from "@/components/ui/checkbox";
 import { FactType, FactTypeFilter } from "@/components/fact-type-filter";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import {
@@ -24,16 +25,17 @@ import {
   Database,
   Brain,
   MessageSquare,
-  Shield,
   X,
   Check,
   Play,
 } from "lucide-react";
+import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
 import JsonView from "react18-json-view";
 import "react18-json-view/src/style.css";
 import { MemoryDetailModal } from "./memory-detail-modal";
 import { MentalModelDetailModal } from "./mental-model-detail-modal";
+import { ResponseSchemaField } from "./response-schema-field";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
@@ -57,13 +59,12 @@ export function ThinkView() {
   const [factTypes, setFactTypes] = useState<FactType[]>([]);
   const [excludeMentalModels, setExcludeMentalModels] = useState(false);
   const [excludeMentalModelIds, setExcludeMentalModelIds] = useState("");
+  const [responseSchema, setResponseSchema] = useState("");
+  const [optionsOpen, setOptionsOpen] = useState(false);
   const [feedback, setFeedback] = useState("");
   const [feedbackSubmitting, setFeedbackSubmitting] = useState(false);
   const [feedbackSubmitted, setFeedbackSubmitted] = useState(false);
   const [selectedMemoryId, setSelectedMemoryId] = useState<string | null>(null);
-  const [selectedDirective, setSelectedDirective] = useState<any | null>(null);
-  const [fullDirective, setFullDirective] = useState<any | null>(null);
-  const [loadingDirective, setLoadingDirective] = useState(false);
   const [selectedObservation, setSelectedObservation] = useState<any | null>(null);
   const [fullObservation, setFullObservation] = useState<any | null>(null);
   const [loadingObservation, setLoadingObservation] = useState(false);
@@ -72,24 +73,17 @@ export function ThinkView() {
 
   const FEEDBACK_DIRECTIVE_NAME = "General Feedback";
 
-  // Load full directive data when one is selected
-  const handleSelectDirective = async (directive: any) => {
-    setSelectedDirective(directive);
-    setFullDirective(null);
-    if (!currentBank || !directive?.id) return;
-
-    setLoadingDirective(true);
-    try {
-      const directives = await client.listDirectives(currentBank);
-      const fullDir = directives.items?.find((d: any) => d.id === directive.id);
-      setFullDirective(fullDir || directive);
-    } catch (error) {
-      console.error("Failed to load directive:", error);
-      setFullDirective(directive); // Fall back to partial data
-    } finally {
-      setLoadingDirective(false);
-    }
-  };
+  // How many collapsed options differ from their defaults, so a hidden setting
+  // still shows on the Options toggle.
+  const activeOptions = [
+    maxTokens !== 4096,
+    !includeFacts,
+    !includeToolCalls,
+    Boolean(tags.trim()),
+    excludeMentalModels,
+    Boolean(excludeMentalModelIds.trim()),
+    Boolean(responseSchema.trim()),
+  ].filter(Boolean).length;
 
   // Load full observation data when one is selected
   const handleSelectObservation = async (observation: any) => {
@@ -116,8 +110,8 @@ export function ThinkView() {
     setFeedbackSubmitting(true);
     try {
       // Find existing "General Feedback" directive
-      const directives = await client.listDirectives(currentBank);
-      const existingDirective = directives.items?.find((d) => d.name === FEEDBACK_DIRECTIVE_NAME);
+      const directives = await client.listAllDirectives(currentBank);
+      const existingDirective = directives.find((d) => d.name === FEEDBACK_DIRECTIVE_NAME);
 
       if (existingDirective) {
         // Append to existing directive content
@@ -162,6 +156,11 @@ export function ThinkView() {
         .map((s) => s.trim())
         .filter((s) => s.length > 0);
 
+      // response_schema is only ever set through the schema builder, which
+      // guarantees valid, usable JSON — so parse it directly.
+      const schemaText = responseSchema.trim();
+      const parsedSchema = schemaText ? JSON.parse(schemaText) : undefined;
+
       const data: any = await client.reflect({
         bank_id: currentBank,
         query,
@@ -173,6 +172,7 @@ export function ThinkView() {
         ...(factTypes.length > 0 && { fact_types: factTypes }),
         ...(excludeMentalModels && { exclude_mental_models: true }),
         ...(excludeIds.length > 0 && { exclude_mental_model_ids: excludeIds }),
+        ...(parsedSchema && { response_schema: parsedSchema }),
       });
       setResult(data);
     } catch (error) {
@@ -216,103 +216,136 @@ export function ThinkView() {
             </Button>
           </div>
 
-          {/* Filters */}
-          <div className="flex flex-wrap items-center gap-6 mt-4 pt-4 border-t">
-            {/* Budget */}
+          {/* Everyday options inline; everything else behind Options. */}
+          <div className="mt-4 flex flex-wrap items-center gap-x-6 gap-y-3">
             <div className="flex items-center gap-2">
-              <span className="text-sm font-medium text-muted-foreground">{t("budgetLabel")}</span>
-              <Select value={budget} onValueChange={(value: any) => setBudget(value)}>
-                <SelectTrigger className="w-24 h-8">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="low">{t("budgetLow")}</SelectItem>
-                  <SelectItem value="mid">{t("budgetMid")}</SelectItem>
-                  <SelectItem value="high">{t("budgetHigh")}</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-
-            {/* Max Tokens */}
-            <div className="flex items-center gap-2">
-              <span className="text-sm text-muted-foreground">{t("tokensLabel")}</span>
-              <Input
-                type="number"
-                value={maxTokens}
-                onChange={(e) => setMaxTokens(parseInt(e.target.value) || 4096)}
-                className="w-24 h-8"
+              <span className="text-sm text-muted-foreground">{t("budget")}</span>
+              <Hint text={t("helpBudget")} />
+              <Segmented
+                value={budget}
+                onChange={setBudget}
+                ariaLabel={t("budget")}
+                options={[
+                  { value: "low", label: t("budgetLow") },
+                  { value: "mid", label: t("budgetMid") },
+                  { value: "high", label: t("budgetHigh") },
+                ]}
               />
             </div>
-
-            <div className="h-6 w-px bg-border" />
-
-            {/* Include options */}
-            <div className="flex items-center gap-4">
-              <label className="flex items-center gap-2 cursor-pointer">
-                <Checkbox
-                  checked={includeFacts}
-                  onCheckedChange={(c) => setIncludeFacts(c as boolean)}
-                />
-                <span className="text-sm">{t("includeSource")}</span>
-              </label>
-              <label className="flex items-center gap-2 cursor-pointer">
-                <Checkbox
-                  checked={includeToolCalls}
-                  onCheckedChange={(c) => setIncludeToolCalls(c as boolean)}
-                />
-                <span className="text-sm">{t("includeTools")}</span>
-              </label>
+            <div className="flex items-center gap-1.5">
+              <FactTypeFilter value={factTypes} onChange={setFactTypes} />
+              <Hint text={t("helpFactTypes")} />
+            </div>
+            <div className="ml-auto">
+              <DisclosureButton
+                open={optionsOpen}
+                onToggle={() => setOptionsOpen((open) => !open)}
+                label={t("optionsLabel")}
+                badge={activeOptions}
+              />
             </div>
           </div>
 
-          {/* Tags Filter */}
-          <div className="flex items-center gap-4 mt-4 pt-4 border-t">
-            <Tag className="h-4 w-4 text-muted-foreground" />
-            <div className="flex-1 max-w-md">
-              <Input
-                type="text"
-                value={tags}
-                onChange={(e) => setTags(e.target.value)}
-                placeholder={t("tagsPlaceholder")}
-                className="h-8"
-              />
-            </div>
-            <Select value={tagsMatch} onValueChange={(v) => setTagsMatch(v as TagsMatch)}>
-              <SelectTrigger className="w-40 h-8">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="any">{t("tagsMatchAny")}</SelectItem>
-                <SelectItem value="all">{t("tagsMatchAll")}</SelectItem>
-                <SelectItem value="any_strict">{t("tagsMatchAnyStrict")}</SelectItem>
-                <SelectItem value="all_strict">{t("tagsMatchAllStrict")}</SelectItem>
-                <SelectItem value="exact">{t("tagsMatchExact")}</SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
+          {optionsOpen && (
+            <div className="mt-5 grid gap-8 md:grid-cols-2">
+              <Section title={t("sectionAnswer")}>
+                <Row
+                  label={t("maxTokensLabel")}
+                  description={t("helpMaxTokens")}
+                  htmlFor="reflect-max-tokens"
+                >
+                  <Input
+                    id="reflect-max-tokens"
+                    type="number"
+                    value={maxTokens}
+                    onChange={(e) => setMaxTokens(parseInt(e.target.value) || 4096)}
+                    className="h-8"
+                  />
+                </Row>
+                <Row
+                  label={t("includeSource")}
+                  description={t("helpIncludeSource")}
+                  htmlFor="reflect-include-source"
+                >
+                  <div className="flex sm:justify-end">
+                    <Switch
+                      id="reflect-include-source"
+                      checked={includeFacts}
+                      onCheckedChange={setIncludeFacts}
+                    />
+                  </div>
+                </Row>
+                <Row
+                  label={t("includeTools")}
+                  description={t("helpIncludeTools")}
+                  htmlFor="reflect-include-tools"
+                >
+                  <div className="flex sm:justify-end">
+                    <Switch
+                      id="reflect-include-tools"
+                      checked={includeToolCalls}
+                      onCheckedChange={setIncludeToolCalls}
+                    />
+                  </div>
+                </Row>
+                <ResponseSchemaField value={responseSchema} onChange={setResponseSchema} />
+              </Section>
 
-          {/* Fact Types & Mental Model Filters */}
-          <div className="flex flex-wrap items-center gap-6 mt-4 pt-4 border-t">
-            <FactTypeFilter value={factTypes} onChange={setFactTypes} />
-            <div className="h-6 w-px bg-border" />
-            <label className="flex items-center gap-2 cursor-pointer">
-              <Checkbox
-                checked={excludeMentalModels}
-                onCheckedChange={(c) => setExcludeMentalModels(c as boolean)}
-              />
-              <span className="text-sm">{t("excludeMentalModels")}</span>
-            </label>
-            <div className="flex items-center gap-2">
-              <span className="text-sm text-muted-foreground">{t("excludeIdsLabel")}</span>
-              <Input
-                type="text"
-                value={excludeMentalModelIds}
-                onChange={(e) => setExcludeMentalModelIds(e.target.value)}
-                placeholder={t("excludeIdsPlaceholder")}
-                className="h-8 w-48"
-              />
+              <Section title={t("sectionScope")}>
+                <Row label={t("tagsLabel")} description={t("helpTags")} htmlFor="reflect-tags">
+                  <Input
+                    id="reflect-tags"
+                    type="text"
+                    value={tags}
+                    onChange={(e) => setTags(e.target.value)}
+                    placeholder={t("tagsPlaceholder")}
+                    className="h-8"
+                  />
+                </Row>
+                <Row label={t("tagsMatchLabel")} description={t("helpTagsMatch")}>
+                  <Select value={tagsMatch} onValueChange={(v) => setTagsMatch(v as TagsMatch)}>
+                    <SelectTrigger className="h-8">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="any">{t("tagsMatchAny")}</SelectItem>
+                      <SelectItem value="all">{t("tagsMatchAll")}</SelectItem>
+                      <SelectItem value="any_strict">{t("tagsMatchAnyStrict")}</SelectItem>
+                      <SelectItem value="all_strict">{t("tagsMatchAllStrict")}</SelectItem>
+                      <SelectItem value="exact">{t("tagsMatchExact")}</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </Row>
+                <Row
+                  label={t("excludeMentalModels")}
+                  description={t("helpExcludeMentalModels")}
+                  htmlFor="reflect-exclude-models"
+                >
+                  <div className="flex sm:justify-end">
+                    <Switch
+                      id="reflect-exclude-models"
+                      checked={excludeMentalModels}
+                      onCheckedChange={setExcludeMentalModels}
+                    />
+                  </div>
+                </Row>
+                <Row
+                  label={t("excludeIdsRowLabel")}
+                  description={t("helpExcludeIds")}
+                  htmlFor="reflect-exclude-ids"
+                >
+                  <Input
+                    id="reflect-exclude-ids"
+                    type="text"
+                    value={excludeMentalModelIds}
+                    onChange={(e) => setExcludeMentalModelIds(e.target.value)}
+                    placeholder={t("excludeIdsPlaceholder")}
+                    className="h-8"
+                  />
+                </Row>
+              </Section>
             </div>
-          </div>
+          )}
         </CardContent>
       </Card>
 
@@ -320,7 +353,7 @@ export function ThinkView() {
       {loading && (
         <Card>
           <CardContent className="flex flex-col items-center justify-center py-16">
-            <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary mb-4" />
+            <Spinner size="lg" variant="jump" className="mb-4" />
             <p className="text-muted-foreground">{t("reflectingOnMemories")}</p>
           </CardContent>
         </Card>
@@ -411,6 +444,20 @@ export function ThinkView() {
                   </div>
                 </CardContent>
               </Card>
+
+              {/* Structured Output */}
+              {result.structured_output && (
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="text-base">{t("structuredOutputTitle")}</CardTitle>
+                  </CardHeader>
+                  <CardContent>
+                    <div className="bg-muted p-4 rounded-lg overflow-auto max-h-[400px]">
+                      <JsonView src={result.structured_output} collapsed={2} theme="default" />
+                    </div>
+                  </CardContent>
+                </Card>
+              )}
 
               {/* Directive */}
               <Card className="border-blue-200 dark:border-blue-800">
@@ -922,83 +969,6 @@ export function ThinkView() {
       {/* Memory Detail Modal */}
       <MemoryDetailModal memoryId={selectedMemoryId} onClose={() => setSelectedMemoryId(null)} />
 
-      {/* Directive Detail Panel */}
-      {selectedDirective && (
-        <div className="fixed right-0 top-0 h-screen w-[420px] bg-card border-l shadow-2xl z-50 overflow-y-auto">
-          <div className="p-6">
-            <div className="flex items-center justify-between mb-6">
-              <div className="flex items-center gap-2">
-                <Shield className="w-5 h-5" />
-                <h2 className="text-lg font-semibold">Directive</h2>
-              </div>
-              <Button
-                variant="ghost"
-                size="icon"
-                onClick={() => {
-                  setSelectedDirective(null);
-                  setFullDirective(null);
-                }}
-              >
-                <X className="w-4 h-4" />
-              </Button>
-            </div>
-            {loadingDirective ? (
-              <div className="flex items-center justify-center py-8">
-                <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary"></div>
-              </div>
-            ) : (
-              <div className="space-y-4">
-                <div>
-                  <h3 className="text-sm font-medium text-muted-foreground">Name</h3>
-                  <p className="mt-1 font-medium">
-                    {fullDirective?.name || selectedDirective.name}
-                  </p>
-                </div>
-                {fullDirective?.description && (
-                  <div>
-                    <h3 className="text-sm font-medium text-muted-foreground">Description</h3>
-                    <p className="mt-1 text-sm">{fullDirective.description}</p>
-                  </div>
-                )}
-                {fullDirective?.tags && fullDirective.tags.length > 0 && (
-                  <div>
-                    <h3 className="text-sm font-medium text-muted-foreground mb-1">Tags</h3>
-                    <div className="flex flex-wrap gap-1">
-                      {fullDirective.tags.map((tag: string) => (
-                        <span
-                          key={tag}
-                          className="text-xs px-2 py-0.5 rounded bg-muted text-muted-foreground flex items-center gap-1"
-                        >
-                          <Tag className="w-2.5 h-2.5" />
-                          {tag}
-                        </span>
-                      ))}
-                    </div>
-                  </div>
-                )}
-                {/* Show content from directive */}
-                {(fullDirective?.content || selectedDirective.content) && (
-                  <div>
-                    <h3 className="text-sm font-medium text-muted-foreground mb-2">Content</h3>
-                    <div className="p-3 bg-muted rounded-lg">
-                      <div className="text-sm text-muted-foreground whitespace-pre-wrap">
-                        {fullDirective?.content || selectedDirective.content}
-                      </div>
-                    </div>
-                  </div>
-                )}
-                <div className="pt-2 border-t">
-                  <h3 className="text-sm font-medium text-muted-foreground">ID</h3>
-                  <p className="mt-1 font-mono text-xs text-muted-foreground">
-                    {selectedDirective.id}
-                  </p>
-                </div>
-              </div>
-            )}
-          </div>
-        </div>
-      )}
-
       {/* Observation Detail Panel */}
       {selectedObservation && (
         <div className="fixed right-0 top-0 h-screen w-[420px] bg-card border-l shadow-2xl z-50 overflow-y-auto">
@@ -1021,7 +991,7 @@ export function ThinkView() {
             </div>
             {loadingObservation ? (
               <div className="flex items-center justify-center py-8">
-                <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary"></div>
+                <Spinner size="lg" variant="jump" />
               </div>
             ) : (
               <div className="space-y-4">

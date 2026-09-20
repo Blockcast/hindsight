@@ -8,10 +8,11 @@ it raises a clear error instead of a confusing connection failure.
 """
 
 import logging
-from typing import Any
+from contextlib import AbstractAsyncContextManager
+from typing import Any, Callable
 
-from ..llm_interface import LLMInterface
-from ..response_models import LLMToolCallResult
+from ..llm_interface import LLM_TOOL_CHOICE_AUTO, LLMInterface, LLMToolChoice
+from ..response_models import LLMCallResult, LLMToolCallResult
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,10 @@ class NoneLLM(LLMInterface):
         """No-op — no LLM connection to verify."""
         logger.debug("NoneLLM: no LLM connection to verify (provider=none)")
 
+    def supports_vision(self) -> bool:
+        """False, definitively: there is no model here to look at an image."""
+        return False
+
     async def call(
         self,
         messages: list[dict[str, str]],
@@ -47,8 +52,8 @@ class NoneLLM(LLMInterface):
         max_backoff: float = 60.0,
         skip_validation: bool = False,
         strict_schema: bool = False,
-        return_usage: bool = False,
-    ) -> Any:
+        attempt_context: Callable[[], AbstractAsyncContextManager[None]] | None = None,
+    ) -> LLMCallResult:
         """Raise LLMNotAvailableError — no LLM is configured."""
         raise LLMNotAvailableError(
             "LLM provider is set to 'none'. This operation requires an LLM. "
@@ -65,7 +70,8 @@ class NoneLLM(LLMInterface):
         max_retries: int = 5,
         initial_backoff: float = 1.0,
         max_backoff: float = 30.0,
-        tool_choice: str | dict[str, Any] = "auto",
+        tool_choice: LLMToolChoice = LLM_TOOL_CHOICE_AUTO,
+        attempt_context: Callable[[], AbstractAsyncContextManager[None]] | None = None,
     ) -> LLMToolCallResult:
         """Raise LLMNotAvailableError — no LLM is configured."""
         raise LLMNotAvailableError(

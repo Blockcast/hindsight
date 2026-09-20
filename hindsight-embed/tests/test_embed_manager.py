@@ -3,7 +3,12 @@
 from unittest.mock import MagicMock, patch
 
 from hindsight_embed import get_embed_manager
+from hindsight_embed._http_probe import ProbeResponse
 from hindsight_embed.daemon_embed_manager import DaemonEmbedManager
+
+
+def _mock_sentence_transformers_present(monkeypatch):
+    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.find_spec", lambda name: object())
 
 
 def test_sanitize_profile_name_via_db_url():
@@ -58,20 +63,47 @@ def test_manager_singleton():
 
 def test_register_profile_skips_when_no_api_keys():
     """
-    When config contains only short keys (no HINDSIGHT_API_* prefix),
-    _register_profile should not call create_profile, preserving any
-    existing profile .env file.
+    When config carries no HINDSIGHT_API_* keys there is nothing to persist, so
+    _register_profile must not call create_profile — which would rewrite the
+    profile .env from an empty config.
 
     Regression test for https://github.com/vectorize-io/hindsight/issues/894
     """
     manager = DaemonEmbedManager()
     manager._profile_manager = MagicMock()
 
-    # Config with short keys (as passed from cli.py's get_config())
-    config = {"llm_api_key": "sk-123", "llm_provider": "openai", "llm_model": "gpt-4o"}
-    manager._register_profile("myprofile", 8100, config)
+    manager._register_profile("myprofile", 8100, {"HINDSIGHT_EMBED_API_URL": "http://elsewhere"})
 
     manager._profile_manager.create_profile.assert_not_called()
+
+
+def test_register_profile_does_not_overwrite_configured_values(tmp_path, monkeypatch):
+    """A daemon start seeds missing keys but never rewrites configured ones.
+
+    `config` reaching _register_profile is the profile merged with this
+    invocation's ambient HINDSIGHT_* environment. Letting it win would make a
+    one-off `HINDSIGHT_API_LLM_MODEL=... hindsight-embed recall` permanently
+    rewrite the user's profile; the file is owned by `configure` and the
+    control center.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+
+    manager = DaemonEmbedManager()
+    manager._profile_manager.create_profile(
+        "p", {"HINDSIGHT_API_LLM_PROVIDER": "anthropic", "HINDSIGHT_API_LLM_MODEL": "claude-sonnet-4-20250514"}
+    )
+
+    manager._register_profile(
+        "p",
+        9100,
+        {"HINDSIGHT_API_LLM_MODEL": "gpt-4o", "HINDSIGHT_API_LLM_BASE_URL": "https://example.com/v1"},
+    )
+
+    env = (tmp_path / ".hindsight" / "profiles" / "p.env").read_text(encoding="utf-8")
+    assert "HINDSIGHT_API_LLM_MODEL=claude-sonnet-4-20250514" in env  # configured value kept
+    assert "HINDSIGHT_API_LLM_MODEL=gpt-4o" not in env
+    assert "HINDSIGHT_API_LLM_BASE_URL=https://example.com/v1" in env  # missing key seeded
 
 
 def test_register_profile_calls_create_when_api_keys_present():
@@ -144,8 +176,60 @@ def test_find_api_command_prefers_installed_binary_over_uvx(tmp_path, monkeypatc
     )
     monkeypatch.setattr("hindsight_embed.daemon_embed_manager.sysconfig.get_path", lambda key: str(scripts_dir))
     monkeypatch.setattr("hindsight_embed.daemon_embed_manager.platform.system", lambda: "Linux")
+    _mock_sentence_transformers_present(monkeypatch)
 
     assert manager._find_api_command("0.0.0") == [str(api_binary)]
+
+
+def test_find_api_command_skips_slim_binary_without_local_ml(tmp_path, monkeypatch):
+    """Default local embeddings/reranker need sentence-transformers.
+
+    A slim sibling hindsight-api binary can exist without local ML extras
+    installed. In that case, use the uvx full-package fallback instead of
+    starting a daemon that immediately fails during local provider init.
+    """
+    scripts_dir = tmp_path / "venv_bin"
+    scripts_dir.mkdir()
+    (scripts_dir / "hindsight-api").touch()
+
+    # Realistic venv layout: the module lives under site-packages, so the
+    # __file__-relative --target path (<site-packages>/bin) is distinct from the
+    # sysconfig scripts dir and finds no binary. The slim sibling is only in the
+    # sysconfig scripts dir — exactly where the #2676 uvx fallback applies (a
+    # --target bundle's sibling would instead be used unconditionally, per #1240).
+    module_path = tmp_path / "site-packages" / "hindsight_embed" / "daemon_embed_manager.py"
+    module_path.parent.mkdir(parents=True)
+    module_path.write_text("")
+
+    manager = DaemonEmbedManager()
+    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.__file__", str(module_path))
+    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.sysconfig.get_path", lambda key: str(scripts_dir))
+    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.platform.system", lambda: "Linux")
+    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.find_spec", lambda name: None)
+
+    assert manager._find_api_command("1.2.3", env={}) == ["uvx", "hindsight-api@1.2.3"]
+
+
+def test_find_api_command_allows_slim_binary_with_external_providers(tmp_path, monkeypatch):
+    """Slim installs are valid when both embeddings and reranker are external."""
+    scripts_dir = tmp_path / "bin"
+    scripts_dir.mkdir()
+    api_binary = scripts_dir / "hindsight-api"
+    api_binary.touch()
+
+    manager = DaemonEmbedManager()
+    monkeypatch.setattr(
+        "hindsight_embed.daemon_embed_manager.__file__", str(tmp_path / "hindsight_embed" / "daemon_embed_manager.py")
+    )
+    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.sysconfig.get_path", lambda key: str(scripts_dir))
+    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.platform.system", lambda: "Linux")
+    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.find_spec", lambda name: None)
+
+    env = {
+        "HINDSIGHT_API_EMBEDDINGS_PROVIDER": "cohere",
+        "HINDSIGHT_API_RERANKER_PROVIDER": "cohere",
+    }
+    assert manager._find_api_command("1.2.3", env=env) == [str(api_binary)]
 
 
 def test_find_api_command_target_install_uses_file_relative_fallback(tmp_path, monkeypatch):
@@ -172,8 +256,42 @@ def test_find_api_command_target_install_uses_file_relative_fallback(tmp_path, m
     monkeypatch.setattr("hindsight_embed.daemon_embed_manager.__file__", str(fake_module))
     monkeypatch.setattr("hindsight_embed.daemon_embed_manager.sysconfig.get_path", lambda key: str(venv_scripts))
     monkeypatch.setattr("hindsight_embed.daemon_embed_manager.platform.system", lambda: "Linux")
+    _mock_sentence_transformers_present(monkeypatch)
 
     assert manager._find_api_command("0.0.0") == [str(sibling_bin)]
+
+
+def test_find_api_command_target_install_uses_sibling_even_without_local_ml(tmp_path, monkeypatch):
+    """A --target-bundled sibling binary must be used even when local ML deps
+    are missing.
+
+    Regression for the #2676 vs #1240 conflict: the "missing sentence-transformers
+    -> uvx" fallback (#2676) applies only to the sysconfig-scripts path (standard
+    venv installs). A deliberate --target bundle must still use its sibling binary,
+    because falling back to uvx on --target installs reintroduces #1240 (enforced
+    by the Windows embed smoke test).
+    """
+    venv_scripts = tmp_path / "venv_bin"
+    venv_scripts.mkdir()
+
+    target_dir = tmp_path / "target"
+    pkg_dir = target_dir / "hindsight_embed"
+    pkg_dir.mkdir(parents=True)
+    fake_module = pkg_dir / "daemon_embed_manager.py"
+    fake_module.write_text("")
+    sibling_bin = target_dir / "bin" / "hindsight-api"
+    sibling_bin.parent.mkdir()
+    sibling_bin.touch()
+
+    manager = DaemonEmbedManager()
+    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.__file__", str(fake_module))
+    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.sysconfig.get_path", lambda key: str(venv_scripts))
+    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.platform.system", lambda: "Linux")
+    # Default local providers + no sentence_transformers: the sysconfig path would
+    # fall back to uvx, but the --target sibling must still win.
+    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.find_spec", lambda name: None)
+
+    assert manager._find_api_command("1.2.3", env={}) == [str(sibling_bin)]
 
 
 def test_find_api_command_falls_back_to_uvx_when_no_binary(tmp_path, monkeypatch):
@@ -217,6 +335,7 @@ def test_find_api_command_windows_uses_exe_suffix(tmp_path, monkeypatch):
     monkeypatch.setattr("hindsight_embed.daemon_embed_manager.sysconfig.get_path", lambda key: str(scripts_dir))
     monkeypatch.setattr("hindsight_embed.daemon_embed_manager.platform.system", lambda: "Windows")
     monkeypatch.setattr("hindsight_embed.daemon_embed_manager.sys.executable", str(interp_dir / "python.exe"))
+    _mock_sentence_transformers_present(monkeypatch)
 
     assert manager._find_api_command("0.0.0") == [str(api_binary)]
 
@@ -244,11 +363,37 @@ def test_find_api_command_windows_prefers_gui_interpreter(tmp_path, monkeypatch)
     monkeypatch.setattr("hindsight_embed.daemon_embed_manager.sysconfig.get_path", lambda key: str(scripts_dir))
     monkeypatch.setattr("hindsight_embed.daemon_embed_manager.platform.system", lambda: "Windows")
     monkeypatch.setattr("hindsight_embed.daemon_embed_manager.sys.executable", str(scripts_dir / "python.exe"))
+    _mock_sentence_transformers_present(monkeypatch)
 
     assert manager._find_api_command("0.0.0") == [str(pythonw), "-m", "hindsight_api.main"]
 
 
-def test_find_pid_on_port_windows_hides_netstat_console(monkeypatch):
+def test_find_api_command_windows_prefers_scripts_dir_pythonw_for_wrappers(tmp_path, monkeypatch):
+    """pip/uv wrapper executables can make sys.executable differ from Scripts."""
+    scripts_dir = tmp_path / "Scripts"
+    scripts_dir.mkdir()
+    (scripts_dir / "hindsight-api.exe").touch()
+    pythonw = scripts_dir / "pythonw.exe"
+    pythonw.touch()
+
+    wrapper_dir = tmp_path / "wrapper"
+    wrapper_dir.mkdir()
+    (wrapper_dir / "hindsight-embed.exe").touch()
+
+    manager = DaemonEmbedManager()
+    monkeypatch.setattr(
+        "hindsight_embed.daemon_embed_manager.__file__",
+        str(tmp_path / "hindsight_embed" / "daemon_embed_manager.py"),
+    )
+    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.sysconfig.get_path", lambda key: str(scripts_dir))
+    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.platform.system", lambda: "Windows")
+    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.sys.executable", str(wrapper_dir / "hindsight-embed.exe"))
+    _mock_sentence_transformers_present(monkeypatch)
+
+    assert manager._find_api_command("0.0.0") == [str(pythonw), "-m", "hindsight_api.main"]
+
+
+def test_listening_pids_windows_hides_netstat_console(monkeypatch):
     """Windows netstat probes must not flash a console window."""
     calls = []
 
@@ -263,7 +408,7 @@ def test_find_pid_on_port_windows_hides_netstat_console(monkeypatch):
     monkeypatch.setattr("hindsight_embed.daemon_embed_manager.subprocess.CREATE_NO_WINDOW", 0x08000000, raising=False)
     monkeypatch.setattr("hindsight_embed.daemon_embed_manager.subprocess.run", fake_run)
 
-    assert DaemonEmbedManager._find_pid_on_port(9177) == 4321
+    assert DaemonEmbedManager._listening_pids(9177) == [4321]
     assert calls[0][1]["creationflags"] == 0x08000000
 
 
@@ -279,7 +424,16 @@ def test_stop_ui_kills_recorded_and_configured_ports(tmp_path, monkeypatch):
     assert manager._ui_port_file(paths).exists()
 
     killed = []
-    monkeypatch.setattr(manager, "_find_pid_on_port", lambda port: {9000: 111, 9001: 222}.get(port))
+    monkeypatch.setattr(
+        DaemonEmbedManager,
+        "_listening_pids",
+        staticmethod(lambda port: {9000: [111], 9001: [222]}.get(port, [])),
+    )
+    monkeypatch.setattr(
+        DaemonEmbedManager,
+        "_process_command_line",
+        staticmethod(lambda pid: "next-server (v16.2.11)"),
+    )
     monkeypatch.setattr(DaemonEmbedManager, "_kill_process", staticmethod(lambda pid: killed.append(pid) or True))
     monkeypatch.setattr(manager, "_is_port_in_use", lambda port: False)
 
@@ -332,3 +486,201 @@ def test_component_version_resolution(tmp_path, monkeypatch):
         "p", {"HINDSIGHT_API_LLM_PROVIDER": "openai", "HINDSIGHT_EMBED_CP_VERSION": "1.2.3"}
     )
     assert manager._component_version("p", "HINDSIGHT_EMBED_CP_VERSION") == "1.2.3"
+
+
+def test_is_ui_running_detects_ipv6_only_ui(tmp_path, monkeypatch):
+    """Regression for #3527: `--hostname localhost` binds ::1 only.
+
+    The old IPv4-only probe got ECONNREFUSED and reported a healthy control
+    plane as down, so `ui start` always timed out and `ui status` lied.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    manager = DaemonEmbedManager()
+
+    requested = []
+
+    # A ::1 listener is not guaranteed on CI hosts, so the probe is stood in for
+    # here; the probe's own transport is covered by test_http_probe.py.
+    def fake_probe(url, **kwargs):
+        requested.append(url)
+        if url.startswith("http://[::1]:"):
+            return ProbeResponse(status_code=200, text="")
+        return None  # connection refused
+
+    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.probe_get", fake_probe)
+
+    assert manager.is_ui_running("hermes", 19177) is True
+    assert requested == [
+        "http://127.0.0.1:19177/api/health",
+        "http://[::1]:19177/api/health",
+    ]
+
+
+def test_is_ui_running_false_when_no_loopback_answers(tmp_path, monkeypatch):
+    """Both families refused — the UI really is down."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    manager = DaemonEmbedManager()
+
+    requested = []
+
+    def refused(url, **kwargs):
+        requested.append(url)
+        return None
+
+    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.probe_get", refused)
+
+    assert manager.is_ui_running("hermes", 19177) is False
+    assert requested == [
+        "http://127.0.0.1:19177/api/health",
+        "http://[::1]:19177/api/health",
+    ]
+
+
+def test_is_port_in_use_checks_both_loopback_families(monkeypatch):
+    """An ::1-only listener occupies the port even though IPv4 refuses."""
+    import socket
+
+    attempted = []
+
+    class FakeSocket:
+        def __init__(self, family, type_):
+            self.family = family
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def settimeout(self, value):
+            pass
+
+        def connect_ex(self, address):
+            attempted.append(address[0])
+            return 0 if self.family == socket.AF_INET6 else 1
+
+    monkeypatch.setattr(socket, "socket", FakeSocket)
+
+    assert DaemonEmbedManager._is_port_in_use(19177) is True
+    assert attempted == ["127.0.0.1", "::1"]
+
+
+class _RecordingProbe:
+    """probe_get stand-in that answers 200 and records each probe's timeouts."""
+
+    def __init__(self):
+        self.reads: list[float] = []
+        self.connects: list[float | None] = []
+
+    def __call__(self, url, *, read_timeout, connect_timeout=None):
+        self.reads.append(read_timeout)
+        self.connects.append(connect_timeout)
+        return ProbeResponse(status_code=200, text="")
+
+
+def test_reclaim_probe_waits_long_enough_for_a_busy_daemon(monkeypatch):
+    """Regression for #3099: a busy event loop must not read as a dead daemon.
+
+    _port_health_ok is the probe whose false negative gets the listener killed,
+    so it is the one that has to allow for a stalled loop.
+    """
+    from hindsight_embed import daemon_embed_manager
+
+    assert daemon_embed_manager.HEALTH_PROBE_TIMEOUT >= 10.0
+
+    probe = _RecordingProbe()
+    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.probe_get", probe)
+    monkeypatch.setattr(daemon_embed_manager, "HEALTH_PROBE_TIMEOUT", 25.0)
+
+    DaemonEmbedManager._port_health_ok(9177)
+    assert probe.reads == [25.0]
+
+
+def test_liveness_probes_stay_short(tmp_path, monkeypatch):
+    """The "is it up?" probes must not inherit the reclaim budget.
+
+    The control center's delete handler asks is_running once and the UI probe
+    once per loopback family. At the 10s reclaim budget that path exceeded the
+    5s default client timeout on Windows and the request never came back.
+    """
+    from hindsight_embed import daemon_embed_manager
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    manager = DaemonEmbedManager()
+
+    probe = _RecordingProbe()
+    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.probe_get", probe)
+
+    assert manager.is_running("hermes") is True
+    assert manager.is_ui_running("hermes", 19177) is True
+
+    assert probe.reads == [2.0, 2.0]
+    assert all(c == daemon_embed_manager.PROBE_CONNECT_TIMEOUT for c in probe.connects)
+
+    # An address that swallows the SYN hangs in connect, not in read, so the
+    # connect cap is what bounds the delete handler's three serial probes
+    # (daemon + one per loopback family). At 1s each that is 3s, below the 5s
+    # default client timeout — and below the 4s the two uncapped 2s probes
+    # could reach before this change.
+    assert daemon_embed_manager.PROBE_CONNECT_TIMEOUT * 3 < 5.0
+
+
+# ── #4344: the probe's decode is pinned, not left to the locale ──────────────
+# `netstat`/`powershell`/`wmic` emit localized text in the console code page. With
+# `text=True` alone the decode uses `locale.getpreferredencoding(False)`, which is
+# `utf-8` in a UTF-8-mode process, and the mismatch raises inside `subprocess`'s own
+# reader thread: the thread dies, `run()` returns with `stdout=None` and returncode 0,
+# and `_windows_listening_pids()` reports no listeners on a host that has plenty.
+
+# A localized zh-CN `netstat -ano -p TCP` answer: cp936 header, ASCII data lines.
+_CP936_NETSTAT = (
+    "\r\n活动连接\r\n\r\n"
+    "  协议  本地地址          外部地址        状态           PID\r\n"
+    "  TCP    127.0.0.1:8642         0.0.0.0:0              LISTENING       4242\r\n"
+    "  TCP    0.0.0.0:445            0.0.0.0:0              LISTENING       4\r\n"
+).encode("cp936")
+
+
+def _emit(payload: bytes) -> list[str]:
+    """A command that writes `payload` to stdout as raw bytes."""
+    import sys as _sys
+
+    return [
+        _sys.executable,
+        "-c",
+        "import sys; sys.stdout.buffer.write(%r); sys.stdout.buffer.flush()" % payload,
+    ]
+
+
+def test_run_probe_reads_output_that_is_not_utf8():
+    """The probe returns the output instead of losing it in a dead reader thread."""
+    output = DaemonEmbedManager._run_probe(_emit(_CP936_NETSTAT))
+
+    assert output is not None
+    # The localized header is replaced rather than raising; the data lines are intact.
+    assert "LISTENING" in output
+    assert "127.0.0.1:8642" in output
+    assert "4242" in output
+
+
+def test_windows_listening_pids_parses_a_localized_netstat(monkeypatch):
+    """The existing parser needs no change: only the header carries non-ASCII."""
+    decoded = _CP936_NETSTAT.decode("utf-8", errors="replace")
+    monkeypatch.setattr(
+        "hindsight_embed.daemon_embed_manager.DaemonEmbedManager._run_probe",
+        staticmethod(lambda cmd, timeout=None: decoded),
+    )
+
+    assert DaemonEmbedManager._windows_listening_pids(8642) == [4242]
+    assert DaemonEmbedManager._windows_listening_pids(445) == [4]
+    assert DaemonEmbedManager._windows_listening_pids(9999) == []
+
+
+def test_run_probe_still_reports_a_failed_command_as_none():
+    """A non-zero exit is still None, so the encoding change did not widen success."""
+    import sys as _sys
+
+    assert DaemonEmbedManager._run_probe([_sys.executable, "-c", "raise SystemExit(3)"]) is None

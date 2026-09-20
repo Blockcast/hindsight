@@ -13,13 +13,10 @@ hs_llm_mat marker.
 """
 
 import os
-from datetime import datetime
 
 import pytest
 
 from hindsight_api.engine.llm_wrapper import LLMProvider
-from hindsight_api.engine.utils import extract_facts
-from hindsight_api.engine.search.think_utils import reflect
 
 pytestmark = pytest.mark.hs_llm_mat
 
@@ -45,11 +42,22 @@ def _get_api_key() -> str:
 
 
 def _make_llm() -> LLMProvider:
+    # LLMProvider uses provider-specific settings as-passed (it does not resolve
+    # them from global config), so forward the ones whose providers require them:
+    # Vertex AI needs project/region, and litellmrouter needs its router config.
+    # Without these, provider=vertexai/litellmrouter raise at construction.
+    from hindsight_api.config import get_config
+
+    config = get_config()
     return LLMProvider(
         provider=_PROVIDER,
         api_key=_get_api_key(),
         base_url=os.environ.get("HINDSIGHT_API_LLM_BASE_URL", ""),
         model=_MODEL,
+        vertexai_project_id=config.llm_vertexai_project_id,
+        vertexai_region=config.llm_vertexai_region,
+        vertexai_service_account_key=config.llm_vertexai_service_account_key,
+        litellmrouter_config=config.llm_litellmrouter_config,
     )
 
 
@@ -75,13 +83,15 @@ async def test_llm_api_methods():
     await llm.verify_connection()
 
     # Test 2: call() with plain text
-    response = await llm.call(
-        messages=[
-            {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": "What is 2+2? Answer in one word."},
-        ],
-        max_completion_tokens=50,
-    )
+    response = (
+        await llm.call(
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "What is 2+2? Answer in one word."},
+            ],
+            max_completion_tokens=50,
+        )
+    ).content
     assert response is not None, "call() returned None"
     assert len(response) > 0, "call() returned empty string"
 
@@ -92,14 +102,16 @@ async def test_llm_api_methods():
         answer: str
         confidence: str
 
-    structured = await llm.call(
-        messages=[
-            {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": "What is the capital of France?"},
-        ],
-        response_format=TestResponse,
-        max_completion_tokens=100,
-    )
+    structured = (
+        await llm.call(
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "What is the capital of France?"},
+            ],
+            response_format=TestResponse,
+            max_completion_tokens=100,
+        )
+    ).content
     assert isinstance(structured, TestResponse), f"Expected TestResponse, got {type(structured)}"
     assert structured.answer, "Structured output missing 'answer'"
     assert structured.confidence, "Structured output missing 'confidence'"
@@ -139,53 +151,3 @@ async def test_llm_api_methods():
     tool_call = result.tool_calls[0]
     assert tool_call.name == "get_weather", f"Expected 'get_weather', got '{tool_call.name}'"
     assert "location" in tool_call.arguments, "Tool call arguments missing 'location'"
-
-
-@pytest.mark.asyncio
-@pytest.mark.timeout(600)
-async def test_llm_memory_operations():
-    """
-    Test fact extraction and reflect with the configured LLM provider.
-    """
-    llm = _make_llm()
-
-    # Fact extraction (structured output)
-    test_text = """
-    User: I just got back from my trip to Paris last week. The Eiffel Tower was amazing!
-    Assistant: That sounds wonderful! How long were you there?
-    User: About 5 days. I also visited the Louvre and saw the Mona Lisa.
-    """
-
-    facts, chunks = await extract_facts(
-        text=test_text,
-        event_date=datetime(2024, 12, 10),
-        context="Travel conversation",
-        llm_config=llm,
-    )
-
-    assert facts is not None, "fact extraction returned None"
-    assert len(facts) > 0, "should extract at least one fact"
-
-    for fact in facts:
-        assert fact.fact, "fact missing text"
-        assert fact.fact_type in ["world", "experience"], f"invalid fact_type: {fact.fact_type}"
-
-    # Reflect
-    response = await reflect(
-        llm_config=llm,
-        query="What was the highlight of my Paris trip?",
-        experience_facts=[
-            "I visited Paris in December 2024",
-            "I saw the Eiffel Tower and it was amazing",
-            "I visited the Louvre and saw the Mona Lisa",
-            "The trip lasted 5 days",
-        ],
-        world_facts=[
-            "The Eiffel Tower is a famous landmark in Paris",
-            "The Mona Lisa is displayed at the Louvre museum",
-        ],
-        name="Traveler",
-    )
-
-    assert response is not None, "reflect returned None"
-    assert len(response) > 10, "reflect response too short"

@@ -14,41 +14,102 @@ AND matching (all/all_strict): Memory matches if ALL request tags are present in
 EXACT matching: Memory matches only if its tag set EQUALS the request tag set (order-
     independent). Used for observation "scope" filtering, where each observation lives
     under exactly one scope (its full tag set) and "scope [a]" must not match "[a, b]".
+    An EMPTY request scope (no tags — ``[]`` or ``None``) is the global/untagged scope and
+    matches only untagged memories — the scope that ``observation_scopes="shared"``
+    consolidation writes to. This is the one mode where absent tags filter rather than
+    meaning "no filter"; all other modes treat empty/absent tags as "no filtering". This
+    mirrors the ``GET .../graph`` endpoint, where ``tags_match="exact"`` with no tags also
+    selects the global scope.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
 TagsMatch = Literal["any", "all", "any_strict", "all_strict", "exact"]
 
+#: How a tag group leaf's tags are matched. Orthogonal to ``TagsMatch``: it says what the
+#: tags *are*, not how they are combined, so it composes with every mode instead of
+#: multiplying the enum. See ``tag_resolution`` for the rule.
+TagResolution = Literal["exact", "fuzzy"]
 
-def _parse_tags_match(match: TagsMatch) -> tuple[str, bool]:
-    """
-    Parse TagsMatch into operator and include_untagged flag.
 
-    Returns:
-        Tuple of (operator, include_untagged)
-        - operator: "&&" for any/any_strict, "@>" for all/all_strict
-        - include_untagged: True for any/all, False for any_strict/all_strict
+@dataclass(frozen=True)
+class TagMatchSemantics:
+    """How one ``TagsMatch`` mode compares a tags column against a value."""
+
+    operator: str
+    """``&&`` (overlap) for any/any_strict, ``@>`` (contains) for all/all_strict."""
+
+    include_untagged: bool
+    """True for any/all — untagged rows are visible; False for the ``_strict`` modes."""
+
+
+@dataclass(frozen=True)
+class TagClause:
+    """A tag filter rendered to SQL, with the bind bookkeeping it implies.
+
+    The three parts are one unit: ``sql`` embeds ``$n`` placeholders that only
+    line up if ``params`` is appended to the caller's list in this order *and*
+    ``next_param_offset`` is threaded into whatever builds the next clause.
+    Returned as a bare 3-tuple, that protocol was invisible — a caller that
+    dropped the offset (several use ``_``) or bound the params out of order got
+    no error, just a query silently reading the wrong placeholder.
     """
+
+    sql: str
+    """The clause, starting with ``AND`` for the top-level builders, or empty for no filter."""
+
+    params: list = field(default_factory=list)
+    """Values to bind, in placeholder order. Empty when the clause needs no binds."""
+
+    next_param_offset: int = 1
+    """First unused placeholder number. Unchanged when nothing was bound."""
+
+
+def _parse_tags_match(match: TagsMatch) -> TagMatchSemantics:
+    """Parse TagsMatch into the operator and untagged-visibility it implies."""
     if match == "any":
-        return "&&", True
+        return TagMatchSemantics("&&", include_untagged=True)
     elif match == "all":
-        return "@>", True
+        return TagMatchSemantics("@>", include_untagged=True)
     elif match == "any_strict":
-        return "&&", False
+        return TagMatchSemantics("&&", include_untagged=False)
     elif match == "all_strict":
-        return "@>", False
+        return TagMatchSemantics("@>", include_untagged=False)
     elif match == "exact":
         # Set equality is handled by the callers via `@> AND <@`; the operator
         # here is unused. Untagged rows never equal a non-empty scope.
-        return "@>", False
+        return TagMatchSemantics("@>", include_untagged=False)
     else:
         # Default to "any" behavior
-        return "&&", True
+        return TagMatchSemantics("&&", include_untagged=True)
+
+
+def tag_clause_is_index_only(tags: list[str] | None, match: TagsMatch) -> bool:
+    """Whether this mode's clause is a bare, GIN-indexable predicate on ``tags``.
+
+    True for the ``_strict`` modes and ``exact`` with a non-empty scope: their
+    clause is `tags @> v` / `tags && v` (plus the untagged exclusions, which are
+    rechecks), so Postgres can answer it from ``idx_memory_units_tags`` alone.
+    False for ``any``/``all``, whose clause is a disjunction —
+    ``tags IS NULL OR tags = '{}' OR tags <op> v`` — that no index can serve, and
+    for an empty scope, which is not a tag filter at all.
+
+    The staleness check reads this to decide which shape of existence test to
+    issue: a scope that can be answered from the tag index is asked with the tag
+    predicate *alone* so the planner reaches that index, while one that cannot is
+    left on the time-ordered walk that at least terminates at the first match.
+    See ``any_memory_updated_since`` for what that buys (#4169).
+    """
+    if not tags:
+        return False
+    if match == "exact":
+        return True
+    return not _parse_tags_match(match).include_untagged
 
 
 def build_tags_where_clause(
@@ -56,7 +117,8 @@ def build_tags_where_clause(
     param_offset: int = 1,
     table_alias: str = "",
     match: TagsMatch = "any",
-) -> tuple[str, list, int]:
+    value_expr: str | None = None,
+) -> TagClause:
     """
     Build a SQL WHERE clause for filtering by tags.
 
@@ -71,38 +133,54 @@ def build_tags_where_clause(
         param_offset: Starting parameter number for SQL placeholders (default 1).
         table_alias: Optional table alias prefix (e.g., "mu." for "memory_units mu").
         match: Matching mode. Defaults to "any".
+        value_expr: SQL expression to match the tags column against, in place of a
+            bind parameter — e.g. ``"s.tags"`` when the clause is applied per row of
+            a joined scope set (the batched staleness check). When given, ``tags``
+            only decides *which* clause is built, nothing is bound, and
+            ``param_offset`` comes back unchanged. It lands in the SQL verbatim, so
+            it must be a literal the caller controls, never user input.
 
     Returns:
-        Tuple of (sql_clause, params, next_param_offset):
-        - sql_clause: SQL WHERE clause string
-        - params: List of parameter values to bind
-        - next_param_offset: Next available parameter number
+        A TagClause carrying the SQL, its bind values, and the next free placeholder.
 
     Example:
-        >>> clause, params, next_offset = build_tags_where_clause(['user_a'], 3, 'mu.', 'any_strict')
-        >>> print(clause)  # "AND mu.tags IS NOT NULL AND mu.tags != '{}' AND mu.tags && $3"
+        >>> built = build_tags_where_clause(['user_a'], 3, 'mu.', 'any_strict')
+        >>> print(built.sql)  # "AND mu.tags IS NOT NULL AND mu.tags != '{}' AND mu.tags && $3"
     """
-    if not tags:
-        return "", [], param_offset
-
     column = f"{table_alias}tags" if table_alias else "tags"
+    # Every branch below matches the column against one right-hand side. Naming it
+    # once is what lets a bound parameter and a joined column share these match
+    # semantics instead of growing a second implementation of them.
+    value = value_expr if value_expr is not None else f"${param_offset}"
+    # A caller supplying the expression binds nothing, so the parameter cursor must
+    # not advance and no value is appended.
+    next_offset = param_offset if value_expr is not None else param_offset + 1
+    bound: list = [] if value_expr is not None else [tags]
+
+    if match == "exact" and not tags:
+        # Empty/absent scope = global/untagged: match only untagged rows. No bind param
+        # needed (callers gate the param on truthy `tags`, so none is appended).
+        return TagClause(f"AND ({column} IS NULL OR {column} = '{{}}')", [], param_offset)
+
+    if not tags:
+        return TagClause("", [], param_offset)
 
     if match == "exact":
         # Set equality (order-independent): superset AND subset. Untagged rows
         # (empty array) never satisfy `@>` of a non-empty scope, so they're excluded.
-        clause = f"AND ({column} @> ${param_offset} AND {column} <@ ${param_offset})"
-        return clause, [tags], param_offset + 1
+        clause = f"AND ({column} @> {value} AND {column} <@ {value})"
+        return TagClause(clause, bound, next_offset)
 
-    operator, include_untagged = _parse_tags_match(match)
+    semantics = _parse_tags_match(match)
 
-    if include_untagged:
+    if semantics.include_untagged:
         # Include untagged memories (NULL or empty array) OR matching tags
-        clause = f"AND ({column} IS NULL OR {column} = '{{}}' OR {column} {operator} ${param_offset})"
+        clause = f"AND ({column} IS NULL OR {column} = '{{}}' OR {column} {semantics.operator} {value})"
     else:
         # Strict: only memories with matching tags (exclude NULL and empty)
-        clause = f"AND {column} IS NOT NULL AND {column} != '{{}}' AND {column} {operator} ${param_offset}"
+        clause = f"AND {column} IS NOT NULL AND {column} != '{{}}' AND {column} {semantics.operator} {value}"
 
-    return clause, [tags], param_offset + 1
+    return TagClause(clause, bound, next_offset)
 
 
 def build_tags_where_clause_simple(
@@ -126,24 +204,29 @@ def build_tags_where_clause_simple(
     Returns:
         SQL clause string or empty string.
     """
+    column = f"{table_alias}tags" if table_alias else "tags"
+
+    if match == "exact" and not tags:
+        # Empty/absent scope = global/untagged: match only untagged rows. No bind param
+        # needed (callers gate the param on truthy `tags`, so none is appended).
+        return f"AND ({column} IS NULL OR {column} = '{{}}')"
+
     if not tags:
         return ""
-
-    column = f"{table_alias}tags" if table_alias else "tags"
 
     if match == "exact":
         # Set equality (order-independent): superset AND subset. Untagged rows
         # (empty array) never satisfy `@>` of a non-empty scope, so they're excluded.
         return f"AND ({column} @> ${param_num} AND {column} <@ ${param_num})"
 
-    operator, include_untagged = _parse_tags_match(match)
+    semantics = _parse_tags_match(match)
 
-    if include_untagged:
+    if semantics.include_untagged:
         # Include untagged memories (NULL or empty array) OR matching tags
-        return f"AND ({column} IS NULL OR {column} = '{{}}' OR {column} {operator} ${param_num})"
+        return f"AND ({column} IS NULL OR {column} = '{{}}' OR {column} {semantics.operator} ${param_num})"
     else:
         # Strict: only memories with matching tags (exclude NULL and empty)
-        return f"AND {column} IS NOT NULL AND {column} != '{{}}' AND {column} {operator} ${param_num}"
+        return f"AND {column} IS NOT NULL AND {column} != '{{}}' AND {column} {semantics.operator} ${param_num}"
 
 
 def filter_results_by_tags(
@@ -164,10 +247,14 @@ def filter_results_by_tags(
     Returns:
         Filtered list of results.
     """
+    if match == "exact" and not tags:
+        # Empty/absent scope = global/untagged: keep only untagged results.
+        return [r for r in results if not getattr(r, "tags", None)]
+
     if not tags:
         return results
 
-    _, include_untagged = _parse_tags_match(match)
+    include_untagged = _parse_tags_match(match).include_untagged
     is_any_match = match in ("any", "any_strict")
 
     tags_set = set(tags)
@@ -211,6 +298,11 @@ class TagGroupLeaf(BaseModel):
 
     tags: list[str]
     match: TagsMatch = "any_strict"
+    resolve: TagResolution = "exact"
+    """How ``tags`` are matched: literally (``exact``, the default), or by trigram
+    similarity against the bank's tags (``fuzzy``), so a filter on ``typsecript`` still
+    reaches the memory tagged ``typescript``. See ``tag_resolution`` for the rule and its
+    limits; it composes with every ``match`` mode."""
 
 
 class TagGroupAnd(BaseModel):
@@ -257,61 +349,64 @@ def _build_group_clause(
     group: TagGroup,
     param_offset: int,
     table_alias: str,
-) -> tuple[str, list, int]:
-    """
-    Recursively build an inner SQL clause (no leading AND/OR) for a single TagGroup.
+) -> TagClause:
+    """Recursively build an inner SQL clause (no leading AND/OR) for a single TagGroup.
 
-    Returns:
-        (inner_clause, params, next_param_offset)
+    ``TagClause.sql`` here carries no leading ``AND`` — the caller joins the parts.
     """
     if isinstance(group, TagGroupLeaf):
         column = f"{table_alias}tags" if table_alias else "tags"
         if group.match == "exact":
+            if len(group.tags) == 0:
+                # Empty scope = global/untagged: match only untagged rows (no bind param).
+                return TagClause(f"({column} IS NULL OR {column} = '{{}}')", [], param_offset)
             clause = f"({column} @> ${param_offset} AND {column} <@ ${param_offset})"
-            return clause, [group.tags], param_offset + 1
-        operator, include_untagged = _parse_tags_match(group.match)
-        if include_untagged:
-            clause = f"({column} IS NULL OR {column} = '{{}}' OR {column} {operator} ${param_offset})"
+            return TagClause(clause, [group.tags], param_offset + 1)
+        semantics = _parse_tags_match(group.match)
+        if semantics.include_untagged:
+            clause = f"({column} IS NULL OR {column} = '{{}}' OR {column} {semantics.operator} ${param_offset})"
         else:
-            clause = f"({column} IS NOT NULL AND {column} != '{{}}' AND {column} {operator} ${param_offset})"
-        return clause, [group.tags], param_offset + 1
+            clause = f"({column} IS NOT NULL AND {column} != '{{}}' AND {column} {semantics.operator} ${param_offset})"
+        return TagClause(clause, [group.tags], param_offset + 1)
 
     elif isinstance(group, TagGroupAnd):
         parts = []
         params: list = []
         offset = param_offset
         for child in group.filters:
-            child_clause, child_params, offset = _build_group_clause(child, offset, table_alias)
-            parts.append(child_clause)
-            params.extend(child_params)
+            built = _build_group_clause(child, offset, table_alias)
+            offset = built.next_param_offset
+            parts.append(built.sql)
+            params.extend(built.params)
         inner = " AND ".join(parts)
-        return f"({inner})", params, offset
+        return TagClause(f"({inner})", params, offset)
 
     elif isinstance(group, TagGroupOr):
         parts = []
         params = []
         offset = param_offset
         for child in group.filters:
-            child_clause, child_params, offset = _build_group_clause(child, offset, table_alias)
-            parts.append(child_clause)
-            params.extend(child_params)
+            built = _build_group_clause(child, offset, table_alias)
+            offset = built.next_param_offset
+            parts.append(built.sql)
+            params.extend(built.params)
         inner = " OR ".join(parts)
-        return f"({inner})", params, offset
+        return TagClause(f"({inner})", params, offset)
 
     elif isinstance(group, TagGroupNot):
-        child_clause, child_params, next_offset = _build_group_clause(group.filter, param_offset, table_alias)
-        return f"NOT {child_clause}", child_params, next_offset
+        built = _build_group_clause(group.filter, param_offset, table_alias)
+        return TagClause(f"NOT {built.sql}", built.params, built.next_param_offset)
 
     else:
         # Should never happen with proper Pydantic validation
-        return "", [], param_offset
+        return TagClause("", [], param_offset)
 
 
 def build_tag_groups_where_clause(
     tag_groups: list[TagGroup] | None,
     param_offset: int,
     table_alias: str = "",
-) -> tuple[str, list, int]:
+) -> TagClause:
     """
     Build a SQL WHERE clause for compound tag group filtering.
 
@@ -324,30 +419,29 @@ def build_tag_groups_where_clause(
         table_alias: Optional table alias prefix (e.g., "mu." for "memory_units mu").
 
     Returns:
-        Tuple of (sql_clause, params, next_param_offset):
-        - sql_clause: SQL WHERE clause string starting with "AND" (or empty string)
-        - params: List of parameter values to bind (one per leaf node)
-        - next_param_offset: Next available parameter number
+        A TagClause whose ``sql`` starts with "AND" (or is empty), carrying one bind
+        value per leaf node.
 
     Example:
         >>> groups = [TagGroupLeaf(tags=["user:alice"], match="all_strict")]
-        >>> clause, params, next_offset = build_tag_groups_where_clause(groups, 3)
-        >>> print(clause)  # "AND (tags IS NOT NULL AND tags != '{}' AND tags @> $3)"
+        >>> built = build_tag_groups_where_clause(groups, 3)
+        >>> print(built.sql)  # "AND (tags IS NOT NULL AND tags != '{}' AND tags @> $3)"
     """
     if not tag_groups:
-        return "", [], param_offset
+        return TagClause("", [], param_offset)
 
     all_params: list = []
     all_clauses: list[str] = []
     offset = param_offset
 
     for group in tag_groups:
-        inner_clause, group_params, offset = _build_group_clause(group, offset, table_alias)
-        all_clauses.append(inner_clause)
-        all_params.extend(group_params)
+        built = _build_group_clause(group, offset, table_alias)
+        offset = built.next_param_offset
+        all_clauses.append(built.sql)
+        all_params.extend(built.params)
 
     combined = " AND ".join(all_clauses)
-    return f"AND {combined}", all_params, offset
+    return TagClause(f"AND {combined}", all_params, offset)
 
 
 # =============================================================================
@@ -369,7 +463,10 @@ def _match_group(result: object, group: TagGroup) -> bool:
     if isinstance(group, TagGroupLeaf):
         result_tags = getattr(result, "tags", None)
         is_untagged = result_tags is None or len(result_tags) == 0
-        _, include_untagged = _parse_tags_match(group.match)
+        if group.match == "exact" and len(group.tags) == 0:
+            # Empty scope = global/untagged: match only untagged results.
+            return is_untagged
+        include_untagged = _parse_tags_match(group.match).include_untagged
         is_any_match = group.match in ("any", "any_strict")
         tags_set = set(group.tags)
 

@@ -5,7 +5,6 @@ import subprocess
 from unittest.mock import MagicMock, patch
 
 import pytest
-
 from lib.bank import _resolve_project_name, derive_bank_id, ensure_bank_mission
 
 
@@ -138,6 +137,19 @@ class TestResolveProjectName:
         # Worktree at /tmp/worktrees/feature-x, main repo at /home/user/hindsight
         mock_run.return_value = self._mock_git("/home/user/hindsight/.git\n")
         assert _resolve_project_name("/tmp/worktrees/feature-x", _cfg()) == "hindsight"
+
+    @patch("lib.bank.subprocess.run")
+    def test_bare_hub_resolves_to_hidden_directory_parent(self, mock_run):
+        mock_run.side_effect = [
+            self._mock_git("/home/user/myrepo/.bare\n"),
+            self._mock_git("true\n"),
+        ]
+        assert _resolve_project_name("/home/user/myrepo/main", _cfg()) == "myrepo"
+
+    @patch("lib.bank.subprocess.run")
+    def test_standalone_bare_keeps_common_directory_name(self, mock_run):
+        mock_run.return_value = self._mock_git("/srv/repos/myproject.git\n")
+        assert _resolve_project_name("/srv/repos/myproject.git", _cfg()) == "myproject.git"
 
     @patch("lib.bank.subprocess.run")
     def test_disabled_falls_back_to_basename(self, mock_run):
@@ -296,3 +308,14 @@ class TestEnsureBankMission:
         ensure_bank_mission(client, "bank-x", cfg)
         ensure_bank_mission(client, "bank-y", cfg)
         assert client.set_bank_mission.call_count == 2
+
+    @pytest.mark.skipif(not hasattr(__import__("os"), "symlink"), reason="symlinks not supported")
+    def test_directorybankmap_matches_symlinked_cwd(self, tmp_path):
+        import os
+        real = os.path.realpath(tmp_path / "proj")
+        os.makedirs(real)
+        link = str(tmp_path / "proj-link")
+        os.symlink(real, link)
+        cfg = _cfg(directoryBankMap={real: "myproj"}, bankId="fallback")
+        assert derive_bank_id({"cwd": real, "session_id": "s"}, cfg) == "myproj"
+        assert derive_bank_id({"cwd": link, "session_id": "s"}, cfg) == "myproj"

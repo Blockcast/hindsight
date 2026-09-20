@@ -15,6 +15,7 @@ import asyncio
 import importlib
 import logging
 import os
+import random
 import re
 
 _resource_mod = importlib.import_module("resource") if importlib.util.find_spec("resource") else None
@@ -164,6 +165,10 @@ logger = logging.getLogger(__name__)
 _meter = None
 
 
+#: Event-loop lag in seconds. Healthy is well under 10 ms; a saturated loop runs into seconds.
+LOOP_LAG_BUCKETS = (0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0)
+
+
 def initialize_metrics(service_name: str = "hindsight-api", service_version: str = "1.0.0"):
     """
     Initialize OpenTelemetry metrics with Prometheus exporter.
@@ -212,7 +217,15 @@ def initialize_metrics(service_name: str = "hindsight-api", service_version: str
     provider = MeterProvider(
         resource=resource,
         metric_readers=[prometheus_reader],
-        views=[duration_view, llm_duration_view, http_duration_view],
+        views=[
+            duration_view,
+            llm_duration_view,
+            http_duration_view,
+            View(
+                instrument_name="hindsight.event_loop.lag",
+                aggregation=ExplicitBucketHistogramAggregation(boundaries=LOOP_LAG_BUCKETS),
+            ),
+        ],
     )
 
     # Set the global meter provider
@@ -292,6 +305,53 @@ class MetricsCollectorBase:
         """Context manager to record HTTP request metrics."""
         raise NotImplementedError
 
+    def record_retain_document(self, bank_id: str, memory_unit_count: int):
+        """Record the fact-extraction outcome of one document processed by retain."""
+        raise NotImplementedError
+
+    def record_db_acquire_wait(self, wait_seconds: float):
+        """Record how long a caller waited to acquire a pooled DB connection."""
+        raise NotImplementedError
+
+    def record_retain_phase(self, phase: str, seconds: float, calls: int = 1, store: str = ""):
+        """Record one phase of a retain."""
+        raise NotImplementedError
+
+    def record_validator_phase(self, operation: str, hook: str, seconds: float):
+        """Record one operation-validator hook (`hook` is "pre" or "post")."""
+        raise NotImplementedError
+
+    def record_recall_phase(self, phase: str, seconds: float, *, diagnostic: bool = False):
+        """Record one phase of a recall.
+
+        `diagnostic` marks a phase that is a SUBSET of another rather than a sibling of it, so a
+        consumer summing phases into a request total can exclude them instead of double-counting.
+        """
+        raise NotImplementedError
+
+    def record_loop_stall(self, stall_seconds: float):
+        """Record a detected event-loop stall (blocked longer than the watchdog threshold)."""
+        raise NotImplementedError
+
+    def record_loop_lag(self, lag_seconds: float):
+        """Record one event-loop lag sample (see ``hindsight_api.loop_lag``).
+
+        A no-op here rather than abstract: the probe calls it on every tick, and a collector that
+        predates it must not kill the probe.
+        """
+
+    def record_consolidation_batch_failure(self, failure_class: str, error_type: str):
+        """Record one consolidation LLM batch call that failed.
+
+        `failed_consolidation` is a gauge over rows carrying `consolidation_failed_at`,
+        so it reports facts left STUCK — never a call that failed and whose facts the
+        caller's adaptive bisection then rescued. A run can burn dozens of schema-invalid
+        calls, drop every delete they carried, and still end with that gauge at 0 and
+        `observations_deleted` at 0, indistinguishable from a healthy run (#4151, #4152).
+        This counter is the missing signal: it counts calls, not stuck rows.
+        """
+        raise NotImplementedError
+
     def set_db_pool(self, pool: "asyncpg.Pool"):
         """Set the database pool for metrics collection."""
         pass
@@ -345,6 +405,35 @@ class NoOpMetricsCollector(MetricsCollectorBase):
         """No-op HTTP request recording."""
         yield
 
+    def record_retain_document(self, bank_id: str, memory_unit_count: int):
+        """No-op retain document outcome recording."""
+        pass
+
+    def record_db_acquire_wait(self, wait_seconds: float):
+        """No-op DB acquire-wait recording."""
+        pass
+
+    def record_retain_phase(self, phase: str, seconds: float, calls: int = 1, store: str = ""):
+        pass
+
+    def record_validator_phase(self, operation: str, hook: str, seconds: float):
+        pass
+
+    def record_recall_phase(self, phase: str, seconds: float, *, diagnostic: bool = False):
+        pass
+
+    def record_loop_stall(self, stall_seconds: float):
+        """No-op loop-stall recording."""
+        pass
+
+    def record_loop_lag(self, lag_seconds: float):
+        """No-op loop-lag recording."""
+        pass
+
+    def record_consolidation_batch_failure(self, failure_class: str, error_type: str):
+        """No-op consolidation batch-failure recording."""
+        pass
+
 
 class MetricsCollector(MetricsCollectorBase):
     """
@@ -358,6 +447,8 @@ class MetricsCollector(MetricsCollectorBase):
         from .config import get_config
 
         self._include_bank_id = get_config().metrics_include_bank_id
+        self._record_diagnostic_phases = get_config().recall_diagnostic_phases
+        self._recall_phase_sample_every = get_config().recall_phase_sample_every
 
         # Operation latency histogram (in seconds)
         # Records duration of retain, recall, reflect operations
@@ -411,6 +502,18 @@ class MetricsCollector(MetricsCollectorBase):
             unit="tokens",
         )
 
+        # Per-document retain outcome. The point of this counter is the
+        # ``outcome=no_facts`` series: a document whose extraction legitimately
+        # produced zero facts is stored but unreachable via recall/reflect (only
+        # memory_units carry embeddings), and nothing else in the system reports
+        # it — the operation still completes successfully. Alert on it to catch a
+        # retain_mission that silently excludes more than intended (issue #3040).
+        self.retain_documents_total = self.meter.create_counter(
+            name="hindsight.retain.documents.total",
+            description="Documents processed by retain, labelled by extraction outcome (facts/no_facts)",
+            unit="documents",
+        )
+
         # HTTP request metrics
         self.http_request_duration = self.meter.create_histogram(
             name="hindsight.http.duration", description="Duration of HTTP requests in seconds", unit="s"
@@ -424,6 +527,112 @@ class MetricsCollector(MetricsCollectorBase):
             name="hindsight.http.requests.in_progress",
             description="Number of HTTP requests in progress",
             unit="requests",
+        )
+
+        # Runtime-stall observability: how long callers wait for a pooled DB
+        # connection (pool-exhaustion signal) and detected event-loop stalls
+        # (blocked-loop signal). See loop_watchdog.py and db/pool_instrumentation.py.
+        self.db_acquire_wait = self.meter.create_histogram(
+            name="hindsight.db.pool.acquire_wait",
+            description="Time spent waiting to acquire a pooled database connection",
+            unit="s",
+        )
+        # Where a retain's wall time goes, per phase. Retain crosses four subsystems -- chunking,
+        # the embedder, the memories store and Postgres -- and until this existed a slow retain in
+        # production could only be attributed by reasoning about which of them was likely, which
+        # got it wrong: the store's share was assumed to be Postgres. Phases overlap when
+        # sub-batches run concurrently, so the sum exceeds the retain's duration by design; read a
+        # phase against `hindsight.retain.duration`, not against the others.
+        self.retain_phase_duration = self.meter.create_histogram(
+            name="hindsight.retain.phase.duration",
+            description="Time attributed to one phase of a retain (phases overlap under concurrency)",
+            unit="s",
+        )
+        self.retain_phase_calls = self.meter.create_counter(
+            name="hindsight.retain.phase.calls",
+            description="Number of times a retain phase ran -- the round-trip count per phase",
+            unit="calls",
+        )
+        # The operation validator runs OUTSIDE the recall/retain timers -- `validate_*` before the
+        # work starts and `on_*_complete` after it ends -- so whatever it does is invisible in the
+        # `[phases]` accounting, which measures only the inner search. A validator that reaches a
+        # database (billing does: an org row and a pricing table, uncached, on a small control
+        # pool) is then latency nobody can see. Labelled by hook so the pre-check and the
+        # post-charge are separable: they fail differently and are fixed differently.
+        self.validator_phase_duration = self.meter.create_histogram(
+            name="hindsight.validator.phase.duration",
+            description="Time in an operation-validator hook, which runs outside the operation's own timer",
+            unit="s",
+        )
+        # A recall's phases, from the same tracer that writes the `[phases]` log line. That line is
+        # per-request and lives in a log; this is the aggregate, so "where does a recall's time go"
+        # is answerable across a window without grepping. `hindsight.operation.duration` for a
+        # recall is one opaque number, and subtracting the store's own timings from it left the
+        # remainder -- hydration, entity build, token filtering, serialization -- as a residual
+        # nobody could attribute. On a measured window that residual was 37% of the request.
+        #
+        # `diagnostic` separates subsets from siblings: some phases are children of another
+        # (a per-arm timing inside parallel_retrieval), and summing them with their parent
+        # double-counts. Sum `diagnostic="false"` to get the request; read the rest for detail.
+        self.recall_phase_duration = self.meter.create_histogram(
+            name="hindsight.recall.phase.duration",
+            description="Time attributed to one phase of a recall (diagnostic phases are subsets, not siblings)",
+            unit="s",
+            # Buckets in SECONDS, sized for phases that take milliseconds. Without them the
+            # SDK default applies -- 0, 5, 10, 25, ... -- which for a unit of seconds means
+            # the first bucket is everything under five seconds. Every recall phase landed
+            # in it, so the histogram could report a mean but no percentile: asked for the
+            # p99 of a phase it answered 2500ms for all fifteen of them, which is simply the
+            # midpoint of that first bucket. A mean cannot explain a tail, and the tail is
+            # what a phase breakdown is for.
+            explicit_bucket_boundaries_advisory=[
+                0.001,
+                0.0025,
+                0.005,
+                0.01,
+                0.025,
+                0.05,
+                0.075,
+                0.1,
+                0.25,
+                0.5,
+                0.75,
+                1.0,
+                2.5,
+                5.0,
+                10.0,
+            ],
+        )
+        # Consolidation batch calls that failed. Labelled by failure class so the two
+        # populations stay separable: `retry` is transport-shaped and usually self-heals,
+        # while `fail_fast` is the model emitting something the response schema rejects —
+        # the case that silently drains the delete path (#4152). Neither reaches
+        # `failed_consolidation`, which only counts facts bisection could not rescue.
+        self.consolidation_batch_failures = self.meter.create_counter(
+            name="hindsight.consolidation.batch_failures",
+            description=(
+                "Consolidation LLM batch calls that failed, by failure class -- "
+                "including those whose facts adaptive bisection later rescued"
+            ),
+            unit="calls",
+        )
+        self.event_loop_stalls = self.meter.create_counter(
+            name="hindsight.event_loop.stalls",
+            description="Number of detected event-loop stalls (loop blocked past the watchdog threshold)",
+            unit="stalls",
+        )
+        self.event_loop_stall_duration = self.meter.create_histogram(
+            name="hindsight.event_loop.stall_duration",
+            description="Duration of detected event-loop stalls in seconds",
+            unit="s",
+        )
+        # How long a ready coroutine waited for the loop (see hindsight_api.loop_lag). Unlike a
+        # stall, which only counts blocks past a threshold, this is the whole distribution, so a
+        # loop that is busy but never blocked still shows up.
+        self.event_loop_lag = self.meter.create_histogram(
+            name="hindsight.event_loop.lag",
+            description="Event-loop lag: extra time a ready coroutine waited before it ran",
+            unit="s",
         )
 
         # Process metrics (observable gauges - collected on scrape)
@@ -527,6 +736,22 @@ class MetricsCollector(MetricsCollectorBase):
 
         # Record operation count
         self.operation_total.add(1, attributes)
+
+    def record_retain_document(self, bank_id: str, memory_unit_count: int):
+        """Record one document's retain outcome.
+
+        ``memory_unit_count == 0`` means fact extraction ran and returned
+        nothing, so the document is stored but unreachable through recall/reflect
+        until it is reprocessed.
+        """
+        attributes = {
+            "tenant": _get_tenant(),
+            "outcome": "facts" if memory_unit_count > 0 else "no_facts",
+        }
+        if self._include_bank_id:
+            attributes["bank_id"] = bank_id
+
+        self.retain_documents_total.add(1, attributes)
 
     def record_llm_call(
         self,
@@ -645,6 +870,65 @@ class MetricsCollector(MetricsCollectorBase):
 
             # Decrement in-progress
             self.http_requests_in_progress.add(-1, base_attributes)
+
+    def record_db_acquire_wait(self, wait_seconds: float):
+        """Record how long a caller waited to acquire a pooled DB connection."""
+        self.db_acquire_wait.record(wait_seconds)
+
+    def record_retain_phase(self, phase: str, seconds: float, calls: int = 1, store: str = ""):
+        """Record one phase of a retain. `store` labels which memories backend served it, so a
+        store-owned bank's profile is separable from a Postgres one on the same deployment."""
+        attrs = {"phase": phase, "tenant": _get_tenant()}
+        if store:
+            attrs["store"] = store
+        self.retain_phase_duration.record(seconds, attrs)
+        self.retain_phase_calls.add(calls, attrs)
+
+    def record_validator_phase(self, operation: str, hook: str, seconds: float):
+        """Record one operation-validator hook. `hook` is "pre" or "post"."""
+        attrs = {"operation": operation, "hook": hook, "tenant": _get_tenant()}
+        self.validator_phase_duration.record(seconds, attrs)
+
+    def record_recall_phase(self, phase: str, seconds: float, *, diagnostic: bool = False):
+        """Record one phase of a recall.
+
+        `diagnostic` marks a phase that is a SUBSET of another rather than a sibling of it — a
+        per-arm timing inside `parallel_retrieval`, say — so a consumer summing phases into a
+        request total can exclude them instead of double-counting.
+        """
+        if diagnostic and not self._record_diagnostic_phases:
+            return
+        # Opt-in sampling: ~10 phases per recall each go through OTel's aggregation, which was
+        # ~4.6% of a recall-heavy API's busy CPU. Sampling each call independently at 1/N keeps
+        # every phase's distribution (and so its percentiles) unbiased; only the histogram's
+        # absolute counts scale by 1/N. Default 1 records every call, exactly as before.
+        if self._recall_phase_sample_every > 1 and random.random() * self._recall_phase_sample_every >= 1.0:
+            return
+        attrs = {"phase": phase, "tenant": _get_tenant(), "diagnostic": str(bool(diagnostic)).lower()}
+        # One instrument, not two: the histogram already carries `_count` for this attribute set,
+        # so the parallel counter was recording the same measurement a second time — and OTel's
+        # consume_measurement path, not the record call, is what costs.
+        self.recall_phase_duration.record(seconds, attrs)
+
+    def record_loop_stall(self, stall_seconds: float):
+        """Record a detected event-loop stall. Called from the watchdog thread."""
+        self.event_loop_stalls.add(1)
+        self.event_loop_stall_duration.record(stall_seconds)
+
+    def record_loop_lag(self, lag_seconds: float):
+        """Record one event-loop lag sample. Called by the probe on every tick."""
+        self.event_loop_lag.record(lag_seconds)
+
+    def record_consolidation_batch_failure(self, failure_class: str, error_type: str):
+        """Record one failed consolidation LLM batch call.
+
+        Called only on the exception path, so the successful batch costs nothing.
+        `error_type` is the exception class name — `ValidationError` is the #4152
+        signature — and is bounded by the exception types the LLM layer can raise.
+        """
+        self.consolidation_batch_failures.add(
+            1, {"failure_class": failure_class, "error_type": error_type, "tenant": _get_tenant()}
+        )
 
     def _setup_process_metrics(self):
         """Set up observable gauges for process metrics."""
@@ -771,6 +1055,20 @@ class MetricsCollector(MetricsCollectorBase):
                 except Exception:
                     pass
 
+        def get_pool_waiting(_options):
+            """Number of callers currently blocked waiting to acquire a connection.
+
+            asyncpg does not expose this; it's tracked in db/pool_instrumentation.py.
+            This is the gauge that actually distinguishes pool exhaustion (a high,
+            sustained value) from a merely busy-but-healthy pool.
+            """
+            try:
+                from .engine.db.pool_instrumentation import waiting_count
+
+                yield metrics.Observation(waiting_count())
+            except Exception:
+                pass
+
         # Create observable gauges for pool metrics
         self.meter.create_observable_gauge(
             name="hindsight.db.pool.size",
@@ -797,6 +1095,13 @@ class MetricsCollector(MetricsCollectorBase):
             name="hindsight.db.pool.max",
             callbacks=[get_pool_max_size],
             description="Maximum pool size",
+            unit="{connections}",
+        )
+
+        self.meter.create_observable_gauge(
+            name="hindsight.db.pool.waiting",
+            callbacks=[get_pool_waiting],
+            description="Callers currently blocked waiting to acquire a pooled connection",
             unit="{connections}",
         )
 
@@ -853,7 +1158,8 @@ class MetricsCollector(MetricsCollectorBase):
         self.meter.create_observable_gauge(
             name="hindsight.consolidation.backlog",
             callbacks=[get_consolidation_backlog],
-            description="Source memories (experience/world) not yet consolidated into observations",
+            description="Source memories (experience/world) still queued for consolidation into "
+            "observations; excludes permanently failed ones, which are in hindsight.consolidation.failed",
             unit="{memories}",
         )
         self.meter.create_observable_gauge(
@@ -942,6 +1248,14 @@ class MetricsCollector(MetricsCollectorBase):
                 #   idx_memory_units_consolidation_failed  WHERE consolidation_failed_at IS NOT NULL ...
                 # GROUP BY bank_id still composes — bank_id is each index's lead column.
                 #
+                # The backlog gauge is disjoint from the failed gauge: it carries the
+                # consolidator's own `consolidation_failed_at IS NULL` (see
+                # reads.find_unconsolidated), so a permanently failed fact does not hold
+                # the backlog above zero forever and "backlog > 0 for N minutes" stays an
+                # alertable condition. That extra term is not in the partial index's
+                # predicate, so it is a cheap recheck on the rows the index already
+                # returned — the failed set is tiny by construction.
+                #
                 # The backlog count runs with seqscan disabled in a scoped
                 # transaction. The partial index matches its predicate, but
                 # `consolidated_at IS NULL` is true for a large fraction of the
@@ -958,7 +1272,8 @@ class MetricsCollector(MetricsCollectorBase):
                         rows = await conn.fetch(
                             f"SELECT {bank_sel}COUNT(*) AS count "
                             f'FROM "{schema}".memory_units '
-                            "WHERE consolidated_at IS NULL AND fact_type IN ('experience', 'world')"
+                            "WHERE consolidated_at IS NULL AND consolidation_failed_at IS NULL "
+                            "AND fact_type IN ('experience', 'world')"
                             f"{bank_grp}"
                         )
                     for row in rows:
@@ -1005,7 +1320,24 @@ def create_metrics_collector() -> MetricsCollector:
     Create and set the global metrics collector.
 
     Should be called after initialize_metrics().
+
+    The collector it replaces is *not* remembered here — callers that can shut
+    down (the API lifespan, tests) should snapshot ``get_metrics_collector()``
+    first and hand it back to ``reset_metrics_collector()`` on teardown.
     """
     global _metrics_collector
     _metrics_collector = MetricsCollector()
     return _metrics_collector
+
+
+def reset_metrics_collector(collector: MetricsCollectorBase | None = None) -> None:
+    """
+    Restore the global metrics collector, undoing ``create_metrics_collector()``.
+
+    Pass the collector that was installed beforehand to put it back; with no
+    argument the process falls back to the default no-op collector. Without
+    this, an app that starts once leaves a live ``MetricsCollector`` (and its
+    reference to a now-closed DB pool) installed for the rest of the process.
+    """
+    global _metrics_collector
+    _metrics_collector = collector if collector is not None else NoOpMetricsCollector()

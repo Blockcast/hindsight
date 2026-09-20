@@ -1,6 +1,10 @@
 """Prompts for the consolidation engine."""
 
-from hindsight_api.engine.prompt_utils import escape_for_prompt, output_language_directive
+from hindsight_api.engine.prompt_utils import (
+    default_language_section,
+    escape_for_prompt,
+    output_language_directive,
+)
 
 # Default mission — tells the consolidator to track anything worth remembering.
 # Banks override this via `observations_mission` to scope what gets retained.
@@ -16,6 +20,19 @@ _MISSION_PRIORITY_NOTE = (
     "If anything in this MISSION conflicts with the PROCESSING RULES, "
     "DECISION GUIDE, or OUTPUT FORMAT below, the MISSION takes priority."
 )
+
+# Consolidation's wording of the preserve-the-source-language rule; the selection
+# between it and an explicit output language belongs to default_language_section(),
+# which documents the invariant. Without this rule the whole prompt is English and
+# multilingual models drift: Chinese source facts intermittently produce English
+# observations. Retain's fact extraction carries the equivalent rule (see
+# _DEFAULT_LANGUAGE_RULE there), making "preserve the source language" the
+# pipeline-wide default.
+_DEFAULT_LANGUAGE_RULE = """## LANGUAGE
+
+Write every observation in the language of its own source facts — never translate them. Per observation, not per batch: when one merges facts of several languages, the majority wins. Proper nouns, identifiers, and units stay verbatim.
+
+When an existing observation is written in a different language from the new facts updating it, do NOT edit its wording in place — that is what produces an English sentence with a Chinese detail bolted on. Discard the old phrasing and compose the merged observation from scratch in the new facts' language."""
 
 _PROCESSING_RULES = """## PROCESSING RULES
 
@@ -37,19 +54,36 @@ _PROCESSING_RULES = """## PROCESSING RULES
 
 9. KEEP DISTINCT TOPICS DISTINCT: do not merge observations about different people, entities, or unrelated topics. Merging is for the same canonical fact recurring — not for related-but-distinct claims."""
 
+# Field-by-field definitions of the input shape used by the cached system
+# prefix. The call site runs .format(), so these strings must contain no braces.
+_FACT_FIELDS = """One per line, formatted as `[uuid] fact text (temporal fields)`:
+- `[uuid]`: the fact's identifier — copy it verbatim into `source_fact_ids`
+- `occurred_start` / `occurred_end`: when the described event happened. This can be long before the fact was stated — a fact recorded today may describe a 2019 event.
+- `mentioned_at`: when the source material that states this fact was written. This is the fact's recency: how up to date the statement is, NOT when it was added to memory. A fact taken from an old document keeps its old `mentioned_at` even if it was only just processed."""
+
+_OBSERVATION_FIELDS = """- `id`: unique identifier — copy this exactly when issuing an UPDATE or DELETE
+- `text`: the observation content
+- `proof_count`: how many source facts this observation has already merged
+- `occurred_start` / `occurred_end`: the span of the events behind the observation — earliest start and latest end across its source facts
+- `mentioned_at`: the latest of the `mentioned_at` values of its source facts — the most recent point at which this observation was stated
+- `source_memories`: the supporting facts behind this observation. May be partial or absent for large observations — the count above remains the true total. Each entry carries the same `text` and temporal fields as a new fact, plus:
+  - `context`: optional surrounding context for that fact"""
+
 # Stable description of the input shape. For the cached split path this lives in
 # the system prefix (build_consolidation_system_prompt) so it is not re-sent on
 # every batch; the per-batch user message then carries only the actual data.
-_INPUT_FORMAT_NOTE = """## INPUT FORMAT
+_INPUT_FORMAT_NOTE = f"""## INPUT FORMAT
 
-Each request provides new facts and existing observations:
-- New facts: one per line, each prefixed with its `[uuid]`, followed by the fact text and optional temporal fields.
-- Existing observations: a JSON array pooled from recalls across the new facts. Each entry has:
-  - `id`: unique identifier — copy this exactly when issuing an UPDATE or DELETE
-  - `text`: the observation content
-  - `proof_count`: number of supporting memories
-  - `occurred_start` / `occurred_end`: temporal range of source facts
-  - `source_memories`: array of supporting facts with their text and dates"""
+Each request provides new facts and existing observations. Every temporal field is optional and is omitted when unknown.
+
+### New facts
+
+{_FACT_FIELDS}
+
+### Existing observations
+
+A JSON array pooled from recalls across the new facts. Each entry has:
+{_OBSERVATION_FIELDS}"""
 
 # Per-batch data section for the cached split path — the stable format
 # explanation above is omitted here (it lives in the cached prefix); only the
@@ -61,24 +95,6 @@ _SPLIT_INPUT_SECTION = """## INPUT
 {facts_text}
 
 ### Existing observations
-
-{observations_text}"""
-
-# Data section — format placeholders {facts_text} and {observations_text} are substituted at call time
-_INPUT_SECTION = """## INPUT
-
-### New facts
-
-{facts_text}
-
-### Existing observations
-
-JSON array, pooled from recalls across all new facts above. Each entry has:
-- `id`: unique identifier — copy this exactly when issuing an UPDATE or DELETE
-- `text`: the observation content
-- `proof_count`: number of supporting memories
-- `occurred_start` / `occurred_end`: temporal range of source facts
-- `source_memories`: array of supporting facts with their text and dates
 
 {observations_text}"""
 
@@ -124,6 +140,20 @@ Expected output (UPDATE for the state change; CREATE for the unrelated work-hour
   "updates": [{{"text": "Alice owned a 2019 Honda Civic; sold it on March 15, 2025.", "observation_id": "22222222-2222-2222-2222-222222222222", "source_fact_ids": ["c3d4e5f6-a7b8-9012-cdef-123456789012"], "reason": "State change to the existing Honda Civic observation 2222 — UPDATE, not a new sibling."}}],
   "deletes": []}}
 
+### Example 3 — A superseded observation is deleted (note the `observation_id`)
+
+Input facts:
+  [e5f6a7b8-c9d0-1234-efab-345678901234] Bob confirmed the beta waitlist was shut down and replaced by open signup. (occurred_start=2025-06-02, mentioned_at=2025-06-02)
+
+Existing observation:
+  {{"id": "33333333-3333-3333-3333-333333333333", "text": "Bob is on the beta waitlist.", "proof_count": 1}}
+
+Expected output (the waitlist observation is no longer true of anyone and records no significant event, so DELETE it and CREATE the replacement):
+
+{{"creates": [{{"text": "Bob uses the product through open signup; the beta waitlist was shut down.", "source_fact_ids": ["e5f6a7b8-c9d0-1234-efab-345678901234"], "reason": "The waitlist observation is superseded outright rather than amended, so CREATE the replacement and DELETE the old one."}}],
+  "updates": [],
+  "deletes": [{{"observation_id": "33333333-3333-3333-3333-333333333333", "reason": "The waitlist no longer exists — this observation is superseded, not merely out of date."}}]}}
+
 ### Observation text rules
 
 - Write clean prose — NEVER copy raw fact lines or their metadata (temporal fields, "Involving:", "When:" labels, UUIDs).
@@ -136,43 +166,10 @@ Expected output (UPDATE for the state change; CREATE for the unrelated work-hour
 - `observation_id`: copy the EXACT `id` UUID string from existing observations.
 - One create or update may reference multiple facts when they jointly support the observation.
 - **AT MOST ONE UPDATE PER `observation_id`**: if several new facts all update the same existing observation, emit a single `updates` entry that lists all contributing `source_fact_ids` and a single consolidated `text`. Never emit two `updates` entries with the same `observation_id` in one response — they would silently overwrite each other.
-- `deletes`: only when an observation is directly superseded or contradicted by new facts.
+- `deletes`: only when an observation is directly superseded or contradicted by new facts. Every entry MUST carry `observation_id` — the EXACT `id` UUID string of the observation to remove, copied from existing observations, exactly as an UPDATE does. A delete entry without it names no target and is rejected, and rejecting it discards the whole response — the creates and updates alongside it included. Naming the observation in `reason` prose is NOT enough. If you cannot supply the id, emit no delete.
 - `reason`: REQUIRED on every create/update/delete — one sentence explaining the choice. For a CREATE, state which existing observation(s) you considered and why none matched (a near-identical existing observation means you should UPDATE, not CREATE). This is audited to catch duplicate creates.
 - Do NOT include `tags` — handled automatically.
 - Return `{{"creates": [], "updates": [], "deletes": []}}` if nothing durable is found."""
-
-
-def build_batch_consolidation_prompt(
-    observations_mission: str | None = None,
-    observation_capacity_note: str | None = None,
-    llm_output_language: str | None = None,
-) -> str:
-    """
-    Build the consolidation prompt for batch mode (multiple facts per LLM call).
-
-    The mission defines *what* to track (customisable per bank) and takes
-    priority over the built-in processing rules when the two conflict.
-    Processing rules, decision guide, and output format are always present.
-    When ``llm_output_language`` is set, observations are emitted in that
-    language.
-    """
-    mission = escape_for_prompt(observations_mission or _DEFAULT_MISSION)
-
-    capacity_section = ""
-    if observation_capacity_note:
-        capacity_section = f"\n\n## CAPACITY CONSTRAINT\n\n{escape_for_prompt(observation_capacity_note)}"
-
-    return (
-        "You are a memory consolidation system. Synthesize new facts into "
-        "observations, merging with existing observations when appropriate.\n\n"
-        f"## MISSION\n\n{mission}\n\n"
-        f"{_MISSION_PRIORITY_NOTE}"
-        f"{capacity_section}\n\n"
-        f"{_PROCESSING_RULES}\n\n"
-        f"{_INPUT_SECTION}\n\n"
-        f"{_DECISION_GUIDE}\n\n"
-        f"{_OUTPUT_SECTION}" + output_language_directive(llm_output_language)
-    )
 
 
 def build_consolidation_system_prompt(
@@ -189,11 +186,17 @@ def build_consolidation_system_prompt(
     bank and a single CachedContent serves them all. Returns final text
     (brace-escaped examples already unescaped) for verbatim use as system message
     and cached prefix.
+
+    ``llm_output_language`` picks between two mutually exclusive language rules:
+    unset keeps each observation in the language of its own source facts (the
+    default), set forces every observation into that one configured language.
     """
+    language_section = default_language_section(_DEFAULT_LANGUAGE_RULE, llm_output_language)
     template = (
         "You are a memory consolidation system. Synthesize new facts into "
         "observations, merging with existing observations when appropriate.\n\n"
         f"{_MISSION_PRIORITY_NOTE}\n\n"
+        f"{language_section}"
         f"{_PROCESSING_RULES}\n\n"
         f"{_INPUT_FORMAT_NOTE}\n\n"
         f"{_DECISION_GUIDE}\n\n"
@@ -202,6 +205,17 @@ def build_consolidation_system_prompt(
     # No {facts_text}/{observations_text} placeholders here — the only braces are
     # the doubled {{ }} in the OUTPUT examples, which .format() unescapes.
     return template.format()
+
+
+def build_mission_section(observations_mission: str | None) -> str:
+    """The MISSION section, heading included, as the user message writes it.
+
+    Shared with the prompt preview, which reports this section as the block the
+    ``observations_mission`` setting produces. Rebuilding the heading there left two
+    blocks both called "Mission" — the setting's, and the built-in gap that this
+    ``## MISSION`` heading names too.
+    """
+    return f"## MISSION\n\n{escape_for_prompt(observations_mission or _DEFAULT_MISSION)}"
 
 
 def build_consolidation_input(
@@ -216,8 +230,7 @@ def build_consolidation_input(
     bank-agnostic and one CachedContent serves every bank. The capacity note also
     lives here since it varies as observation slots fill.
     """
-    mission = escape_for_prompt(observations_mission or _DEFAULT_MISSION)
-    mission_section = f"## MISSION\n\n{mission}\n\n"
+    mission_section = f"{build_mission_section(observations_mission)}\n\n"
     capacity_section = ""
     if observation_capacity_note:
         capacity_section = f"## CAPACITY CONSTRAINT\n\n{escape_for_prompt(observation_capacity_note)}\n\n"

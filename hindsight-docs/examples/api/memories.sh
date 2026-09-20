@@ -32,7 +32,7 @@ MEMORY_ID=$(hindsight memory list "$BANK_ID" -o json | python3 -c "import sys,js
 
 if [ -n "$MEMORY_ID" ]; then
   # [docs:get-memory]
-  # Fetch a single memory unit (entities, dates, state)
+  # Fetch a single memory unit (metadata, entities, dates, state)
   curl -s "$HINDSIGHT_URL/v1/default/banks/$BANK_ID/memories/$MEMORY_ID"
   # [/docs:get-memory]
 
@@ -47,9 +47,11 @@ if [ -n "$MEMORY_ID" ]; then
   # [docs:edit-memory-fields]
   # Correct dates, fact type, and entities in one call. "" clears a field;
   # entities replaces the set ([] detaches all); omit to leave unchanged.
+  # resolve_entities false keeps the entity names you wrote from being matched
+  # onto a similar entity that already exists.
   curl -s -X PATCH "$HINDSIGHT_URL/v1/default/banks/$BANK_ID/memories/$MEMORY_ID" \
     -H "Content-Type: application/json" \
-    -d '{"occurred_start": "2023-06-01", "fact_type": "experience", "entities": ["Alice", "Paris"]}'
+    -d '{"occurred_start": "2023-06-01", "fact_type": "experience", "entities": ["Alice", "Paris"], "resolve_entities": false}'
   # [/docs:edit-memory-fields]
 
   # [docs:invalidate-memory]

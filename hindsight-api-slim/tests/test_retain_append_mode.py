@@ -2,6 +2,7 @@
 Tests for retain update_mode='append' — appends new content to existing documents.
 """
 
+import json
 import logging
 from datetime import datetime, timezone
 
@@ -17,6 +18,7 @@ def _ts():
 
 
 @pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
 async def test_append_mode_concatenates_content(memory, request_context):
     """
     When update_mode='append', new content should be appended to the existing
@@ -42,7 +44,7 @@ async def test_append_mode_concatenates_content(memory, request_context):
         assert "Alice works at Google" in v1_text
 
         # Second retain with append — add new content
-        v2_units = await memory.retain_batch_async(
+        await memory.retain_batch_async(
             bank_id=bank_id,
             contents=[
                 {
@@ -80,6 +82,53 @@ async def test_append_mode_concatenates_content(memory, request_context):
         )
         assert len(result_bob.results) > 0, "Should recall facts about Bob"
 
+    finally:
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+
+@pytest.mark.asyncio
+async def test_append_mode_metadata_consistent_for_unchanged_and_new_units(memory, request_context):
+    """Append metadata should become authoritative for old and new facts."""
+    bank_id = f"test_append_meta_{_ts()}"
+    document_id = "append-metadata"
+
+    try:
+        await memory.retain_batch_async(
+            bank_id=bank_id,
+            contents=[
+                {
+                    "content": "Alice works at Google as a software engineer.",
+                    "document_id": document_id,
+                    "metadata": {"source": "email"},
+                }
+            ],
+            request_context=request_context,
+        )
+
+        await memory.retain_batch_async(
+            bank_id=bank_id,
+            contents=[
+                {
+                    "content": "Bob works at Microsoft as a data scientist.",
+                    "document_id": document_id,
+                    "metadata": {"source": "crm"},
+                    "update_mode": "append",
+                }
+            ],
+            request_context=request_context,
+        )
+
+        doc = await memory.get_document(document_id, bank_id, request_context=request_context)
+        assert doc is not None
+        assert doc["document_metadata"] == {"source": "crm"}
+
+        listing = await memory.list_memory_units(bank_id, document_id=document_id, request_context=request_context)
+        rows = listing["items"]
+
+        assert rows
+        for row in rows:
+            # list_memory_units already parses the JSON metadata into a dict.
+            assert row["metadata"] == {"source": "crm"}
     finally:
         await memory.delete_bank(bank_id, request_context=request_context)
 
@@ -235,6 +284,102 @@ async def test_replace_mode_is_default(memory, request_context):
         # With replace, only new content should remain
         assert "Bob works at Microsoft" in text, "New content should be present"
         assert "Alice works at Google" not in text, "Old content should be replaced"
+
+    finally:
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+
+@pytest.mark.asyncio
+async def test_append_mode_conversation_arrays_produce_valid_json(memory, request_context):
+    """When conversation-format JSON arrays are appended, original_text
+    must remain a valid flat JSON array after multiple append cycles.
+
+    Regression test for #2409: without the merge fix, original_text
+    becomes newline-joined arrays which breaks conversation-aware chunking.
+    """
+    bank_id = f"test_append_conv_{_ts()}"
+    document_id = "conversation-json-append"
+
+    try:
+        # First retain - JSON conversation array
+        turn1 = json.dumps(
+            [
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "Hi there"},
+            ]
+        )
+        await memory.retain_batch_async(
+            bank_id=bank_id,
+            contents=[
+                {
+                    "content": turn1,
+                    "context": "conversation",
+                    "document_id": document_id,
+                }
+            ],
+            request_context=request_context,
+        )
+
+        # Second retain - append more turns
+        turn2 = json.dumps(
+            [
+                {"role": "user", "content": "How are you"},
+                {"role": "assistant", "content": "Doing well"},
+            ]
+        )
+        await memory.retain_batch_async(
+            bank_id=bank_id,
+            contents=[
+                {
+                    "content": turn2,
+                    "context": "conversation",
+                    "document_id": document_id,
+                    "update_mode": "append",
+                }
+            ],
+            request_context=request_context,
+        )
+
+        # Verify original_text is valid JSON (not newline-joined arrays)
+        doc = await memory.get_document(document_id, bank_id, request_context=request_context)
+        text = doc["original_text"]
+
+        parsed = json.loads(text)
+        assert isinstance(parsed, list), "original_text must be a JSON array"
+        assert all(isinstance(e, dict) for e in parsed), (
+            "original_text must be a flat array of dicts, not nested arrays"
+        )
+        assert len(parsed) == 4, "Should contain all 4 messages from both retains"
+
+        # Third retain - append again, verify no degradation
+        turn3 = json.dumps(
+            [
+                {"role": "user", "content": "What is new"},
+                {"role": "assistant", "content": "Not much"},
+            ]
+        )
+        await memory.retain_batch_async(
+            bank_id=bank_id,
+            contents=[
+                {
+                    "content": turn3,
+                    "context": "conversation",
+                    "document_id": document_id,
+                    "update_mode": "append",
+                }
+            ],
+            request_context=request_context,
+        )
+
+        doc = await memory.get_document(document_id, bank_id, request_context=request_context)
+        text = doc["original_text"]
+
+        parsed = json.loads(text)
+        assert isinstance(parsed, list), "original_text must remain a JSON array after 3rd append"
+        assert all(isinstance(e, dict) for e in parsed), (
+            "original_text must remain a flat array of dicts after 3rd append"
+        )
+        assert len(parsed) == 6, "Should contain all 6 messages from three retains"
 
     finally:
         await memory.delete_bank(bank_id, request_context=request_context)

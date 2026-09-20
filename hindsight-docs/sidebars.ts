@@ -39,6 +39,18 @@ const sidebars: SidebarsConfig = {
         },
         {
           type: 'doc',
+          id: 'developer/mental-models',
+          label: 'Mental Models',
+          customProps: { icon: 'lu-layers' },
+        },
+        {
+          type: 'doc',
+          id: 'developer/knowledge-pages',
+          label: 'Knowledge Pages',
+          customProps: { icon: 'lu-book-text' },
+        },
+        {
+          type: 'doc',
           id: 'developer/multilingual',
           label: 'Multilingual',
           customProps: { icon: 'lu-languages' },
@@ -97,6 +109,12 @@ const sidebars: SidebarsConfig = {
           id: 'developer/api/mental-models',
           label: 'Mental Models',
           customProps: { icon: 'lu-layers' },
+        },
+        {
+          type: 'doc',
+          id: 'developer/api/knowledge-pages',
+          label: 'Knowledge Pages',
+          customProps: { icon: 'lu-book-text' },
         },
         {
           type: 'doc',
@@ -234,6 +252,12 @@ const sidebars: SidebarsConfig = {
         },
         {
           type: 'doc',
+          id: 'developer/oracle',
+          label: 'Oracle Database',
+          customProps: { icon: 'lu-database' },
+        },
+        {
+          type: 'doc',
           id: 'developer/extensions',
           label: 'Extensions',
           customProps: { icon: 'lu-plug' },
@@ -345,7 +369,7 @@ const sidebars: SidebarsConfig = {
         },
         {
           type: 'link',
-          href: 'https://join.slack.com/t/hindsight-space/shared_invite/zt-3nhbm4w29-LeSJ5Ixi6j8PdiYOCPlOgg',
+          href: 'https://vectorize.io/slack',
           label: 'Community',
           customProps: { icon: 'si-slack', iconAfter: 'lu-arrow-up-right' },
         },

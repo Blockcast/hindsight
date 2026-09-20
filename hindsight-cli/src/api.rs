@@ -10,6 +10,26 @@ use serde::{Deserialize, Serialize};
 use serde_json;
 use std::collections::HashMap;
 
+const DEFAULT_CLI_USER_AGENT: &str = concat!("hindsight-cli/", env!("CARGO_PKG_VERSION"));
+
+fn default_headers(api_key: Option<&str>) -> Result<reqwest::header::HeaderMap> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::USER_AGENT,
+        reqwest::header::HeaderValue::from_static(DEFAULT_CLI_USER_AGENT),
+    );
+
+    if let Some(key) = api_key {
+        let auth_value = format!("Bearer {}", key);
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            reqwest::header::HeaderValue::from_str(&auth_value)?,
+        );
+    }
+
+    Ok(headers)
+}
+
 /// Convert a progenitor client error into an anyhow error that includes the
 /// HTTP response body. Without this, errors render as
 /// "Unexpected Response: Response { ... }" with no body, hiding validation
@@ -42,6 +62,28 @@ where
     }
 }
 
+/// Await a generated-client call as `call(..).humanized().await?` rather than
+/// `call(..).await?`: this carries the HTTP response body into the error so the
+/// CLI can print what the server actually said, instead of progenitor's
+/// body-less "Unexpected Response: Response { .. }" (see issue #4049).
+#[allow(async_fn_in_trait)]
+trait Humanized<T> {
+    async fn humanized(self) -> anyhow::Result<T>;
+}
+
+impl<F, T, E> Humanized<T> for F
+where
+    F: std::future::Future<Output = std::result::Result<T, ClientError<E>>>,
+    E: serde::Serialize + std::fmt::Debug + Send + Sync + 'static,
+{
+    async fn humanized(self) -> anyhow::Result<T> {
+        match self.await {
+            Ok(value) => Ok(value),
+            Err(err) => Err(humanize_client_error(err).await),
+        }
+    }
+}
+
 // Types not defined in OpenAPI spec (TODO: add to openapi.json)
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AgentStats {
@@ -62,6 +104,7 @@ pub struct Operation {
     pub id: String,
     pub task_type: String,
     pub items_count: i32,
+    pub filename: Option<String>,
     pub document_id: Option<String>,
     pub created_at: String,
     pub status: String,
@@ -111,15 +154,7 @@ impl ApiClient {
         let mut client_builder =
             reqwest::Client::builder().timeout(std::time::Duration::from_secs(120));
 
-        if let Some(key) = api_key {
-            let mut headers = reqwest::header::HeaderMap::new();
-            let auth_value = format!("Bearer {}", key);
-            headers.insert(
-                reqwest::header::AUTHORIZATION,
-                reqwest::header::HeaderValue::from_str(&auth_value)?,
-            );
-            client_builder = client_builder.default_headers(headers);
-        }
+        client_builder = client_builder.default_headers(default_headers(api_key.as_deref())?);
 
         let http_client = client_builder.build()?;
 
@@ -133,26 +168,57 @@ impl ApiClient {
     }
 
     pub fn list_agents(&self, _verbose: bool) -> Result<Vec<types::BankListItem>> {
+        // The endpoint is paginated and the CLI lists every bank, so walk the pages.
+        const PAGE_SIZE: u64 = 100;
         self.runtime.block_on(async {
-            let response = self.client.list_banks(None).await?;
-            Ok(response.into_inner().banks)
+            let mut banks: Vec<types::BankListItem> = Vec::new();
+            loop {
+                let page = self
+                    .client
+                    .list_banks(Some(PAGE_SIZE), Some(banks.len() as u64), None, None)
+                    .humanized()
+                    .await?
+                    .into_inner();
+                let fetched = page.banks.len();
+                let total = page.total;
+                banks.extend(page.banks);
+                if fetched == 0 || banks.len() as i64 >= total {
+                    break;
+                }
+            }
+            Ok(banks)
         })
     }
 
-    pub fn get_profile(
-        &self,
-        agent_id: &str,
-        _verbose: bool,
-    ) -> Result<types::BankProfileResponse> {
+    /// Look one bank up by exact id.
+    ///
+    /// The per-bank profile endpoint was retired server-side (it answers 410), so a
+    /// single bank is found by filtering the list endpoint — `q` is a substring
+    /// match, hence the exact-id check on the way out.
+    pub fn find_bank(&self, bank_id: &str, _verbose: bool) -> Result<types::BankListItem> {
         self.runtime.block_on(async {
-            let response = self.client.get_bank_profile(agent_id, None).await?;
-            Ok(response.into_inner())
+            let page = self
+                .client
+                .list_banks(Some(100), Some(0), Some(bank_id), None)
+                .humanized()
+                .await?
+                .into_inner();
+            page.banks
+                .into_iter()
+                .find(|bank| bank.bank_id == bank_id)
+                .ok_or_else(|| anyhow::anyhow!("Bank '{}' not found", bank_id))
         })
     }
 
     pub fn get_stats(&self, agent_id: &str, _verbose: bool) -> Result<AgentStats> {
         self.runtime.block_on(async {
-            let response = self.client.get_agent_stats(agent_id, None).await?;
+            // Third arg is the `refresh` query param (force fresh stats); the CLI
+            // always reads the cached value, so pass None.
+            let response = self
+                .client
+                .get_agent_stats(agent_id, None, None)
+                .humanized()
+                .await?;
             let value = response.into_inner();
             // Convert to JSON Value first, then parse into our type
             let json_value = serde_json::to_value(&value)?;
@@ -178,26 +244,7 @@ impl ApiClient {
             let response = self
                 .client
                 .create_or_update_bank(agent_id, None, &request)
-                .await?;
-            Ok(response.into_inner())
-        })
-    }
-
-    pub fn add_background(
-        &self,
-        agent_id: &str,
-        content: &str,
-        update_disposition: bool,
-        _verbose: bool,
-    ) -> Result<types::BackgroundResponse> {
-        self.runtime.block_on(async {
-            let request = types::AddBackgroundRequest {
-                content: content.to_string(),
-                update_disposition,
-            };
-            let response = self
-                .client
-                .add_bank_background(agent_id, None, &request)
+                .humanized()
                 .await?;
             Ok(response.into_inner())
         })
@@ -216,10 +263,11 @@ impl ApiClient {
             );
         }
         self.runtime.block_on(async {
-            let response = match self.client.recall_memories(agent_id, None, request).await {
-                Ok(r) => r,
-                Err(e) => return Err(humanize_client_error(e).await),
-            };
+            let response = self
+                .client
+                .recall_memories(agent_id, None, request)
+                .humanized()
+                .await?;
             Ok(response.into_inner())
         })
     }
@@ -231,10 +279,11 @@ impl ApiClient {
         _verbose: bool,
     ) -> Result<types::ReflectResponse> {
         self.runtime.block_on(async {
-            let response = match self.client.reflect(agent_id, None, request).await {
-                Ok(r) => r,
-                Err(e) => return Err(humanize_client_error(e).await),
-            };
+            let response = self
+                .client
+                .reflect(agent_id, None, request)
+                .humanized()
+                .await?;
             Ok(response.into_inner())
         })
     }
@@ -247,10 +296,11 @@ impl ApiClient {
         _verbose: bool,
     ) -> Result<MemoryPutResult> {
         self.runtime.block_on(async {
-            let response = match self.client.retain_memories(agent_id, None, request).await {
-                Ok(r) => r,
-                Err(e) => return Err(humanize_client_error(e).await),
-            };
+            let response = self
+                .client
+                .retain_memories(agent_id, None, request)
+                .humanized()
+                .await?;
             let result = response.into_inner();
             Ok(MemoryPutResult {
                 success: result.success,
@@ -343,6 +393,7 @@ impl ApiClient {
                 let response = self
                     .client
                     .list_operations(agent_id, None, None, None, None, None, None)
+                    .humanized()
                     .await?;
                 let ops = response.into_inner();
 
@@ -407,6 +458,7 @@ impl ApiClient {
             let response = self
                 .client
                 .clear_bank_memories(agent_id, None, Some(fact_type))
+                .humanized()
                 .await?;
             Ok(response.into_inner())
         })
@@ -425,13 +477,17 @@ impl ApiClient {
                 .client
                 .list_documents(
                     agent_id,
-                    limit.map(|l| l as i64),
-                    offset.map(|o| o as i64),
+                    None, // end_date
+                    limit.map(|l| l as u64),
+                    offset.map(|o| o as u64),
                     q,
-                    None,
-                    None,
-                    None,
+                    None, // start_date
+                    None, // tags
+                    None, // tags_match
+                    None, // time_field
+                    None, // authorization
                 )
+                .humanized()
                 .await?;
             Ok(response.into_inner())
         })
@@ -447,6 +503,7 @@ impl ApiClient {
             let response = self
                 .client
                 .get_document(agent_id, document_id, None)
+                .humanized()
                 .await?;
             Ok(response.into_inner())
         })
@@ -462,6 +519,7 @@ impl ApiClient {
             let response = self
                 .client
                 .delete_document(agent_id, document_id, None)
+                .humanized()
                 .await?;
             let value = response.into_inner();
             // Convert typed response to DeleteResponse
@@ -478,6 +536,7 @@ impl ApiClient {
             let response = self
                 .client
                 .list_operations(agent_id, None, None, None, None, None, None)
+                .humanized()
                 .await?;
             let value = response.into_inner();
             // Convert to JSON Value first, then parse into our type
@@ -497,6 +556,7 @@ impl ApiClient {
             let response = self
                 .client
                 .cancel_operation(agent_id, operation_id, None)
+                .humanized()
                 .await?;
             let value = response.into_inner();
             // Convert typed response to DeleteResponse
@@ -524,13 +584,20 @@ impl ApiClient {
                     bank_id,
                     None, // consolidation_state
                     None, // document_id
-                    limit,
-                    offset,
+                    None, // end_date
+                    None, // entity_id
+                    limit.map(|l| l as u64),
+                    offset.map(|o| o as u64),
                     q,
+                    None, // start_date
                     None, // state
+                    None, // tags
+                    None, // tags_match
+                    None, // time_field
                     type_filter,
                     None, // authorization
                 )
+                .humanized()
                 .await?;
             Ok(response.into_inner())
         })
@@ -546,7 +613,13 @@ impl ApiClient {
         self.runtime.block_on(async {
             let response = self
                 .client
-                .list_entities(bank_id, limit, offset, None)
+                .list_entities(
+                    bank_id,
+                    limit.map(|l| l as u64),
+                    offset.map(|o| o as u64),
+                    None,
+                )
+                .humanized()
                 .await?;
             Ok(response.into_inner())
         })
@@ -559,7 +632,11 @@ impl ApiClient {
         _verbose: bool,
     ) -> Result<types::EntityDetailResponse> {
         self.runtime.block_on(async {
-            let response = self.client.get_entity(bank_id, entity_id, None).await?;
+            let response = self
+                .client
+                .get_entity(bank_id, entity_id, None)
+                .humanized()
+                .await?;
             Ok(response.into_inner())
         })
     }
@@ -574,6 +651,7 @@ impl ApiClient {
             let response = self
                 .client
                 .regenerate_entity_observations(bank_id, entity_id, None)
+                .humanized()
                 .await?;
             Ok(response.into_inner())
         })
@@ -581,7 +659,7 @@ impl ApiClient {
 
     pub fn delete_bank(&self, bank_id: &str, _verbose: bool) -> Result<types::DeleteResponse> {
         self.runtime.block_on(async {
-            let response = self.client.delete_bank(bank_id, None).await?;
+            let response = self.client.delete_bank(bank_id, None).humanized().await?;
             Ok(response.into_inner())
         })
     }
@@ -601,7 +679,11 @@ impl ApiClient {
         _verbose: bool,
     ) -> Result<serde_json::Value> {
         self.runtime.block_on(async {
-            let response = self.client.get_memory(bank_id, memory_id, None).await?;
+            let response = self
+                .client
+                .get_memory(bank_id, memory_id, None)
+                .humanized()
+                .await?;
             Ok(response.into_inner())
         })
     }
@@ -618,6 +700,7 @@ impl ApiClient {
             let response = self
                 .client
                 .create_or_update_bank(bank_id, None, request)
+                .humanized()
                 .await?;
             Ok(response.into_inner())
         })
@@ -630,7 +713,11 @@ impl ApiClient {
         _verbose: bool,
     ) -> Result<types::BankProfileResponse> {
         self.runtime.block_on(async {
-            let response = self.client.update_bank(bank_id, None, request).await?;
+            let response = self
+                .client
+                .update_bank(bank_id, None, request)
+                .humanized()
+                .await?;
             Ok(response.into_inner())
         })
     }
@@ -649,7 +736,11 @@ impl ApiClient {
                 disposition: None,
                 ..Default::default()
             };
-            let response = self.client.update_bank(bank_id, None, &request).await?;
+            let response = self
+                .client
+                .update_bank(bank_id, None, &request)
+                .humanized()
+                .await?;
             Ok(response.into_inner())
         })
     }
@@ -664,7 +755,18 @@ impl ApiClient {
         self.runtime.block_on(async {
             let response = self
                 .client
-                .get_graph(bank_id, None, None, limit, None, None, None, type_filter, None)
+                .get_graph(
+                    bank_id,
+                    None,
+                    None,
+                    limit.map(|l| l as u64),
+                    None,
+                    None,
+                    None,
+                    type_filter,
+                    None,
+                )
+                .humanized()
                 .await?;
             Ok(response.into_inner())
         })
@@ -676,7 +778,11 @@ impl ApiClient {
         _verbose: bool,
     ) -> Result<types::BankConfigResponse> {
         self.runtime.block_on(async {
-            let response = self.client.get_bank_config(bank_id, None).await?;
+            let response = self
+                .client
+                .get_bank_config(bank_id, None)
+                .humanized()
+                .await?;
             Ok(response.into_inner())
         })
     }
@@ -697,6 +803,7 @@ impl ApiClient {
             let response = self
                 .client
                 .update_bank_config(bank_id, None, &request)
+                .humanized()
                 .await?;
             Ok(response.into_inner())
         })
@@ -708,7 +815,11 @@ impl ApiClient {
         _verbose: bool,
     ) -> Result<types::BankConfigResponse> {
         self.runtime.block_on(async {
-            let response = self.client.reset_bank_config(bank_id, None).await?;
+            let response = self
+                .client
+                .reset_bank_config(bank_id, None)
+                .humanized()
+                .await?;
             Ok(response.into_inner())
         })
     }
@@ -726,7 +837,15 @@ impl ApiClient {
         self.runtime.block_on(async {
             let response = self
                 .client
-                .list_tags(bank_id, limit, offset, q, None, None)
+                .list_tags(
+                    bank_id,
+                    limit.map(|l| l as u64),
+                    offset.map(|o| o as u64),
+                    q,
+                    None,
+                    None,
+                )
+                .humanized()
                 .await?;
             Ok(response.into_inner())
         })
@@ -736,7 +855,7 @@ impl ApiClient {
 
     pub fn get_chunk(&self, chunk_id: &str, _verbose: bool) -> Result<types::ChunkResponse> {
         self.runtime.block_on(async {
-            let response = self.client.get_chunk(chunk_id, None).await?;
+            let response = self.client.get_chunk(chunk_id, None).humanized().await?;
             Ok(response.into_inner())
         })
     }
@@ -753,6 +872,7 @@ impl ApiClient {
             let response = self
                 .client
                 .get_operation_status(bank_id, operation_id, None, None)
+                .humanized()
                 .await?;
             Ok(response.into_inner())
         })
@@ -762,14 +882,18 @@ impl ApiClient {
 
     pub fn health(&self, _verbose: bool) -> Result<serde_json::Value> {
         self.runtime.block_on(async {
-            let response = self.client.health_endpoint_health_get().await?;
+            let response = self.client.health_endpoint_health_get().humanized().await?;
             Ok(response.into_inner())
         })
     }
 
     pub fn metrics(&self, _verbose: bool) -> Result<serde_json::Value> {
         self.runtime.block_on(async {
-            let response = self.client.metrics_endpoint_metrics_get().await?;
+            let response = self
+                .client
+                .metrics_endpoint_metrics_get()
+                .humanized()
+                .await?;
             Ok(response.into_inner())
         })
     }
@@ -779,12 +903,22 @@ impl ApiClient {
     pub fn list_mental_models(
         &self,
         bank_id: &str,
-        _verbose: bool,
+        verbose: bool,
     ) -> Result<types::MentalModelListResponse> {
+        // The endpoint defaults to `metadata`, which omits the content this
+        // command previews (and that scripts read out of `--output json`), so
+        // ask for it explicitly. `--verbose` additionally pulls the heavyweight
+        // reflect_response provenance chains.
+        let detail = if verbose {
+            types::Detail::Full
+        } else {
+            types::Detail::Content
+        };
         self.runtime.block_on(async {
             let response = self
                 .client
-                .list_mental_models(bank_id, None, None, None, None, None, None)
+                .list_mental_models(bank_id, Some(detail), None, None, None, None, None)
+                .humanized()
                 .await?;
             Ok(response.into_inner())
         })
@@ -800,6 +934,7 @@ impl ApiClient {
             let response = self
                 .client
                 .get_mental_model(bank_id, mental_model_id, None, None)
+                .humanized()
                 .await?;
             Ok(response.into_inner())
         })
@@ -815,6 +950,7 @@ impl ApiClient {
             let response = self
                 .client
                 .create_mental_model(bank_id, None, request)
+                .humanized()
                 .await?;
             Ok(response.into_inner())
         })
@@ -831,6 +967,7 @@ impl ApiClient {
             let response = self
                 .client
                 .update_mental_model(bank_id, mental_model_id, None, request)
+                .humanized()
                 .await?;
             Ok(response.into_inner())
         })
@@ -846,6 +983,7 @@ impl ApiClient {
             let response = self
                 .client
                 .delete_mental_model(bank_id, mental_model_id, None)
+                .humanized()
                 .await?;
             Ok(response.into_inner())
         })
@@ -861,6 +999,23 @@ impl ApiClient {
             let response = self
                 .client
                 .refresh_mental_model(bank_id, mental_model_id, None)
+                .humanized()
+                .await?;
+            Ok(response.into_inner())
+        })
+    }
+
+    pub fn dry_run_refresh_mental_model(
+        &self,
+        bank_id: &str,
+        mental_model_id: &str,
+        _verbose: bool,
+    ) -> Result<types::MentalModelDryRunRefreshResult> {
+        self.runtime.block_on(async {
+            let response = self
+                .client
+                .dry_run_refresh_mental_model(bank_id, mental_model_id, None)
+                .humanized()
                 .await?;
             Ok(response.into_inner())
         })
@@ -876,6 +1031,137 @@ impl ApiClient {
             let response = self
                 .client
                 .get_mental_model_history(bank_id, mental_model_id, None)
+                .humanized()
+                .await?;
+            Ok(response.into_inner())
+        })
+    }
+
+    // --- Knowledge Base Methods ---
+
+    pub fn get_knowledge_base_tree(
+        &self,
+        bank_id: &str,
+        _verbose: bool,
+    ) -> Result<types::KnowledgeTreeResponse> {
+        self.runtime.block_on(async {
+            let response = self
+                .client
+                .get_knowledge_base_tree(bank_id, None)
+                .humanized()
+                .await?;
+            Ok(response.into_inner())
+        })
+    }
+
+    pub fn create_knowledge_folder(
+        &self,
+        bank_id: &str,
+        request: &types::CreateFolderRequest,
+        _verbose: bool,
+    ) -> Result<types::KnowledgeNode> {
+        self.runtime.block_on(async {
+            let response = self
+                .client
+                .create_knowledge_folder(bank_id, None, request)
+                .humanized()
+                .await?;
+            Ok(response.into_inner())
+        })
+    }
+
+    pub fn create_knowledge_page(
+        &self,
+        bank_id: &str,
+        request: &types::CreatePageRequest,
+        _verbose: bool,
+    ) -> Result<types::CreateKnowledgePageResponse> {
+        self.runtime.block_on(async {
+            let response = self
+                .client
+                .create_knowledge_page(bank_id, None, request)
+                .humanized()
+                .await?;
+            Ok(response.into_inner())
+        })
+    }
+
+    pub fn get_knowledge_page(
+        &self,
+        bank_id: &str,
+        page_id: &str,
+        _verbose: bool,
+    ) -> Result<types::KnowledgePageResponse> {
+        self.runtime.block_on(async {
+            let response = self
+                .client
+                .get_knowledge_page(bank_id, page_id, None)
+                .humanized()
+                .await?;
+            Ok(response.into_inner())
+        })
+    }
+
+    pub fn search_knowledge_base(
+        &self,
+        bank_id: &str,
+        query: &types::Q,
+        limit: Option<std::num::NonZeroU64>,
+        _verbose: bool,
+    ) -> Result<types::KnowledgePageSearchResponse> {
+        self.runtime.block_on(async {
+            let response = self
+                .client
+                .search_knowledge_base(bank_id, limit, query, None)
+                .humanized()
+                .await?;
+            Ok(response.into_inner())
+        })
+    }
+
+    pub fn update_knowledge_node(
+        &self,
+        bank_id: &str,
+        node_id: &str,
+        request: &types::UpdateNodeRequest,
+        _verbose: bool,
+    ) -> Result<types::KnowledgeNode> {
+        self.runtime.block_on(async {
+            let response = self
+                .client
+                .update_knowledge_node(bank_id, node_id, None, request)
+                .humanized()
+                .await?;
+            Ok(response.into_inner())
+        })
+    }
+
+    pub fn delete_knowledge_node(
+        &self,
+        bank_id: &str,
+        node_id: &str,
+        _verbose: bool,
+    ) -> Result<serde_json::Value> {
+        self.runtime.block_on(async {
+            let response = self
+                .client
+                .delete_knowledge_node(bank_id, node_id, None)
+                .humanized()
+                .await?;
+            Ok(response.into_inner())
+        })
+    }
+
+    pub fn export_knowledge_base(
+        &self,
+        bank_id: &str,
+        _verbose: bool,
+    ) -> Result<types::KnowledgePageBundleResponse> {
+        self.runtime.block_on(async {
+            let response = self
+                .client
+                .export_knowledge_base(bank_id, None)
+                .humanized()
                 .await?;
             Ok(response.into_inner())
         })
@@ -892,6 +1178,7 @@ impl ApiClient {
             let response = self
                 .client
                 .list_directives(bank_id, None, None, None, None, None, None)
+                .humanized()
                 .await?;
             Ok(response.into_inner())
         })
@@ -907,6 +1194,7 @@ impl ApiClient {
             let response = self
                 .client
                 .get_directive(bank_id, directive_id, None)
+                .humanized()
                 .await?;
             Ok(response.into_inner())
         })
@@ -919,7 +1207,11 @@ impl ApiClient {
         _verbose: bool,
     ) -> Result<types::DirectiveResponse> {
         self.runtime.block_on(async {
-            let response = self.client.create_directive(bank_id, None, request).await?;
+            let response = self
+                .client
+                .create_directive(bank_id, None, request)
+                .humanized()
+                .await?;
             Ok(response.into_inner())
         })
     }
@@ -935,6 +1227,7 @@ impl ApiClient {
             let response = self
                 .client
                 .update_directive(bank_id, directive_id, None, request)
+                .humanized()
                 .await?;
             Ok(response.into_inner())
         })
@@ -950,6 +1243,7 @@ impl ApiClient {
             let response = self
                 .client
                 .delete_directive(bank_id, directive_id, None)
+                .humanized()
                 .await?;
             Ok(response.into_inner())
         })
@@ -967,6 +1261,7 @@ impl ApiClient {
             let response = self
                 .client
                 .trigger_consolidation(bank_id, None, &body)
+                .humanized()
                 .await?;
             Ok(response.into_inner())
         })
@@ -978,7 +1273,11 @@ impl ApiClient {
         _verbose: bool,
     ) -> Result<types::DeleteResponse> {
         self.runtime.block_on(async {
-            let response = self.client.clear_observations(bank_id, None).await?;
+            let response = self
+                .client
+                .clear_observations(bank_id, None)
+                .humanized()
+                .await?;
             Ok(response.into_inner())
         })
     }
@@ -987,7 +1286,7 @@ impl ApiClient {
 
     pub fn get_version(&self, _verbose: bool) -> Result<types::VersionResponse> {
         self.runtime.block_on(async {
-            let response = self.client.get_version().await?;
+            let response = self.client.get_version().humanized().await?;
             Ok(response.into_inner())
         })
     }
@@ -1007,7 +1306,11 @@ impl ApiClient {
         _verbose: bool,
     ) -> Result<types::WebhookListResponse> {
         self.runtime.block_on(async {
-            let response = self.client.list_webhooks(bank_id, None).await?;
+            let response = self
+                .client
+                .list_webhooks(bank_id, None, None, None)
+                .humanized()
+                .await?;
             Ok(response.into_inner())
         })
     }
@@ -1019,7 +1322,11 @@ impl ApiClient {
         _verbose: bool,
     ) -> Result<types::WebhookResponse> {
         self.runtime.block_on(async {
-            let response = self.client.create_webhook(bank_id, None, request).await?;
+            let response = self
+                .client
+                .create_webhook(bank_id, None, request)
+                .humanized()
+                .await?;
             Ok(response.into_inner())
         })
     }
@@ -1035,6 +1342,7 @@ impl ApiClient {
             let response = self
                 .client
                 .update_webhook(bank_id, webhook_id, None, request)
+                .humanized()
                 .await?;
             Ok(response.into_inner())
         })
@@ -1050,6 +1358,7 @@ impl ApiClient {
             let response = self
                 .client
                 .delete_webhook(bank_id, webhook_id, None)
+                .humanized()
                 .await?;
             Ok(response.into_inner())
         })
@@ -1067,6 +1376,7 @@ impl ApiClient {
             let response = self
                 .client
                 .list_webhook_deliveries(bank_id, webhook_id, cursor, limit, None)
+                .humanized()
                 .await?;
             Ok(response.into_inner())
         })
@@ -1092,6 +1402,7 @@ impl ApiClient {
                 .list_audit_logs(
                     bank_id, action, end_date, limit_nz, offset, start_date, transport, None,
                 )
+                .humanized()
                 .await?;
             Ok(response.into_inner())
         })
@@ -1108,6 +1419,7 @@ impl ApiClient {
             let response = self
                 .client
                 .audit_log_stats(bank_id, action, period, None)
+                .humanized()
                 .await?;
             Ok(response.into_inner())
         })
@@ -1117,7 +1429,7 @@ impl ApiClient {
 
     pub fn get_bank_template_schema(&self, _verbose: bool) -> Result<serde_json::Value> {
         self.runtime.block_on(async {
-            let response = self.client.get_bank_template_schema().await?;
+            let response = self.client.get_bank_template_schema().humanized().await?;
             Ok(response.into_inner())
         })
     }
@@ -1128,14 +1440,20 @@ impl ApiClient {
         _verbose: bool,
     ) -> Result<types::BankTemplateManifest> {
         self.runtime.block_on(async {
-            let response = self.client.export_bank_template(bank_id, None).await?;
+            let response = self
+                .client
+                .export_bank_template(bank_id, None)
+                .humanized()
+                .await?;
             Ok(response.into_inner())
         })
     }
 
-    /// Import a bank template manifest. The OpenAPI spec does not declare a
-    /// request body for this endpoint, so the progenitor-generated client does
-    /// not expose one — we POST the manifest JSON via raw HTTP instead.
+    /// Import a bank template manifest via the JSON endpoint.
+    ///
+    /// The CLI keeps using its direct HTTP path here so it can accept the
+    /// manifest as an untyped JSON value; the generated Rust client now also
+    /// exposes the typed request body from the OpenAPI schema.
     pub fn import_bank_template(
         &self,
         bank_id: &str,
@@ -1176,6 +1494,7 @@ impl ApiClient {
             let response = self
                 .client
                 .update_document(bank_id, document_id, None, &request)
+                .humanized()
                 .await?;
             Ok(response.into_inner())
         })
@@ -1193,6 +1512,7 @@ impl ApiClient {
             let response = self
                 .client
                 .get_observation_history(bank_id, memory_id, None)
+                .humanized()
                 .await?;
             Ok(response.into_inner())
         })
@@ -1208,6 +1528,7 @@ impl ApiClient {
             let response = self
                 .client
                 .clear_memory_observations(bank_id, memory_id, None)
+                .humanized()
                 .await?;
             Ok(response.into_inner())
         })
@@ -1225,6 +1546,23 @@ impl ApiClient {
             let response = self
                 .client
                 .retry_operation(bank_id, operation_id, None)
+                .humanized()
+                .await?;
+            Ok(response.into_inner())
+        })
+    }
+
+    pub fn delete_operation(
+        &self,
+        bank_id: &str,
+        operation_id: &str,
+        _verbose: bool,
+    ) -> Result<types::DeleteOperationResponse> {
+        self.runtime.block_on(async {
+            let response = self
+                .client
+                .delete_operation(bank_id, operation_id, None)
+                .humanized()
                 .await?;
             Ok(response.into_inner())
         })
@@ -1238,39 +1576,32 @@ impl ApiClient {
         _verbose: bool,
     ) -> Result<types::RecoverConsolidationResponse> {
         self.runtime.block_on(async {
-            let response = self.client.recover_consolidation(bank_id, None).await?;
+            let response = self
+                .client
+                .recover_consolidation(bank_id, None)
+                .humanized()
+                .await?;
             Ok(response.into_inner())
         })
     }
 
     // --- Bank Disposition ---
 
-    pub fn update_bank_disposition(
+    /// Disposition traits are bank configuration; there is no profile endpoint.
+    pub fn set_bank_disposition(
         &self,
         bank_id: &str,
         skepticism: u64,
         literalism: u64,
         empathy: u64,
-        _verbose: bool,
-    ) -> Result<types::BankProfileResponse> {
-        self.runtime.block_on(async {
-            let to_nz = |v: u64| -> Result<std::num::NonZeroU64> {
-                std::num::NonZeroU64::new(v)
-                    .ok_or_else(|| anyhow::anyhow!("disposition traits must be 1-5"))
-            };
-            let request = types::UpdateDispositionRequest {
-                disposition: types::DispositionTraits {
-                    skepticism: to_nz(skepticism)?,
-                    literalism: to_nz(literalism)?,
-                    empathy: to_nz(empathy)?,
-                },
-            };
-            let response = self
-                .client
-                .update_bank_disposition(bank_id, None, &request)
-                .await?;
-            Ok(response.into_inner())
-        })
+        verbose: bool,
+    ) -> Result<types::BankConfigResponse> {
+        let updates = std::collections::HashMap::from([
+            ("disposition_skepticism".to_string(), skepticism.into()),
+            ("disposition_literalism".to_string(), literalism.into()),
+            ("disposition_empathy".to_string(), empathy.into()),
+        ]);
+        self.update_bank_config(bank_id, updates, verbose)
     }
 }
 
@@ -1285,11 +1616,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn default_headers_set_cli_user_agent_without_api_key() {
+        let headers = default_headers(None).unwrap();
+
+        assert_eq!(
+            headers.get(reqwest::header::USER_AGENT).unwrap(),
+            DEFAULT_CLI_USER_AGENT,
+        );
+        assert!(!headers.contains_key(reqwest::header::AUTHORIZATION));
+    }
+
+    #[test]
+    fn default_headers_keep_authorization_with_cli_user_agent() {
+        let headers = default_headers(Some("hsk_test")).unwrap();
+
+        assert_eq!(
+            headers.get(reqwest::header::USER_AGENT).unwrap(),
+            DEFAULT_CLI_USER_AGENT,
+        );
+        assert_eq!(
+            headers.get(reqwest::header::AUTHORIZATION).unwrap(),
+            "Bearer hsk_test",
+        );
+    }
+
+    #[test]
     fn test_operation_deserialize() {
         let json = r#"{
             "id": "test-op-123",
             "task_type": "retain",
             "items_count": 5,
+            "filename": "notes.md",
             "document_id": "doc-456",
             "created_at": "2024-01-15T10:00:00Z",
             "status": "pending",
@@ -1299,6 +1656,7 @@ mod tests {
         assert_eq!(op.id, "test-op-123");
         assert_eq!(op.task_type, "retain");
         assert_eq!(op.items_count, 5);
+        assert_eq!(op.filename, Some("notes.md".to_string()));
         assert_eq!(op.document_id, Some("doc-456".to_string()));
         assert_eq!(op.status, "pending");
         assert!(op.error_message.is_none());
@@ -1310,6 +1668,7 @@ mod tests {
             "id": "test-op-456",
             "task_type": "retain",
             "items_count": 3,
+            "filename": null,
             "document_id": null,
             "created_at": "2024-01-15T10:00:00Z",
             "status": "failed",
@@ -1317,6 +1676,7 @@ mod tests {
         }"#;
         let op: Operation = serde_json::from_str(json).unwrap();
         assert_eq!(op.status, "failed");
+        assert_eq!(op.filename, None);
         assert_eq!(op.error_message, Some("Something went wrong".to_string()));
     }
 
@@ -1358,6 +1718,7 @@ mod tests {
                     "id": "op-1",
                     "task_type": "retain",
                     "items_count": 2,
+                    "filename": "first.md",
                     "document_id": null,
                     "created_at": "2024-01-15T10:00:00Z",
                     "status": "pending",
@@ -1367,6 +1728,7 @@ mod tests {
                     "id": "op-2",
                     "task_type": "retain",
                     "items_count": 3,
+                    "filename": null,
                     "document_id": "doc-123",
                     "created_at": "2024-01-15T11:00:00Z",
                     "status": "completed",
@@ -1378,6 +1740,8 @@ mod tests {
         assert_eq!(ops.bank_id, "test-bank");
         assert_eq!(ops.operations.len(), 2);
         assert_eq!(ops.operations[0].status, "pending");
+        assert_eq!(ops.operations[0].filename, Some("first.md".to_string()));
         assert_eq!(ops.operations[1].status, "completed");
+        assert_eq!(ops.operations[1].filename, None);
     }
 }

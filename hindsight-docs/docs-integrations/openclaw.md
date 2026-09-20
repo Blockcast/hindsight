@@ -106,7 +106,6 @@ Optional settings in `~/.openclaw/openclaw.json`:
         "enabled": true,
         "config": {
           "apiPort": 9077,
-          "daemonIdleTimeout": 0,
           "embedVersion": "latest"
         }
       }
@@ -116,17 +115,25 @@ Optional settings in `~/.openclaw/openclaw.json`:
 ```
 
 **Options:**
+
 - `apiPort` - Port for the openclaw profile daemon (default: `9077`)
-- `daemonIdleTimeout` - Seconds before daemon shuts down from inactivity (default: `0` = never)
 - `embedVersion` - hindsight-embed version (default: `"latest"`)
 - `llmProvider` - LLM provider for memory extraction (`openai`, `anthropic`, `gemini`, `groq`, `ollama`, `openai-codex`, `claude-code`). Required unless `hindsightApiUrl` is set.
 - `llmModel` - LLM model used with `llmProvider` (provider default if omitted)
 - `llmApiKey` - API key for the LLM provider. **Sensitive** — set via `openclaw config set ... --ref-source env --ref-id OPENAI_API_KEY` to reference an env var.
 - `llmBaseUrl` - Optional base URL override for OpenAI-compatible providers (e.g. `https://openrouter.ai/api/v1`)
-- `bankMission` - Agent identity/purpose stored on the memory bank. Helps the memory engine understand context for better fact extraction during retain. Set once per bank on first use — not a recall prompt.
+- `bankMission` - Agent identity/purpose stored on the memory bank's `reflect_mission`. **Only affects `reflect`** — does not steer retain or recall. Set once per bank on first use.
+- `retainMission` - Stamped onto the bank's `retain_mission` on first use. Steers what gets extracted as facts during retain.
+- `observationsMission` - Stamped onto the bank's `observations_mission` on first use. Controls what gets synthesised into observations during consolidation.
+- `retainExtractionMode` - Fact extraction mode stamped on first bank use: `concise`, `verbose`, `custom`, `verbatim`, or `chunks`. Leave unset to keep the server default.
+- `enableObservations` - Toggle observation consolidation after retain, stamped on first bank use.
+- `enableAutoConsolidation` - Toggle automatic consolidation scheduling, stamped on first bank use (via the bank config API).
+- `dispositionSkepticism` / `dispositionLiteralism` / `dispositionEmpathy` - Reflect disposition traits (`1`–`5`) stamped on first bank use.
+- `entityLabels` - Controlled vocabulary for entity labels. Either a list of attribute defs (e.g. `[{ "name": "person", "description": "Human user" }]`) or a `{ "attributes": [...] }` object; other shapes are ignored. Stamped on first bank use.
 - `dynamicBankId` - Enable per-context memory banks (default: `true`)
 - `bankId` - Static bank ID used when `dynamicBankId` is `false`.
 - `bankIdPrefix` - Optional prefix for bank IDs (e.g. `"prod"` → `"prod-slack-C123"` or `"prod-shared-bank"`)
+- `agentBankMap` - Explicit `agentId` → `bankId` routing, checked before static/dynamic derivation. Lets a group of agents share one named bank while other agents keep their derived banks. Mapped names are used exactly as given (`bankIdPrefix` is not applied).
 - `dynamicBankGranularity` - Fields used to derive bank ID: `agent`, `channel`, `user`, `provider` (default: `["agent", "channel", "user"]`)
 - `excludeProviders` - Message providers to skip for recall/retain (e.g. `["slack"]`, `["telegram"]`, `["discord"]`)
 - `autoRecall` - Auto-inject memories before each turn (default: `true`). Set to `false` when the agent has its own recall tool.
@@ -136,17 +143,20 @@ Optional settings in `~/.openclaw/openclaw.json`:
 - `recallMaxTokens` - Max tokens for recall response (default: `1024`). Controls how much memory context is injected per turn.
 - `recallTopK` - Max number of memories to inject per turn (default: unlimited).
 - `recallTypes` - Memory types to recall (default: `["observation"]`). Options: `world`, `experience`, `observation`. Defaults to observations — the consolidated, deduplicated view — to avoid surfacing the same answer multiple times when many raw memories say the same thing.
+- `preferObservations` - When `true`, recall drops raw facts already consolidated into an observation while keeping unconsolidated ones (default: `false`). Pair it with a `recallTypes` that includes raw types (e.g. `["observation", "world", "experience"]`) to surface just-retained facts before consolidation catches up — for example after a `/reset` followed by "what did I just say?" — without duplicating already-consolidated content.
+- `recallMinScores` - Optional score floors for auto-recall, keyed by stage (for example `{"reranker": 0.3}`). Missing fields impose no floor; memories with missing or `null` scores pass. Reranker scores are query-local, so use this as a garbage gate rather than a calibrated relevance dial.
 - `recallContextTurns` - Number of prior user turns to include in the recall query (default: `1`).
 - `recallMaxQueryChars` - Max characters for the composed recall query (default: `800`).
 - `recallPromptPreamble` - Custom preamble text placed above recalled memories. Overrides the built-in guidance text.
-- `recallInjectionPosition` - Where to inject recalled memories: `"prepend"` (default), `"append"`, or `"user"`. Use `"append"` to preserve prompt caching with large static system prompts. Use `"user"` to inject before the user message instead of in the system prompt.
+- `recallInjectionPosition` - Where to inject recalled memories: `"user"` (default), `"prepend"`, or `"append"`. The default injects before the user message and preserves the system prompt cache. Use `"prepend"` or `"append"` when memories need system-level context.
 - `recallRoles` - Which message roles to include when composing the contextual recall query (default: `["user", "assistant"]`).
 - `retainEveryNTurns` - Retain every Nth turn (default: `1` = every turn). Values > 1 enable chunked retention.
+- `senderPrefixPattern` - Regex matching a human display-name prefix that some channels prepend to the user's text (e.g. `Alice: today weather?`). Supply the name part only — `Alice|Bob` or `[A-Za-z ]{1,20}` — the `:` separator and anchoring are added by the plugin. When set, the prefix is stripped from both the recall query and the retained transcript, so the sender's name no longer pollutes vector search or get extracted as a fact. Unset (default) strips nothing; an invalid regex is ignored.
 - `retainOverlapTurns` - Extra prior turns included when chunked retention fires (default: `0`).
 - `enableKnowledgeTools` - Register `agent_knowledge_*` tools for explicit agent-driven lookup, reflection, ingest, and knowledge-page management (default: `false`).
 - `debug` - Enable debug logging (default: `false`).
 
-When using `agent_knowledge_recall` manually, pass `max_tokens` to control how much memory text the recall response may contain. Do not use `max_results` for this tool; OpenClaw auto-recall uses `recallTopK` when you need a count cap for automatically injected memories.
+When using `agent_knowledge_recall` manually, pass `max_tokens` to control how much memory text the recall response may contain. The tool has no `max_results` parameter — to cap the number of automatically injected memories, use `recallTopK` on auto-recall instead. When the answer needs verbatim wording or an exact number rather than an extracted fact, pass `include_chunks: true` to also get the raw source text those memories came from, and `max_chunk_tokens` to bound it (default `8192`).
 
 When using `agent_knowledge_reflect`, keep the default conservative settings unless you intentionally need a deeper synthesis: `budget` defaults to `low`, `max_tokens` defaults to `1024`, and `fact_types` defaults to `world`, `experience`, and `observation`. Reflect calls can be more expensive than recall because they retrieve memories and then call the configured Reflect LLM to generate an answer. For production banks, set a finite bank-level `reflect_source_facts_max_tokens` value (for example `4096` or `8192`) instead of leaving it unlimited, so ad-hoc reflection cannot pull an unbounded amount of source facts into the LLM context.
 
@@ -174,12 +184,77 @@ You can customize which fields are used for bank segmentation with `dynamicBankG
 In this example, memories are isolated per provider + user, meaning the same user shares memories across all channels within a provider.
 
 Available isolation fields:
+
 - `agent` - The agent/bot identity
 - `channel` - The channel or conversation ID
 - `user` - The user interacting with the agent
 - `provider` - The message provider (e.g. Slack, Discord)
 
 Use `bankIdPrefix` to namespace bank IDs across environments (e.g. `"prod"`, `"staging"`). Set `dynamicBankId` to `false` to use a single shared bank for all conversations. In static mode, the plugin uses `bankId` if set, otherwise the default `openclaw` bank name.
+
+#### Mixing shared and isolated banks
+
+Those two modes are all-or-nothing. When you run several agents in one gateway and want some of them to share knowledge while others stay isolated, use `agentBankMap`:
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "hindsight-openclaw": {
+        "enabled": true,
+        "config": {
+          "dynamicBankId": true,
+          "dynamicBankGranularity": ["agent", "channel", "user"],
+          "agentBankMap": {
+            "inbound": "ps-technology",
+            "outbound": "ps-technology",
+            "limpieza": "ps-limpieza"
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+The `inbound` and `outbound` agents share the `ps-technology` bank, `limpieza` writes to `ps-limpieza`, and any agent not listed keeps the bank it would otherwise derive. The map is checked before both static and dynamic derivation, so it also takes precedence over a configured `bankId`.
+
+Agent ids are matched exactly (case-sensitive), and mapped bank names are used exactly as written — `bankIdPrefix` is not applied to them. Mapped banks still receive your configured bank defaults on first use, and auto-recall, auto-retain and the knowledge tools all resolve the same mapped bank.
+
+### Per-user bank defaults
+
+With `dynamicBankId` enabled (the default), each derived bank otherwise inherits only the Hindsight **server** defaults (`concise` extraction, no entity labels, etc.). To make every per-user bank match your intended base/shared bank, set the bank-default options below — they are stamped onto each bank **on first use**, before its first retain or recall:
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "hindsight-openclaw": {
+        "enabled": true,
+        "config": {
+          "dynamicBankId": true,
+          "dynamicBankGranularity": ["agent", "channel", "user"],
+          "retainExtractionMode": "verbose",
+          "enableObservations": true,
+          "enableAutoConsolidation": true,
+          "dispositionSkepticism": 3,
+          "dispositionLiteralism": 3,
+          "dispositionEmpathy": 4,
+          "entityLabels": [
+            { "name": "person", "description": "A human user or contact" },
+            { "name": "project", "description": "A software project or product" }
+          ],
+          "retainMission": "Extract durable preferences, decisions, and project context.",
+          "observationsMission": "Synthesise stable user preferences and active projects.",
+          "bankMission": "You are a helpful assistant with long-term memory across channels."
+        }
+      }
+    }
+  }
+}
+```
+
+Unset options are not sent, so existing behaviour is unchanged when you only configure missions. Each bank is configured at most once per gateway process.
 
 ### Retention Controls
 
@@ -215,15 +290,15 @@ should be stored as `SecretRef` values so they're resolved from env vars,
 mounted files, or `exec`-style secret managers (Vault, etc.) at runtime
 instead of sitting in plaintext on disk.
 
-| Provider | `llmProvider` | API key |
-|---|---|---|
-| OpenAI | `openai` | required |
-| Anthropic | `anthropic` | required |
-| Gemini | `gemini` | required |
-| Groq | `groq` | required |
-| Ollama | `ollama` | not required (local) |
-| Claude Code | `claude-code` | not required (uses Claude Code CLI) |
-| OpenAI Codex | `openai-codex` | not required (uses Codex CLI auth) |
+| Provider     | `llmProvider`  | API key                             |
+| ------------ | -------------- | ----------------------------------- |
+| OpenAI       | `openai`       | required                            |
+| Anthropic    | `anthropic`    | required                            |
+| Gemini       | `gemini`       | required                            |
+| Groq         | `groq`         | required                            |
+| Ollama       | `ollama`       | not required (local)                |
+| Claude Code  | `claude-code`  | not required (uses Claude Code CLI) |
+| OpenAI Codex | `openai-codex` | not required (uses Codex CLI auth)  |
 
 **Set provider + API key:**
 
@@ -297,6 +372,7 @@ Configure in `~/.openclaw/openclaw.json`:
 ```
 
 **Options:**
+
 - `hindsightApiUrl` - Full URL to external Hindsight API (e.g., `https://mcp.hindsight.example.com`)
 - `hindsightApiToken` - API token for authentication (optional). **Sensitive** — set as a SecretRef:
 
@@ -308,6 +384,7 @@ Configure in `~/.openclaw/openclaw.json`:
 #### Behavior
 
 When external API mode is enabled:
+
 - **No local daemon** is started (no hindsight-embed process)
 - **Health check** runs on startup to verify API connectivity
 - **All memory operations** (retain, recall, reflect) go to the external API
@@ -361,6 +438,42 @@ uvx hindsight-embed@latest -p openclaw memory list openclaw --limit 10
 # Open web UI (uses openclaw profile's daemon)
 uvx hindsight-embed@latest -p openclaw ui
 ```
+
+## OpenClaw compatibility
+
+The plugin is tested against the current OpenClaw release and against older ones.
+Version 0.12.0 and later work with **OpenClaw 2026.7.x through 2026.9.x**.
+
+**If you are on OpenClaw 2026.8.1 or later, upgrade to plugin 0.12.0.** OpenClaw
+2026.8.1 changed how it labels the conversation metadata it attaches to each
+message. Earlier plugin versions no longer recognised those labels, which caused
+three problems on affected setups:
+
+- Turns were skipped instead of being remembered, with
+  `missing stable sender identity` in the gateway log.
+- OpenClaw's internal routing details (sender and channel IDs) were stored as if
+  they were part of the conversation, so they could surface in later recalls.
+- Automatic recall sometimes searched using that metadata instead of what you
+  actually said, returning irrelevant memories.
+
+  0.12.0 reads both the old and new labels, so it is safe on any supported OpenClaw
+  version — you do not need to match plugin and OpenClaw versions.
+
+Two things to expect after installing on OpenClaw 2026.8.1 or later:
+
+- Install prints
+  `Exclusive slot "memory" switched from "memory-core" to "hindsight-openclaw"`.
+  This is correct: Hindsight replaces OpenClaw's built-in memory.
+- `openclaw plugins doctor` then reports that `memory-core` is not selected for
+  the memory slot. This is expected and not an error — it is OpenClaw noting that
+  its built-in memory stepped aside.
+
+:::note Upgrading from 0.11.1 or earlier
+Installing 0.11.x could fail with
+`npm error Cannot read properties of null (reading 'edgesOut')`. That was a
+packaging problem in the plugin, triggered by a change in the npm registry, and
+it is fixed in 0.12.0 — retry the install with the new version.
+:::
 
 ## Troubleshooting
 
@@ -422,6 +535,20 @@ openclaw config get plugins.entries.hindsight-openclaw.config.llmProvider
 If you used `--ref-source env`, double-check that the referenced env var
 (e.g. `OPENAI_API_KEY`) is exported in the shell that runs `openclaw gateway`.
 
+## Limitations
+
+### `memory-wiki` bridge mode is not supported
+
+`hindsight-openclaw` does not export OpenClaw `publicArtifacts`, so OpenClaw's
+`memory-wiki` **bridge mode** (`vaultMode: "bridge"`) is not supported. With the
+Hindsight plugin active, `openclaw wiki bridge import` imports `0` artifacts and
+`openclaw wiki status` warns that the active memory plugin isn't exporting any
+public memory artifacts.
+
+This applies only to the wiki bridge. Hindsight's own memory works normally —
+retain / recall / reflect, shared banks, and the external-API setup above are all
+unaffected.
+
 ### Verify it's working
 
 Check gateway logs for memory operations:
@@ -447,17 +574,17 @@ previously came from shell env vars must now go through OpenClaw's plugin config
 from `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / etc. — you must set
 `llmProvider` explicitly.
 
-| Old (0.5.x) | New (0.6.0) |
-|---|---|
-| `OPENAI_API_KEY=…` (auto-detected) | `openclaw config set plugins.entries.hindsight-openclaw.config.llmProvider openai` <br/> `openclaw config set plugins.entries.hindsight-openclaw.config.llmApiKey --ref-source env --ref-id OPENAI_API_KEY` |
-| `HINDSIGHT_API_LLM_PROVIDER=…` | `openclaw config set plugins.entries.hindsight-openclaw.config.llmProvider …` |
-| `HINDSIGHT_API_LLM_MODEL=…` | `openclaw config set plugins.entries.hindsight-openclaw.config.llmModel …` |
-| `HINDSIGHT_API_LLM_API_KEY=…` | `openclaw config set plugins.entries.hindsight-openclaw.config.llmApiKey --ref-source env --ref-id …` |
-| `HINDSIGHT_API_LLM_BASE_URL=…` | `openclaw config set plugins.entries.hindsight-openclaw.config.llmBaseUrl …` |
-| `HINDSIGHT_EMBED_API_URL=…` | `openclaw config set plugins.entries.hindsight-openclaw.config.hindsightApiUrl …` |
-| `HINDSIGHT_EMBED_API_TOKEN=…` | `openclaw config set plugins.entries.hindsight-openclaw.config.hindsightApiToken --ref-source env --ref-id …` |
-| `HINDSIGHT_BANK_ID=…` | `openclaw config set plugins.entries.hindsight-openclaw.config.bankId …` |
-| `llmApiKeyEnv: "MY_KEY"` (plugin config) | `llmApiKey` configured as a SecretRef with `--ref-id MY_KEY` |
+| Old (0.5.x)                              | New (0.6.0)                                                                                                                                                                                                 |
+| ---------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `OPENAI_API_KEY=…` (auto-detected)       | `openclaw config set plugins.entries.hindsight-openclaw.config.llmProvider openai` <br/> `openclaw config set plugins.entries.hindsight-openclaw.config.llmApiKey --ref-source env --ref-id OPENAI_API_KEY` |
+| `HINDSIGHT_API_LLM_PROVIDER=…`           | `openclaw config set plugins.entries.hindsight-openclaw.config.llmProvider …`                                                                                                                               |
+| `HINDSIGHT_API_LLM_MODEL=…`              | `openclaw config set plugins.entries.hindsight-openclaw.config.llmModel …`                                                                                                                                  |
+| `HINDSIGHT_API_LLM_API_KEY=…`            | `openclaw config set plugins.entries.hindsight-openclaw.config.llmApiKey --ref-source env --ref-id …`                                                                                                       |
+| `HINDSIGHT_API_LLM_BASE_URL=…`           | `openclaw config set plugins.entries.hindsight-openclaw.config.llmBaseUrl …`                                                                                                                                |
+| `HINDSIGHT_EMBED_API_URL=…`              | `openclaw config set plugins.entries.hindsight-openclaw.config.hindsightApiUrl …`                                                                                                                           |
+| `HINDSIGHT_EMBED_API_TOKEN=…`            | `openclaw config set plugins.entries.hindsight-openclaw.config.hindsightApiToken --ref-source env --ref-id …`                                                                                               |
+| `HINDSIGHT_BANK_ID=…`                    | `openclaw config set plugins.entries.hindsight-openclaw.config.bankId …`                                                                                                                                    |
+| `llmApiKeyEnv: "MY_KEY"` (plugin config) | `llmApiKey` configured as a SecretRef with `--ref-id MY_KEY`                                                                                                                                                |
 
 If your shell already exports `OPENAI_API_KEY`, the SecretRef config above
 resolves to the same value at startup — you don't need to change your shell

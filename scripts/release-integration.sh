@@ -13,7 +13,7 @@ print_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
 print_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 print_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
-VALID_INTEGRATIONS=("ag2" "agent-framework" "agentcore" "agno" "ai-sdk" "autogen" "chat" "claude-agent-sdk" "claude-code" "cline" "cloudflare-oauth-proxy" "codex" "composio" "continue" "crewai" "cursor" "cursor-cli" "dify" "flowise" "gemini-spark" "google-adk" "haystack" "langgraph" "litellm" "llamaindex" "n8n" "nemoclaw" "obsidian" "omo" "openai-agents" "openclaw" "opencode" "openhands" "paperclip" "pipecat" "pydantic-ai" "roo-code" "smolagents" "strands" "superagent" "vapi" "zed")
+VALID_INTEGRATIONS=("ag2" "agent-framework" "agent-plugin" "agentcore" "agno" "aider" "ai-sdk" "autogen" "chat" "claude-agent-sdk" "claude-code" "cline" "cloudflare-oauth-proxy" "coding-agents" "codex" "composio" "continue" "copilot-cli" "crewai" "cursor" "cursor-cli" "devin-desktop" "dify" "eliza" "eve" "flowise" "gemini-spark" "github-copilot" "google-adk" "haystack" "langgraph" "litellm" "llamaindex" "n8n" "nemoclaw" "obsidian" "omo" "openai-agents" "openclaw" "opencode" "openhands" "paperclip" "pipecat" "pydantic-ai" "roo-code" "smolagents" "strands" "superagent" "vapi" "zcode" "zed")
 
 usage() {
     print_error "Usage: $0 <integration> <version>"
@@ -58,6 +58,8 @@ get_current_version() {
         grep '"version"' "$dir/package.json" | head -1 | sed 's/.*"version": "\(.*\)".*/\1/'
     elif [ -f "$dir/.claude-plugin/plugin.json" ]; then
         grep '"version"' "$dir/.claude-plugin/plugin.json" | head -1 | sed 's/.*"version": "\(.*\)".*/\1/'
+    elif [ -f "$dir/plugin.json" ]; then
+        grep '"version"' "$dir/plugin.json" | head -1 | sed 's/.*"version": "\(.*\)".*/\1/'
     elif [ -f "$dir/settings.json" ] && grep -q '"version"' "$dir/settings.json"; then
         grep '"version"' "$dir/settings.json" | head -1 | sed 's/.*"version": "\(.*\)".*/\1/'
     else
@@ -151,10 +153,30 @@ elif [ -f "$INTEGRATION_DIR/package.json" ]; then
     print_info "Updating version in $INTEGRATION_DIR/package.json"
     sed -i.bak "s/\"version\": \".*\"/\"version\": \"$VERSION\"/" "$INTEGRATION_DIR/package.json"
     rm "$INTEGRATION_DIR/package.json.bak"
+    # package-lock.json carries the package's own version twice, and the sed above does not touch
+    # it — so every npm release since the lock was committed left it pinned at whatever version it
+    # was born with (coding-agents still said 0.0.5 at v0.3.2). `npm version` rewrites exactly
+    # those two fields and nothing else; `--package-lock-only` was rejected because it re-resolves
+    # dependencies, which would smuggle dependency bumps into a release commit.
+    if [ -f "$INTEGRATION_DIR/package-lock.json" ]; then
+        print_info "Syncing $INTEGRATION_DIR/package-lock.json"
+        (cd "$INTEGRATION_DIR" && npm version "$VERSION" --no-git-tag-version --allow-same-version >/dev/null)
+    fi
+    # coding-agents also ships a root Agent Plugin manifest. Keep its Dcode-visible version in
+    # lockstep with package.json so Dcode's versioned cache cannot retain an older runtime.
+    if [ -f "$INTEGRATION_DIR/plugin.json" ]; then
+        print_info "Updating version in $INTEGRATION_DIR/plugin.json"
+        sed -i.bak "s/\"version\": \".*\"/\"version\": \"$VERSION\"/" "$INTEGRATION_DIR/plugin.json"
+        rm "$INTEGRATION_DIR/plugin.json.bak"
+    fi
 elif [ -f "$INTEGRATION_DIR/.claude-plugin/plugin.json" ]; then
     print_info "Updating version in $INTEGRATION_DIR/.claude-plugin/plugin.json"
     sed -i.bak "s/\"version\": \".*\"/\"version\": \"$VERSION\"/" "$INTEGRATION_DIR/.claude-plugin/plugin.json"
     rm "$INTEGRATION_DIR/.claude-plugin/plugin.json.bak"
+elif [ -f "$INTEGRATION_DIR/plugin.json" ]; then
+    print_info "Updating version in $INTEGRATION_DIR/plugin.json"
+    sed -i.bak "s/\"version\": \".*\"/\"version\": \"$VERSION\"/" "$INTEGRATION_DIR/plugin.json"
+    rm "$INTEGRATION_DIR/plugin.json.bak"
 elif [ -f "$INTEGRATION_DIR/settings.json" ] && grep -q '"version"' "$INTEGRATION_DIR/settings.json"; then
     print_info "Updating version in $INTEGRATION_DIR/settings.json"
     sed -i.bak "s/\"version\": \".*\"/\"version\": \"$VERSION\"/" "$INTEGRATION_DIR/settings.json"
@@ -162,6 +184,18 @@ elif [ -f "$INTEGRATION_DIR/settings.json" ] && grep -q '"version"' "$INTEGRATIO
 else
     print_error "No pyproject.toml, package.json, plugin.json, or versioned settings.json found in $INTEGRATION_DIR"
     exit 1
+fi
+
+# The Claude Code plugin ships via the marketplace manifest (no package
+# registry). `claude plugin marketplace add vectorize-io/hindsight` only ever
+# reads the root .claude-plugin/marketplace.json, so its "version" must be
+# bumped in lockstep with the plugin so the published catalog reflects the new
+# release (see #2386).
+if [ "$INTEGRATION" = "claude-code" ]; then
+    MARKETPLACE_FILE=".claude-plugin/marketplace.json"
+    print_info "Updating marketplace version in $MARKETPLACE_FILE"
+    sed -i.bak "s/\"version\": \".*\"/\"version\": \"$VERSION\"/" "$MARKETPLACE_FILE"
+    rm "$MARKETPLACE_FILE.bak"
 fi
 
 # Generate changelog entry using LLM
@@ -183,6 +217,8 @@ print_info "Regenerating docs skill..."
 # Commit version bump + changelog + regenerated skill together
 print_info "Committing changes..."
 git add "hindsight-integrations/$INTEGRATION/" "hindsight-docs/src/pages/changelog/integrations/$INTEGRATION.md" "skills/"
+# claude-code also bumps the root marketplace manifest (no-op stage for other integrations)
+git add ".claude-plugin/marketplace.json"
 git commit --no-verify -m "release($INTEGRATION): v$VERSION"
 
 # Create annotated tag

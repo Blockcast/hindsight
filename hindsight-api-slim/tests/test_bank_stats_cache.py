@@ -7,11 +7,49 @@ directly so the semantics are checked in isolation from `MemoryEngine`.
 from __future__ import annotations
 
 import asyncio
+import threading
 from typing import Any
 
 import pytest
 
 from hindsight_api.engine.bank_stats_cache import BankStatsCache
+
+
+def test_force_refresh_supersedes_in_flight_loader_on_another_loop() -> None:
+    cache = BankStatsCache(ttl_seconds=60, max_entries=100)
+    old_started = threading.Event()
+    release_old = threading.Event()
+    errors: list[BaseException] = []
+
+    async def old_loader() -> dict[str, str]:
+        old_started.set()
+        while not release_old.is_set():
+            await asyncio.sleep(0.001)
+        return {"value": "old"}
+
+    def load_old() -> None:
+        try:
+            asyncio.run(cache.get_or_load("schema", "bank", old_loader))
+        except BaseException as exc:
+            errors.append(exc)
+
+    old_thread = threading.Thread(target=load_old)
+    old_thread.start()
+    assert old_started.wait(timeout=2)
+
+    async def new_loader() -> dict[str, str]:
+        return {"value": "new"}
+
+    assert asyncio.run(cache.get_or_load("schema", "bank", new_loader, force_refresh=True)) == {"value": "new"}
+    release_old.set()
+    old_thread.join(timeout=2)
+    assert not old_thread.is_alive()
+    assert not errors
+
+    async def should_not_run() -> dict[str, str]:
+        raise AssertionError("fresh force-refresh result should remain cached")
+
+    assert asyncio.run(cache.get_or_load("schema", "bank", should_not_run)) == {"value": "new"}
 
 
 def make_loader(return_value: dict[str, Any]) -> tuple[Any, list[int]]:
@@ -187,6 +225,43 @@ async def test_invalidate_drops_entry() -> None:
 
 
 @pytest.mark.asyncio
+async def test_invalidate_detaches_in_flight_loader() -> None:
+    cache = BankStatsCache(ttl_seconds=60, max_entries=100)
+    stale_started = asyncio.Event()
+    release_stale = asyncio.Event()
+    fresh_started = asyncio.Event()
+
+    async def stale_loader() -> dict[str, Any]:
+        stale_started.set()
+        await release_stale.wait()
+        return {"v": "stale"}
+
+    async def fresh_loader() -> dict[str, Any]:
+        fresh_started.set()
+        return {"v": "fresh"}
+
+    stale_task = asyncio.create_task(cache.get_or_load("schema", "bank", stale_loader))
+    await stale_started.wait()
+    await cache.invalidate("schema", "bank")
+
+    # A request after invalidation must start a new load instead of joining the
+    # pre-invalidation query, which may contain data from before a bank write.
+    fresh_result = await asyncio.wait_for(cache.get_or_load("schema", "bank", fresh_loader), timeout=1)
+    assert fresh_started.is_set()
+    assert fresh_result == {"v": "fresh"}
+
+    release_stale.set()
+    assert await stale_task == {"v": "stale"}
+
+    # The stale loader completed last, but must not overwrite the fresh value.
+    async def should_not_run() -> dict[str, Any]:
+        raise AssertionError("fresh value was not cached")
+
+    cached = await cache.get_or_load("schema", "bank", should_not_run)
+    assert cached == {"v": "fresh"}
+
+
+@pytest.mark.asyncio
 async def test_clear_drops_all_entries() -> None:
     cache = BankStatsCache(ttl_seconds=60, max_entries=100)
     loader, calls = make_loader({"v": 1})
@@ -199,3 +274,27 @@ async def test_clear_drops_all_entries() -> None:
     await cache.get_or_load("s", "a", loader)
     await cache.get_or_load("s", "b", loader)
     assert calls[0] == 4
+
+
+@pytest.mark.asyncio
+async def test_clear_detaches_in_flight_loaders() -> None:
+    cache = BankStatsCache(ttl_seconds=60, max_entries=100)
+    stale_started = asyncio.Event()
+    release_stale = asyncio.Event()
+
+    async def stale_loader() -> dict[str, Any]:
+        stale_started.set()
+        await release_stale.wait()
+        return {"v": "stale"}
+
+    async def fresh_loader() -> dict[str, Any]:
+        return {"v": "fresh"}
+
+    stale_task = asyncio.create_task(cache.get_or_load("schema", "bank", stale_loader))
+    await stale_started.wait()
+    await cache.clear()
+    assert await cache.get_or_load("schema", "bank", fresh_loader) == {"v": "fresh"}
+
+    release_stale.set()
+    assert await stale_task == {"v": "stale"}
+    assert await cache.get_or_load("schema", "bank", fresh_loader) == {"v": "fresh"}

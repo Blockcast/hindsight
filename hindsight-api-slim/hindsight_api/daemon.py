@@ -1,32 +1,42 @@
 """
 Daemon mode support for Hindsight API.
 
-Provides idle timeout for running as a background daemon.
+Provides process detachment for running as a background daemon.
+
+The daemon used to auto-exit after a configurable idle period.  That was
+removed: idleness was measured as "time since the last request *started*", so a
+long retain/reflect/consolidation call that outlived the timeout got SIGTERM'd
+mid-flight (#3903).  A daemon now runs until it is stopped.  ``--idle-timeout``
+is still accepted so existing launchers keep working, but it does nothing.
 """
 
 from __future__ import annotations
 
-import asyncio
-import logging
 import os
 import platform
 import subprocess
 import sys
-import time
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import IO
 
-if TYPE_CHECKING:
-    from typing import IO
-
-logger = logging.getLogger(__name__)
+from .config import ENV_DAEMON_LOG, get_config
 
 # Default daemon configuration
 DEFAULT_DAEMON_PORT = 8888
-DEFAULT_IDLE_TIMEOUT = 0  # 0 = no auto-exit (hindsight-embed passes its own timeout)
 
-# Allow override via environment variable for profile-specific logs
-DAEMON_LOG_PATH = Path(os.getenv("HINDSIGHT_API_DAEMON_LOG", str(Path.home() / ".hindsight" / "daemon.log")))
+
+def daemon_log_path() -> Path:
+    """Where the daemon redirects its stdio (HINDSIGHT_API_DAEMON_LOG).
+
+    Resolved per call, not once at import: this module is imported by ``main`` at
+    module scope, which is *before* ``main()`` runs ``load_dotenv_for_entrypoint()``.
+    Reading the config here at import time would build and cache it from an
+    environment that has not yet had the discovered ``.env`` applied — and since that
+    config is then cached for the process, every later reader would see the wrong
+    values too (a whole `.env` silently ignored).
+    """
+    return Path(get_config().daemon_log or Path.home() / ".hindsight" / "daemon.log")
+
 
 # Internal env var: set by daemonize() in the re-exec'd child so the child
 # skips re-exec and just redirects stdio.  Also set by hindsight-embed's
@@ -35,44 +45,7 @@ DAEMON_LOG_PATH = Path(os.getenv("HINDSIGHT_API_DAEMON_LOG", str(Path.home() / "
 ENV_DAEMON_CHILD = "_HINDSIGHT_DAEMON_CHILD"
 
 
-class IdleTimeoutMiddleware:
-    """ASGI middleware that tracks activity and exits after idle timeout."""
-
-    def __init__(self, app, idle_timeout: int = DEFAULT_IDLE_TIMEOUT):
-        self.app = app
-        self.idle_timeout = idle_timeout
-        self.last_activity = time.time()
-        self._checker_task = None
-
-    async def __call__(self, scope, receive, send):
-        # Update activity timestamp on each request
-        self.last_activity = time.time()
-        await self.app(scope, receive, send)
-
-    def start_idle_checker(self):
-        """Start the background task that checks for idle timeout."""
-        self._checker_task = asyncio.create_task(self._check_idle())
-
-    async def _check_idle(self):
-        """Background task that exits the process after idle timeout."""
-        # If idle_timeout is 0, don't auto-exit
-        if self.idle_timeout <= 0:
-            return
-
-        while True:
-            await asyncio.sleep(30)  # Check every 30 seconds
-            idle_time = time.time() - self.last_activity
-            if idle_time > self.idle_timeout:
-                logger.info(f"Idle timeout reached ({self.idle_timeout}s), shutting down daemon")
-                # Give a moment for any in-flight requests
-                await asyncio.sleep(1)
-                # Send SIGTERM to ourselves to trigger graceful shutdown
-                import signal
-
-                os.kill(os.getpid(), signal.SIGTERM)
-
-
-def _detach_popen_kwargs(log_handle: "IO[bytes]") -> dict:
+def _detach_popen_kwargs(log_handle: IO[bytes]) -> dict:
     """Cross-platform kwargs to spawn a subprocess detached from the caller.
 
     On POSIX, ``start_new_session=True`` calls ``setsid(2)`` so the child
@@ -105,7 +78,7 @@ def _redirect_stdio_to_log() -> None:
 
     Called in the daemon child process after re-exec.
     """
-    DAEMON_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    daemon_log_path().parent.mkdir(parents=True, exist_ok=True)
 
     sys.stdout.flush()
     sys.stderr.flush()
@@ -113,7 +86,7 @@ def _redirect_stdio_to_log() -> None:
     with open(os.devnull, "r") as devnull:
         os.dup2(devnull.fileno(), sys.stdin.fileno())
 
-    log_fd = open(DAEMON_LOG_PATH, "a")
+    log_fd = open(daemon_log_path(), "a")
     os.dup2(log_fd.fileno(), sys.stdout.fileno())
     os.dup2(log_fd.fileno(), sys.stderr.fileno())
 
@@ -142,7 +115,7 @@ def daemonize():
     We still ensure the log directory exists.
     """
     if sys.platform == "win32":
-        DAEMON_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        daemon_log_path().parent.mkdir(parents=True, exist_ok=True)
         return
 
     # If we are already the daemon child (re-exec'd by a previous daemonize()
@@ -161,25 +134,11 @@ def daemonize():
 
     env = os.environ.copy()
     env[ENV_DAEMON_CHILD] = "1"
-    env["HINDSIGHT_API_DAEMON_LOG"] = str(DAEMON_LOG_PATH)
+    env[ENV_DAEMON_LOG] = str(daemon_log_path())
 
-    DAEMON_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    daemon_log_path().parent.mkdir(parents=True, exist_ok=True)
 
-    with open(DAEMON_LOG_PATH, "ab") as log_handle:
+    with open(daemon_log_path(), "ab") as log_handle:
         subprocess.Popen(cmd, env=env, **_detach_popen_kwargs(log_handle))
 
     sys.exit(0)
-
-
-def check_daemon_running(port: int = DEFAULT_DAEMON_PORT) -> bool:
-    """Check if a daemon is running and responsive on the given port."""
-    import socket
-
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(1)
-        result = sock.connect_ex(("127.0.0.1", port))
-        sock.close()
-        return result == 0
-    except Exception:
-        return False

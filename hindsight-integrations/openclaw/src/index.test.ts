@@ -1,18 +1,28 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import { createRequire } from "module";
+import { mkdtempSync, rmSync, writeFileSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import {
+  knowledgeToolDetails,
+  normalizeAgentBankMap,
   stripMemoryTags,
   extractRecallQuery,
   formatCurrentTimeForRecall,
   formatMemories,
   prepareRetentionTranscript,
-  countUserTurns,
-  getRetentionTurnIndex,
   sliceLastTurnsByUserBoundary,
   composeRecallQuery,
   truncateRecallQuery,
   buildRetainRequest,
+  getDocumentIdBootToken,
   meetsMinimumVersion,
+  sessionEndMessagesFromTranscript,
+  parseHindsightApiCapabilities,
+  supportsAppendFromCapabilities,
+  supportsAsyncRetainOperationIdFromCapabilities,
+  createAsyncRetainOperationId,
+  refreshAsyncRetainOperationIdCapability,
   parseSessionKey,
   extractTelegramDirectSenderId,
   resolveSessionIdentity,
@@ -20,12 +30,17 @@ import {
   getIdentitySkipReason,
   isEphemeralOperationalText,
   deriveBankId,
+  resolveBankIdForKnowledgeTools,
   normalizeRetainTags,
   extractInlineRetainTags,
   stripInlineRetainTags,
   stripInlineTimestampPrefix,
   stripRuntimeEnvelope,
+  stripMetadataEnvelopes,
+  extractSenderIdFromText,
+  configureSenderPrefixStripping,
   getPluginConfig,
+  scopeClient,
   formatHookPerf,
   DEFAULT_RETAIN_CONTEXT,
 } from "./index.js";
@@ -296,6 +311,120 @@ describe("formatMemories", () => {
     );
   });
 
+  it("appends a [doc:...] marker when document_id is present", () => {
+    const memories: MemoryResult[] = [
+      makeMemoryResult({
+        id: "1",
+        text: "ComfyUI flux tip",
+        type: "world",
+        mentioned_at: "2026-07-04T00:00:00Z",
+        document_id: "openclaw:agent:main:tg:-1003825475854",
+      }),
+    ];
+    expect(formatMemories(memories)).toBe(
+      "- ComfyUI flux tip [world] (2026-07-04T00:00:00Z) [doc:openclaw:agent:main:tg:-1003825475854]"
+    );
+  });
+
+  it("omits the [doc:...] marker when document_id is missing (e.g. observations)", () => {
+    const memories: MemoryResult[] = [
+      makeMemoryResult({
+        id: "1",
+        text: "User prefers dark mode",
+        type: "observation",
+        mentioned_at: "2026-01-01T00:00:00Z",
+        document_id: null,
+      }),
+    ];
+    const output = formatMemories(memories);
+    expect(output).toBe("- User prefers dark mode [observation] (2026-01-01T00:00:00Z)");
+    expect(output).not.toContain("[doc:");
+  });
+
+  it("omits the [doc:...] marker when document_id is an empty string", () => {
+    const memories: MemoryResult[] = [
+      makeMemoryResult({
+        id: "1",
+        text: "User likes tea",
+        type: "experience",
+        document_id: "",
+      }),
+    ];
+    const output = formatMemories(memories);
+    expect(output).toBe("- User likes tea [experience]");
+    expect(output).not.toContain("[doc:");
+  });
+
+  it("renders a collapsed occurred window when start and end match", () => {
+    const memories: MemoryResult[] = [
+      makeMemoryResult({
+        id: "1",
+        text: "Deployed the new indexer",
+        type: "experience",
+        mentioned_at: "2026-01-20T00:00:00Z",
+        occurred_start: "2026-01-15T10:30:00Z",
+        occurred_end: "2026-01-15T10:30:00Z",
+      }),
+    ];
+    expect(formatMemories(memories)).toBe(
+      "- Deployed the new indexer [experience] (2026-01-20T00:00:00Z) [occurred: 2026-01-15T10:30:00Z]"
+    );
+  });
+
+  it("renders a range when start and end differ", () => {
+    const memories: MemoryResult[] = [
+      makeMemoryResult({
+        id: "1",
+        text: "Visited Paris",
+        type: "experience",
+        occurred_start: "2026-03-01T00:00:00Z",
+        occurred_end: "2026-03-08T00:00:00Z",
+      }),
+    ];
+    expect(formatMemories(memories)).toBe(
+      "- Visited Paris [experience] [occurred: 2026-03-01T00:00:00Z → 2026-03-08T00:00:00Z]"
+    );
+  });
+
+  it("renders an open-ended window when only one bound is present", () => {
+    const startOnly = formatMemories([
+      makeMemoryResult({ text: "Started at Vectorize", occurred_start: "2026-02-01T00:00:00Z" }),
+    ]);
+    expect(startOnly).toBe("- Started at Vectorize [world] [occurred from: 2026-02-01T00:00:00Z]");
+
+    const endOnly = formatMemories([
+      makeMemoryResult({ text: "Left the old team", occurred_end: "2026-02-01T00:00:00Z" }),
+    ]);
+    expect(endOnly).toBe("- Left the old team [world] [occurred until: 2026-02-01T00:00:00Z]");
+  });
+
+  it("orders the occurred window before the [doc:...] marker", () => {
+    const memories: MemoryResult[] = [
+      makeMemoryResult({
+        id: "1",
+        text: "Fixed the LiteLLM port issue",
+        type: "experience",
+        mentioned_at: "2026-01-15T00:00:00Z",
+        occurred_start: "2026-01-14T09:00:00Z",
+        occurred_end: "2026-01-14T11:00:00Z",
+        document_id: "openclaw:agent:main:tg:-1003825475854",
+      }),
+    ];
+    expect(formatMemories(memories)).toBe(
+      "- Fixed the LiteLLM port issue [experience] (2026-01-15T00:00:00Z) " +
+        "[occurred: 2026-01-14T09:00:00Z → 2026-01-14T11:00:00Z] " +
+        "[doc:openclaw:agent:main:tg:-1003825475854]"
+    );
+  });
+
+  it("omits the occurred window when neither bound is present", () => {
+    const output = formatMemories([
+      makeMemoryResult({ text: "User likes tea", occurred_start: null, occurred_end: null }),
+    ]);
+    expect(output).toBe("- User likes tea [world]");
+    expect(output).not.toContain("[occurred");
+  });
+
   it("returns empty string for empty memories", () => {
     expect(formatMemories([])).toBe("");
   });
@@ -320,35 +449,6 @@ describe("formatCurrentTimeForRecall", () => {
 // ---------------------------------------------------------------------------
 // retention helpers
 // ---------------------------------------------------------------------------
-
-describe("countUserTurns", () => {
-  it("counts user messages across a resumed conversation history", () => {
-    expect(
-      countUserTurns([
-        { role: "user", content: "turn 1" },
-        { role: "assistant", content: "reply 1" },
-        { role: "system", content: "meta" },
-        { role: "user", content: "turn 2" },
-        { role: "assistant", content: "reply 2" },
-        { role: "user", content: "turn 3" },
-      ])
-    ).toBe(3);
-  });
-});
-
-describe("getRetentionTurnIndex", () => {
-  it("uses the full conversation turn count for per-turn retention", () => {
-    expect(getRetentionTurnIndex(7, 1)).toBe(7);
-  });
-
-  it("derives a stable window sequence for chunked retention", () => {
-    expect(getRetentionTurnIndex(6, 3)).toBe(2);
-  });
-
-  it("returns null when a chunk boundary has not been reached", () => {
-    expect(getRetentionTurnIndex(5, 3)).toBeNull();
-  });
-});
 
 describe("normalizeRetainTags", () => {
   it("trims, deduplicates, and preserves order for string arrays", () => {
@@ -509,7 +609,9 @@ describe("buildRetainRequest", () => {
       1700000000000,
       { turnIndex: 4, appendSupported: false }
     );
-    expect(request.documentId).toBe("openclaw:agent:main:main:turn:000004");
+    expect(request.documentId).toBe(
+      `openclaw:agent:main:main:turn:${getDocumentIdBootToken()}:000004`
+    );
     expect(request.updateMode).toBeUndefined();
   });
 
@@ -526,8 +628,29 @@ describe("buildRetainRequest", () => {
       1700000000000,
       { turnIndex: 6 }
     );
-    expect(request.documentId).toBe("openclaw:agent:main:main:turn:000006");
+    expect(request.documentId).toBe(
+      `openclaw:agent:main:main:turn:${getDocumentIdBootToken()}:000006`
+    );
     expect(request.updateMode).toBeUndefined();
+  });
+
+  it("stamps a stable per-process boot token into fallback doc ids (#3686)", () => {
+    // The turn counter lives in memory, so it restarts at 1 on every host
+    // restart. The boot token is what keeps the replayed counter from landing
+    // on the previous run's document, which retain would then *replace*.
+    const ctx = { agentId: "main", sessionKey: "agent:main:main" };
+    const first = buildRetainRequest("a", 1, ctx, {}, 1700000000000, { turnIndex: 1 });
+    const second = buildRetainRequest("b", 1, ctx, {}, 1700000000000, { turnIndex: 2 });
+
+    expect(getDocumentIdBootToken()).toMatch(/^[0-9a-f]{8}$/);
+    // Same process → same token, so ids stay comparable within a run.
+    expect(first.documentId).toBe(
+      `openclaw:agent:main:main:turn:${getDocumentIdBootToken()}:000001`
+    );
+    expect(second.documentId).toBe(
+      `openclaw:agent:main:main:turn:${getDocumentIdBootToken()}:000002`
+    );
+    expect(first.documentId).not.toBe(second.documentId);
   });
 
   it("uses window ids and metadata for chunked retention", () => {
@@ -552,7 +675,7 @@ describe("buildRetainRequest", () => {
     );
 
     expect(request.documentId).toBe(
-      "openclaw:agent:agentname:discord:group:123:topic:456:window:000002"
+      `openclaw:agent:agentname:discord:group:123:topic:456:window:${getDocumentIdBootToken()}:000002`
     );
     expect(request.metadata).toMatchObject({
       source: "openclaw",
@@ -1041,6 +1164,45 @@ describe("sliceLastTurnsByUserBoundary", () => {
     const messages = [{ role: "user", content: "Hello" }];
     expect(sliceLastTurnsByUserBoundary(messages, 0)).toEqual([]);
   });
+
+  it("skips synthetic user messages that contain only tool_result blocks", () => {
+    const messages = [
+      { role: "user", content: [{ type: "text", text: "Real user input 1" }] },
+      { role: "assistant", content: [{ type: "text", text: "Assistant reply 1" }] },
+      {
+        role: "user",
+        content: [{ type: "tool_result", content: "Tool output for call 1" }],
+      },
+      {
+        role: "user",
+        content: [{ type: "tool_result", content: "Tool output for call 2" }],
+      },
+      { role: "assistant", content: [{ type: "text", text: "Assistant after tools" }] },
+      { role: "user", content: [{ type: "text", text: "Real user input 2" }] },
+      { role: "assistant", content: [{ type: "text", text: "Assistant reply 2" }] },
+    ];
+    // 3 user turns requested, but only 2 have real text content.
+    // Should fall back to returning all messages.
+    const result = sliceLastTurnsByUserBoundary(messages, 3);
+    expect(result).toEqual(messages);
+  });
+
+  it("uses real user turns when tool_result synthetic messages are present", () => {
+    const messages = [
+      { role: "user", content: [{ type: "text", text: "Real user input 1" }] },
+      { role: "assistant", content: [{ type: "text", text: "Assistant reply 1" }] },
+      {
+        role: "user",
+        content: [{ type: "tool_result", content: "Tool output 1" }],
+      },
+      { role: "assistant", content: [{ type: "text", text: "Assistant after tool 1" }] },
+      { role: "user", content: [{ type: "text", text: "Real user input 2" }] },
+      { role: "assistant", content: [{ type: "text", text: "Assistant reply 2" }] },
+    ];
+    // 2 real user turns. Should start at message 0 (first real user).
+    const result = sliceLastTurnsByUserBoundary(messages, 2);
+    expect(result).toEqual(messages);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1164,6 +1326,12 @@ describe("session identity helpers", () => {
     });
   });
 
+  it("parses Control UI Dashboard sessions", () => {
+    expect(parseSessionKey("agent:main:dashboard:12345678-90ab-cdef-1234-567890abcdef")).toEqual({
+      agentId: "main",
+    });
+  });
+
   it("extracts telegram direct sender ids from channel ids", () => {
     expect(extractTelegramDirectSenderId("direct:12345")).toBe("12345");
     expect(extractTelegramDirectSenderId("group:12345")).toBeUndefined();
@@ -1180,6 +1348,20 @@ describe("session identity helpers", () => {
       messageProvider: "telegram",
       channelId: "direct:12345",
       senderId: "12345",
+    });
+  });
+
+  it("resolves msteams direct identity from session key when senderId is missing", () => {
+    const resolved = resolveSessionIdentity({
+      agentId: "nemoclaw",
+      sessionKey: "agent:nemoclaw:msteams:direct:user-teams-42",
+    });
+
+    expect(resolved).toMatchObject({
+      agentId: "nemoclaw",
+      messageProvider: "msteams",
+      channelId: "direct:user-teams-42",
+      senderId: "user-teams-42",
     });
   });
 
@@ -1296,6 +1478,38 @@ describe("session identity helpers", () => {
     );
     expect(result.reason).toBeUndefined();
     expect(result.resolvedCtx?.senderId).toBe("agent-user:main");
+  });
+
+  it("allows Dashboard sessions through when a static bankId is configured", () => {
+    const result = resolveAndCacheIdentity({
+      sessionKey: "agent:main:dashboard:12345678-90ab-cdef-1234-567890abcdef",
+      ctx: { sessionKey: "agent:main:dashboard:12345678-90ab-cdef-1234-567890abcdef" },
+      dispatchChannel: "webchat",
+      pluginConfig: { dynamicBankId: false, bankId: "shared-bank" },
+    });
+
+    expect(result.skipReason).toBeUndefined();
+    expect(result.resolvedCtx).toEqual({
+      sessionKey: "agent:main:dashboard:12345678-90ab-cdef-1234-567890abcdef",
+      agentId: "main",
+      messageProvider: "webchat",
+      channelId: undefined,
+      senderId: "agent-user:main",
+    });
+  });
+
+  it("does not synthesize a Dashboard sender when agent and static banking are disabled", () => {
+    const result = resolveAndCacheIdentity({
+      sessionKey: "agent:main:dashboard:12345678-90ab-cdef-1234-567890abcdee",
+      ctx: { sessionKey: "agent:main:dashboard:12345678-90ab-cdef-1234-567890abcdee" },
+      dispatchChannel: "webchat",
+      pluginConfig: { dynamicBankGranularity: ["channel", "user"] },
+    });
+
+    expect(result.skipReason).toEqual({
+      kind: "retryable",
+      detail: "missing stable sender identity",
+    });
   });
 
   it("allows agent:*:main when dynamicBankId is false but bankId is missing (default granularity includes 'agent')", () => {
@@ -1427,6 +1641,57 @@ describe("resolveAndCacheIdentity dispatch-surface gate (#1541)", () => {
 
     expect(skipReason).toBeUndefined();
   });
+
+  // A mapped agent is pinned like a static bank: the surface cannot route its
+  // turn into the wrong bank, so the mismatch must not skip it. The skip is
+  // cached as final, so getting this wrong loses the session for the whole
+  // process. (#3890)
+  it("does not skip a mapped agent whose dispatch surface differs", () => {
+    const { skipReason } = resolveAndCacheIdentity({
+      sessionKey: "agent:inbound:telegram:direct:user-3890",
+      ctx: {
+        sessionKey: "agent:inbound:telegram:direct:user-3890",
+        agentId: "inbound",
+        senderId: "user-3890",
+      },
+      dispatchChannel: "webchat",
+      pluginConfig: { agentBankMap: { inbound: "ps-technology" } },
+    });
+
+    expect(skipReason).toBeUndefined();
+  });
+
+  it("still skips an unmapped agent on the same mismatch", () => {
+    const { skipReason } = resolveAndCacheIdentity({
+      sessionKey: "agent:stranger:telegram:direct:user-3890b",
+      ctx: {
+        sessionKey: "agent:stranger:telegram:direct:user-3890b",
+        agentId: "stranger",
+        senderId: "user-3890b",
+      },
+      dispatchChannel: "webchat",
+      pluginConfig: { agentBankMap: { inbound: "ps-technology" } },
+    });
+
+    expect(skipReason).toEqual({
+      kind: "final",
+      detail: "dispatch surface webchat does not match session provider telegram",
+    });
+  });
+
+  it("still skips operational sessions for a mapped agent", () => {
+    // The map widens allowCliSessions; cron/heartbeat/subagent and temp:
+    // sessions return before that is consulted and must stay skipped.
+    for (const sessionKey of ["agent:inbound:cron:job-1", "temp:inbound:scratch"]) {
+      const { skipReason } = resolveAndCacheIdentity({
+        sessionKey,
+        ctx: { sessionKey, agentId: "inbound" },
+        pluginConfig: { agentBankMap: { inbound: "ps-technology" } },
+      });
+
+      expect(skipReason?.kind).toBe("final");
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1480,6 +1745,129 @@ describe("meetsMinimumVersion", () => {
   it("returns false for malformed versions instead of throwing", () => {
     expect(meetsMinimumVersion("garbage", "0.5.0")).toBe(false);
     expect(meetsMinimumVersion("", "0.5.0")).toBe(false);
+  });
+});
+
+describe("append capability helpers", () => {
+  it("supports append for legacy version payloads without a features block", () => {
+    const capabilities = parseHindsightApiCapabilities({ api_version: "0.8.4" });
+
+    expect(capabilities).toEqual({ version: "0.8.4", storeDocumentText: true });
+    expect(supportsAppendFromCapabilities(capabilities)).toBe(true);
+  });
+
+  it("supports append when the version is new enough and document text storage is enabled", () => {
+    const capabilities = parseHindsightApiCapabilities({
+      api_version: "0.8.4",
+      features: { store_document_text: true },
+    });
+
+    expect(capabilities).toEqual({ version: "0.8.4", storeDocumentText: true });
+    expect(supportsAppendFromCapabilities(capabilities)).toBe(true);
+  });
+
+  it("rejects append when features are present but document text storage is not enabled", () => {
+    expect(
+      supportsAppendFromCapabilities(
+        parseHindsightApiCapabilities({
+          api_version: "0.8.4",
+          features: { store_document_text: false },
+        })
+      )
+    ).toBe(false);
+    expect(
+      supportsAppendFromCapabilities(
+        parseHindsightApiCapabilities({
+          api_version: "0.8.4",
+          features: {},
+        })
+      )
+    ).toBe(false);
+  });
+
+  it("rejects append for old API versions even when document text storage is enabled", () => {
+    const capabilities = parseHindsightApiCapabilities({
+      api_version: "0.4.99",
+      features: { store_document_text: true },
+    });
+
+    expect(supportsAppendFromCapabilities(capabilities)).toBe(false);
+  });
+
+  it("returns null for malformed version payloads", () => {
+    expect(parseHindsightApiCapabilities({ features: { store_document_text: true } })).toBeNull();
+    expect(parseHindsightApiCapabilities(null)).toBeNull();
+  });
+});
+
+describe("async retain operation id capability", () => {
+  it("requires API 0.8.6 or newer", () => {
+    expect(
+      supportsAsyncRetainOperationIdFromCapabilities(
+        parseHindsightApiCapabilities({ api_version: "0.8.5" })
+      )
+    ).toBe(false);
+    expect(
+      supportsAsyncRetainOperationIdFromCapabilities(
+        parseHindsightApiCapabilities({ api_version: "0.8.6" })
+      )
+    ).toBe(true);
+    expect(
+      supportsAsyncRetainOperationIdFromCapabilities(
+        parseHindsightApiCapabilities({ api_version: "0.9.0" })
+      )
+    ).toBe(true);
+    expect(supportsAsyncRetainOperationIdFromCapabilities(null)).toBe(false);
+  });
+
+  it("rejects malformed and prerelease versions conservatively", () => {
+    for (const version of [
+      "0.8.6junk",
+      "0.8.6-beta.1",
+      "1.garbage",
+      "0.8",
+      "0.08.6",
+      "00.8.6",
+      "0.8.6\n",
+    ]) {
+      expect(
+        supportsAsyncRetainOperationIdFromCapabilities(
+          parseHindsightApiCapabilities({ api_version: version })
+        )
+      ).toBe(false);
+    }
+  });
+
+  it("refreshes supported, downgraded, and unknown live capability states", async () => {
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ api_version: "0.8.6" }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ api_version: "0.8.5" }) })
+      .mockRejectedValueOnce(new Error("version endpoint unavailable"));
+    globalThis.fetch = fetchMock as typeof fetch;
+    try {
+      await expect(refreshAsyncRetainOperationIdCapability("https://example.test")).resolves.toBe(
+        "supported"
+      );
+      await expect(refreshAsyncRetainOperationIdCapability("https://example.test")).resolves.toBe(
+        "unsupported"
+      );
+      await expect(refreshAsyncRetainOperationIdCapability("https://example.test")).resolves.toBe(
+        "unknown"
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("generates one valid, distinct UUID for each supported logical retain", () => {
+    const first = createAsyncRetainOperationId();
+    const second = createAsyncRetainOperationId();
+
+    expect(first).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    expect(second).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    expect(second).not.toBe(first);
   });
 });
 
@@ -1559,6 +1947,44 @@ describe("getPluginConfig — enableKnowledgeTools whitelist", () => {
   });
 });
 
+describe("getPluginConfig — preferObservations (#2977)", () => {
+  it("passes preferObservations=true through when set", () => {
+    expect(getPluginConfig(makeApi({ preferObservations: true })).preferObservations).toBe(true);
+  });
+
+  it("defaults to false when not set or set to a non-boolean truthy value", () => {
+    expect(getPluginConfig(makeApi({})).preferObservations).toBe(false);
+    expect(getPluginConfig(makeApi({ preferObservations: false })).preferObservations).toBe(false);
+    expect(getPluginConfig(makeApi({ preferObservations: "true" })).preferObservations).toBe(false);
+    expect(getPluginConfig(makeApi({ preferObservations: 1 })).preferObservations).toBe(false);
+  });
+});
+
+describe("recallMinScores (#4143)", () => {
+  it("passes configured score floors through plugin config", () => {
+    const recallMinScores = { semantic: 0.2, reranker: 0.3, final: null };
+    expect(getPluginConfig(makeApi({ recallMinScores })).recallMinScores).toEqual(recallMinScores);
+  });
+
+  it("passes score floors to the Hindsight client", async () => {
+    const recall = vi.fn().mockResolvedValue({ results: [] });
+    const scoped = scopeClient({ recall } as never, "test-bank");
+
+    await scoped.recall({ query: "test", minScores: { reranker: 0.3 } });
+
+    expect(recall).toHaveBeenCalledWith("test-bank", "test", {
+      maxTokens: undefined,
+      budget: undefined,
+      types: undefined,
+      preferObservations: undefined,
+      minScores: { reranker: 0.3 },
+      // A deadline controller is always created, so the client sees a real signal
+      // even when no service signal was passed in.
+      signal: expect.any(AbortSignal),
+    });
+  });
+});
+
 describe("formatHookPerf (#1406)", () => {
   it("emits the hook name, total ms, and field key=value pairs", () => {
     const line = formatHookPerf("before_prompt_build", 4200, {
@@ -1606,6 +2032,21 @@ describe("getPluginConfig — debugPerfTiming flag (#1406)", () => {
   });
 });
 
+describe("getPluginConfig — recall injection position", () => {
+  it("defaults missing or invalid values to user context", () => {
+    expect(getPluginConfig(makeApi({})).recallInjectionPosition).toBe("user");
+    expect(
+      getPluginConfig(makeApi({ recallInjectionPosition: "invalid" })).recallInjectionPosition
+    ).toBe("user");
+  });
+
+  it.each(["prepend", "append", "user"] as const)("preserves an explicit %s value", (position) => {
+    expect(
+      getPluginConfig(makeApi({ recallInjectionPosition: position })).recallInjectionPosition
+    ).toBe(position);
+  });
+});
+
 describe("getPluginConfig — mission semantics (#1270, #1353)", () => {
   it("does not substitute a default mission when bankMission is unset", () => {
     const cfg = getPluginConfig(makeApi({}));
@@ -1640,6 +2081,48 @@ describe("getPluginConfig — mission semantics (#1270, #1353)", () => {
   });
 });
 
+describe("getPluginConfig — dynamic bank defaults", () => {
+  it("leaves bank default fields unset when not configured", () => {
+    const cfg = getPluginConfig(makeApi({}));
+    expect(cfg.retainExtractionMode).toBeUndefined();
+    expect(cfg.enableObservations).toBeUndefined();
+    expect(cfg.enableAutoConsolidation).toBeUndefined();
+    expect(cfg.dispositionSkepticism).toBeUndefined();
+    expect(cfg.entityLabels).toBeUndefined();
+  });
+
+  it("normalizes configured bank default fields", () => {
+    const labels = [{ name: "person", description: "Human" }];
+    const cfg = getPluginConfig(
+      makeApi({
+        retainExtractionMode: "VERBOSE",
+        enableObservations: true,
+        enableAutoConsolidation: false,
+        dispositionSkepticism: 4,
+        dispositionLiteralism: 2,
+        dispositionEmpathy: 5,
+        entityLabels: labels,
+      })
+    );
+    expect(cfg.retainExtractionMode).toBe("verbose");
+    expect(cfg.enableObservations).toBe(true);
+    expect(cfg.enableAutoConsolidation).toBe(false);
+    expect(cfg.dispositionSkepticism).toBe(4);
+    expect(cfg.entityLabels).toEqual(labels);
+  });
+
+  it("rejects invalid retainExtractionMode and disposition values", () => {
+    const cfg = getPluginConfig(
+      makeApi({
+        retainExtractionMode: "not-a-mode",
+        dispositionSkepticism: 9,
+      })
+    );
+    expect(cfg.retainExtractionMode).toBeUndefined();
+    expect(cfg.dispositionSkepticism).toBeUndefined();
+  });
+});
+
 describe("getPluginConfig — retainContext", () => {
   it("defaults retainContext to the built-in OpenClaw transcript guidance", () => {
     const cfg = getPluginConfig(makeApi({}));
@@ -1669,5 +2152,435 @@ describe("getPluginConfig — retainContext", () => {
     expect(openclawManifest.configSchema?.properties?.retainContext?.default).toBe(
       DEFAULT_RETAIN_CONTEXT
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveBankIdForKnowledgeTools — dynamic user-scoped banking (#2441)
+// ---------------------------------------------------------------------------
+
+describe("resolveBankIdForKnowledgeTools", () => {
+  const userScopedConfig: PluginConfig = {
+    dynamicBankGranularity: ["user"],
+    bankIdPrefix: "nemoclaw_intel",
+  };
+
+  it("routes msteams direct sessions to the per-user bank, not shared defaults", () => {
+    const userId = "a1b2c3d4-e5f6-7890-abcd-ef1234567890";
+    const resolution = resolveBankIdForKnowledgeTools(
+      {
+        agentId: "nemoclaw",
+        sessionKey: `agent:nemoclaw:msteams:direct:${userId}`,
+      },
+      userScopedConfig
+    );
+
+    expect(resolution.identityError).toBeUndefined();
+    expect(resolution.bankId).toBe(`nemoclaw_intel-${userId}`);
+    expect(resolution.bankId).not.toBe("openclaw");
+    expect(resolution.bankId).not.toBe("nemoclaw_intel-openclaw");
+    expect(resolution.bankId).not.toBe("nemoclaw_intel-anonymous");
+  });
+
+  it("does not silently fall back to shared/default bank when user identity is missing", () => {
+    const resolution = resolveBankIdForKnowledgeTools(
+      {
+        agentId: "nemoclaw",
+        sessionKey: "agent:nemoclaw:msteams:group:19:general@thread.tacv2",
+      },
+      userScopedConfig
+    );
+
+    expect(resolution.identityError).toMatch(/missing stable sender identity/);
+    expect(resolution.bankId).not.toBe("openclaw");
+    expect(resolution.bankId).not.toBe("nemoclaw_intel-openclaw");
+    expect(resolution.bankId).toBe("nemoclaw_intel-anonymous");
+  });
+
+  it("uses static bankId when dynamicBankId is false", () => {
+    const resolution = resolveBankIdForKnowledgeTools(
+      { sessionKey: "agent:nemoclaw:main" },
+      { dynamicBankId: false, bankId: "shared-team-memory" }
+    );
+
+    expect(resolution.identityError).toBeUndefined();
+    expect(resolution.bankId).toBe("shared-team-memory");
+  });
+
+  it("routes a mapped agent to its bank without requiring sender identity (#3890)", () => {
+    // The group session below has no resolvable sender, which is exactly the case
+    // the user-scoped guard rejects. A mapped agent's bank does not depend on the
+    // sender, so the guard must not fire for it.
+    const resolution = resolveBankIdForKnowledgeTools(
+      {
+        agentId: "inbound",
+        sessionKey: "agent:inbound:msteams:group:19:general@thread.tacv2",
+      },
+      { ...userScopedConfig, agentBankMap: { inbound: "ps-technology" } }
+    );
+
+    expect(resolution.identityError).toBeUndefined();
+    expect(resolution.bankId).toBe("ps-technology");
+  });
+
+  it("still guards an unmapped agent under the same config (#3890)", () => {
+    const resolution = resolveBankIdForKnowledgeTools(
+      {
+        agentId: "nemoclaw",
+        sessionKey: "agent:nemoclaw:msteams:group:19:general@thread.tacv2",
+      },
+      { ...userScopedConfig, agentBankMap: { inbound: "ps-technology" } }
+    );
+
+    expect(resolution.identityError).toMatch(/missing stable sender identity/);
+    expect(resolution.bankId).not.toBe("ps-technology");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// normalizeAgentBankMap — config comes from hand-edited JSON (#3890)
+// ---------------------------------------------------------------------------
+
+describe("normalizeAgentBankMap", () => {
+  it("keeps valid entries and trims the bank name", () => {
+    expect(normalizeAgentBankMap({ inbound: " ps-technology ", limpieza: "ps-limpieza" })).toEqual({
+      inbound: "ps-technology",
+      limpieza: "ps-limpieza",
+    });
+  });
+
+  it("drops entries whose bank is blank or not a string", () => {
+    // A blank value would otherwise route that agent to a bank named "".
+    expect(normalizeAgentBankMap({ a: "bank-a", b: "   ", c: 42, d: null })).toEqual({
+      a: "bank-a",
+    });
+  });
+
+  it("treats a map with no usable entry as unset", () => {
+    expect(normalizeAgentBankMap({ a: "", b: "  " })).toBeUndefined();
+    expect(normalizeAgentBankMap({})).toBeUndefined();
+  });
+
+  it("ignores shapes that are not a plain object", () => {
+    expect(normalizeAgentBankMap(undefined)).toBeUndefined();
+    expect(normalizeAgentBankMap(null)).toBeUndefined();
+    expect(normalizeAgentBankMap("inbound=ps-technology")).toBeUndefined();
+    expect(normalizeAgentBankMap([["inbound", "ps-technology"]])).toBeUndefined();
+  });
+
+  it("trims the agent id too, so a padded key is not silently inert", () => {
+    // Keying on the raw " inbound" would keep an entry that can never match a
+    // resolved agent id — and it would not show up in the dropped-entry warning.
+    expect(normalizeAgentBankMap({ " inbound ": "ps-technology" })).toEqual({
+      inbound: "ps-technology",
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// senderPrefixPattern — opt-in display-name stripping (#3070)
+// ---------------------------------------------------------------------------
+
+describe("senderPrefixPattern display-name stripping (#3070)", () => {
+  // The pattern is module-global; leaking it would change unrelated tests.
+  afterEach(() => configureSenderPrefixStripping(undefined));
+
+  const cases: Array<{ name: string; pattern?: string; input: string; expected: string }> = [
+    {
+      name: "strips a literal configured display name",
+      pattern: "UserName",
+      input: "UserName: today weather?",
+      expected: "today weather?",
+    },
+    {
+      name: "strips a name-class pattern with spaces",
+      pattern: "[A-Za-z ]{1,20}",
+      input: "Jane Doe: today weather?",
+      expected: "today weather?",
+    },
+    {
+      name: "strips the display name left after the runtime id line",
+      pattern: "UserName",
+      input: "[message_id: om_x100b6d3512c5ccb0c084ad240a38842]\nUserName: today weather?",
+      expected: "today weather?",
+    },
+    {
+      name: "still strips opaque sender ids while enabled",
+      pattern: "UserName",
+      input: "[message_id: om_x100b6d3512c5ccb0c084ad240a38842]\nou_cb923a19: 真实内容",
+      expected: "真实内容",
+    },
+    {
+      name: "leaves non-matching text alone while enabled",
+      pattern: "UserName",
+      input: "计划: 今天修 retain 污染",
+      expected: "计划: 今天修 retain 污染",
+    },
+    {
+      name: "keeps the prefix when unset (default behaviour)",
+      input: "UserName: today weather?",
+      expected: "UserName: today weather?",
+    },
+    {
+      name: "leaves non-matching text alone when unset",
+      input: "计划: 今天修 retain 污染",
+      expected: "计划: 今天修 retain 污染",
+    },
+    {
+      name: "fails closed on an invalid regex",
+      pattern: "([",
+      input: "UserName: today weather?",
+      expected: "UserName: today weather?",
+    },
+    {
+      name: "only strips at the head, not mid-text",
+      pattern: "UserName",
+      input: "weather please\nUserName: again",
+      expected: "weather please\nUserName: again",
+    },
+    {
+      // One call peels one prefix — same semantics the opaque-id regex already
+      // has. The recall path composes two passes (see the test below), so a
+      // doubled prefix still converges there.
+      name: "peels a single prefix per call on a doubled prefix",
+      pattern: "UserName",
+      input: "UserName: UserName: today weather?",
+      expected: "UserName: today weather?",
+    },
+  ];
+
+  for (const { name, pattern, input, expected } of cases) {
+    it(name, () => {
+      configureSenderPrefixStripping(pattern);
+      expect(stripRuntimeEnvelope(input)).toBe(expected);
+    });
+  }
+
+  it("strips the display name out of the recall query", () => {
+    configureSenderPrefixStripping("UserName");
+    expect(extractRecallQuery("UserName: today weather?", undefined)).toBe("today weather?");
+    configureSenderPrefixStripping(undefined);
+    expect(extractRecallQuery("UserName: today weather?", undefined)).toBe(
+      "UserName: today weather?"
+    );
+  });
+
+  it("strips the display name out of the reported #3070 Feishu DM shape", () => {
+    const raw = "[message_id: om_x100b6d3512c5ccb0c084ad240a38842]\nUserName: today weather?";
+
+    configureSenderPrefixStripping("UserName");
+    expect(extractRecallQuery(raw, undefined)).toBe("today weather?");
+
+    // Unset, the runtime id line still goes but the display name survives —
+    // the pre-fix behaviour this option exists to opt out of.
+    configureSenderPrefixStripping(undefined);
+    expect(extractRecallQuery(raw, undefined)).toBe("UserName: today weather?");
+  });
+
+  it("strips the display name out of the retained transcript", () => {
+    configureSenderPrefixStripping("UserName");
+    const messages = [
+      { role: "user", content: "UserName: today weather?" },
+      { role: "assistant", content: "Sunny all day." },
+    ];
+    const config: PluginConfig = {
+      dynamicBankId: true,
+      retainRoles: ["user", "assistant"],
+      retainToolCalls: false,
+    };
+    const result = prepareRetentionTranscript(messages, config);
+    expect(result).not.toBeNull();
+    expect(JSON.parse(result!.transcript)).toEqual([
+      { role: "user", content: "today weather?" },
+      { role: "assistant", content: "Sunny all day." },
+    ]);
+  });
+
+  it("is armed by getPluginConfig and ignores blank or invalid values", () => {
+    expect(
+      getPluginConfig(makeApi({ senderPrefixPattern: "  UserName  " })).senderPrefixPattern
+    ).toBe("UserName");
+    expect(stripRuntimeEnvelope("UserName: today weather?")).toBe("today weather?");
+
+    expect(
+      getPluginConfig(makeApi({ senderPrefixPattern: "   " })).senderPrefixPattern
+    ).toBeUndefined();
+    expect(stripRuntimeEnvelope("UserName: today weather?")).toBe("UserName: today weather?");
+
+    expect(() => getPluginConfig(makeApi({ senderPrefixPattern: "([" }))).not.toThrow();
+    expect(stripRuntimeEnvelope("UserName: today weather?")).toBe("UserName: today weather?");
+
+    expect(getPluginConfig(makeApi({})).senderPrefixPattern).toBeUndefined();
+  });
+});
+
+// OpenClaw 2026.8.1 replaced the "(untrusted metadata)" label on every injected
+// inbound context header with a `⟦openclaw:ctx⟧` provenance marker. Both forms
+// have to keep working: hosts on either side of that change are in the field.
+describe("inbound metadata blocks (marker and legacy forms)", () => {
+  const MARKER = "⟦openclaw:ctx⟧";
+  const markerBlock = (label: string, json: string) =>
+    `${label} ${MARKER}\n\`\`\`json\n${json}\n\`\`\``;
+  const legacyBlock = (label: string, json: string) =>
+    `${label} (untrusted metadata):\n\`\`\`json\n${json}\n\`\`\``;
+
+  it("extracts sender_id from a marker-form Conversation info block", () => {
+    const text = `${markerBlock("Conversation info:", '{"message_id":"om_abc","sender_id":"ou_xyz"}')}\n\nwhat did I say about postgres?`;
+    expect(extractSenderIdFromText(text)).toBe("ou_xyz");
+  });
+
+  it("extracts sender_id from a marker-form Sender block", () => {
+    const text = `${markerBlock("Sender:", '{"id":"ou_sender_only"}')}\n\nhello`;
+    expect(extractSenderIdFromText(text)).toBe("ou_sender_only");
+  });
+
+  it("still extracts sender_id from the legacy label", () => {
+    const text = `${legacyBlock("Conversation info", '{"sender_id":"ou_legacy"}')}\n\nhello`;
+    expect(extractSenderIdFromText(text)).toBe("ou_legacy");
+  });
+
+  it("strips a marker-form block from retained content", () => {
+    const text = `${markerBlock("Conversation info:", '{"sender_id":"ou_xyz"}')}\n\nremember I use pnpm`;
+    expect(stripMetadataEnvelopes(text)).toBe("remember I use pnpm");
+  });
+
+  it("strips a marker-form block that has no json fence", () => {
+    const text = `Chat history since last reply: ${MARKER}\nalice: hi\nbob: hey\n\nremember I use pnpm`;
+    expect(stripMetadataEnvelopes(text)).toBe("remember I use pnpm");
+  });
+
+  it("strips several marker-form blocks and keeps the user text", () => {
+    const text = [
+      markerBlock("Conversation info:", '{"sender_id":"ou_xyz"}'),
+      "",
+      markerBlock("Location:", '{"city":"Milan"}'),
+      "",
+      "what is the plan?",
+    ].join("\n");
+    expect(stripMetadataEnvelopes(text)).toBe("what is the plan?");
+  });
+
+  it("still strips the legacy label form", () => {
+    const text = `${legacyBlock("Conversation info", '{"sender_id":"ou_legacy"}')}\n\nremember I use pnpm`;
+    expect(stripMetadataEnvelopes(text)).toBe("remember I use pnpm");
+  });
+
+  it("leaves ordinary user text untouched", () => {
+    expect(stripMetadataEnvelopes("just a normal message")).toBe("just a normal message");
+  });
+
+  it("rejects a marker-only prompt as a recall query", () => {
+    const text = markerBlock("Conversation info:", '{"sender_id":"ou_xyz"}');
+    expect(extractRecallQuery(text, undefined)).toBeNull();
+  });
+
+  it("recovers the user query from a marker-wrapped prompt", () => {
+    const text = `${markerBlock("Conversation info:", '{"sender_id":"ou_xyz"}')}\n\nwhat did I say about postgres?`;
+    expect(extractRecallQuery(undefined, text)).toBe("what did I say about postgres?");
+  });
+});
+
+// ── #4341: session_end carries no transcript ────────────────────────────────
+// OpenClaw's buildSessionEndHookPayload() sends sessionId/messageCount/reason/
+// sessionFile and nothing else, so the forced flush added for #1726 ended at its own
+// "no messages" guard on every session close and the turns after the last cadence
+// boundary were never retained.
+describe("sessionEndMessagesFromTranscript", () => {
+  const madeDirs: string[] = [];
+  const writeTranscript = (lines: unknown[]): string => {
+    const dir = mkdtempSync(join(tmpdir(), "hs-session-end-"));
+    madeDirs.push(dir);
+    const file = join(dir, "sess-1.jsonl");
+    writeFileSync(file, lines.map((line) => JSON.stringify(line)).join("\n") + "\n");
+    return file;
+  };
+  afterEach(() => {
+    for (const dir of madeDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
+  const sessionEndEvent = (sessionFile?: string) => ({
+    // The real payload shape: ids and counts, no messages array.
+    sessionId: "sess-1",
+    sessionKey: "agent:main:telegram:group:1",
+    messageCount: 4,
+    durationMs: 12_000,
+    reason: "reset",
+    ...(sessionFile === undefined ? {} : { sessionFile }),
+    context: { sessionId: "sess-1", sessionKey: "agent:main:telegram:group:1", agentId: "main" },
+  });
+
+  it("reads the transcript the event points at", () => {
+    const file = writeTranscript([
+      { type: "session", id: "sess-1", timestamp: "2026-09-12T20:00:00Z" },
+      { type: "message", message: { role: "user", content: "where were we" } },
+      { type: "message", message: { role: "assistant", content: "the tail of the session" } },
+    ]);
+
+    const messages = sessionEndMessagesFromTranscript(sessionEndEvent(file)) as Array<{
+      role: string;
+      content: unknown;
+    }>;
+
+    expect(messages).toHaveLength(2);
+    expect(messages[0].role).toBe("user");
+    expect(messages[1].content).toBe("the tail of the session");
+  });
+
+  it("returns undefined when the event points at no transcript", () => {
+    expect(sessionEndMessagesFromTranscript(sessionEndEvent())).toBeUndefined();
+  });
+
+  it("returns undefined for an unreadable transcript instead of throwing", () => {
+    const file = writeTranscript([{ type: "session", id: "sess-1" }]);
+    rmSync(file);
+    expect(sessionEndMessagesFromTranscript(sessionEndEvent(file))).toBeUndefined();
+  });
+
+  it("returns undefined when the transcript holds no messages", () => {
+    // The caller's own guard then skips the flush, exactly as before.
+    const file = writeTranscript([
+      { type: "session", id: "sess-1" },
+      { type: "message", message: { role: "user", content: "   " } },
+    ]);
+    expect(sessionEndMessagesFromTranscript(sessionEndEvent(file))).toBeUndefined();
+  });
+
+  it("passes the agent id from the event context to the reader", () => {
+    const seen: string[] = [];
+    const read = ((filePath: string, agentId: string) => {
+      seen.push(agentId);
+      return { filePath, agentId, sessionId: "s", messages: [{ role: "user", content: "hi" }] };
+    }) as never;
+
+    sessionEndMessagesFromTranscript(sessionEndEvent("/tmp/whatever.jsonl"), read);
+
+    expect(seen).toEqual(["main"]);
+  });
+});
+
+describe("knowledgeToolDetails — Code Mode structured result (#4308)", () => {
+  it("parses the SDK's JSON text payload into details", () => {
+    const result = {
+      content: [
+        { type: "text", text: JSON.stringify({ results: [{ id: "m1", text: "fact" }] }, null, 2) },
+      ],
+    };
+    expect(knowledgeToolDetails(result)).toEqual({ results: [{ id: "m1", text: "fact" }] });
+  });
+
+  it("wraps a non-object payload so the guest still receives it", () => {
+    expect(knowledgeToolDetails({ content: [{ type: "text", text: "[1,2]" }] })).toEqual({
+      result: [1, 2],
+    });
+    expect(knowledgeToolDetails({ content: [{ type: "text", text: '"ok"' }] })).toEqual({
+      result: "ok",
+    });
+  });
+
+  it("falls back to an empty object for missing or unparseable text", () => {
+    expect(knowledgeToolDetails({ content: [{ type: "text", text: "not json" }] })).toEqual({});
+    expect(knowledgeToolDetails({ content: [] })).toEqual({});
+    expect(knowledgeToolDetails({})).toEqual({});
+    expect(knowledgeToolDetails(undefined)).toEqual({});
   });
 });

@@ -12,7 +12,9 @@ Tests cover:
 
 import asyncio
 import json
+import os
 import uuid
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -35,16 +37,94 @@ async def _ensure_bank(pool, bank_id: str) -> None:
 pytestmark = pytest.mark.xdist_group("worker_tests")
 
 
+@pytest.fixture(scope="session")
+def isolated_ops_schema(pg0_db_url):
+    """A private, migrated Postgres schema for this file's claim tests.
+
+    ``WorkerPoller.claim_batch`` claims across the whole schema on the
+    connection's search_path, bounded by ``max_slots`` minus the reservations,
+    and ordered by ``created_at``. Sharing ``public`` with the rest of the suite
+    therefore makes an exact claim count unassertable: any concurrently running
+    test that leaves a claimable row (``status='pending'`` with a non-null
+    ``task_payload``) competes for the same batch, and older foreign rows
+    *displace* this file's own — filtering the result to our own bank sees the
+    shortfall but cannot prevent it (#3963).
+
+    That is not hypothetical. ``tests/test_operation_status.py`` writes exactly
+    such rows, and once ``pytest-split`` put it in the same shard the batch came
+    back one row short; with enough foreign rows it comes back with none of ours
+    at all.
+
+    So give this file its own schema, the way the claim-serialisation tests
+    already do (``test_claim_bank_serialization.py``): "the whole schema" is then
+    only its own rows. One schema per worker, created + migrated once and dropped
+    at session end. ``search_path`` is set on the pool in :func:`backend`, so
+    every unqualified table reference here resolves into it.
+    """
+    from hindsight_api.engine.db import create_database_backend
+    from hindsight_api.pg0 import resolve_database_url
+
+    worker = os.environ.get("PYTEST_XDIST_WORKER", "master")
+    schema = f"workerclaim_iso_{worker}"
+
+    async def _provision() -> str:
+        url = await resolve_database_url(pg0_db_url)
+        b = create_database_backend("postgresql")
+        await b.initialize(url, min_size=1, max_size=2)
+        try:
+            async with b.get_pool().acquire() as conn:
+                # Rebuild from scratch so a schema left by a crashed prior run
+                # can't carry stale state into this session.
+                await conn.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+                await conn.execute(f'CREATE SCHEMA "{schema}"')
+            # run_migrations is sync; call it with the loop running (as elsewhere
+            # in the suite) — it builds banks/async_operations/etc. in the schema.
+            b.run_migrations(url, schema=schema)
+        finally:
+            await b.shutdown()
+        return url
+
+    async def _drop(url: str) -> None:
+        b = create_database_backend("postgresql")
+        await b.initialize(url, min_size=1, max_size=2)
+        try:
+            async with b.get_pool().acquire() as conn:
+                await conn.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+        finally:
+            await b.shutdown()
+
+    loop = asyncio.new_event_loop()
+    try:
+        url = loop.run_until_complete(_provision())
+    finally:
+        loop.close()
+
+    yield schema
+
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(_drop(url))
+    finally:
+        loop.close()
+
+
 @pytest_asyncio.fixture
-async def backend(pg0_db_url):
-    """Create a DatabaseBackend for worker tests."""
+async def backend(pg0_db_url, isolated_ops_schema):
+    """Create a DatabaseBackend whose pool is pinned to this file's private schema."""
     from hindsight_api.engine.db import create_database_backend
     from hindsight_api.pg0 import resolve_database_url
 
     resolved_url = await resolve_database_url(pg0_db_url)
 
+    async def _use_isolated_schema(conn):
+        # init runs once per new connection, setup runs on every acquire (after
+        # asyncpg's release-time RESET ALL), so this pins search_path for the
+        # pool's whole lifetime — every unqualified table resolves into the
+        # private schema, so claims and cleanup never see the shared public one.
+        await conn.execute(f'SET search_path TO "{isolated_ops_schema}", public')
+
     b = create_database_backend("postgresql")
-    await b.initialize(resolved_url, min_size=2, max_size=10, command_timeout=30)
+    await b.initialize(resolved_url, min_size=2, max_size=10, command_timeout=30, init_callback=_use_isolated_schema)
     yield b
     await b.shutdown()
 
@@ -57,18 +137,26 @@ async def pool(backend):
 
 @pytest_asyncio.fixture
 async def clean_operations(pool):
-    """Clean up async_operations table before and after tests.
+    """Clear this file's async_operations rows before and after each test.
 
-    We must clean ALL pending operations (not just test-worker-* prefixed ones)
-    because WorkerPoller.claim_batch scans the entire schema for pending tasks.
-    Stale operations left by other tests (e.g. consolidation) cause spurious
-    failures when the poller picks them up unexpectedly.
+    Safe to be broad now: the pool is pinned to this file's private schema
+    (:func:`isolated_ops_schema`), so this only ever touches its own rows. It
+    must also *be* broad — a delete scoped to the worker-test bank prefixes
+    leaves rows from any other id a test invents, and those stay claimable for
+    the next test's ``claim_batch``.
+
+    This deliberately no longer runs against ``public``. The scoped form it
+    replaced was itself a fix for a global ``DELETE FROM async_operations WHERE
+    status = 'pending'`` that, under pytest-xdist, removed *other* workers'
+    in-flight operations mid-run (a refresh op sits ``pending`` for the window
+    between ``_submit_async_operation`` committing it and ``SyncTaskBackend``
+    marking it ``completed``; deleting it there made ``get_operation_status``
+    read back ``not_found`` and flaked an unrelated test). Owning the schema
+    removes the conflict at its source instead of trading one flake for another.
     """
-    await pool.execute("DELETE FROM async_operations WHERE status = 'pending'")
+    await pool.execute("DELETE FROM async_operations")
     yield
-    await pool.execute(
-        "DELETE FROM async_operations WHERE bank_id LIKE 'test-worker-%' OR bank_id LIKE 'test_worker_%'"
-    )
+    await pool.execute("DELETE FROM async_operations")
 
 
 def test_metric_operation_label_normalises_retain_variants():
@@ -92,12 +180,13 @@ class TestWorkerOperationMetrics:
 
         poller = WorkerPoller(backend=MagicMock(), worker_id="w-test", executor=executor)
         # Stub terminal-state handlers so _execute_task_inner never touches the DB.
+        poller._mark_completed = AsyncMock()
         poller._mark_failed = AsyncMock()
         poller._defer_operation = AsyncMock()
         poller._schedule_retry = AsyncMock()
         return poller
 
-    async def _run(self, executor, task_type="batch_retain"):
+    async def _run_with_poller(self, executor, task_type="batch_retain"):
         from hindsight_api.worker.poller import ClaimedTask
 
         poller = self._make_poller(executor)
@@ -109,6 +198,10 @@ class TestWorkerOperationMetrics:
         collector = MagicMock()
         with patch("hindsight_api.worker.poller.get_metrics_collector", return_value=collector):
             await poller._execute_task_inner(task)
+        return collector, poller, task
+
+    async def _run(self, executor, task_type="batch_retain"):
+        collector, _poller, _task = await self._run_with_poller(executor, task_type=task_type)
         return collector
 
     @pytest.mark.asyncio
@@ -123,7 +216,8 @@ class TestWorkerOperationMetrics:
         hindsight_async_operations{status="failed"} gauge, which reads each
         operation's final DB status.
         """
-        collector = await self._run(AsyncMock())  # executor returns normally
+        collector, poller, task = await self._run_with_poller(AsyncMock())  # executor returns normally
+        poller._mark_completed.assert_awaited_once_with(task.operation_id, task.schema)
         collector.record_operation_result.assert_called_once()
         call = collector.record_operation_result.call_args
         assert call.args[0] == "retain"  # batch_retain normalised
@@ -164,19 +258,82 @@ class TestWorkerOperationMetrics:
         collector.record_operation_result.assert_not_called()
 
 
+class _AsyncContext:
+    def __init__(self, value):
+        self.value = value
+
+    async def __aenter__(self):
+        return self.value
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+class _CompletionConn:
+    def __init__(self, execute_result):
+        self.execute_result = execute_result
+        self.execute_calls = []
+
+    def transaction(self):
+        return _AsyncContext(self)
+
+    async def execute(self, query, *args):
+        self.execute_calls.append((query, args))
+        return self.execute_result
+
+
+class _CompletionBackend:
+    def __init__(self, conn):
+        self.conn = conn
+
+    def acquire(self):
+        return _AsyncContext(self.conn)
+
+
+class TestWorkerMarkCompleted:
+    def _make_poller(self, execute_result):
+        from hindsight_api.worker import WorkerPoller
+
+        conn = _CompletionConn(execute_result)
+        poller = WorkerPoller(backend=_CompletionBackend(conn), worker_id="w-test", executor=AsyncMock())
+        poller._maybe_update_parent_operation = AsyncMock()
+        return poller, conn
+
+    @pytest.mark.asyncio
+    async def test_mark_completed_updates_only_processing_rows_and_updates_parent(self):
+        poller, conn = self._make_poller("UPDATE 1")
+
+        await poller._mark_completed("op-1", schema=None)
+
+        query, args = conn.execute_calls[0]
+        assert "status = 'completed'" in query
+        assert "WHERE operation_id = $1 AND status = 'processing'" in query
+        assert args == ("op-1",)
+        poller._maybe_update_parent_operation.assert_awaited_once_with("op-1", None, conn)
+
+    @pytest.mark.asyncio
+    async def test_mark_completed_does_not_overwrite_terminal_rows(self):
+        poller, conn = self._make_poller("UPDATE 0")
+
+        await poller._mark_completed("op-1", schema=None)
+
+        assert conn.execute_calls
+        poller._maybe_update_parent_operation.assert_not_awaited()
+
+
 def test_all_operation_types_have_slot_reservation_config():
     """Every operation_type used in memory_engine must be listed in
-    WORKER_SLOT_RESERVATION_TYPES so it can be reserved via env var.
+    WORKER_SLOT_TYPE_DEFAULTS so it can be reserved via env var.
 
     If this test fails, a new operation_type was added to memory_engine.py
-    without a corresponding entry in config.WORKER_SLOT_RESERVATION_TYPES.
-    Add the new type there (single line) and it will automatically get an
+    without a corresponding entry in config.WORKER_SLOT_TYPE_DEFAULTS. Add the
+    new type there (single line) and it will automatically get a RESERVED_SLOTS
     env var, config field, and validation.
     """
     import ast
     import pathlib
 
-    from hindsight_api.config import WORKER_SLOT_RESERVATION_TYPES
+    from hindsight_api.config import WORKER_SLOT_TYPE_DEFAULTS
 
     # Parse memory_engine.py and extract all operation_type="..." string values
     engine_path = pathlib.Path(__file__).parent.parent / "hindsight_api" / "engine" / "memory_engine.py"
@@ -187,11 +344,11 @@ def test_all_operation_types_have_slot_reservation_config():
         if isinstance(node, ast.keyword) and node.arg == "operation_type" and isinstance(node.value, ast.Constant):
             operation_types_in_code.add(node.value.value)
 
-    missing = operation_types_in_code - set(WORKER_SLOT_RESERVATION_TYPES.keys())
+    missing = operation_types_in_code - set(WORKER_SLOT_TYPE_DEFAULTS)
     assert not missing, (
         f"Operation types {missing} are used in memory_engine.py but missing from "
-        f"config.WORKER_SLOT_RESERVATION_TYPES. Add them there so they can be "
-        f"reserved via env var."
+        f"config.WORKER_SLOT_TYPE_DEFAULTS. Add them there so they can be reserved "
+        f"via env var."
     )
 
 
@@ -247,7 +404,7 @@ class TestBrokerTaskBackend:
         bank_id = f"test-worker-{uuid.uuid4().hex[:8]}"
         await _ensure_bank(pool, bank_id)
         task_dict = {
-            "type": "access_count_update",
+            "type": "graph_maintenance",
             "bank_id": bank_id,
             "node_ids": ["node1", "node2"],
         }
@@ -259,7 +416,7 @@ class TestBrokerTaskBackend:
             bank_id,
         )
         assert row is not None
-        assert row["operation_type"] == "access_count_update"
+        assert row["operation_type"] == "graph_maintenance"
         assert row["status"] == "pending"
         payload = json.loads(row["task_payload"])
         assert payload["node_ids"] == ["node1", "node2"]
@@ -370,6 +527,55 @@ class TestWorkerPoller:
             assert row["worker_id"] == "test-worker-1"
 
     @pytest.mark.asyncio
+    async def test_claim_batch_cannot_see_rows_outside_this_files_schema(self, pool, clean_operations):
+        """Rows in ``public`` are invisible here, so they can never crowd out our claims (#3963).
+
+        ``claim_batch`` takes at most ``max_slots`` minus the reservations, oldest
+        first, across the whole schema on the connection's search_path. That makes
+        an exact claim count unassertable while this file shares ``public`` with
+        the rest of the suite: any concurrently running test that leaves a
+        claimable row (``status='pending'`` with a non-null ``task_payload``)
+        competes for the same batch, and older foreign rows *displace* ours.
+        Filtering the result to our own bank sees the shortfall but cannot prevent
+        it — the isolation has to come from owning the schema.
+
+        That is not hypothetical: ``tests/test_operation_status.py`` writes exactly
+        such rows, and once ``pytest-split`` moved it into this shard the batch
+        came back a row short.
+
+        The row planted below is deliberately unclaimable (``task_payload`` NULL)
+        so this test can never itself become the neighbour it is guarding against.
+        What it pins is visibility: unqualify the table and it must resolve into
+        this file's private schema, never ``public``.
+        """
+        marker = uuid.uuid4()
+        await pool.execute(
+            "INSERT INTO public.banks (bank_id, name) VALUES ($1, $1) ON CONFLICT DO NOTHING",
+            f"test-worker-public-{marker.hex[:8]}",
+        )
+        try:
+            await pool.execute(
+                """
+                INSERT INTO public.async_operations (operation_id, bank_id, operation_type, status)
+                VALUES ($1, $2, 'retain', 'pending')
+                """,
+                marker,
+                f"test-worker-public-{marker.hex[:8]}",
+            )
+
+            # Unqualified: resolves through search_path into the private schema.
+            visible = await pool.fetchval("SELECT count(*) FROM async_operations WHERE operation_id = $1", marker)
+            assert visible == 0, "public rows are visible here — the pool is not pinned to the private schema"
+
+            # And the row really does exist, so the count above is isolation, not a failed insert.
+            in_public = await pool.fetchval(
+                "SELECT count(*) FROM public.async_operations WHERE operation_id = $1", marker
+            )
+            assert in_public == 1
+        finally:
+            await pool.execute("DELETE FROM public.async_operations WHERE operation_id = $1", marker)
+            await pool.execute("DELETE FROM public.banks WHERE bank_id = $1", f"test-worker-public-{marker.hex[:8]}")
+
     async def test_claim_batch_respects_max_slots(self, pool, backend, clean_operations):
         """Test that claim_batch respects the max_slots limit."""
         from hindsight_api.worker import WorkerPoller
@@ -1200,6 +1406,586 @@ class TestWorkerRecovery:
 
         recovered_count = await poller.recover_own_tasks()
         assert recovered_count == 0
+
+    @pytest.mark.asyncio
+    async def test_recover_own_tasks_increments_retry_count(self, pool, backend, clean_operations):
+        """Test that crash recovery increments retry_count."""
+        from hindsight_api.worker import WorkerPoller
+
+        bank_id = f"test-worker-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(pool, bank_id)
+        worker_id = "crashed-worker-v2"
+
+        # Create a task with existing retry_count=1
+        op_id = uuid.uuid4()
+        payload = json.dumps({"type": "test_task", "bank_id": bank_id})
+        await pool.execute(
+            """
+            INSERT INTO async_operations
+                (operation_id, bank_id, operation_type, status, task_payload,
+                 worker_id, retry_count, claimed_at)
+            VALUES ($1, $2, 'test', 'processing', $3::jsonb, $4, 1, now())
+            """,
+            op_id,
+            bank_id,
+            payload,
+            worker_id,
+        )
+
+        poller = WorkerPoller(
+            backend=backend,
+            worker_id=worker_id,
+            executor=lambda x: None,
+        )
+        recovered = await poller.recover_own_tasks()
+        assert recovered == 1
+
+        # retry_count should have been incremented from 1 → 2
+        row = await pool.fetchrow(
+            "SELECT status, retry_count FROM async_operations WHERE operation_id = $1",
+            op_id,
+        )
+        assert row["status"] == "pending"
+        assert row["retry_count"] == 2
+
+    @pytest.mark.asyncio
+    async def test_recover_own_tasks_moves_exceeded_to_failed(self, pool, backend, clean_operations):
+        """Test that tasks exceeding max_retries are moved to failed."""
+        from hindsight_api.worker import WorkerPoller
+
+        bank_id = f"test-worker-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(pool, bank_id)
+        worker_id = "crash-loop-worker"
+
+        # Create 2 tasks at the threshold (retry_count=3, max_retries=3 → at limit)
+        op_ok = uuid.uuid4()
+        op_fail = uuid.uuid4()
+        payload = json.dumps({"type": "test_task", "bank_id": bank_id})
+        for i, (op_id, rc) in enumerate([(op_ok, 2), (op_fail, 3)]):
+            await pool.execute(
+                """
+                INSERT INTO async_operations
+                    (operation_id, bank_id, operation_type, status, task_payload,
+                     worker_id, retry_count, claimed_at)
+                VALUES ($1, $2, 'test', 'processing', $3::jsonb, $4, $5, now())
+                """,
+                op_id,
+                bank_id,
+                payload,
+                worker_id,
+                rc,
+            )
+
+        poller = WorkerPoller(
+            backend=backend,
+            worker_id=worker_id,
+            executor=lambda x: None,
+            max_retries=3,
+        )
+        recovered = await poller.recover_own_tasks()
+        # Only the under-limit task should be counted as recovered
+        assert recovered == 1
+
+        # Task at retry_count=2 → should become pending (now retry_count=3)
+        row_ok = await pool.fetchrow(
+            "SELECT status, retry_count FROM async_operations WHERE operation_id = $1",
+            op_ok,
+        )
+        assert row_ok["status"] == "pending"
+        assert row_ok["retry_count"] == 3
+
+        # Task at retry_count=3 → should be moved to failed
+        row_fail = await pool.fetchrow(
+            "SELECT status, retry_count, error_message FROM async_operations WHERE operation_id = $1",
+            op_fail,
+        )
+        assert row_fail["status"] == "failed"
+        assert row_fail["error_message"] is not None
+        assert "exceeded" in row_fail["error_message"]
+
+    @pytest.mark.asyncio
+    async def test_recover_own_tasks_handles_null_retry_count(self, pool, backend, clean_operations):
+        """Test that COALESCE handles NULL retry_count gracefully."""
+        from hindsight_api.worker import WorkerPoller
+
+        bank_id = f"test-worker-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(pool, bank_id)
+        worker_id = "null-retry-worker"
+
+        op_id = uuid.uuid4()
+        payload = json.dumps({"type": "test_task", "bank_id": bank_id})
+        await pool.execute(
+            """
+            INSERT INTO async_operations
+                (operation_id, bank_id, operation_type, status, task_payload,
+                 worker_id, claimed_at)
+            VALUES ($1, $2, 'test', 'processing', $3::jsonb, $4, now())
+            """,
+            op_id,
+            bank_id,
+            payload,
+            worker_id,
+        )
+
+        poller = WorkerPoller(
+            backend=backend,
+            worker_id=worker_id,
+            executor=lambda x: None,
+        )
+        recovered = await poller.recover_own_tasks()
+        assert recovered == 1
+
+        row = await pool.fetchrow(
+            "SELECT status, retry_count FROM async_operations WHERE operation_id = $1",
+            op_id,
+        )
+        assert row["status"] == "pending"
+        assert row["retry_count"] == 1  # COALESCE(NULL, 0) + 1
+
+    @pytest.mark.asyncio
+    async def test_recover_own_tasks_failed_child_propagates_to_parent(self, pool, backend, clean_operations):
+        """A crash-failed batch_retain child must roll its parent up to a terminal state.
+
+        A batch_retain child sub-batch carries `parent_operation_id` (not `batch_id`)
+        in its metadata, so crash recovery *can* move it to 'failed' once it exceeds
+        the retry budget. If that terminal transition does not propagate to the parent
+        aggregator operation, the parent is left stuck in 'processing' forever — the
+        same failure mode this PR set out to fix, one level up.
+        """
+        from hindsight_api.worker import WorkerPoller
+
+        bank_id = f"test-worker-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(pool, bank_id)
+        worker_id = "crash-loop-batch-worker"
+
+        # Parent aggregator: 'processing', not owned by any worker (children do the
+        # work). Recovery must not touch it directly — only via child roll-up.
+        parent_id = uuid.uuid4()
+        await pool.execute(
+            """
+            INSERT INTO async_operations
+                (operation_id, bank_id, operation_type, status, result_metadata)
+            VALUES ($1, $2, 'batch_retain', 'processing', '{}'::jsonb)
+            """,
+            parent_id,
+            bank_id,
+        )
+
+        # Sole child sub-batch, crash-interrupted at the retry limit.
+        child_id = uuid.uuid4()
+        child_payload = json.dumps({"type": "retain", "bank_id": bank_id})
+        child_metadata = json.dumps({"parent_operation_id": str(parent_id)})
+        await pool.execute(
+            """
+            INSERT INTO async_operations
+                (operation_id, bank_id, operation_type, status, task_payload,
+                 result_metadata, worker_id, retry_count, claimed_at)
+            VALUES ($1, $2, 'retain', 'processing', $3::jsonb, $4::jsonb, $5, 3, now())
+            """,
+            child_id,
+            bank_id,
+            child_payload,
+            child_metadata,
+            worker_id,
+        )
+
+        poller = WorkerPoller(
+            backend=backend,
+            worker_id=worker_id,
+            executor=lambda x: None,
+            max_retries=3,
+        )
+        await poller.recover_own_tasks()
+
+        # Child exceeded the budget → failed.
+        child_row = await pool.fetchrow(
+            "SELECT status FROM async_operations WHERE operation_id = $1",
+            child_id,
+        )
+        assert child_row["status"] == "failed"
+
+        # Parent must roll up to failed once its only child is terminal — not be
+        # left stranded in 'processing'.
+        parent_row = await pool.fetchrow(
+            "SELECT status FROM async_operations WHERE operation_id = $1",
+            parent_id,
+        )
+        assert parent_row["status"] == "failed"
+
+    @pytest.mark.asyncio
+    async def test_reconcile_completes_parent_when_all_children_completed(self, pool, backend, clean_operations):
+        """A pending batch_retain parent whose children all completed is promoted.
+
+        Models the crash window where the last child committed 'completed' but the
+        parent aggregation was skipped (issue #2985). Recovery must finalize the
+        parent to 'completed' rather than leave it stranded 'pending'.
+        """
+        from hindsight_api.worker import WorkerPoller
+
+        bank_id = f"test-worker-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(pool, bank_id)
+
+        parent_id = uuid.uuid4()
+        await pool.execute(
+            """
+            INSERT INTO async_operations
+                (operation_id, bank_id, operation_type, status, task_payload, result_metadata)
+            VALUES ($1, $2, 'batch_retain', 'pending', NULL, '{}'::jsonb)
+            """,
+            parent_id,
+            bank_id,
+        )
+        for _ in range(2):
+            await pool.execute(
+                """
+                INSERT INTO async_operations
+                    (operation_id, bank_id, operation_type, status, task_payload, result_metadata)
+                VALUES ($1, $2, 'retain', 'completed', '{}'::jsonb, $3::jsonb)
+                """,
+                uuid.uuid4(),
+                bank_id,
+                json.dumps({"parent_operation_id": str(parent_id)}),
+            )
+
+        poller = WorkerPoller(backend=backend, worker_id="reconcile-worker", executor=lambda x: None)
+        reconciled = await poller._reconcile_orphaned_parents(None)
+        assert reconciled == 1
+
+        parent_row = await pool.fetchrow(
+            "SELECT status, completed_at FROM async_operations WHERE operation_id = $1",
+            parent_id,
+        )
+        assert parent_row["status"] == "completed"
+        assert parent_row["completed_at"] is not None
+
+    @pytest.mark.asyncio
+    async def test_reconcile_fails_parent_when_a_child_failed(self, pool, backend, clean_operations):
+        """A pending parent with a failed child is finalized 'failed', inheriting its reason."""
+        from hindsight_api.worker import WorkerPoller
+
+        bank_id = f"test-worker-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(pool, bank_id)
+
+        parent_id = uuid.uuid4()
+        await pool.execute(
+            """
+            INSERT INTO async_operations
+                (operation_id, bank_id, operation_type, status, task_payload, result_metadata)
+            VALUES ($1, $2, 'batch_retain', 'pending', NULL, '{}'::jsonb)
+            """,
+            parent_id,
+            bank_id,
+        )
+        meta = json.dumps({"parent_operation_id": str(parent_id)})
+        await pool.execute(
+            """
+            INSERT INTO async_operations
+                (operation_id, bank_id, operation_type, status, task_payload, result_metadata)
+            VALUES ($1, $2, 'retain', 'completed', '{}'::jsonb, $3::jsonb)
+            """,
+            uuid.uuid4(),
+            bank_id,
+            meta,
+        )
+        await pool.execute(
+            """
+            INSERT INTO async_operations
+                (operation_id, bank_id, operation_type, status, task_payload,
+                 result_metadata, error_message)
+            VALUES ($1, $2, 'retain', 'failed', '{}'::jsonb, $3::jsonb, 'boom: extraction failed')
+            """,
+            uuid.uuid4(),
+            bank_id,
+            meta,
+        )
+
+        poller = WorkerPoller(backend=backend, worker_id="reconcile-worker", executor=lambda x: None)
+        assert await poller._reconcile_orphaned_parents(None) == 1
+
+        parent_row = await pool.fetchrow(
+            "SELECT status, error_message FROM async_operations WHERE operation_id = $1",
+            parent_id,
+        )
+        assert parent_row["status"] == "failed"
+        # Inherits the representative child reason, not a generic string.
+        assert parent_row["error_message"] == "boom: extraction failed"
+
+    @pytest.mark.asyncio
+    async def test_reconcile_fails_orphaned_parent_with_no_children(self, pool, backend, clean_operations):
+        """A pending parent with zero children is failed with an explicit, resubmit-hint reason.
+
+        This is the exact symptom in issue #2985: task_payload IS NULL, no children,
+        invisible to failed_operations. After reconciliation it is terminal and visible.
+        """
+        from hindsight_api.worker import WorkerPoller
+
+        bank_id = f"test-worker-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(pool, bank_id)
+
+        parent_id = uuid.uuid4()
+        await pool.execute(
+            """
+            INSERT INTO async_operations
+                (operation_id, bank_id, operation_type, status, task_payload, result_metadata)
+            VALUES ($1, $2, 'batch_retain', 'pending', NULL, '{}'::jsonb)
+            """,
+            parent_id,
+            bank_id,
+        )
+
+        poller = WorkerPoller(backend=backend, worker_id="reconcile-worker", executor=lambda x: None)
+        assert await poller._reconcile_orphaned_parents(None) == 1
+
+        parent_row = await pool.fetchrow(
+            "SELECT status, error_message, completed_at FROM async_operations WHERE operation_id = $1",
+            parent_id,
+        )
+        assert parent_row["status"] == "failed"
+        assert "orphaned batch_retain parent" in parent_row["error_message"]
+        assert parent_row["completed_at"] is not None
+
+    @pytest.mark.asyncio
+    async def test_reconcile_leaves_parent_with_live_child_untouched(self, pool, backend, clean_operations):
+        """A parent with a still-pending child must not be finalized prematurely."""
+        from hindsight_api.worker import WorkerPoller
+
+        bank_id = f"test-worker-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(pool, bank_id)
+
+        parent_id = uuid.uuid4()
+        await pool.execute(
+            """
+            INSERT INTO async_operations
+                (operation_id, bank_id, operation_type, status, task_payload, result_metadata)
+            VALUES ($1, $2, 'batch_retain', 'pending', NULL, '{}'::jsonb)
+            """,
+            parent_id,
+            bank_id,
+        )
+        meta = json.dumps({"parent_operation_id": str(parent_id)})
+        # One completed, one still pending — aggregation is not done yet.
+        await pool.execute(
+            """
+            INSERT INTO async_operations
+                (operation_id, bank_id, operation_type, status, task_payload, result_metadata)
+            VALUES ($1, $2, 'retain', 'completed', '{}'::jsonb, $3::jsonb)
+            """,
+            uuid.uuid4(),
+            bank_id,
+            meta,
+        )
+        await pool.execute(
+            """
+            INSERT INTO async_operations
+                (operation_id, bank_id, operation_type, status, task_payload, result_metadata)
+            VALUES ($1, $2, 'retain', 'pending', '{}'::jsonb, $3::jsonb)
+            """,
+            uuid.uuid4(),
+            bank_id,
+            meta,
+        )
+
+        poller = WorkerPoller(backend=backend, worker_id="reconcile-worker", executor=lambda x: None)
+        assert await poller._reconcile_orphaned_parents(None) == 0
+
+        parent_row = await pool.fetchrow(
+            "SELECT status FROM async_operations WHERE operation_id = $1",
+            parent_id,
+        )
+        assert parent_row["status"] == "pending"
+
+
+class TestTaskReleaseOnStop:
+    """A task that stops running must not leave its operation 'processing'.
+
+    Both paths strand the row under a worker id that is never coming back:
+    shutdown cancelling in-flight work past the drain timeout, and _mark_failed
+    (itself a DB write) failing. See issue #3228.
+    """
+
+    async def _insert_pending(self, pool, bank_id: str) -> uuid.UUID:
+        """Insert one claimable pending operation, returning its id."""
+        op_id = uuid.uuid4()
+        payload = json.dumps({"type": "test_task", "bank_id": bank_id, "operation_id": str(op_id)})
+        await pool.execute(
+            """
+            INSERT INTO async_operations (operation_id, bank_id, operation_type, status, task_payload)
+            VALUES ($1, $2, 'test', 'pending', $3::jsonb)
+            """,
+            op_id,
+            bank_id,
+            payload,
+        )
+        return op_id
+
+    async def _claim_ours(self, poller, op_id) -> object:
+        """Claim until our operation comes back (other rows may be queued too)."""
+        claimed = await poller.claim_batch()
+        ours = [t for t in claimed if t.operation_id == str(op_id)]
+        assert len(ours) == 1, "test operation should have been claimed"
+        return ours[0]
+
+    async def _wait_for_status(self, pool, op_id, status: str, timeout: float = 5.0):
+        """Poll until the row leaves 'processing'; return the final row."""
+        deadline = asyncio.get_event_loop().time() + timeout
+        while True:
+            row = await pool.fetchrow(
+                "SELECT status, worker_id, claimed_at, retry_count FROM async_operations WHERE operation_id = $1",
+                op_id,
+            )
+            if row["status"] == status or asyncio.get_event_loop().time() > deadline:
+                return row
+            await asyncio.sleep(0.05)
+
+    @pytest.mark.asyncio
+    async def test_shutdown_releases_cancelled_operations(self, pool, backend, clean_operations):
+        """shutdown_graceful must hand back the rows whose tasks it cancelled."""
+        from hindsight_api.worker import WorkerPoller
+
+        bank_id = f"test-worker-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(pool, bank_id)
+        op_id = await self._insert_pending(pool, bank_id)
+
+        started = asyncio.Event()
+        block = asyncio.Event()
+
+        async def blocking_executor(task_dict):
+            started.set()
+            await block.wait()
+
+        poller = WorkerPoller(backend=backend, worker_id="release-worker", executor=blocking_executor)
+        task = await self._claim_ours(poller, op_id)
+
+        row = await pool.fetchrow("SELECT status, worker_id FROM async_operations WHERE operation_id = $1", op_id)
+        assert row["status"] == "processing"
+        assert row["worker_id"] == "release-worker"
+
+        await poller.execute_task(task)
+        await asyncio.wait_for(started.wait(), timeout=5)
+
+        await poller.shutdown_graceful(timeout=0.1)
+
+        row = await pool.fetchrow(
+            "SELECT status, worker_id, claimed_at, retry_count FROM async_operations WHERE operation_id = $1",
+            op_id,
+        )
+        assert row["status"] == "pending", "shutdown must not strand a row it cancelled"
+        assert row["worker_id"] is None
+        assert row["claimed_at"] is None
+        assert row["retry_count"] == 1, "an interrupted run counts against the retry budget"
+
+    @pytest.mark.asyncio
+    async def test_shutdown_fails_operation_over_retry_budget(self, pool, backend, clean_operations):
+        """A row already at the retry limit is failed, not handed back forever."""
+        from hindsight_api.worker import WorkerPoller
+
+        bank_id = f"test-worker-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(pool, bank_id)
+        op_id = await self._insert_pending(pool, bank_id)
+
+        started = asyncio.Event()
+        block = asyncio.Event()
+
+        async def blocking_executor(task_dict):
+            started.set()
+            await block.wait()
+
+        poller = WorkerPoller(backend=backend, worker_id="release-worker", executor=blocking_executor, max_retries=2)
+        task = await self._claim_ours(poller, op_id)
+        await pool.execute("UPDATE async_operations SET retry_count = 2 WHERE operation_id = $1", op_id)
+
+        await poller.execute_task(task)
+        await asyncio.wait_for(started.wait(), timeout=5)
+
+        await poller.shutdown_graceful(timeout=0.1)
+
+        row = await pool.fetchrow(
+            "SELECT status, worker_id, error_message FROM async_operations WHERE operation_id = $1",
+            op_id,
+        )
+        assert row["status"] == "failed", "a row over the retry budget must not be re-claimed forever"
+        assert row["worker_id"] is None
+        assert "retry_count" in row["error_message"]
+
+    @pytest.mark.asyncio
+    async def test_shutdown_leaves_completed_operation_alone(self, pool, backend, clean_operations):
+        """A task that finished during the drain keeps its terminal state."""
+        from hindsight_api.worker import WorkerPoller
+
+        bank_id = f"test-worker-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(pool, bank_id)
+        op_id = await self._insert_pending(pool, bank_id)
+
+        async def quick_executor(task_dict):
+            return None
+
+        poller = WorkerPoller(backend=backend, worker_id="release-worker", executor=quick_executor)
+        task = await self._claim_ours(poller, op_id)
+
+        await poller.execute_task(task)
+        await poller.shutdown_graceful(timeout=5.0)
+
+        row = await pool.fetchrow(
+            "SELECT status, retry_count FROM async_operations WHERE operation_id = $1",
+            op_id,
+        )
+        assert row["status"] == "completed"
+        assert row["retry_count"] == 0, "a completed task must not be charged a retry"
+
+    @pytest.mark.asyncio
+    async def test_shutdown_does_not_touch_other_workers(self, pool, backend, clean_operations):
+        """The release is scoped to this worker's own rows."""
+        from hindsight_api.worker import WorkerPoller
+
+        bank_id = f"test-worker-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(pool, bank_id)
+        other_op_id = uuid.uuid4()
+        await pool.execute(
+            """
+            INSERT INTO async_operations (operation_id, bank_id, operation_type, status, task_payload, worker_id, claimed_at)
+            VALUES ($1, $2, 'test', 'processing', '{}'::jsonb, 'other-worker', now())
+            """,
+            other_op_id,
+            bank_id,
+        )
+
+        poller = WorkerPoller(backend=backend, worker_id="release-worker", executor=lambda x: None)
+        await poller.shutdown_graceful(timeout=0.1)
+
+        row = await pool.fetchrow(
+            "SELECT status, worker_id FROM async_operations WHERE operation_id = $1",
+            other_op_id,
+        )
+        assert row["status"] == "processing", "another live worker's row must be left alone"
+        assert row["worker_id"] == "other-worker"
+
+    @pytest.mark.asyncio
+    async def test_failed_terminal_write_releases_operation(self, pool, backend, clean_operations):
+        """If _mark_failed itself raises, the row is reconciled, not stranded."""
+        from hindsight_api.worker import WorkerPoller
+
+        bank_id = f"test-worker-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(pool, bank_id)
+        op_id = await self._insert_pending(pool, bank_id)
+
+        async def failing_executor(task_dict):
+            raise RuntimeError("executor blew up")
+
+        poller = WorkerPoller(backend=backend, worker_id="release-worker", executor=failing_executor)
+
+        async def broken_mark_failed(operation_id, error_message, schema):
+            raise RuntimeError("pool exhausted")
+
+        poller._mark_failed = broken_mark_failed
+
+        task = await self._claim_ours(poller, op_id)
+        await poller.execute_task(task)
+
+        row = await self._wait_for_status(pool, op_id, "pending")
+        assert row["status"] == "pending", "a failed terminal write must not strand the row"
+        assert row["worker_id"] is None
+        assert row["claimed_at"] is None
+        assert row["retry_count"] == 1
 
 
 class TestConcurrentWorkers:
@@ -2631,6 +3417,89 @@ class TestMarkFailedParentPropagation:
         )
 
     @pytest.mark.asyncio
+    async def test_cancelled_sibling_counts_as_done_and_settles_parent(self, pool, backend, clean_operations):
+        """A cancelled child must not strand the parent in 'processing' (issue #4131).
+
+        The poller's copy of the rollup mirrors MemoryEngine._maybe_update_parent_operation:
+        'cancelled' is a done state, and with no failures the parent settles on 'cancelled'.
+        """
+        from hindsight_api.worker import WorkerPoller
+
+        bank_id = f"test-worker-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(pool, bank_id)
+
+        parent_id = uuid.uuid4()
+        cancelled_child_id = uuid.uuid4()
+        last_child_id = uuid.uuid4()
+
+        await self._insert_op(
+            pool, op_id=parent_id, bank_id=bank_id, operation_type="batch_retain", status="processing"
+        )
+        await self._insert_op(
+            pool,
+            op_id=cancelled_child_id,
+            bank_id=bank_id,
+            operation_type="retain",
+            status="cancelled",
+            result_metadata={"parent_operation_id": str(parent_id)},
+        )
+        await self._insert_op(
+            pool,
+            op_id=last_child_id,
+            bank_id=bank_id,
+            operation_type="retain",
+            status="processing",
+            result_metadata={"parent_operation_id": str(parent_id)},
+        )
+
+        poller = WorkerPoller(backend=backend, worker_id="test-worker-1", executor=lambda x: None)
+        await poller._mark_completed(str(last_child_id), None)
+
+        parent_status = await pool.fetchval("SELECT status FROM async_operations WHERE operation_id = $1", parent_id)
+        assert parent_status == "cancelled", f"parent must not be left in 'processing', got '{parent_status}'"
+
+    @pytest.mark.asyncio
+    async def test_failed_sibling_outranks_cancelled_one(self, pool, backend, clean_operations):
+        """A real failure still wins over a cancellation — it carries a cause to surface."""
+        from hindsight_api.worker import WorkerPoller
+
+        bank_id = f"test-worker-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(pool, bank_id)
+
+        parent_id = uuid.uuid4()
+        cancelled_child_id = uuid.uuid4()
+        last_child_id = uuid.uuid4()
+
+        await self._insert_op(
+            pool, op_id=parent_id, bank_id=bank_id, operation_type="batch_retain", status="processing"
+        )
+        await self._insert_op(
+            pool,
+            op_id=cancelled_child_id,
+            bank_id=bank_id,
+            operation_type="retain",
+            status="cancelled",
+            result_metadata={"parent_operation_id": str(parent_id)},
+        )
+        await self._insert_op(
+            pool,
+            op_id=last_child_id,
+            bank_id=bank_id,
+            operation_type="retain",
+            status="processing",
+            result_metadata={"parent_operation_id": str(parent_id)},
+        )
+
+        poller = WorkerPoller(backend=backend, worker_id="test-worker-1", executor=lambda x: None)
+        await poller._mark_failed(str(last_child_id), "DB constraint violation", schema=None)
+
+        parent_row = await pool.fetchrow(
+            "SELECT status, error_message FROM async_operations WHERE operation_id = $1", parent_id
+        )
+        assert parent_row["status"] == "failed"
+        assert "DB constraint violation" in parent_row["error_message"]
+
+    @pytest.mark.asyncio
     async def test_mark_failed_finalises_parent_when_last_sibling_fails(self, pool, backend, clean_operations):
         """When the last pending child fails, parent batch_retain is marked failed."""
         from hindsight_api.worker import WorkerPoller
@@ -2872,7 +3741,7 @@ class TestClaimBatchRotation:
 
         serviced: list[str] = []
 
-        async def fake_claim(schema, reserved_limits, shared_limit):
+        async def fake_claim(conn, schema, reserved_limits, shared_limit):
             # Tests only exercise non-reserved ("test") tasks, so we only
             # consult the shared_limit.
             remaining = pending_per_schema.get(schema, 0)
@@ -2894,7 +3763,7 @@ class TestClaimBatchRotation:
 
         poller._claim_batch_for_schema = fake_claim  # type: ignore[method-assign]
 
-        async def fake_scan(scan_schemas):
+        async def fake_scan(conn, scan_schemas):
             return {s for s in scan_schemas if pending_per_schema.get(s, 0) > 0}
 
         poller._scan_active_schemas = fake_scan  # type: ignore[method-assign]
@@ -3006,7 +3875,8 @@ class TestClaimBatchRotation:
         )
 
         try:
-            result = await poller._scan_active_schemas([None])
+            async with backend.acquire() as conn:
+                result = await poller._scan_active_schemas(conn, [None])
             assert None in result, "Scan missed schema with pending work"
         finally:
             await pool.execute("DELETE FROM async_operations WHERE operation_id = $1", op_id)
@@ -3055,7 +3925,8 @@ class TestClaimBatchRotation:
             PostgresConnection.fetch = spy_fetch  # type: ignore[method-assign]
             PostgresConnection.fetchval = spy_fetchval  # type: ignore[method-assign]
             try:
-                await poller._scan_active_schemas([None])
+                async with backend.acquire() as conn:
+                    await poller._scan_active_schemas(conn, [None])
             finally:
                 PostgresConnection.fetch = original_fetch  # type: ignore[method-assign]
                 PostgresConnection.fetchval = original_fetchval  # type: ignore[method-assign]
@@ -3097,7 +3968,8 @@ class TestClaimBatchRotation:
                 executor=lambda x: None,
             )
 
-            result = await poller._scan_active_schemas([None])
+            async with backend.acquire() as conn:
+                result = await poller._scan_active_schemas(conn, [None])
 
             assert result == {None}
         finally:
@@ -3131,9 +4003,9 @@ class TestClaimBatchRotation:
         )
         original_claim = poller._claim_batch_for_schema
 
-        async def tracking_claim(schema, nc_limit, cons_limit):
+        async def tracking_claim(conn, schema, nc_limit, cons_limit):
             schemas_claimed.append(schema)
-            return await original_claim(schema, nc_limit, cons_limit)
+            return await original_claim(conn, schema, nc_limit, cons_limit)
 
         poller._claim_batch_for_schema = tracking_claim  # type: ignore[method-assign]
 
@@ -3747,3 +4619,634 @@ class TestConsolidationBankPriority:
             high_pending_op,
         )
         assert row["status"] == "pending"
+
+
+class TestTerminalOperationRetention:
+    """Terminal operation rows remain intact until bounded worker cleanup expires them."""
+
+    @staticmethod
+    async def _insert_operation(
+        pool,
+        *,
+        operation_id: uuid.UUID,
+        bank_id: str,
+        status: str,
+        updated_at: datetime,
+        marker: str,
+    ) -> None:
+        await pool.execute(
+            """
+            INSERT INTO async_operations
+                (operation_id, bank_id, operation_type, status, task_payload, result_metadata,
+                 created_at, updated_at)
+            VALUES ($1, $2, 'retain', $3, $4::jsonb, $5::jsonb, $6, $6)
+            """,
+            operation_id,
+            bank_id,
+            status,
+            json.dumps({"marker": marker, "contents": ["payload must survive until expiry"]}),
+            json.dumps({"marker": marker, "debug": "metadata must share the same TTL"}),
+            updated_at,
+        )
+
+    @pytest.mark.asyncio
+    async def test_prune_terminal_operations_is_bounded_oldest_first_and_preserves_live_rows(
+        self, pool, backend, clean_operations
+    ):
+        bank_id = f"test-worker-retention-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(pool, bank_id)
+        # Keep this cutoff far outside normal test data so the schema-wide
+        # cleanup method cannot consume another concurrently running test's rows.
+        cutoff = datetime(2000, 1, 1, tzinfo=UTC)
+
+        id_prefix = uuid.uuid4().int & ~0xFFFF
+        oldest_id = uuid.UUID(int=id_prefix + 1)
+        tied_first_id = uuid.UUID(int=id_prefix + 2)
+        tied_second_id = uuid.UUID(int=id_prefix + 3)
+        newer_expired_id = uuid.UUID(int=id_prefix + 4)
+        fresh_failed_id = uuid.UUID(int=id_prefix + 5)
+        fresh_cancelled_id = uuid.UUID(int=id_prefix + 6)
+        old_pending_id = uuid.UUID(int=id_prefix + 7)
+        old_processing_id = uuid.UUID(int=id_prefix + 8)
+
+        rows = [
+            (oldest_id, "completed", cutoff - timedelta(days=4), "expired-completed"),
+            (tied_first_id, "failed", cutoff - timedelta(days=3), "expired-failed"),
+            (tied_second_id, "cancelled", cutoff - timedelta(days=3), "expired-cancelled"),
+            (newer_expired_id, "completed", cutoff - timedelta(days=2), "expired-newer"),
+            (fresh_failed_id, "failed", cutoff + timedelta(days=1), "fresh-failed"),
+            (fresh_cancelled_id, "cancelled", cutoff + timedelta(days=1), "fresh-cancelled"),
+            (old_pending_id, "pending", cutoff - timedelta(days=10), "old-pending"),
+            (old_processing_id, "processing", cutoff - timedelta(days=10), "old-processing"),
+        ]
+        for operation_id, status, updated_at, marker in rows:
+            await self._insert_operation(
+                pool,
+                operation_id=operation_id,
+                bank_id=bank_id,
+                status=status,
+                updated_at=updated_at,
+                marker=marker,
+            )
+
+        raw_before = await pool.fetch(
+            """
+            SELECT operation_id, task_payload->>'marker' AS payload_marker,
+                   result_metadata->>'marker' AS metadata_marker
+            FROM async_operations
+            WHERE bank_id = $1
+            """,
+            bank_id,
+        )
+        assert {row["payload_marker"] for row in raw_before} == {marker for *_, marker in rows}
+        assert {row["metadata_marker"] for row in raw_before} == {marker for *_, marker in rows}
+
+        async with backend.acquire() as conn:
+            async with conn.transaction():
+                deleted = await backend.ops.prune_terminal_operations(
+                    conn,
+                    "async_operations",
+                    cutoff,
+                    batch_size=2,
+                )
+        assert deleted == 2
+
+        raw_after_first_batch = await pool.fetch(
+            """
+            SELECT operation_id, status, task_payload->>'marker' AS payload_marker,
+                   result_metadata->>'marker' AS metadata_marker
+            FROM async_operations
+            WHERE bank_id = $1
+            ORDER BY operation_id
+            """,
+            bank_id,
+        )
+        remaining_ids = {row["operation_id"] for row in raw_after_first_batch}
+        assert oldest_id not in remaining_ids
+        assert tied_first_id not in remaining_ids
+        assert tied_second_id in remaining_ids
+        assert newer_expired_id in remaining_ids
+
+        async with backend.acquire() as conn:
+            async with conn.transaction():
+                deleted = await backend.ops.prune_terminal_operations(
+                    conn,
+                    "async_operations",
+                    cutoff,
+                    batch_size=100,
+                )
+        assert deleted == 2
+
+        raw_final = await pool.fetch(
+            """
+            SELECT operation_id, status, task_payload->>'marker' AS payload_marker,
+                   result_metadata->>'marker' AS metadata_marker
+            FROM async_operations
+            WHERE bank_id = $1
+            ORDER BY operation_id
+            """,
+            bank_id,
+        )
+        assert {(row["status"], row["payload_marker"], row["metadata_marker"]) for row in raw_final} == {
+            ("failed", "fresh-failed", "fresh-failed"),
+            ("cancelled", "fresh-cancelled", "fresh-cancelled"),
+            ("pending", "old-pending", "old-pending"),
+            ("processing", "old-processing", "old-processing"),
+        }
+
+    @pytest.mark.asyncio
+    async def test_concurrent_pruning_is_safe_and_idempotent(self, pool, backend, clean_operations):
+        bank_id = f"test-worker-retention-concurrent-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(pool, bank_id)
+        cutoff = datetime(2000, 1, 1, tzinfo=UTC)
+        operation_ids = [uuid.uuid4() for _ in range(25)]
+        for index, operation_id in enumerate(operation_ids):
+            await self._insert_operation(
+                pool,
+                operation_id=operation_id,
+                bank_id=bank_id,
+                status=("completed", "failed", "cancelled")[index % 3],
+                updated_at=cutoff - timedelta(minutes=25 - index),
+                marker=f"expired-{index}",
+            )
+
+        async def prune(batch_size: int) -> int:
+            async with backend.acquire() as conn:
+                async with conn.transaction():
+                    return await backend.ops.prune_terminal_operations(
+                        conn,
+                        "async_operations",
+                        cutoff,
+                        batch_size=batch_size,
+                    )
+
+        first_counts = await asyncio.gather(prune(10), prune(10))
+        assert sum(first_counts) == 20
+        assert await pool.fetchval("SELECT COUNT(*) FROM async_operations WHERE bank_id = $1", bank_id) == 5
+        second_counts = await asyncio.gather(prune(10), prune(10))
+        assert sum(second_counts) == 5
+        assert await pool.fetchval("SELECT COUNT(*) FROM async_operations WHERE bank_id = $1", bank_id) == 0
+        assert await prune(10) == 0
+
+    @pytest.mark.asyncio
+    async def test_pruning_cancelled_child_cancels_parent_before_deletion_and_releases_siblings_later(
+        self, pool, backend, clean_operations
+    ):
+        bank_id = f"test-worker-retention-parent-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(pool, bank_id)
+        cutoff = datetime(2000, 1, 1, tzinfo=UTC)
+        parent_id = uuid.uuid4()
+        failed_child_id = uuid.uuid4()
+        completed_child_id = uuid.uuid4()
+        cancelled_child_id = uuid.uuid4()
+        standalone_id = uuid.uuid4()
+
+        await pool.execute(
+            """
+            INSERT INTO async_operations
+                (operation_id, bank_id, operation_type, status, result_metadata, created_at, updated_at)
+            VALUES ($1, $2, 'batch_retain', 'pending', '{}'::jsonb, $3, $3)
+            """,
+            parent_id,
+            bank_id,
+            cutoff - timedelta(days=5),
+        )
+        for child_id, status in (
+            (failed_child_id, "failed"),
+            (completed_child_id, "completed"),
+            (cancelled_child_id, "cancelled"),
+        ):
+            await pool.execute(
+                """
+                INSERT INTO async_operations
+                    (operation_id, bank_id, operation_type, status, task_payload, result_metadata,
+                     created_at, updated_at)
+                VALUES ($1, $2, 'retain', $3, '{}'::jsonb, $4::jsonb, $5, $5)
+                """,
+                child_id,
+                bank_id,
+                status,
+                json.dumps({"parent_operation_id": str(parent_id)}),
+                cutoff - timedelta(days=4),
+            )
+        await self._insert_operation(
+            pool,
+            operation_id=standalone_id,
+            bank_id=bank_id,
+            status="completed",
+            updated_at=cutoff - timedelta(days=3),
+            marker="standalone",
+        )
+
+        cleanup_started_at = await pool.fetchval("SELECT now()")
+        async with backend.acquire() as conn:
+            async with conn.transaction():
+                deleted = await backend.ops.prune_terminal_operations(conn, "async_operations", cutoff, batch_size=100)
+
+        assert deleted == 2
+        parent = await pool.fetchrow(
+            """
+            SELECT status, updated_at, completed_at, error_message
+            FROM async_operations
+            WHERE operation_id = $1
+            """,
+            parent_id,
+        )
+        assert parent["status"] == "cancelled"
+        assert parent["updated_at"] >= cleanup_started_at
+        assert parent["completed_at"] >= cleanup_started_at
+        assert parent["error_message"] == "Cancelled because a child operation was cancelled"
+        assert (
+            await pool.fetchval("SELECT COUNT(*) FROM async_operations WHERE operation_id = $1", failed_child_id) == 1
+        )
+        assert (
+            await pool.fetchval("SELECT COUNT(*) FROM async_operations WHERE operation_id = $1", completed_child_id)
+            == 1
+        )
+        assert (
+            await pool.fetchval("SELECT COUNT(*) FROM async_operations WHERE operation_id = $1", cancelled_child_id)
+            == 0
+        )
+        assert await pool.fetchval("SELECT COUNT(*) FROM async_operations WHERE operation_id = $1", standalone_id) == 0
+
+        await pool.execute(
+            "UPDATE async_operations SET updated_at = $2 WHERE operation_id = $1",
+            parent_id,
+            cutoff - timedelta(days=1),
+        )
+        async with backend.acquire() as conn:
+            async with conn.transaction():
+                deleted = await backend.ops.prune_terminal_operations(conn, "async_operations", cutoff, batch_size=100)
+
+        assert deleted == 1
+        assert await pool.fetchval("SELECT COUNT(*) FROM async_operations WHERE operation_id = $1", parent_id) == 0
+        assert (
+            await pool.fetchval("SELECT COUNT(*) FROM async_operations WHERE operation_id = $1", failed_child_id) == 1
+        )
+        assert (
+            await pool.fetchval("SELECT COUNT(*) FROM async_operations WHERE operation_id = $1", completed_child_id)
+            == 1
+        )
+
+        async with backend.acquire() as conn:
+            async with conn.transaction():
+                deleted = await backend.ops.prune_terminal_operations(conn, "async_operations", cutoff, batch_size=100)
+
+        assert deleted == 2
+        assert (
+            await pool.fetchval("SELECT COUNT(*) FROM async_operations WHERE operation_id = $1", failed_child_id) == 0
+        )
+        assert (
+            await pool.fetchval("SELECT COUNT(*) FROM async_operations WHERE operation_id = $1", completed_child_id)
+            == 0
+        )
+
+    @pytest.mark.asyncio
+    async def test_postgresql_pruning_reconciles_pending_same_bank_parent_before_child_delete(self):
+        from hindsight_api.engine.db.ops_postgresql import PostgreSQLOps
+
+        operation_id = uuid.uuid4()
+        calls = []
+        conn = MagicMock()
+
+        async def fetch(query, *args):
+            calls.append(("fetch", query))
+            return [{"operation_id": operation_id}]
+
+        async def execute(query, *args):
+            calls.append(("execute", query))
+
+        conn.fetch = AsyncMock(side_effect=fetch)
+        conn.execute = AsyncMock(side_effect=execute)
+
+        deleted = await PostgreSQLOps().prune_terminal_operations(
+            conn,
+            "async_operations",
+            datetime(2000, 1, 1, tzinfo=UTC),
+            batch_size=100,
+        )
+
+        assert deleted == 1
+        candidate_query = " ".join(conn.fetch.await_args_list[0].args[0].split())
+        reconciliation_query = " ".join(conn.execute.await_args.args[0].split())
+        delete_query = " ".join(conn.fetch.await_args_list[1].args[0].split())
+        assert "candidate_operation.status = 'cancelled' OR NOT EXISTS" in candidate_query
+        assert "parent.operation_id = CASE" in candidate_query
+        assert "UPDATE async_operations parent SET status = 'cancelled'" in reconciliation_query
+        assert "parent.status = 'pending'" in reconciliation_query
+        assert "candidate_operation.bank_id = parent.bank_id" in reconciliation_query
+        assert "candidate_operation.status = 'cancelled'" in reconciliation_query
+        assert "parent.operation_id = CASE" in reconciliation_query
+        assert "~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'" in reconciliation_query
+        assert "completed_at = COALESCE(parent.completed_at, now())" in reconciliation_query
+        assert "error_message = COALESCE(" in reconciliation_query
+        assert "DELETE FROM async_operations" in delete_query
+        assert [kind for kind, _ in calls] == ["fetch", "execute", "fetch"]
+
+    @pytest.mark.asyncio
+    async def test_oracle_pruning_clamps_candidate_batch_to_in_list_limit(self):
+        from hindsight_api.engine.db.ops_oracle import ORACLE_IN_LIST_LIMIT, OracleOps
+
+        candidate_ids = [uuid.uuid4() for _ in range(ORACLE_IN_LIST_LIMIT)]
+        rows = [{"operation_id": operation_id, "result_metadata": {}} for operation_id in candidate_ids]
+        conn = MagicMock()
+        conn.fetch = AsyncMock(side_effect=[rows, rows])
+        conn.execute = AsyncMock()
+
+        deleted = await OracleOps().prune_terminal_operations(
+            conn,
+            "async_operations",
+            datetime(2000, 1, 1, tzinfo=UTC),
+            batch_size=ORACLE_IN_LIST_LIMIT + 500,
+        )
+
+        assert deleted == ORACLE_IN_LIST_LIMIT
+        assert conn.fetch.await_args_list[0].args[-1] == ORACLE_IN_LIST_LIMIT
+        assert len(conn.fetch.await_args_list[1].args[1]) == ORACLE_IN_LIST_LIMIT
+        assert conn.execute.await_count == 2
+        assert len(conn.execute.await_args_list[0].args[1]) == ORACLE_IN_LIST_LIMIT
+        assert len(conn.execute.await_args_list[1].args[1]) == ORACLE_IN_LIST_LIMIT
+
+    @pytest.mark.asyncio
+    async def test_oracle_pruning_reconciles_pending_same_bank_parent_before_child_delete(self):
+        from hindsight_api.engine.db.ops_oracle import OracleOps
+        from hindsight_api.engine.db.oracle import _rewrite_pg_to_oracle
+
+        standalone_id = uuid.uuid4()
+        candidates = [{"operation_id": standalone_id}]
+        calls = []
+        conn = MagicMock()
+
+        async def fetch(query, *args):
+            calls.append(("fetch", query))
+            if len(conn.fetch.await_args_list) == 1:
+                return candidates
+            return [{"operation_id": standalone_id}]
+
+        async def execute(query, *args):
+            calls.append(("execute", query))
+
+        conn.fetch = AsyncMock(side_effect=fetch)
+        conn.execute = AsyncMock(side_effect=execute)
+
+        deleted = await OracleOps().prune_terminal_operations(
+            conn,
+            "async_operations",
+            datetime(2000, 1, 1, tzinfo=UTC),
+            batch_size=100,
+        )
+
+        assert deleted == 1
+        candidate_query = conn.fetch.await_args_list[0].args[0]
+        lock_query = conn.fetch.await_args_list[1].args[0]
+        reconciliation_query = conn.execute.await_args_list[0].args[0]
+        delete_query = conn.execute.await_args_list[1].args[0]
+        safe_parent_lookup = (
+            "parent.operation_id = CASE WHEN REGEXP_LIKE( JSON_VALUE( "
+            "candidate_operation.result_metadata, '$.parent_operation_id' RETURNING VARCHAR2(36) NULL ON ERROR ), "
+            "'^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$' ) "
+            "THEN HEXTORAW(REPLACE( JSON_VALUE( candidate_operation.result_metadata, "
+            "'$.parent_operation_id' RETURNING VARCHAR2(36) NULL ON ERROR ), '-', '' )) ELSE NULL END"
+        )
+        for query in (candidate_query, lock_query):
+            compact_query = " ".join(query.split())
+            assert "candidate_operation.status = 'cancelled' OR NOT EXISTS" in compact_query
+            assert safe_parent_lookup in compact_query
+            assert "RAWTOHEX" not in compact_query
+        compact_reconciliation_query = " ".join(reconciliation_query.split())
+        assert "UPDATE async_operations parent SET status = 'cancelled'" in compact_reconciliation_query
+        assert "parent.status = 'pending'" in compact_reconciliation_query
+        assert "candidate_operation.bank_id = parent.bank_id" in compact_reconciliation_query
+        assert "candidate_operation.status = 'cancelled'" in compact_reconciliation_query
+        assert safe_parent_lookup in compact_reconciliation_query
+        assert "completed_at = COALESCE(parent.completed_at, now())" in compact_reconciliation_query
+        assert "error_message = COALESCE(" in compact_reconciliation_query
+        assert "RAWTOHEX" not in compact_reconciliation_query
+        candidate_oracle_query = _rewrite_pg_to_oracle(candidate_query).query
+        lock_oracle_query = _rewrite_pg_to_oracle(lock_query).query
+        reconciliation_oracle_query = _rewrite_pg_to_oracle(reconciliation_query).query
+        assert "LIMIT" not in candidate_oracle_query
+        assert "FETCH FIRST :2 ROWS ONLY" in candidate_oracle_query
+        for query in (candidate_oracle_query, lock_oracle_query):
+            compact_query = " ".join(query.split())
+            assert "candidate_operation.status = 'cancelled' OR NOT EXISTS" in compact_query
+            assert safe_parent_lookup in compact_query
+            assert "RAWTOHEX" not in compact_query
+        compact_reconciliation_oracle_query = " ".join(reconciliation_oracle_query.split())
+        assert "parent.status = 'pending'" in compact_reconciliation_oracle_query
+        assert "candidate_operation.bank_id = parent.bank_id" in compact_reconciliation_oracle_query
+        assert safe_parent_lookup in compact_reconciliation_oracle_query
+        assert "SYSTIMESTAMP" in compact_reconciliation_oracle_query
+        assert "RAWTOHEX" not in compact_reconciliation_oracle_query
+        assert "FOR UPDATE OF candidate_operation.operation_id SKIP LOCKED" in lock_oracle_query
+        assert conn.fetch.await_args_list[1].args[1] == [standalone_id]
+        assert conn.execute.await_args_list[0].args[1] == [standalone_id]
+        assert conn.execute.await_args_list[1].args[1] == [standalone_id]
+        assert "DELETE FROM async_operations" in delete_query
+        assert [kind for kind, _ in calls] == ["fetch", "fetch", "execute", "execute"]
+
+    @pytest.mark.asyncio
+    async def test_oracle_pruning_filters_parent_blocked_children_before_batch_limit(self):
+        from hindsight_api.engine.db.ops_oracle import OracleOps
+
+        parent_ids = [uuid.uuid4(), uuid.uuid4()]
+        child_ids = [uuid.uuid4(), uuid.uuid4()]
+        eligible_id = uuid.uuid4()
+        blocked_candidates = [
+            {
+                "operation_id": child_id,
+                "result_metadata": {"parent_operation_id": str(parent_id)},
+            }
+            for child_id, parent_id in zip(child_ids, parent_ids, strict=True)
+        ]
+
+        conn = MagicMock()
+
+        async def fetch(query, *args):
+            if "LIMIT $2" in query:
+                if "NOT EXISTS" in query:
+                    return [{"operation_id": eligible_id}]
+                return blocked_candidates
+            if "operation_id = ANY($1)" in query:
+                return [{"operation_id": operation_id} for operation_id in args[0]]
+            raise AssertionError(f"Unexpected query: {query}")
+
+        conn.fetch = AsyncMock(side_effect=fetch)
+        conn.execute = AsyncMock()
+
+        deleted = await OracleOps().prune_terminal_operations(
+            conn,
+            "async_operations",
+            datetime(2000, 1, 1, tzinfo=UTC),
+            batch_size=2,
+        )
+
+        assert deleted == 1
+        candidate_query = conn.fetch.await_args_list[0].args[0]
+        assert candidate_query.index("NOT EXISTS") < candidate_query.index("LIMIT $2")
+        assert conn.execute.await_count == 2
+        assert conn.execute.await_args_list[0].args[1] == [eligible_id]
+        assert conn.execute.await_args_list[1].args[1] == [eligible_id]
+
+    @pytest.mark.asyncio
+    async def test_oracle_backend_resets_default_schema_on_pooled_connection(self):
+        from hindsight_api.engine.db.oracle import OracleBackend
+        from hindsight_api.engine.memory_engine import _current_schema
+
+        backend = OracleBackend()
+        backend._default_schema = "APP_USER"
+        cursor = MagicMock()
+        cursor.execute = AsyncMock()
+        conn = MagicMock()
+        conn.cursor.return_value = cursor
+
+        tenant_token = _current_schema.set("TENANT_A")
+        try:
+            await backend._set_session_schema(conn)
+        finally:
+            _current_schema.reset(tenant_token)
+        cursor.execute.assert_awaited_with('ALTER SESSION SET CURRENT_SCHEMA = "TENANT_A"')
+
+        cursor.execute.reset_mock()
+        default_token = _current_schema.set(None)
+        try:
+            await backend._set_session_schema(conn)
+        finally:
+            _current_schema.reset(default_token)
+        cursor.execute.assert_awaited_once_with('ALTER SESSION SET CURRENT_SCHEMA = "APP_USER"')
+        assert cursor.close.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_oracle_backend_discovers_session_user_before_first_schema_switch(self):
+        from hindsight_api.engine.db.oracle import OracleBackend
+        from hindsight_api.engine.memory_engine import _current_schema
+
+        backend = OracleBackend()
+        cursor = MagicMock()
+        cursor.execute = AsyncMock()
+        cursor.fetchone = AsyncMock(return_value=("APP_USER",))
+        conn = MagicMock()
+        conn.cursor.return_value = cursor
+
+        schema_token = _current_schema.set(None)
+        try:
+            await backend._set_session_schema(conn)
+        finally:
+            _current_schema.reset(schema_token)
+
+        assert [call.args[0] for call in cursor.execute.await_args_list] == [
+            "SELECT SYS_CONTEXT('USERENV', 'SESSION_USER') FROM DUAL",
+            'ALTER SESSION SET CURRENT_SCHEMA = "APP_USER"',
+        ]
+        assert backend._default_schema == "APP_USER"
+
+
+class TestCancelledStatusIsFinal:
+    """`DELETE /operations/{id}` may now cancel a 'processing' row (issue #4131).
+
+    Cancellation is cooperative: the worker running the operation only notices at
+    its next checkpoint, so every one of its status writes can still land *after*
+    an operator cancelled. None of them may overwrite 'cancelled' — otherwise the
+    operator's decision is silently reverted, and `_schedule_retry` in particular
+    would put the cancelled work back on the queue to be re-claimed.
+    """
+
+    async def _cancelled_op(self, pool, op_type: str = "consolidation") -> uuid.UUID:
+        bank_id = f"test-worker-{uuid.uuid4().hex[:8]}"
+        op_id = uuid.uuid4()
+        await _ensure_bank(pool, bank_id)
+        await pool.execute(
+            """
+            INSERT INTO async_operations (operation_id, bank_id, operation_type, status, worker_id)
+            VALUES ($1, $2, $3, 'cancelled', 'test-worker-1')
+            """,
+            op_id,
+            bank_id,
+            op_type,
+        )
+        return op_id
+
+    def _poller(self, backend):
+        from hindsight_api.worker import WorkerPoller
+
+        return WorkerPoller(backend=backend, worker_id="test-worker-1", executor=AsyncMock())
+
+    @pytest.mark.asyncio
+    async def test_mark_failed_does_not_overwrite_cancelled(self, pool, backend, clean_operations):
+        op_id = await self._cancelled_op(pool)
+
+        await self._poller(backend)._mark_failed(str(op_id), "boom", None)
+
+        row = await pool.fetchrow("SELECT status, error_message FROM async_operations WHERE operation_id = $1", op_id)
+        assert row["status"] == "cancelled"
+        assert row["error_message"] is None
+
+    @pytest.mark.asyncio
+    async def test_schedule_retry_does_not_requeue_cancelled(self, pool, backend, clean_operations):
+        """The important one: without the guard the row goes back to 'pending' and is re-claimed."""
+        op_id = await self._cancelled_op(pool)
+
+        retry_at = datetime.now(UTC) + timedelta(seconds=60)
+        await self._poller(backend)._schedule_retry(str(op_id), retry_at, "transient", None)
+
+        row = await pool.fetchrow(
+            "SELECT status, retry_count, next_retry_at FROM async_operations WHERE operation_id = $1", op_id
+        )
+        assert row["status"] == "cancelled"
+        assert (row["retry_count"] or 0) == 0
+        assert row["next_retry_at"] is None
+
+    @pytest.mark.asyncio
+    async def test_defer_does_not_requeue_cancelled(self, pool, backend, clean_operations):
+        op_id = await self._cancelled_op(pool)
+
+        exec_date = datetime.now(UTC) + timedelta(seconds=60)
+        await self._poller(backend)._defer_operation(str(op_id), exec_date, "quota", None)
+
+        row = await pool.fetchrow("SELECT status FROM async_operations WHERE operation_id = $1", op_id)
+        assert row["status"] == "cancelled"
+
+    @pytest.mark.asyncio
+    async def test_mark_completed_does_not_overwrite_cancelled(self, pool, backend, clean_operations):
+        """Already guarded on status='processing' — asserted here so it stays that way."""
+        op_id = await self._cancelled_op(pool)
+
+        await self._poller(backend)._mark_completed(str(op_id), None)
+
+        row = await pool.fetchrow("SELECT status FROM async_operations WHERE operation_id = $1", op_id)
+        assert row["status"] == "cancelled"
+
+    @pytest.mark.asyncio
+    async def test_executor_failure_after_cancel_leaves_row_cancelled(self, pool, backend, clean_operations):
+        """End-to-end: a task cancelled mid-flight that then raises stays 'cancelled'."""
+        from hindsight_api.worker import WorkerPoller
+        from hindsight_api.worker.poller import ClaimedTask
+
+        bank_id = f"test-worker-{uuid.uuid4().hex[:8]}"
+        op_id = uuid.uuid4()
+        payload = json.dumps({"type": "consolidation", "operation_id": str(op_id), "bank_id": bank_id})
+        await _ensure_bank(pool, bank_id)
+        await pool.execute(
+            """
+            INSERT INTO async_operations (operation_id, bank_id, operation_type, status, task_payload, worker_id)
+            VALUES ($1, $2, 'consolidation', 'processing', $3::jsonb, 'test-worker-1')
+            """,
+            op_id,
+            bank_id,
+            payload,
+        )
+
+        async def cancel_then_fail(task_dict):
+            # An operator cancels while the task is running, then the task raises.
+            await pool.execute(
+                "UPDATE async_operations SET status = 'cancelled', updated_at = now() WHERE operation_id = $1",
+                op_id,
+            )
+            raise RuntimeError("boom")
+
+        poller = WorkerPoller(backend=backend, worker_id="test-worker-1", executor=cancel_then_fail)
+        await poller.execute_task(ClaimedTask(operation_id=str(op_id), task_dict=json.loads(payload), schema=None))
+        assert await poller.wait_for_active_tasks(timeout=5.0)
+
+        row = await pool.fetchrow("SELECT status FROM async_operations WHERE operation_id = $1", op_id)
+        assert row["status"] == "cancelled", "a cancelled operation must not be resurrected by the failure path"

@@ -7,7 +7,7 @@ from datetime import timedelta, timezone
 import obstore as obs
 from obstore.store import GCSStore
 
-from .base import FileStorage
+from .base import FileStorage, delete_object_store_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +85,12 @@ class GCSFileStorage(FileStorage):
     async def retrieve(self, key: str) -> bytes:
         try:
             response = await obs.get_async(self._store, key)
-            return await response.bytes_async()
+            # obstore returns its own Bytes buffer, not a Python `bytes`. Callers rely on
+            # the `-> bytes` return type, and handing a non-`bytes` to something strict about
+            # the type (e.g. a Starlette Response, whose render() calls `.encode()` on a
+            # non-`bytes`) fails at runtime. Copy into native bytes so the backend honours
+            # its declared contract.
+            return bytes(await response.bytes_async())
         except Exception as e:
             if "not found" in str(e).lower():
                 raise FileNotFoundError(f"File not found: {key}") from e
@@ -93,6 +98,9 @@ class GCSFileStorage(FileStorage):
 
     async def delete(self, key: str) -> None:
         await obs.delete_async(self._store, key)
+
+    async def delete_prefix(self, prefix: str) -> int:
+        return await delete_object_store_prefix(self._store, prefix)
 
     async def exists(self, key: str) -> bool:
         try:

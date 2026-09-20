@@ -5,12 +5,41 @@ import { useTranslations } from "next-intl";
 import { useBank } from "@/lib/bank-context";
 import { useFeatures } from "@/lib/features-context";
 import { client } from "@/lib/api";
+import { PreviewPromptButton } from "@/components/prompt-preview-dialog";
+import {
+  MentalModelTriggerFields,
+  TriggerSummary,
+  triggerFormFromTrigger,
+  triggerFromForm,
+  type TriggerForm,
+} from "@/components/mental-model-trigger-fields";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
+  EntityLabelsEditor,
+  type LabelGroup,
+  type LabelValue,
+  type MapField,
+} from "@/components/entity-labels-editor";
 import {
   deserializeRetainStrategies,
   serializeRetainStrategies,
   type RetainStrategy,
   type RetainStrategyValues,
 } from "@/lib/retain-strategy-config";
+import {
+  mergeObservationsOverrides,
+  mergeResolvedObservations,
+  observationsSlice,
+  reconcileObservationsEdits,
+  type ObservationsEdits,
+} from "@/lib/observations-config";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
@@ -35,7 +64,8 @@ import {
 import { Switch } from "@/components/ui/switch";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
-import { Loader2, AlertCircle, Plus, Trash2, ChevronDown, ChevronRight } from "lucide-react";
+import { AlertCircle, Plus, Trash2, ChevronDown, ChevronRight } from "lucide-react";
+import { Spinner } from "@/components/ui/spinner";
 import { Card } from "@/components/ui/card";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -62,32 +92,6 @@ type StrategiesEdits = {
   retain_strategies: Record<string, Record<string, any>> | null;
 };
 
-type ObservationsEdits = {
-  enable_observations: boolean | null;
-  consolidation_llm_batch_size: number | null;
-  consolidation_source_facts_max_tokens: number | null;
-  consolidation_source_facts_max_tokens_per_observation: number | null;
-  observations_mission: string | null;
-  max_observations_per_scope: number | null;
-};
-
-type LabelValue = { value: string; description: string };
-type MapField = {
-  type: "text" | "value" | "multi-values" | "map";
-  description: string;
-  values?: LabelValue[];
-  fields?: Record<string, MapField>;
-};
-type LabelGroup = {
-  key: string;
-  description: string;
-  type: "value" | "multi-values" | "text" | "map";
-  optional: boolean;
-  tag: boolean;
-  values: LabelValue[];
-  fields: Record<string, MapField>;
-};
-
 type MCPEdits = {
   mcp_enabled_tools: string[] | null;
 };
@@ -99,6 +103,61 @@ type GeminiSafetySetting = {
 
 type GeminiEdits = {
   llm_gemini_safety_settings: GeminiSafetySetting[] | null;
+};
+
+type AuditEdits = {
+  // null = no bank override, inherit the server default. Distinct from an
+  // explicit false, which overrides a server default of true.
+  audit_log_enabled: boolean | null;
+};
+
+type DocStorageEdits = {
+  // null = inherit the server default. Explicit false keeps only derived
+  // facts (documents.original_text NULL, chunks.chunk_text empty).
+  store_document_text: boolean | null;
+};
+
+// Mental models and the knowledge pages backed by them. null = inherit the
+// server default.
+type MentalModelsEdits = {
+  mental_model_min_refresh_interval_seconds: number | null;
+};
+
+// The bank's default reflect options (reflect_default_options). Stored as one
+// object, edited as two fields; null means "not set", so reflect falls back to
+// the shipped default.
+type ReflectOptionsEdits = {
+  reflect_search_observations_max_tokens: number | null;
+  reflect_search_observations_include_entities: boolean | null;
+};
+
+// The server's built-in knowledge-page trigger (MemoryEngine.KNOWLEDGE_PAGE_DEFAULT_TRIGGER).
+// The configured default merges over it, so the form starts from the pair to show
+// what a new page actually gets.
+const KNOWLEDGE_PAGE_BUILTIN_TRIGGER = {
+  mode: "delta",
+  fact_types: ["observation"],
+  exclude_mental_models: true,
+  refresh_after_consolidation: true,
+} as const;
+
+function effectivePageTrigger(configured: Record<string, any> | null | undefined): TriggerForm {
+  const merged: Record<string, any> = { ...KNOWLEDGE_PAGE_BUILTIN_TRIGGER, ...configured };
+  // Same exclusivity rule as the server's merge: a configured cron replaces the
+  // built-in refresh-after-consolidation.
+  if (configured?.refresh_cron && configured.refresh_after_consolidation === undefined)
+    merged.refresh_after_consolidation = false;
+  return triggerFormFromTrigger(merged);
+}
+
+// Recall pipeline stages. null = inherit the server default (all four ship
+// enabled); explicit false switches that stage off for this bank, trading
+// recall breadth for latency. Semantic always runs — it is the baseline arm.
+type RecallEdits = {
+  enable_text_search: boolean | null;
+  enable_temporal_retrieval: boolean | null;
+  enable_graph_retrieval: boolean | null;
+  enable_reranking: boolean | null;
 };
 
 // ─── Gemini safety settings catalogue ────────────────────────────────────────
@@ -195,6 +254,19 @@ function getMcpToolGroups(t: (key: string) => string): McpToolGroup[] {
       tools: ["list_operations", "get_operation", "cancel_operation"],
     },
     { key: "tags", label: t("mcpGroupTags"), tools: ["list_tags"] },
+    {
+      key: "knowledgeBase",
+      label: t("mcpGroupKnowledgeBase"),
+      tools: [
+        "get_knowledge_base_tree",
+        "search_knowledge_base",
+        "get_knowledge_page",
+        "create_knowledge_folder",
+        "create_knowledge_page",
+        "update_knowledge_node",
+        "delete_knowledge_node",
+      ],
+    },
   ];
 }
 
@@ -231,6 +303,13 @@ const MCP_ALL_TOOLS: string[] = [
   "get_operation",
   "cancel_operation",
   "list_tags",
+  "get_knowledge_base_tree",
+  "search_knowledge_base",
+  "get_knowledge_page",
+  "create_knowledge_folder",
+  "create_knowledge_page",
+  "update_knowledge_node",
+  "delete_knowledge_node",
 ];
 const ALL_TOOLS: string[] = MCP_ALL_TOOLS;
 
@@ -262,18 +341,6 @@ function strategiesSlice(config: Record<string, any>): StrategiesEdits {
   };
 }
 
-function observationsSlice(config: Record<string, any>): ObservationsEdits {
-  return {
-    enable_observations: config.enable_observations ?? null,
-    consolidation_llm_batch_size: config.consolidation_llm_batch_size ?? null,
-    consolidation_source_facts_max_tokens: config.consolidation_source_facts_max_tokens ?? null,
-    consolidation_source_facts_max_tokens_per_observation:
-      config.consolidation_source_facts_max_tokens_per_observation ?? null,
-    observations_mission: config.observations_mission ?? null,
-    max_observations_per_scope: config.max_observations_per_scope ?? null,
-  };
-}
-
 function mcpSlice(config: Record<string, any>): MCPEdits {
   return {
     mcp_enabled_tools: config.mcp_enabled_tools ?? null,
@@ -283,6 +350,73 @@ function mcpSlice(config: Record<string, any>): MCPEdits {
 function geminiSlice(config: Record<string, any>): GeminiEdits {
   return {
     llm_gemini_safety_settings: config.llm_gemini_safety_settings ?? null,
+  };
+}
+
+// Reads the bank's OVERRIDES, not the resolved config: the resolved value can
+// not distinguish "inherited true" from "explicitly set to true", and the UI
+// needs that distinction to offer "Server Default".
+function auditSlice(overrides: Record<string, any>): AuditEdits {
+  return {
+    audit_log_enabled: overrides.audit_log_enabled ?? null,
+  };
+}
+
+function docStorageSlice(overrides: Record<string, any>): DocStorageEdits {
+  return {
+    store_document_text: overrides.store_document_text ?? null,
+  };
+}
+
+function mentalModelsSlice(overrides: Record<string, any>): MentalModelsEdits {
+  return {
+    mental_model_min_refresh_interval_seconds:
+      overrides.mental_model_min_refresh_interval_seconds ?? null,
+  };
+}
+
+/** The bank's reflect defaults as chips, so the row reads without opening the dialog. */
+function ReflectOptionsSummary({ options }: { options: ReflectOptionsEdits }) {
+  const t = useTranslations("bankConfig");
+  const chips = [
+    options.reflect_search_observations_max_tokens != null
+      ? t("reflectObservationsMaxTokensChip", {
+          tokens: options.reflect_search_observations_max_tokens,
+        })
+      : t("reflectObservationsMaxTokensChipDefault"),
+    options.reflect_search_observations_include_entities === false
+      ? t("reflectObservationsEntitiesOff")
+      : t("reflectObservationsEntitiesOn"),
+  ];
+  return (
+    <div className="flex flex-wrap gap-1.5">
+      {chips.map((chip) => (
+        <span
+          key={chip}
+          className="rounded-full border border-border/60 bg-background px-2.5 py-0.5 text-xs text-foreground"
+        >
+          {chip}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function reflectOptionsSlice(overrides: Record<string, any>): ReflectOptionsEdits {
+  const opts = overrides.reflect_default_options ?? {};
+  return {
+    reflect_search_observations_max_tokens: opts.reflect_search_observations_max_tokens ?? null,
+    reflect_search_observations_include_entities:
+      opts.reflect_search_observations_include_entities ?? null,
+  };
+}
+
+function recallSlice(overrides: Record<string, any>): RecallEdits {
+  return {
+    enable_text_search: overrides.enable_text_search ?? null,
+    enable_temporal_retrieval: overrides.enable_temporal_retrieval ?? null,
+    enable_graph_retrieval: overrides.enable_graph_retrieval ?? null,
+    enable_reranking: overrides.enable_reranking ?? null,
   };
 }
 
@@ -297,6 +431,7 @@ const DEFAULT_PROFILE: ProfileData = {
 
 export function BankConfigView() {
   const t = useTranslations("bankConfig");
+  const tMentalModels = useTranslations("mentalModels");
   const { currentBank: bankId } = useBank();
   const { features } = useFeatures();
   const bankConfigEnabled = features?.bank_config_api ?? true; // optimistic default while loading
@@ -304,17 +439,42 @@ export function BankConfigView() {
 
   // Source of truth
   const [baseConfig, setBaseConfig] = useState<Record<string, any>>({});
+  // Explicit per-bank overrides only (server defaults excluded), so sections
+  // can tell "inherited" apart from "explicitly set to the same value".
+  const [baseOverrides, setBaseOverrides] = useState<Record<string, any>>({});
   const [baseProfile, setBaseProfile] = useState<ProfileData>(DEFAULT_PROFILE);
 
   // Per-section local edits
   const [retainEdits, setRetainEdits] = useState<RetainEdits>(retainSlice({}));
   const [strategiesEdits, setStrategiesEdits] = useState<StrategiesEdits>(strategiesSlice({}));
   const [observationsEdits, setObservationsEdits] = useState<ObservationsEdits>(
-    observationsSlice({})
+    observationsSlice({}, {})
   );
   const [reflectEdits, setReflectEdits] = useState<ProfileData>(DEFAULT_PROFILE);
+  // Reflect's default options are edited in their own dialog and saved from
+  // there, apart from the section's Save — same as the knowledge-page trigger.
+  const [reflectOptionsOpen, setReflectOptionsOpen] = useState(false);
+  const [reflectOptionsForm, setReflectOptionsForm] = useState<ReflectOptionsEdits>(
+    reflectOptionsSlice({})
+  );
+  const [reflectOptionsSaving, setReflectOptionsSaving] = useState(false);
+  const [reflectOptionsError, setReflectOptionsError] = useState<string | null>(null);
   const [mcpEdits, setMcpEdits] = useState<MCPEdits>(mcpSlice({}));
   const [geminiEdits, setGeminiEdits] = useState<GeminiEdits>(geminiSlice({}));
+  const [auditEdits, setAuditEdits] = useState<AuditEdits>(auditSlice({}));
+  const [docStorageEdits, setDocStorageEdits] = useState<DocStorageEdits>(docStorageSlice({}));
+  const [recallEdits, setRecallEdits] = useState<RecallEdits>(recallSlice({}));
+  const [mentalModelsEdits, setMentalModelsEdits] = useState<MentalModelsEdits>(
+    mentalModelsSlice({})
+  );
+  // The knowledge-page default trigger is edited in its own dialog and saved
+  // from there, apart from the section's Save.
+  const [pageTriggerOpen, setPageTriggerOpen] = useState(false);
+  const [pageTriggerForm, setPageTriggerForm] = useState<TriggerForm>(() =>
+    effectivePageTrigger(null)
+  );
+  const [pageTriggerSaving, setPageTriggerSaving] = useState(false);
+  const [pageTriggerError, setPageTriggerError] = useState<string | null>(null);
 
   // Per-section saving/error state
   const [retainSaving, setRetainSaving] = useState(false);
@@ -322,11 +482,17 @@ export function BankConfigView() {
   const [reflectSaving, setReflectSaving] = useState(false);
   const [mcpSaving, setMcpSaving] = useState(false);
   const [geminiSaving, setGeminiSaving] = useState(false);
+  const [securityPrivacySaving, setSecurityPrivacySaving] = useState(false);
+  const [recallSaving, setRecallSaving] = useState(false);
+  const [mentalModelsSaving, setMentalModelsSaving] = useState(false);
   const [retainError, setRetainError] = useState<string | null>(null);
   const [observationsError, setObservationsError] = useState<string | null>(null);
   const [reflectError, setReflectError] = useState<string | null>(null);
   const [mcpError, setMcpError] = useState<string | null>(null);
   const [geminiError, setGeminiError] = useState<string | null>(null);
+  const [securityPrivacyError, setSecurityPrivacyError] = useState<string | null>(null);
+  const [recallError, setRecallError] = useState<string | null>(null);
+  const [mentalModelsError, setMentalModelsError] = useState<string | null>(null);
 
   // Dirty tracking
   const retainDirty = useMemo(
@@ -336,8 +502,10 @@ export function BankConfigView() {
     [retainEdits, strategiesEdits, baseConfig]
   );
   const observationsDirty = useMemo(
-    () => JSON.stringify(observationsEdits) !== JSON.stringify(observationsSlice(baseConfig)),
-    [observationsEdits, baseConfig]
+    () =>
+      JSON.stringify(observationsEdits) !==
+      JSON.stringify(observationsSlice(baseConfig, baseOverrides)),
+    [observationsEdits, baseConfig, baseOverrides]
   );
   const reflectDirty = useMemo(
     () => JSON.stringify(reflectEdits) !== JSON.stringify(baseProfile),
@@ -351,6 +519,22 @@ export function BankConfigView() {
     () => JSON.stringify(geminiEdits) !== JSON.stringify(geminiSlice(baseConfig)),
     [geminiEdits, baseConfig]
   );
+  const auditDirty = useMemo(
+    () => JSON.stringify(auditEdits) !== JSON.stringify(auditSlice(baseOverrides)),
+    [auditEdits, baseOverrides]
+  );
+  const docStorageDirty = useMemo(
+    () => JSON.stringify(docStorageEdits) !== JSON.stringify(docStorageSlice(baseOverrides)),
+    [docStorageEdits, baseOverrides]
+  );
+  const recallDirty = useMemo(
+    () => JSON.stringify(recallEdits) !== JSON.stringify(recallSlice(baseOverrides)),
+    [recallEdits, baseOverrides]
+  );
+  const mentalModelsDirty = useMemo(
+    () => JSON.stringify(mentalModelsEdits) !== JSON.stringify(mentalModelsSlice(baseOverrides)),
+    [mentalModelsEdits, baseOverrides]
+  );
   useEffect(() => {
     if (bankId) loadAll();
   }, [bankId]);
@@ -359,27 +543,31 @@ export function BankConfigView() {
     if (!bankId) return;
     setLoading(true);
     try {
-      const [configResp, profileResp] = await Promise.all([
-        client.getBankConfig(bankId),
-        client.getBankProfile(bankId),
-      ]);
+      const configResp = await client.getBankConfig(bankId);
       const cfg = configResp.config;
+      const overrides = configResp.overrides ?? {};
+      // Disposition and the reflect mission are ordinary config keys — the separate
+      // profile read they used to be merged with no longer exists.
       const prof: ProfileData = {
-        reflect_mission: profileResp.mission ?? "",
-        disposition_skepticism:
-          cfg.disposition_skepticism ?? profileResp.disposition?.skepticism ?? 3,
-        disposition_literalism:
-          cfg.disposition_literalism ?? profileResp.disposition?.literalism ?? 3,
-        disposition_empathy: cfg.disposition_empathy ?? profileResp.disposition?.empathy ?? 3,
+        reflect_mission: cfg.reflect_mission ?? "",
+        disposition_skepticism: cfg.disposition_skepticism ?? 3,
+        disposition_literalism: cfg.disposition_literalism ?? 3,
+        disposition_empathy: cfg.disposition_empathy ?? 3,
       };
       setBaseConfig(cfg);
+      setBaseOverrides(overrides);
       setBaseProfile(prof);
       setRetainEdits(retainSlice(cfg));
       setStrategiesEdits(strategiesSlice(cfg));
-      setObservationsEdits(observationsSlice(cfg));
+      setObservationsEdits(observationsSlice(cfg, overrides));
       setReflectEdits(prof);
+      setReflectOptionsForm(reflectOptionsSlice(cfg));
       setMcpEdits(mcpSlice(cfg));
       setGeminiEdits(geminiSlice(cfg));
+      setAuditEdits(auditSlice(overrides));
+      setDocStorageEdits(docStorageSlice(overrides));
+      setRecallEdits(recallSlice(overrides));
+      setMentalModelsEdits(mentalModelsSlice(overrides));
     } catch (err) {
       console.error("Failed to load bank data:", err);
     } finally {
@@ -406,9 +594,17 @@ export function BankConfigView() {
     if (!bankId) return;
     setObservationsSaving(true);
     setObservationsError(null);
+    const submittedEdits = observationsEdits;
     try {
-      await client.updateBankConfig(bankId, observationsEdits);
-      setBaseConfig((prev) => ({ ...prev, ...observationsEdits }));
+      const response = await client.updateBankConfig(bankId, submittedEdits);
+      // Overrides are a complete bank-only snapshot. Resolved config may omit
+      // permission-filtered fields, so merge it against the accepted payload.
+      const overrides = response.overrides ?? {};
+      setBaseConfig((prev) => mergeResolvedObservations(prev, submittedEdits, response.config));
+      setBaseOverrides((prev) => mergeObservationsOverrides(prev, overrides));
+      setObservationsEdits((current) =>
+        reconcileObservationsEdits(current, submittedEdits, response.config, overrides)
+      );
     } catch (err: any) {
       setObservationsError(err.message || t("observationsFailedToSave"));
     } finally {
@@ -432,6 +628,35 @@ export function BankConfigView() {
       setReflectError(err.message || t("reflectFailedToSave"));
     } finally {
       setReflectSaving(false);
+    }
+  };
+
+  const openReflectOptions = () => {
+    setReflectOptionsError(null);
+    setReflectOptionsForm(reflectOptionsSlice(baseConfig));
+    setReflectOptionsOpen(true);
+  };
+
+  const saveReflectOptions = async (reset: boolean) => {
+    if (!bankId) return;
+    setReflectOptionsSaving(true);
+    setReflectOptionsError(null);
+    try {
+      // Every field left unset means "no bank default at all": send null so the
+      // override is cleared rather than stored as an empty object.
+      const options = Object.fromEntries(
+        Object.entries(reflectOptionsForm).filter(([, v]) => v !== null)
+      );
+      const reflect_default_options = reset || Object.keys(options).length === 0 ? null : options;
+      await client.updateBankConfig(bankId, { reflect_default_options });
+      setBaseConfig((prev) => ({ ...prev, reflect_default_options }));
+      setBaseOverrides((prev) => ({ ...prev, reflect_default_options }));
+      setReflectOptionsForm(reflectOptionsSlice({ reflect_default_options }));
+      setReflectOptionsOpen(false);
+    } catch (err: any) {
+      setReflectOptionsError(err.message || t("reflectFailedToSave"));
+    } finally {
+      setReflectOptionsSaving(false);
     }
   };
 
@@ -463,6 +688,112 @@ export function BankConfigView() {
     }
   };
 
+  const saveSecurityPrivacy = async () => {
+    if (!bankId) return;
+    setSecurityPrivacySaving(true);
+    setSecurityPrivacyError(null);
+    try {
+      // A null on either key clears that override server-side (JSON null is the
+      // "Server Default" tombstone); mirror both into local override state.
+      await client.updateBankConfig(bankId, { ...auditEdits, ...docStorageEdits });
+      setBaseOverrides((prev) => {
+        const next = { ...prev };
+        if (auditEdits.audit_log_enabled === null) delete next.audit_log_enabled;
+        else next.audit_log_enabled = auditEdits.audit_log_enabled;
+        if (docStorageEdits.store_document_text === null) delete next.store_document_text;
+        else next.store_document_text = docStorageEdits.store_document_text;
+        return next;
+      });
+    } catch (err: any) {
+      setSecurityPrivacyError(err.message || t("securityPrivacyFailedToSave"));
+    } finally {
+      setSecurityPrivacySaving(false);
+    }
+  };
+
+  const saveRecall = async () => {
+    if (!bankId) return;
+    setRecallSaving(true);
+    setRecallError(null);
+    try {
+      // Same tombstone convention as the sections above: a null clears the bank
+      // override server-side, so the stage falls back to the server default.
+      await client.updateBankConfig(bankId, { ...recallEdits });
+      setBaseOverrides((prev) => {
+        const next = { ...prev };
+        for (const key of [
+          "enable_text_search",
+          "enable_temporal_retrieval",
+          "enable_graph_retrieval",
+          "enable_reranking",
+        ] as const) {
+          if (recallEdits[key] === null) delete next[key];
+          else next[key] = recallEdits[key];
+        }
+        return next;
+      });
+    } catch (err: any) {
+      setRecallError(err.message || t("recallFailedToSave"));
+    } finally {
+      setRecallSaving(false);
+    }
+  };
+
+  const saveMentalModels = async () => {
+    if (!bankId) return;
+    setMentalModelsSaving(true);
+    setMentalModelsError(null);
+    try {
+      // Same tombstone convention as the sections above: a null clears the bank
+      // override server-side, so the setting falls back to the server default.
+      await client.updateBankConfig(bankId, { ...mentalModelsEdits });
+      setBaseOverrides((prev) => {
+        const next = { ...prev };
+        const value = mentalModelsEdits.mental_model_min_refresh_interval_seconds;
+        if (value === null) delete next.mental_model_min_refresh_interval_seconds;
+        else next.mental_model_min_refresh_interval_seconds = value;
+        return next;
+      });
+    } catch (err: any) {
+      setMentalModelsError(err.message || t("mentalModelsFailedToSave"));
+    } finally {
+      setMentalModelsSaving(false);
+    }
+  };
+
+  const openPageTrigger = () => {
+    setPageTriggerForm(effectivePageTrigger(baseConfig.knowledge_page_default_trigger));
+    setPageTriggerError(null);
+    setPageTriggerOpen(true);
+  };
+
+  // null clears the bank override; the value inherited from the tenant/server
+  // isn't known client-side, so a reset reloads the resolved config.
+  const savePageTrigger = async (reset: boolean) => {
+    if (!bankId) return;
+    const trigger = reset ? null : triggerFromForm(pageTriggerForm);
+    if (!reset && !trigger) {
+      setPageTriggerError(tMentalModels("invalidTagGroupsJson"));
+      return;
+    }
+    setPageTriggerSaving(true);
+    setPageTriggerError(null);
+    try {
+      await client.updateBankConfig(bankId, { knowledge_page_default_trigger: trigger });
+      if (reset) {
+        await loadAll();
+      } else {
+        setBaseConfig((prev) => ({ ...prev, knowledge_page_default_trigger: trigger }));
+        setBaseOverrides((prev) => ({ ...prev, knowledge_page_default_trigger: trigger }));
+      }
+      setPageTriggerOpen(false);
+    } catch (err: any) {
+      setPageTriggerError(err.message || t("mentalModelsFailedToSave"));
+    } finally {
+      setPageTriggerSaving(false);
+    }
+  };
+
   if (!bankId) {
     return (
       <div className="flex items-center justify-center py-12">
@@ -489,7 +820,7 @@ export function BankConfigView() {
   if (loading) {
     return (
       <div className="flex items-center justify-center py-12">
-        <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
+        <Spinner size="lg" variant="jump" />
       </div>
     );
   }
@@ -505,6 +836,17 @@ export function BankConfigView() {
           dirty={retainDirty}
           saving={retainSaving}
           onSave={saveRetain}
+          action={
+            // At section level, not inside the strategy form: the tester renders the
+            // bank's resolved retain config and picks its own strategy, so it is not
+            // a property of whichever strategy tab happens to be open.
+            <PreviewPromptButton
+              operation="retain"
+              onSaved={(field, value) =>
+                setRetainEdits((prev) => ({ ...prev, [field]: value }) as RetainEdits)
+              }
+            />
+          }
         >
           <FieldRow label={t("defaultStrategyLabel")} description={t("defaultStrategyDescription")}>
             <Select
@@ -554,14 +896,38 @@ export function BankConfigView() {
             label={t("enableObservationsLabel")}
             description={t("enableObservationsDescription")}
           >
-            <div className="flex justify-end">
-              <Switch
-                checked={observationsEdits.enable_observations ?? false}
-                onCheckedChange={(v) =>
-                  setObservationsEdits((prev) => ({ ...prev, enable_observations: v }))
-                }
-              />
-            </div>
+            <Select
+              value={
+                observationsEdits.enable_observations === null
+                  ? INHERIT_SENTINEL
+                  : String(observationsEdits.enable_observations)
+              }
+              onValueChange={(v) =>
+                setObservationsEdits((prev) => ({
+                  ...prev,
+                  enable_observations: v === INHERIT_SENTINEL ? null : v === "true",
+                }))
+              }
+            >
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value={INHERIT_SENTINEL}>
+                  {/* The resolved value reveals the parent default only when
+                      there is no bank override. */}
+                  {(baseOverrides.enable_observations === undefined ||
+                    baseOverrides.enable_observations === null) &&
+                  typeof baseConfig.enable_observations === "boolean"
+                    ? t("auditServerDefault", {
+                        state: baseConfig.enable_observations ? t("enabled") : t("disabled"),
+                      })
+                    : t("serverDefault")}
+                </SelectItem>
+                <SelectItem value="true">{t("enabled")}</SelectItem>
+                <SelectItem value="false">{t("disabled")}</SelectItem>
+              </SelectContent>
+            </Select>
           </FieldRow>
           <TextareaRow
             label={t("missionLabel")}
@@ -572,6 +938,14 @@ export function BankConfigView() {
             }
             placeholder={t("observationsMissionPlaceholder")}
             rows={3}
+            action={
+              <PreviewPromptButton
+                operation="consolidation"
+                onSaved={(field, value) =>
+                  setObservationsEdits((prev) => ({ ...prev, [field]: value }) as ObservationsEdits)
+                }
+              />
+            }
           />
           <FieldRow label={t("llmBatchSizeLabel")} description={t("llmBatchSizeDescription")}>
             <Input
@@ -663,7 +1037,133 @@ export function BankConfigView() {
             onChange={(v) => setReflectEdits((prev) => ({ ...prev, reflect_mission: v }))}
             placeholder={t("reflectMissionPlaceholder")}
             rows={3}
+            action={
+              <PreviewPromptButton
+                operation="reflect"
+                onSaved={(field, value) =>
+                  setReflectEdits((prev) => ({ ...prev, [field]: value ?? "" }) as ProfileData)
+                }
+              />
+            }
           />
+          <div className="px-6 py-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between sm:gap-6">
+            <div className="min-w-0 space-y-2">
+              <div>
+                <p className="text-sm font-medium">{t("reflectDefaultOptionsLabel")}</p>
+                <p className="text-xs text-muted-foreground mt-0.5">
+                  {t("reflectDefaultOptionsDescription")}
+                </p>
+              </div>
+              <ReflectOptionsSummary options={reflectOptionsSlice(baseConfig)} />
+            </div>
+            <Button variant="outline" size="sm" className="shrink-0" onClick={openReflectOptions}>
+              {t("knowledgePageDefaultTriggerEdit")}
+            </Button>
+          </div>
+          <Dialog
+            open={reflectOptionsOpen}
+            onOpenChange={(o) => !o && setReflectOptionsOpen(false)}
+          >
+            <DialogContent className="sm:max-w-2xl">
+              <DialogHeader>
+                <DialogTitle>{t("reflectDefaultOptionsDialogTitle")}</DialogTitle>
+                <DialogDescription>{t("reflectDefaultOptionsDialogHint")}</DialogDescription>
+              </DialogHeader>
+              <div className="space-y-4 py-2">
+                <div className="space-y-2">
+                  <div>
+                    <p className="text-sm font-medium">{t("reflectObservationsMaxTokensLabel")}</p>
+                    <p className="text-xs text-muted-foreground mt-0.5">
+                      {t("reflectObservationsMaxTokensDescription")}
+                    </p>
+                  </div>
+                  <Input
+                    type="number"
+                    min={1}
+                    value={reflectOptionsForm.reflect_search_observations_max_tokens ?? ""}
+                    onChange={(e) =>
+                      setReflectOptionsForm((prev) => ({
+                        ...prev,
+                        reflect_search_observations_max_tokens: e.target.value
+                          ? parseInt(e.target.value, 10)
+                          : null,
+                      }))
+                    }
+                    placeholder={t("serverDefault")}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <div>
+                    <p className="text-sm font-medium">{t("reflectObservationsEntitiesLabel")}</p>
+                    <p className="text-xs text-muted-foreground mt-0.5">
+                      {t("reflectObservationsEntitiesDescription")}
+                    </p>
+                  </div>
+                  <Select
+                    value={
+                      reflectOptionsForm.reflect_search_observations_include_entities === null
+                        ? "default"
+                        : String(reflectOptionsForm.reflect_search_observations_include_entities)
+                    }
+                    onValueChange={(v) =>
+                      setReflectOptionsForm((prev) => ({
+                        ...prev,
+                        reflect_search_observations_include_entities:
+                          v === "default" ? null : v === "true",
+                      }))
+                    }
+                  >
+                    <SelectTrigger>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="default">{t("serverDefault")}</SelectItem>
+                      <SelectItem value="true">{t("reflectObservationsEntitiesOn")}</SelectItem>
+                      <SelectItem value="false">{t("reflectObservationsEntitiesOff")}</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
+              {reflectOptionsError && (
+                <Alert variant="destructive">
+                  <AlertCircle className="h-4 w-4" />
+                  <AlertDescription>{reflectOptionsError}</AlertDescription>
+                </Alert>
+              )}
+              <DialogFooter className="sm:justify-between">
+                <div>
+                  {baseOverrides.reflect_default_options && (
+                    <Button
+                      variant="ghost"
+                      onClick={() => saveReflectOptions(true)}
+                      disabled={reflectOptionsSaving}
+                    >
+                      {t("resetToInherited")}
+                    </Button>
+                  )}
+                </div>
+                <div className="flex gap-2">
+                  <Button
+                    variant="outline"
+                    onClick={() => setReflectOptionsOpen(false)}
+                    disabled={reflectOptionsSaving}
+                  >
+                    {tMentalModels("cancelButton")}
+                  </Button>
+                  <Button onClick={() => saveReflectOptions(false)} disabled={reflectOptionsSaving}>
+                    {reflectOptionsSaving ? (
+                      <>
+                        <Spinner size="sm" className="mr-2" />
+                        {t("saving")}
+                      </>
+                    ) : (
+                      t("saveChanges")
+                    )}
+                  </Button>
+                </div>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
           <TraitRow
             label={t("skepticismLabel")}
             description={t("skepticismDescription")}
@@ -688,6 +1188,101 @@ export function BankConfigView() {
             value={reflectEdits.disposition_empathy}
             onChange={(v) => setReflectEdits((prev) => ({ ...prev, disposition_empathy: v }))}
           />
+        </ConfigSection>
+
+        {/* Mental Models & Knowledge Pages Section */}
+        <ConfigSection
+          title={t("mentalModelsTitle")}
+          description={t("mentalModelsDescription")}
+          error={mentalModelsError}
+          dirty={mentalModelsDirty}
+          saving={mentalModelsSaving}
+          onSave={saveMentalModels}
+        >
+          <FieldRow
+            label={t("mentalModelMinRefreshIntervalLabel")}
+            description={t("mentalModelMinRefreshIntervalDescription")}
+          >
+            <Input
+              type="number"
+              min={0}
+              value={mentalModelsEdits.mental_model_min_refresh_interval_seconds ?? ""}
+              onChange={(e) =>
+                setMentalModelsEdits((prev) => ({
+                  ...prev,
+                  mental_model_min_refresh_interval_seconds: e.target.value
+                    ? parseInt(e.target.value, 10)
+                    : null,
+                }))
+              }
+              placeholder={t("serverDefault")}
+            />
+          </FieldRow>
+          <div className="px-6 py-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between sm:gap-6">
+            <div className="min-w-0 space-y-2">
+              <div>
+                <p className="text-sm font-medium">{t("knowledgePageDefaultTriggerLabel")}</p>
+                <p className="text-xs text-muted-foreground mt-0.5">
+                  {t("knowledgePageDefaultTriggerDescription")}
+                </p>
+              </div>
+              <TriggerSummary
+                form={effectivePageTrigger(baseConfig.knowledge_page_default_trigger)}
+              />
+            </div>
+            <Button variant="outline" size="sm" className="shrink-0" onClick={openPageTrigger}>
+              {t("knowledgePageDefaultTriggerEdit")}
+            </Button>
+          </div>
+          <Dialog open={pageTriggerOpen} onOpenChange={(o) => !o && setPageTriggerOpen(false)}>
+            <DialogContent className="sm:max-w-4xl max-h-[90vh] flex flex-col">
+              <DialogHeader>
+                <DialogTitle>{t("knowledgePageDefaultTriggerDialogTitle")}</DialogTitle>
+                <DialogDescription>{t("knowledgePageDefaultTriggerDialogHint")}</DialogDescription>
+              </DialogHeader>
+              <div className="flex-1 overflow-y-auto px-1.5 py-2">
+                <MentalModelTriggerFields value={pageTriggerForm} onChange={setPageTriggerForm} />
+              </div>
+              {pageTriggerError && (
+                <Alert variant="destructive">
+                  <AlertCircle className="h-4 w-4" />
+                  <AlertDescription>{pageTriggerError}</AlertDescription>
+                </Alert>
+              )}
+              <DialogFooter className="sm:justify-between">
+                <div>
+                  {baseOverrides.knowledge_page_default_trigger && (
+                    <Button
+                      variant="ghost"
+                      onClick={() => savePageTrigger(true)}
+                      disabled={pageTriggerSaving}
+                    >
+                      {t("resetToInherited")}
+                    </Button>
+                  )}
+                </div>
+                <div className="flex gap-2">
+                  <Button
+                    variant="outline"
+                    onClick={() => setPageTriggerOpen(false)}
+                    disabled={pageTriggerSaving}
+                  >
+                    {tMentalModels("cancelButton")}
+                  </Button>
+                  <Button onClick={() => savePageTrigger(false)} disabled={pageTriggerSaving}>
+                    {pageTriggerSaving ? (
+                      <>
+                        <Spinner size="sm" className="mr-2" />
+                        {t("saving")}
+                      </>
+                    ) : (
+                      t("saveChanges")
+                    )}
+                  </Button>
+                </div>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
         </ConfigSection>
 
         {/* MCP Tools Section */}
@@ -720,6 +1315,120 @@ export function BankConfigView() {
               onChange={(tools) => setMcpEdits({ mcp_enabled_tools: tools })}
             />
           )}
+        </ConfigSection>
+
+        {/* Security & Privacy Section — audit logging + document-text storage */}
+        <ConfigSection
+          title={t("securityPrivacyTitle")}
+          description={t("securityPrivacyDescription")}
+          error={securityPrivacyError}
+          dirty={auditDirty || docStorageDirty}
+          saving={securityPrivacySaving}
+          onSave={saveSecurityPrivacy}
+        >
+          <FieldRow label={t("auditEnabledLabel")} description={t("auditEnabledDescription")}>
+            {/* Tri-state rather than a Switch: the bank may inherit the server
+                default, or override it in either direction. A Switch cannot
+                express "inherit", and would silently write an explicit value. */}
+            <Select
+              value={
+                auditEdits.audit_log_enabled === null
+                  ? INHERIT_SENTINEL
+                  : String(auditEdits.audit_log_enabled)
+              }
+              onValueChange={(v) =>
+                setAuditEdits({
+                  audit_log_enabled: v === INHERIT_SENTINEL ? null : v === "true",
+                })
+              }
+            >
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {/* Sentinel, not "": Radix rejects an empty SelectItem value. */}
+                <SelectItem value={INHERIT_SENTINEL}>
+                  {t("auditServerDefault", {
+                    state: features?.audit_log ? t("enabled") : t("disabled"),
+                  })}
+                </SelectItem>
+                <SelectItem value="true">{t("enabled")}</SelectItem>
+                <SelectItem value="false">{t("disabled")}</SelectItem>
+              </SelectContent>
+            </Select>
+          </FieldRow>
+          <FieldRow
+            label={t("docStorageEnabledLabel")}
+            description={t("docStorageEnabledDescription")}
+          >
+            {/* Tri-state: inherit the server default, or override per bank. */}
+            <Select
+              value={
+                docStorageEdits.store_document_text === null
+                  ? INHERIT_SENTINEL
+                  : String(docStorageEdits.store_document_text)
+              }
+              onValueChange={(v) =>
+                setDocStorageEdits({
+                  store_document_text: v === INHERIT_SENTINEL ? null : v === "true",
+                })
+              }
+            >
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value={INHERIT_SENTINEL}>
+                  {t("docStorageServerDefault", {
+                    state: features?.store_document_text ? t("enabled") : t("disabled"),
+                  })}
+                </SelectItem>
+                <SelectItem value="true">{t("enabled")}</SelectItem>
+                <SelectItem value="false">{t("disabled")}</SelectItem>
+              </SelectContent>
+            </Select>
+          </FieldRow>
+        </ConfigSection>
+
+        {/* Recall Section — per-bank retrieval pipeline stages */}
+        <ConfigSection
+          title={t("recallTitle")}
+          description={t("recallDescription")}
+          error={recallError}
+          dirty={recallDirty}
+          saving={recallSaving}
+          onSave={saveRecall}
+        >
+          {(
+            [
+              ["enable_text_search", "recallTextSearch"],
+              ["enable_temporal_retrieval", "recallTemporalRetrieval"],
+              ["enable_graph_retrieval", "recallGraphRetrieval"],
+              ["enable_reranking", "recallReranking"],
+            ] as const
+          ).map(([field, key]) => (
+            <FieldRow key={field} label={t(`${key}Label`)} description={t(`${key}Description`)}>
+              {/* Tri-state: inherit the server default, or override per bank. */}
+              <Select
+                value={recallEdits[field] === null ? INHERIT_SENTINEL : String(recallEdits[field])}
+                onValueChange={(v) =>
+                  setRecallEdits({
+                    ...recallEdits,
+                    [field]: v === INHERIT_SENTINEL ? null : v === "true",
+                  })
+                }
+              >
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={INHERIT_SENTINEL}>{t("recallServerDefault")}</SelectItem>
+                  <SelectItem value="true">{t("enabled")}</SelectItem>
+                  <SelectItem value="false">{t("disabled")}</SelectItem>
+                </SelectContent>
+              </Select>
+            </FieldRow>
+          ))}
         </ConfigSection>
 
         {/* Models Section */}
@@ -785,7 +1494,17 @@ export function BankConfigView() {
 
 type RetainFormValues = RetainStrategyValues<LabelGroup[]>;
 
-const EXTRACTION_MODES = ["concise", "verbose", "verbatim", "chunks", "custom"];
+// Value/label pairs rather than bare values: the option list is user-facing, so
+// the labels are translated while the values stay the API's mode strings.
+function getExtractionModes(t: (key: string) => string): { value: string; label: string }[] {
+  return [
+    { value: "concise", label: t("extractionModeConcise") },
+    { value: "verbose", label: t("extractionModeVerbose") },
+    { value: "verbatim", label: t("extractionModeVerbatim") },
+    { value: "chunks", label: t("extractionModeChunks") },
+    { value: "custom", label: t("extractionModeCustom") },
+  ];
+}
 const INHERIT_SENTINEL = "__inherit__";
 
 function RetainStrategyForm({
@@ -819,9 +1538,9 @@ function RetainStrategyForm({
                 <span className="text-muted-foreground italic">{t("inherited")}</span>
               </SelectItem>
             )}
-            {EXTRACTION_MODES.map((opt) => (
-              <SelectItem key={opt} value={opt}>
-                {opt}
+            {getExtractionModes(t).map((opt) => (
+              <SelectItem key={opt.value} value={opt.value}>
+                {opt.label}
               </SelectItem>
             ))}
           </SelectContent>
@@ -975,29 +1694,39 @@ function RetainStrategiesPanel({
       {/* Tab bar */}
       <div className="border-b border-border px-6 flex items-stretch gap-1 flex-wrap">
         {/* Default tab */}
+        {/* Active tab is marked with the brand gradient, which can't be
+            expressed as a border colour — so the active underline is an
+            absolutely-positioned bar and the border-b-2 is kept transparent
+            purely to carry the subtle hover underline on inactive tabs. */}
         <button
           type="button"
           onClick={() => setSelectedTab("default")}
-          className={`relative py-3 px-4 text-sm font-semibold transition-colors border-b-2 -mb-px ${
+          className={`relative py-3 px-4 text-sm font-semibold transition-colors border-b-2 border-transparent -mb-px ${
             selectedTab === "default"
-              ? "border-primary text-foreground"
-              : "border-transparent text-muted-foreground hover:text-foreground hover:border-border"
+              ? "text-foreground"
+              : "text-muted-foreground hover:text-foreground hover:border-border"
           }`}
         >
           {t("default")}
+          {selectedTab === "default" && (
+            <div className="absolute bottom-[-2px] left-0 right-0 h-0.5 bg-primary-gradient" />
+          )}
         </button>
 
         {/* Named strategy tabs */}
         {local.map((s) => (
           <div
             key={s.id}
-            className={`relative flex items-center gap-2 py-3 px-4 text-sm font-semibold transition-colors border-b-2 -mb-px cursor-pointer ${
+            className={`relative flex items-center gap-2 py-3 px-4 text-sm font-semibold transition-colors border-b-2 border-transparent -mb-px cursor-pointer ${
               selectedTab === s.id
-                ? "border-primary text-foreground"
-                : "border-transparent text-muted-foreground hover:text-foreground hover:border-border"
+                ? "text-foreground"
+                : "text-muted-foreground hover:text-foreground hover:border-border"
             }`}
             onClick={() => setSelectedTab(s.id)}
           >
+            {selectedTab === s.id && (
+              <div className="absolute bottom-[-2px] left-0 right-0 h-0.5 bg-primary-gradient" />
+            )}
             <span className="font-mono">
               {s.name || <span className="italic font-normal opacity-50">{t("unnamed")}</span>}
             </span>
@@ -1194,6 +1923,7 @@ function ConfigSection({
   dirty,
   saving,
   onSave,
+  action,
 }: {
   title: string;
   description: string;
@@ -1202,13 +1932,18 @@ function ConfigSection({
   dirty: boolean;
   saving: boolean;
   onSave: () => void;
+  /** Rendered opposite the heading — used by Retain for the prompt tester. */
+  action?: ReactNode;
 }) {
   const t = useTranslations("bankConfig");
   return (
     <section className="space-y-3">
-      <div>
-        <h2 className="text-lg font-semibold">{title}</h2>
-        <p className="text-sm text-muted-foreground">{description}</p>
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <h2 className="text-lg font-semibold">{title}</h2>
+          <p className="text-sm text-muted-foreground">{description}</p>
+        </div>
+        {action}
       </div>
       <Card className="bg-muted/20 border-border/40">
         <div className="divide-y divide-border/40">{children}</div>
@@ -1224,7 +1959,7 @@ function ConfigSection({
           <Button size="sm" disabled={!dirty || saving} onClick={onSave}>
             {saving ? (
               <>
-                <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                <Spinner size="sm" className="mr-2" />
                 {t("saving")}
               </>
             ) : (
@@ -1270,6 +2005,7 @@ function TextareaRow({
   onChange,
   placeholder,
   rows,
+  action,
 }: {
   label: string;
   description?: string;
@@ -1277,13 +2013,18 @@ function TextareaRow({
   onChange: (v: string) => void;
   placeholder?: string;
   rows?: number;
+  /** Rendered opposite the label — used by the mission fields for "Preview prompt". */
+  action?: React.ReactNode;
 }) {
   return (
     <div className="px-6 py-4">
       <div className="space-y-2">
-        <div>
-          <p className="text-sm font-medium">{label}</p>
-          {description && <p className="text-xs text-muted-foreground mt-0.5">{description}</p>}
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <p className="text-sm font-medium">{label}</p>
+            {description && <p className="text-xs text-muted-foreground mt-0.5">{description}</p>}
+          </div>
+          {action}
         </div>
         <Textarea
           value={value}
@@ -1345,354 +2086,6 @@ function TraitRow({
           <span className="text-xs font-mono text-muted-foreground ml-1 shrink-0">{value}/5</span>
         </div>
       </div>
-    </div>
-  );
-}
-
-// ─── MapFieldsEditor (recursive) ─────────────────────────────────────────────
-
-/** Build an output-example string for the badge. */
-function exampleBadge(
-  key: string,
-  attr: { type: string; values?: LabelValue[]; fields?: Record<string, MapField> }
-): string {
-  if (attr.type === "map" && attr.fields && Object.keys(attr.fields).length > 0)
-    return `e.g. ${Object.keys(attr.fields)
-      .slice(0, 2)
-      .map((f) => `${key}:${f}:<value>`)
-      .join(", ")}`;
-  if (attr.type === "text") return `e.g. ${key}:<any text>`;
-  if ((attr.values?.length ?? 0) > 0) return `e.g. ${key}:${attr.values![0].value || "<value>"}`;
-  return `e.g. ${key}:<value>`;
-}
-
-function MapFieldsEditor({
-  fields,
-  onChange,
-  depth,
-  extraControls,
-  examplePrefix,
-}: {
-  fields: Record<string, MapField>;
-  onChange: (fields: Record<string, MapField>) => void;
-  depth: number;
-  extraControls?: React.ReactNode;
-  examplePrefix?: string;
-}) {
-  const t = useTranslations("bankConfig");
-  const FIELD_TYPE_LABELS: Record<MapField["type"], string> = {
-    text: t("fieldTypeText"),
-    value: t("fieldTypeValue"),
-    "multi-values": t("fieldTypeMultiValues"),
-    map: t("fieldTypeMap"),
-  };
-  const [expanded, setExpanded] = useState<Record<number, boolean>>({});
-
-  const updateField = (oldName: string, patch: Partial<MapField>) => {
-    const newFields: Record<string, MapField> = {};
-    for (const [k, v] of Object.entries(fields)) {
-      newFields[k] = k === oldName ? { ...v, ...patch } : v;
-    }
-    onChange(newFields);
-  };
-
-  const renameField = (oldName: string, newName: string) => {
-    const newFields: Record<string, MapField> = {};
-    for (const [k, v] of Object.entries(fields)) {
-      newFields[k === oldName ? newName : k] = v;
-    }
-    onChange(newFields);
-  };
-
-  const removeField = (name: string) => {
-    const newFields = { ...fields };
-    delete newFields[name];
-    onChange(newFields);
-  };
-
-  const addField = () => {
-    const newFields = { ...fields, "": { type: "text" as const, description: "" } };
-    onChange(newFields);
-  };
-
-  const isRoot = depth === 0;
-
-  return (
-    <div
-      className={
-        isRoot ? "space-y-1.5 py-1" : "space-y-1.5 py-1 ml-3 border-l-2 border-border/40 pl-3"
-      }
-    >
-      {Object.keys(fields).length === 0 && (
-        <p className="text-xs text-muted-foreground italic">{t("noFieldsYet")}</p>
-      )}
-      {Object.entries(fields).map(([fieldName, field], fi) => {
-        const isNestedMap = field.type === "map";
-        const hasEnum = field.type === "value" || field.type === "multi-values";
-        const isOpen = expanded[fi] ?? true;
-        const hasExpandable = isNestedMap || hasEnum;
-        return (
-          <div key={fi} className="space-y-1">
-            {/* Field row */}
-            <div className="flex items-center gap-1.5">
-              {hasExpandable ? (
-                <button
-                  type="button"
-                  onClick={() => setExpanded((prev) => ({ ...prev, [fi]: !isOpen }))}
-                  className="text-muted-foreground hover:text-foreground shrink-0 p-0.5 rounded hover:bg-muted/50"
-                >
-                  {isOpen ? (
-                    <ChevronDown className="h-3.5 w-3.5" />
-                  ) : (
-                    <ChevronRight className="h-3.5 w-3.5" />
-                  )}
-                </button>
-              ) : (
-                <span className="w-[18px] shrink-0" />
-              )}
-              <Input
-                placeholder={t("fieldNamePlaceholder")}
-                value={fieldName}
-                onChange={(e) => renameField(fieldName, e.target.value)}
-                className="h-7 text-xs font-mono w-28 shrink-0"
-              />
-              <Input
-                placeholder={t("extractorHintWhatPlaceholder")}
-                value={field.description}
-                onChange={(e) => updateField(fieldName, { description: e.target.value })}
-                className="h-7 text-xs flex-1 min-w-0"
-              />
-              <Select
-                value={field.type}
-                onValueChange={(v: MapField["type"]) =>
-                  updateField(fieldName, {
-                    type: v,
-                    ...(v === "map" ? { fields: field.fields ?? {}, values: undefined } : {}),
-                    ...(v === "text" ? { fields: undefined, values: undefined } : {}),
-                    ...(v === "value" || v === "multi-values"
-                      ? { fields: undefined, values: field.values ?? [] }
-                      : {}),
-                  })
-                }
-              >
-                <SelectTrigger className="h-7 text-xs w-[120px] shrink-0 px-2 py-0">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {Object.entries(FIELD_TYPE_LABELS).map(([val, label]) => (
-                    <SelectItem key={val} value={val} className="text-xs">
-                      {label}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              {extraControls}
-              <button
-                type="button"
-                onClick={() => removeField(fieldName)}
-                className="text-muted-foreground hover:text-destructive shrink-0 p-0.5 rounded hover:bg-destructive/10"
-              >
-                <Trash2 className="h-3.5 w-3.5" />
-              </button>
-            </div>
-
-            {/* Example badge — only at root level to avoid clutter */}
-            {isRoot && examplePrefix && fieldName && (
-              <div className="ml-[18px] pl-1.5">
-                <span className="text-[10px] font-mono text-muted-foreground/60 leading-none">
-                  {exampleBadge(examplePrefix, field)}
-                </span>
-              </div>
-            )}
-
-            {/* Nested map fields */}
-            {isOpen && isNestedMap && (
-              <MapFieldsEditor
-                fields={field.fields ?? {}}
-                onChange={(subFields) => updateField(fieldName, { fields: subFields })}
-                depth={depth + 1}
-                examplePrefix={examplePrefix ? `${examplePrefix}:${fieldName}` : undefined}
-              />
-            )}
-
-            {/* Enum values for value/multi-values fields */}
-            {isOpen && hasEnum && (
-              <div className="ml-6 space-y-0.5 py-1">
-                {(field.values ?? []).length === 0 && (
-                  <p className="text-[11px] text-muted-foreground italic">{t("noValuesYet")}</p>
-                )}
-                {(field.values ?? []).map((v, vi) => (
-                  <div key={vi} className="flex items-center gap-1.5 group/val">
-                    <span className="text-muted-foreground/50 text-[10px] shrink-0">&#x2022;</span>
-                    <Input
-                      placeholder={t("addValueShort")}
-                      value={v.value}
-                      onChange={(e) => {
-                        const newValues = [...(field.values ?? [])];
-                        newValues[vi] = { ...v, value: e.target.value };
-                        updateField(fieldName, { values: newValues });
-                      }}
-                      className="h-6 text-[11px] font-mono w-24 shrink-0 border-dashed"
-                    />
-                    <Input
-                      placeholder={t("extractorHintWhichPlaceholder")}
-                      value={v.description}
-                      onChange={(e) => {
-                        const newValues = [...(field.values ?? [])];
-                        newValues[vi] = { ...v, description: e.target.value };
-                        updateField(fieldName, { values: newValues });
-                      }}
-                      className="h-6 text-[11px] flex-1 min-w-0 border-dashed"
-                    />
-                    <button
-                      type="button"
-                      onClick={() => {
-                        const newValues = (field.values ?? []).filter((_, i) => i !== vi);
-                        updateField(fieldName, { values: newValues });
-                      }}
-                      className="text-muted-foreground/40 hover:text-destructive shrink-0 p-0.5 rounded hover:bg-destructive/10 opacity-0 group-hover/val:opacity-100 transition-opacity"
-                    >
-                      <Trash2 className="h-3 w-3" />
-                    </button>
-                  </div>
-                ))}
-                <button
-                  type="button"
-                  onClick={() => {
-                    const newValues = [...(field.values ?? []), { value: "", description: "" }];
-                    updateField(fieldName, { values: newValues });
-                  }}
-                  className="text-[11px] text-muted-foreground/60 hover:text-foreground inline-flex items-center gap-1 ml-2.5"
-                >
-                  <Plus className="h-2.5 w-2.5" />
-                  {t("addValueShort")}
-                </button>
-              </div>
-            )}
-          </div>
-        );
-      })}
-      <button
-        type="button"
-        onClick={addField}
-        className="text-xs text-muted-foreground hover:text-foreground inline-flex items-center gap-1"
-      >
-        <Plus className="h-3 w-3" />
-        {t("addField")}
-      </button>
-    </div>
-  );
-}
-
-// ─── EntityLabelsEditor ───────────────────────────────────────────────────────
-
-function emptyAttribute(): LabelGroup {
-  return {
-    key: "",
-    description: "",
-    type: "value",
-    optional: true,
-    tag: false,
-    values: [],
-    fields: {},
-  };
-}
-
-function EntityLabelsEditor({
-  value,
-  onChange,
-}: {
-  value: LabelGroup[];
-  onChange: (attrs: LabelGroup[]) => void;
-}) {
-  const t = useTranslations("entityLabelsEditor");
-  const updateAttr = (i: number, patch: Partial<LabelGroup>) => {
-    const next = value.map((a, idx) => (idx === i ? { ...a, ...patch } : a));
-    onChange(next);
-  };
-
-  const removeAttr = (i: number) => {
-    onChange(value.filter((_, idx) => idx !== i));
-  };
-
-  const addAttr = () => {
-    onChange([...value, emptyAttribute()]);
-  };
-
-  return (
-    <div className="px-6 py-4 space-y-3">
-      <div className="flex items-center justify-between">
-        <div>
-          <p className="text-sm font-medium">{t("entityLabelsTitle")}</p>
-          <p className="text-xs text-muted-foreground mt-0.5">{t("entityLabelsDescription")}</p>
-        </div>
-        {value.length > 0 && (
-          <span className="text-xs bg-primary/10 text-primary px-2 py-0.5 rounded-full shrink-0">
-            {t("labelCount", { count: value.length })}
-          </span>
-        )}
-      </div>
-
-      {value.length === 0 && (
-        <p className="text-xs text-muted-foreground italic">{t("noEntityLabelsDefined")}</p>
-      )}
-
-      <div className="space-y-2">
-        {value.map((attr, i) => (
-          <div key={i} className="border border-border/50 rounded-md bg-background">
-            {/* Rendered via MapFieldsEditor as a single-field editor */}
-            <MapFieldsEditor
-              fields={{
-                [attr.key]: {
-                  type: attr.type as MapField["type"],
-                  description: attr.description,
-                  values: attr.values,
-                  fields: attr.fields,
-                },
-              }}
-              onChange={(updated) => {
-                const entries = Object.entries(updated);
-                if (entries.length === 0) {
-                  removeAttr(i);
-                } else {
-                  const [newKey, newField] = entries[0];
-                  updateAttr(i, {
-                    key: newKey,
-                    type: newField.type as LabelGroup["type"],
-                    description: newField.description,
-                    values: newField.values ?? [],
-                    fields: newField.fields ?? {},
-                  });
-                }
-              }}
-              depth={0}
-              extraControls={
-                <label
-                  className="flex items-center gap-1.5 text-xs text-muted-foreground shrink-0 cursor-pointer select-none"
-                  title={t("alsoStoreAsTagTooltip")}
-                >
-                  <Checkbox
-                    checked={attr.tag}
-                    onCheckedChange={(checked) => updateAttr(i, { tag: !!checked })}
-                    className="h-4 w-4"
-                  />
-                  {t("plusTag")}
-                </label>
-              }
-              examplePrefix={attr.key}
-            />
-          </div>
-        ))}
-      </div>
-
-      <button
-        type="button"
-        onClick={addAttr}
-        className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground"
-      >
-        <Plus className="h-3.5 w-3.5" />
-        {t("addLabel")}
-      </button>
     </div>
   );
 }

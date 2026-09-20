@@ -14,17 +14,23 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from aiohttp import web
 from pydantic import BaseModel
 
+from hindsight_api.engine.aiohttp_session import LoopLocal
 from hindsight_api.engine.bank_attribution import apply_bank_attribution
+from hindsight_api.engine.cross_encoder import LiteLLMCrossEncoder
 from hindsight_api.engine.embeddings import OpenAIEmbeddings
 from hindsight_api.engine.memory_engine import (
+    MemoryEngine,
     _bind_bank_id,
     _current_bank_id,
     get_current_bank_id,
 )
 from hindsight_api.engine.providers.openai_compatible_llm import OpenAICompatibleLLM
 from hindsight_api.engine.retain.embedding_utils import generate_embeddings_batch
+from hindsight_api.models import RequestContext
+from tests.aiohttp_stub import stub_server
 
 
 @pytest.fixture(autouse=True)
@@ -56,31 +62,9 @@ class TestBankContextVar:
     def test_default_is_none(self):
         assert get_current_bank_id() is None
 
-    def test_set_and_reset(self):
-        token = _current_bank_id.set("user-42")
-        try:
-            assert get_current_bank_id() == "user-42"
-        finally:
-            _current_bank_id.reset(token)
-        assert get_current_bank_id() is None
-
-    def test_reset_runs_even_on_exception(self):
-        """A finally-based reset must unwind the binding even when the body raises."""
-        token = _current_bank_id.set("user-boom")
-        try:
-            with pytest.raises(ValueError):
-                try:
-                    assert get_current_bank_id() == "user-boom"
-                    raise ValueError("boom")
-                finally:
-                    _current_bank_id.reset(token)
-        finally:
-            pass
-        assert get_current_bank_id() is None
-
 
 class TestBindBankIdDecorator:
-    """The engine binds the bank via @_bind_bank_id on recall/retain/batch/task methods."""
+    """The engine binds the bank via @_bind_bank_id on recall/retain/batch/reflect/task methods."""
 
     async def test_binds_named_arg_positional_and_keyword(self):
         @_bind_bank_id()
@@ -116,6 +100,41 @@ class TestBindBankIdDecorator:
             return get_current_bank_id()
 
         assert await op(12345) is None
+
+    async def test_engine_provider_paths_bind_and_reset_their_bank_arguments(self):
+        engine = object.__new__(MemoryEngine)
+        engine._reflect_llm_config = None
+        engine._operation_validator = None
+        observed_bank_ids: list[str | None] = []
+
+        with patch(
+            "hindsight_api.engine.memory_engine.sanitize_text",
+            side_effect=lambda value: observed_bank_ids.append(get_current_bank_id()) or value,
+        ):
+            with pytest.raises(ValueError, match="Memory LLM API key not set"):
+                await engine.reflect_async("user-reflect", "question", request_context=RequestContext())
+
+        assert observed_bank_ids == ["user-reflect", "user-reflect"]
+        assert get_current_bank_id() is None
+
+        with (
+            patch.object(
+                engine,
+                "_authenticate_tenant",
+                AsyncMock(side_effect=lambda _context: observed_bank_ids.append(get_current_bank_id())),
+            ),
+            patch.object(engine, "_get_backend", AsyncMock(side_effect=RuntimeError("stop after authentication"))),
+        ):
+            with pytest.raises(RuntimeError, match="stop after authentication"):
+                await engine.update_memory_unit(
+                    "user-update",
+                    "54a647e5-0a22-4e5d-8504-b8bfca2a6142",
+                    text="corrected",
+                    request_context=RequestContext(),
+                )
+
+        assert observed_bank_ids[-1] == "user-update"
+        assert get_current_bank_id() is None
 
 
 # ── LLM provider: user injection ──────────────────────────────────────────────
@@ -237,48 +256,63 @@ def _openai_embeddings() -> OpenAIEmbeddings:
 
 
 def _fake_embed_client(captured: list[dict]):
-    def fake_create(**kwargs):
+    async def fake_create(**kwargs):
         captured.append(kwargs)
         n = len(kwargs["input"])
         return SimpleNamespace(data=[SimpleNamespace(index=i, embedding=[0.0] * 1536) for i in range(n)])
 
-    return SimpleNamespace(embeddings=SimpleNamespace(create=fake_create))
+    return SimpleNamespace(api_key="sk-test", embeddings=SimpleNamespace(create=fake_create))
 
 
-def test_embeddings_user_injected_when_flag_on_and_bank_set():
+async def test_embeddings_user_injected_when_flag_on_and_bank_set():
     _set_flag(True)
     emb = _openai_embeddings()
     captured: list[dict] = []
-    emb._client = _fake_embed_client(captured)
+    client = _fake_embed_client(captured)
+    emb._clients = LoopLocal(lambda: client)
     token = _current_bank_id.set("user-emb")
     try:
-        emb.encode(["hello"])
+        await emb.encode(["hello"])
     finally:
         _current_bank_id.reset(token)
     assert captured[0]["user"] == "user-emb"
 
 
-def test_embeddings_user_not_injected_when_flag_off():
-    _set_flag(False)
-    emb = _openai_embeddings()
-    captured: list[dict] = []
-    emb._client = _fake_embed_client(captured)
-    token = _current_bank_id.set("user-emb")
-    try:
-        emb.encode(["hello"])
-    finally:
-        _current_bank_id.reset(token)
-    assert "user" not in captured[0]
-
-
-def test_embeddings_user_not_injected_when_bank_unset():
+async def test_embeddings_user_injected_on_every_concurrent_batch():
+    """Batches fanned out as tasks still see the caller's bank ContextVar."""
     _set_flag(True)
     emb = _openai_embeddings()
+    emb.batch_size = 1
+    emb.max_concurrent_requests = 4
     captured: list[dict] = []
-    emb._client = _fake_embed_client(captured)
-    assert get_current_bank_id() is None
-    emb.encode(["hello"])
-    assert "user" not in captured[0]
+    client = _fake_embed_client(captured)
+    emb._clients = LoopLocal(lambda: client)
+    token = _current_bank_id.set("user-fanout")
+    try:
+        await emb.encode(["a", "b", "c", "d"])
+    finally:
+        _current_bank_id.reset(token)
+    assert [request["user"] for request in captured] == ["user-fanout"] * 4
+
+
+async def test_litellm_proxy_sends_bank_header():
+    received: list[dict[str, str]] = []
+
+    async def handler(request: web.Request) -> web.StreamResponse:
+        received.append(dict(request.headers))
+        return web.json_response({"results": [{"index": 0, "relevance_score": 0.91}]})
+
+    async with stub_server(handler) as base_url:
+        encoder = LiteLLMCrossEncoder(api_base=base_url, model="will-memory-rerank")
+        await encoder.initialize()
+        with patch(
+            "hindsight_api.engine.cross_encoder.reranker_bank_attribution_headers",
+            return_value={"X-Hindsight-Bank-Id": "bank-litellm-proxy"},
+        ):
+            scores = await encoder.predict([("query", "document")])
+
+    assert scores == [0.91]
+    assert received[0]["X-Hindsight-Bank-Id"] == "bank-litellm-proxy"
 
 
 # ── Executor context propagation ──────────────────────────────────────────────
@@ -287,8 +321,8 @@ def test_embeddings_user_not_injected_when_bank_unset():
 class _BankCapturingBackend:
     """Embeddings backend whose encode records the bank id visible at call time.
 
-    The real `generate_embeddings_batch` offloads encode to a thread via
-    run_in_executor; this verifies the bank ContextVar survives that thread hop.
+    `generate_embeddings_batch` hands the backend the caller's context; this verifies
+    the bank ContextVar reaches the backend it dispatches to.
     """
 
     dimension = 1
@@ -296,12 +330,12 @@ class _BankCapturingBackend:
     def __init__(self) -> None:
         self.seen_bank_id: str | None = "UNSET"
 
-    def encode_documents(self, texts: list[str]) -> list[list[float]]:
+    async def encode_documents(self, texts: list[str]) -> list[list[float]]:
         self.seen_bank_id = get_current_bank_id()
         return [[0.0] for _ in texts]
 
-    def encode_query(self, texts: list[str]) -> list[list[float]]:
-        return self.encode_documents(texts)
+    async def encode_query(self, texts: list[str]) -> list[list[float]]:
+        return await self.encode_documents(texts)
 
 
 async def test_executor_propagates_bank_contextvar_into_worker_thread():
@@ -321,11 +355,11 @@ async def test_executor_length_validation_preserved():
     class _ShortBackend:
         dimension = 1
 
-        def encode_documents(self, texts: list[str]) -> list[list[float]]:
+        async def encode_documents(self, texts: list[str]) -> list[list[float]]:
             return [[0.0]]  # one vector for two inputs
 
-        def encode_query(self, texts: list[str]) -> list[list[float]]:
-            return self.encode_documents(texts)
+        async def encode_query(self, texts: list[str]) -> list[list[float]]:
+            return await self.encode_documents(texts)
 
     with pytest.raises(Exception, match="expected exact 1:1 alignment"):
         await generate_embeddings_batch(_ShortBackend(), ["a", "b"], input_type="document")

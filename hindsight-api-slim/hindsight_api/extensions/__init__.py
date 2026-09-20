@@ -13,14 +13,16 @@ Example:
 
 Extensions receive an ExtensionContext that provides a controlled API for interacting
 with the system (e.g., running migrations for tenant schemas).
+
+This package exports the extension *interfaces* only. Concrete implementations —
+including the ones bundled under ``hindsight_api.extensions.builtin`` — are
+imported by path at load time, so importing this package never pulls in an
+implementation's dependencies. Extensions distributed outside the server live in
+``hindsight-extensions/`` in the repository.
 """
 
+from hindsight_api.extensions.bank_tables import BankScopedTable
 from hindsight_api.extensions.base import Extension
-from hindsight_api.extensions.builtin import (
-    ApiKeyTenantExtension,
-    MemoryDefenseRegexExtension,
-    SupabaseTenantExtension,
-)
 from hindsight_api.extensions.context import DefaultExtensionContext, ExtensionContext
 from hindsight_api.extensions.http import HttpExtension
 from hindsight_api.extensions.loader import load_extension
@@ -39,10 +41,13 @@ from hindsight_api.extensions.operation_validator import (
     BankListContext,
     BankListResult,
     BankReadContext,
+    BankReadOperation,
     BankWriteContext,
+    BankWriteOperation,
     # Consolidation operation
     ConsolidateContext,
     ConsolidateResult,
+    CreateBankContext,
     # File Conversion
     FileConvertResult,
     # Mental Model operations
@@ -54,10 +59,12 @@ from hindsight_api.extensions.operation_validator import (
     OperationValidationError,
     OperationValidatorExtension,
     PrecheckContext,
+    PrecheckOperation,
     RecallContext,
     RecallResult,
     ReflectContext,
     ReflectResultContext,
+    RetainAttachmentInfo,
     RetainContext,
     RetainResult,
     ValidationResult,
@@ -74,6 +81,7 @@ from hindsight_api.worker.exceptions import DeferOperation
 __all__ = [
     # Base
     "Extension",
+    "BankScopedTable",
     "load_extension",
     # Context
     "ExtensionContext",
@@ -87,10 +95,12 @@ __all__ = [
     "OperationValidationError",
     "OperationValidatorExtension",
     "PrecheckContext",
+    "PrecheckOperation",
     "RecallContext",
     "RecallResult",
     "ReflectContext",
     "ReflectResultContext",
+    "RetainAttachmentInfo",
     "RetainContext",
     "RetainResult",
     "ValidationResult",
@@ -98,7 +108,10 @@ __all__ = [
     "BankListContext",
     "BankListResult",
     "BankReadContext",
+    "BankReadOperation",
     "BankWriteContext",
+    "BankWriteOperation",
+    "CreateBankContext",
     # Operation Validator - Consolidation
     "ConsolidateContext",
     "ConsolidateResult",
@@ -110,8 +123,6 @@ __all__ = [
     "MentalModelRefreshContext",
     "MentalModelRefreshResult",
     # Tenant/Auth
-    "ApiKeyTenantExtension",
-    "SupabaseTenantExtension",
     "AuthenticationError",
     "RequestContext",
     "Tenant",
@@ -122,7 +133,6 @@ __all__ = [
     "DefenseDecision",
     "DefensePolicy",
     "MemoryDefenseExtension",
-    "MemoryDefenseRegexExtension",
     "PolicyRule",
     "apply_redaction",
     "parse_policy",

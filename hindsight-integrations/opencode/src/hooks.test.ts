@@ -74,6 +74,31 @@ describe("event hook — session.idle", () => {
     expect(opts.metadata.session_id).toBe("sess-1");
   });
 
+  it("passes retainTags from config to retain call", async () => {
+    const client = makeClient();
+    const messages = [
+      { info: { role: "user" }, parts: [{ type: "text", text: "Hello" }] },
+      { info: { role: "assistant" }, parts: [{ type: "text", text: "Hi there" }] },
+    ];
+    const opencodeClient = makeOpencodeClient(messages);
+    const state = makeState();
+    const hooks = createHooks(
+      client,
+      "bank",
+      makeConfig({ retainTags: ["user:alice", "shared"], retainEveryNTurns: 1 }),
+      state,
+      opencodeClient
+    );
+
+    await hooks.event({
+      event: { type: "session.idle", properties: { sessionID: "sess-1" } },
+    });
+
+    expect(client.retain).toHaveBeenCalledTimes(1);
+    const opts = client.retain.mock.calls[0][2];
+    expect(opts.tags).toEqual(["user:alice", "shared"]);
+  });
+
   it("skips retain when autoRetain is false", async () => {
     const client = makeClient();
     const messages = [
@@ -252,6 +277,29 @@ describe("compacting hook", () => {
     expect(opts.metadata.session_id).toBe("sess-1");
   });
 
+  it("pre-compaction retain passes retainTags from config", async () => {
+    const client = makeClient();
+    client.recall.mockResolvedValue({ results: [] });
+    const messages = [
+      { info: { role: "user" }, parts: [{ type: "text", text: "Hello" }] },
+      { info: { role: "assistant" }, parts: [{ type: "text", text: "Hi" }] },
+    ];
+    const output = { context: [] as string[] };
+    const hooks = createHooks(
+      client,
+      "bank",
+      makeConfig({ retainTags: ["user:alice", "auto-tag"] }),
+      makeState(),
+      makeOpencodeClient(messages)
+    );
+
+    await hooks["experimental.session.compacting"]({ sessionID: "sess-1" }, output);
+
+    expect(client.retain).toHaveBeenCalledTimes(1);
+    const opts = client.retain.mock.calls[0][2];
+    expect(opts.tags).toEqual(["user:alice", "auto-tag"]);
+  });
+
   it("pre-compaction retain uses chunked documentId in last-turn mode", async () => {
     const client = makeClient();
     client.recall.mockResolvedValue({ results: [] });
@@ -413,5 +461,67 @@ describe("system transform hook", () => {
 
     expect(output.system.length).toBe(0);
     expect(client.recall).not.toHaveBeenCalled();
+  });
+
+  it("queries on the user's latest message instead of a fixed string", async () => {
+    const client = makeClient();
+    const messages = [
+      {
+        info: { role: "user" },
+        parts: [{ type: "text", text: "How do I configure Oracle vector search?" }],
+      },
+    ];
+    const state = makeState();
+    const output = { system: [] as string[] };
+    const hooks = createHooks(
+      client,
+      "bank",
+      makeConfig({ recallContextTurns: 1 }),
+      state,
+      makeOpencodeClient(messages)
+    );
+
+    await hooks["experimental.chat.system.transform"]({ sessionID: "sess-1", model: {} }, output);
+
+    expect(client.recall).toHaveBeenCalledTimes(1);
+    expect(client.recall.mock.calls[0][1]).toBe("How do I configure Oracle vector search?");
+  });
+
+  it("includes prior turns when recallContextTurns > 1", async () => {
+    const client = makeClient();
+    const messages = [
+      { info: { role: "user" }, parts: [{ type: "text", text: "Set up the database" }] },
+      { info: { role: "assistant" }, parts: [{ type: "text", text: "Which engine?" }] },
+      { info: { role: "user" }, parts: [{ type: "text", text: "Use Postgres with pgvector" }] },
+    ];
+    const state = makeState();
+    const output = { system: [] as string[] };
+    const hooks = createHooks(
+      client,
+      "bank",
+      makeConfig({ recallContextTurns: 3 }),
+      state,
+      makeOpencodeClient(messages)
+    );
+
+    await hooks["experimental.chat.system.transform"]({ sessionID: "sess-1", model: {} }, output);
+
+    const query = client.recall.mock.calls[0][1] as string;
+    expect(query).toContain("Use Postgres with pgvector");
+    expect(query).toContain("Prior context:");
+    expect(query).toContain("Set up the database");
+  });
+
+  it("falls back to the generic query when there is no user message yet", async () => {
+    const client = makeClient();
+    const state = makeState();
+    const output = { system: [] as string[] };
+    // No messages available on the session.
+    const hooks = createHooks(client, "bank", makeConfig(), state, makeOpencodeClient());
+
+    await hooks["experimental.chat.system.transform"]({ sessionID: "sess-1", model: {} }, output);
+
+    expect(client.recall).toHaveBeenCalledTimes(1);
+    expect(client.recall.mock.calls[0][1]).toBe("project context and recent work");
   });
 });
