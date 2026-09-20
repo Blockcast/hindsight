@@ -124,6 +124,27 @@ PostgreSQL with pgvector. Schema managed via Alembic migrations in `hindsight-ap
 
 Key tables: `banks`, `memory_units`, `documents`, `entities`, `entity_links`
 
+### Keeping Postgres Indexes Usable
+
+Two query shapes silently lost their index in production (2026-09-03, fixed in #24).
+Both regress invisibly — same results, orders of magnitude slower — so treat them as
+conventions, not one-off fixes.
+
+**Bank-scoped ANN queries must go through `_fetch_with_per_bank_index_plan`**
+(`hindsight-api-slim/hindsight_api/engine/search/retrieval.py`), never `conn.fetch`
+directly. The per-bank HNSW indexes are *partial* (`WHERE fact_type = '...' AND bank_id
+= '...'`). Under a cached generic plan the planner cannot prove a `bank_id = $n` bind
+implies that predicate, so every per-bank index drops out and the arm sequentially
+scans. The helper wraps the fetch in `SET LOCAL plan_cache_mode = force_custom_plan`.
+Do not inline `bank_id` as a literal to dodge this — it is caller-controlled tenant text.
+
+**Cast the parameter, never the indexed column.** `id::text = ANY($1)` makes the uuid
+primary-key index unusable; filter the input text and cast that instead — see
+`fetch_unit_dates` in `hindsight-api-slim/hindsight_api/engine/db/ops_postgresql.py`.
+
+Both shapes are guarded by `hindsight-api-slim/tests/test_partial_index_plans.py`
+(pure unit tests, no database required).
+
 ### Helm Operations
 
 Helm liveness probes must stay process-local so database pressure does not restart healthy pods: API liveness uses `/version`, worker liveness uses `/metrics`. Readiness is DB-independent as well — see **Helm Health Probes** below. The default embedded-PostgreSQL chart values intentionally cap API DB pools and worker/retain concurrency; do not raise those defaults without validating connection pressure under retain/consolidation backlog.
