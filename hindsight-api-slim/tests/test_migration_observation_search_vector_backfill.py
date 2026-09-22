@@ -3,14 +3,15 @@
 Observations written by the consolidator under the ``native`` text-search
 backend landed with a NULL ``search_vector`` and were invisible to BM25. The
 writer is fixed to populate the tsvector; migration
-``c3f7a1b9d2e4`` backfills the historical NULL observations.
+``c3f7a1b9d2e4`` is deliberately data-free, and the explicit admin command
+backfills the historical NULL observations in bounded transactions.
 
 This test seeds an observation with a NULL ``search_vector`` at the revision
-just before the backfill, runs the migration to head, and asserts the row is
+just before the migration, runs the migration, verifies it does not perform a
+large UPDATE, then invokes the bounded admin repair and asserts the row is
 populated with a valid tsvector — and that already-populated rows are left
-untouched. Uses a dedicated pg0 instance (mirrors test_migration_backsweep) so
-it controls exactly which migrations have run and never stamps the shared test
-instance.
+untouched. Uses a dedicated pg0 instance so it controls exactly which
+migrations have run and never stamps the shared test instance.
 """
 
 import asyncio
@@ -21,6 +22,11 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import create_engine, text
+
+from hindsight_api.admin.cli import (
+    ObservationSearchVectorBackfillResult,
+    _run_observation_search_vector_backfill,
+)
 
 # Drives alembic and asserts on the search_vector column itself — an internal FTS
 # index column, not part of the public read model.
@@ -44,8 +50,7 @@ def _alembic_cfg(db_url: str) -> Config:
 
 @pytest.fixture(scope="module")
 def pre_backfill_db_url():
-    """pg0 instance brought to the revision just before the backfill so the
-    migration's UPDATE runs against seeded NULL-search_vector observations."""
+    """pg0 instance brought to the revision just before the repair migration."""
     from hindsight_api.pg0 import EmbeddedPostgres
 
     # port=None lets pg0 auto-assign a free port. A hardcoded port is not
@@ -54,7 +59,7 @@ def pre_backfill_db_url():
     # which the retry loop then reports as "Failed to start embedded PostgreSQL
     # after 5 attempts". The connection URL from ensure_running() carries the
     # assigned port, so nothing downstream needs to know it.
-    pg0 = EmbeddedPostgres(name="hindsight-obs-sv-backfill-test", port=None)
+    pg0 = EmbeddedPostgres(name=f"hindsight-obs-sv-backfill-{uuid.uuid4().hex[:8]}", port=None)
     loop = asyncio.new_event_loop()
     try:
         url = loop.run_until_complete(pg0.ensure_running())
@@ -72,7 +77,8 @@ def test_backfill_populates_null_observation_search_vector(pre_backfill_db_url):
     db_url = pre_backfill_db_url
     bank_id = f"obs-sv-{uuid.uuid4().hex[:12]}"
 
-    null_obs_id = uuid.uuid4()
+    null_obs_id = uuid.UUID(int=0)
+    second_null_obs_id = uuid.uuid4()
     populated_obs_id = uuid.uuid4()
     world_id = uuid.uuid4()
 
@@ -102,6 +108,15 @@ def test_backfill_populates_null_observation_search_vector(pre_backfill_db_url):
             ),
             {"id": null_obs_id, "b": bank_id},
         )
+        conn.execute(
+            text(
+                """
+                INSERT INTO memory_units (id, bank_id, text, fact_type, search_vector)
+                VALUES (:id, :b, 'PostgreSQL supports bounded batch updates', 'observation', NULL)
+                """
+            ),
+            {"id": second_null_obs_id, "b": bank_id},
+        )
         # An observation already populated — must be left byte-for-byte intact.
         conn.execute(
             text(
@@ -126,8 +141,47 @@ def test_backfill_populates_null_observation_search_vector(pre_backfill_db_url):
         )
         conn.commit()
 
-    # Run the backfill.
+    # The migration itself must not scan/update the live table.
     command.upgrade(_alembic_cfg(db_url), _BACKFILL_REVISION)
+
+    with engine.connect() as conn:
+        assert conn.execute(
+            text("SELECT search_vector IS NULL FROM memory_units WHERE id = :id"),
+            {"id": null_obs_id},
+        ).scalar(), "Alembic migration must not run the historical backfill"
+
+    # A locked low-ID row must not block the repair. The single-batch ceiling
+    # must commit the unlocked row and report remaining work, not false success.
+    with engine.begin() as lock_conn:
+        lock_conn.execute(text("SELECT id FROM memory_units WHERE id = :id FOR UPDATE"), {"id": null_obs_id})
+        result = asyncio.run(
+            _run_observation_search_vector_backfill(
+                db_url,
+                base_schema="public",
+                schema="public",
+                language="english",
+                batch_size=1,
+                max_batches=1,
+            )
+        )
+        assert result["public"] == ObservationSearchVectorBackfillResult(updated=1, batches=1, remaining=True)
+        assert lock_conn.execute(
+            text("SELECT search_vector IS NOT NULL FROM memory_units WHERE id = :id"),
+            {"id": second_null_obs_id},
+        ).scalar(), "each batch must commit independently"
+
+    # A new invocation revisits the previously locked row, including UUID zero.
+    result = asyncio.run(
+        _run_observation_search_vector_backfill(
+            db_url,
+            base_schema="public",
+            schema="public",
+            language="english",
+            batch_size=1,
+            max_batches=10,
+        )
+    )
+    assert result["public"] == ObservationSearchVectorBackfillResult(updated=1, batches=1)
 
     with engine.connect() as conn:
         null_obs_sv, null_obs_match = conn.execute(
@@ -155,11 +209,51 @@ def test_backfill_populates_null_observation_search_vector(pre_backfill_db_url):
         ).scalar()
         assert world_null, "non-observation rows must be left untouched by the backfill"
 
-    # Idempotency: re-running touches nothing and stays at head.
-    command.upgrade(_alembic_cfg(db_url), "heads")
+    # Idempotency: rerunning the bounded repair touches nothing.
+    result = asyncio.run(
+        _run_observation_search_vector_backfill(
+            db_url,
+            base_schema="public",
+            schema="public",
+            language="english",
+            batch_size=1,
+            max_batches=10,
+        )
+    )
+    assert result["public"] == ObservationSearchVectorBackfillResult()
     with engine.connect() as conn:
         still_populated = conn.execute(
             text("SELECT search_vector IS NOT NULL FROM memory_units WHERE id = :id"),
             {"id": null_obs_id},
         ).scalar()
         assert still_populated
+
+
+@pytest.mark.parametrize(
+    "column_definition",
+    ["text", "tsvector GENERATED ALWAYS AS (to_tsvector('english'::regconfig, text)) STORED"],
+)
+def test_backfill_skips_non_native_or_generated_vectors(pre_backfill_db_url, column_definition):
+    # A minimal isolated schema models the backend-specific column shape without
+    # altering the shared memory table or requiring optional search extensions.
+    engine = create_engine(pre_backfill_db_url)
+    schema = f"backfill_backend_{uuid.uuid4().hex}"
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(f'CREATE SCHEMA "{schema}"'))
+            conn.execute(text(f'CREATE TABLE "{schema}".memory_units (text text, search_vector {column_definition})'))
+        result = asyncio.run(
+            _run_observation_search_vector_backfill(
+                pre_backfill_db_url,
+                base_schema="public",
+                schema=schema,
+                language="english",
+                batch_size=1,
+                max_batches=1,
+            )
+        )
+        assert result[schema] == ObservationSearchVectorBackfillResult(skipped=True)
+    finally:
+        with engine.begin() as conn:
+            conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+        engine.dispose()

@@ -29,6 +29,7 @@ from ..config import (
     DEFAULT_RERANKER_LITELLM_SDK_MODEL,
     DEFAULT_RERANKER_LOCAL_BATCH_SIZE,
     DEFAULT_RERANKER_LOCAL_MODEL,
+    DEFAULT_RERANKER_LOCAL_TORCH_THREADS,
     DEFAULT_RERANKER_SILICONFLOW_BASE_URL,
     DEFAULT_RERANKER_SILICONFLOW_MODEL,
     DEFAULT_RERANKER_TEI_BATCH_SIZE,
@@ -152,6 +153,7 @@ class LocalSTCrossEncoder(CrossEncoderModel):
         self,
         model_name: str | None = None,
         max_concurrent: int = 4,
+        torch_threads: int = DEFAULT_RERANKER_LOCAL_TORCH_THREADS,
         force_cpu: bool = False,
         trust_remote_code: bool = False,
         fp16: bool = False,
@@ -166,6 +168,9 @@ class LocalSTCrossEncoder(CrossEncoderModel):
                        Default: cross-encoder/ms-marco-MiniLM-L-6-v2
             max_concurrent: Maximum concurrent reranking calls (default: 2).
                            Higher values may cause CPU thrashing under load.
+            torch_threads: Number of intra-op and inter-op PyTorch CPU threads
+                           (default: 2). PyTorch defaults to the host CPU count,
+                           which oversubscribes a CPU-limited API worker.
             force_cpu: Force CPU mode for local inference.
                       Default: False
             trust_remote_code: Allow loading models with custom code (security risk).
@@ -180,7 +185,10 @@ class LocalSTCrossEncoder(CrossEncoderModel):
                        hardware and model (CPU: 32, CUDA: 128+). Default: 32.
         """
         self.model_name = model_name or DEFAULT_RERANKER_LOCAL_MODEL
+        if torch_threads < 1:
+            raise ValueError("torch_threads must be >= 1")
         self.force_cpu = force_cpu
+        self.torch_threads = torch_threads
         self.trust_remote_code = trust_remote_code
         self.fp16 = fp16
         self.bucket_batching = bucket_batching
@@ -209,6 +217,21 @@ class LocalSTCrossEncoder(CrossEncoderModel):
                 "sentence-transformers is required for LocalSTCrossEncoder. "
                 "Install it with: pip install sentence-transformers"
             )
+
+        # PyTorch pools are process-wide. The default is the host CPU count,
+        # which is disastrous in a 6-CPU API pod: one rerank spawned 20+ workers.
+        # Configure both pools before loading/inferencing the model so concurrent
+        # API requests do not multiply that oversubscription. set_num_interop_threads
+        # is only legal before the first inter-op parallel region; a second local
+        # member in the same process can therefore already have configured it.
+        import torch
+
+        torch.set_num_threads(self.torch_threads)
+        try:
+            torch.set_num_interop_threads(self.torch_threads)
+        except RuntimeError as exc:
+            logger.debug("Reranker: PyTorch inter-op pool already initialized: %s", exc)
+        logger.info("Reranker: PyTorch CPU thread pools set to %d", self.torch_threads)
 
         logger.info(f"Reranker: initializing local provider with model {self.model_name}")
 
@@ -1871,6 +1894,7 @@ def _create_cross_encoder_backend(member: RerankerMemberConfig) -> CrossEncoderM
         return LocalSTCrossEncoder(
             model_name=member.local_model,
             max_concurrent=member.local_max_concurrent,
+            torch_threads=member.local_torch_threads,
             force_cpu=member.local_force_cpu,
             trust_remote_code=member.local_trust_remote_code,
             fp16=member.local_fp16,

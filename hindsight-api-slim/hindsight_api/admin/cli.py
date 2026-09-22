@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 import asyncpg
 import typer
@@ -81,7 +82,20 @@ BACKUP_TABLES = [
     "entity_maintenance_queue",
 ]
 
+# Keep the historical repair out of Alembic's startup transaction. Each batch
+# is a short commit and the command can be resumed after this ceiling.
+_OBSERVATION_SEARCH_VECTOR_BATCH_SIZE = 500
+_OBSERVATION_SEARCH_VECTOR_MAX_BATCHES = 1000
+
 MANIFEST_VERSION = "2"
+
+
+@dataclass(frozen=True)
+class ObservationSearchVectorBackfillResult:
+    updated: int = 0
+    batches: int = 0
+    skipped: bool = False
+    remaining: bool = False
 
 
 @dataclass(frozen=True)
@@ -680,6 +694,165 @@ async def _resolve_schemas(base_schema: str | None) -> list[str]:
         tenants = await tenant_extension.list_tenants()
         schemas.extend(tenant.schema for tenant in tenants if tenant.schema)
     return list(dict.fromkeys(schemas))
+
+
+async def _backfill_observation_search_vector_schema(
+    conn: asyncpg.Connection,
+    schema: str,
+    language: str,
+    *,
+    batch_size: int,
+    max_batches: int,
+) -> ObservationSearchVectorBackfillResult:
+    """Repair one schema in short, independently committed transactions.
+
+    ``FOR UPDATE SKIP LOCKED`` makes concurrent invocations safe: each process
+    claims a disjoint batch, and a failed process leaves only its current batch
+    to be retried. The column-type gate keeps non-native text-search backends
+    untouched.
+    """
+    column = await conn.fetchrow(
+        """
+        SELECT is_generated, udt_name
+        FROM information_schema.columns
+        WHERE table_schema = $1
+          AND table_name = 'memory_units'
+          AND column_name = 'search_vector'
+        """,
+        schema,
+    )
+    if not column or column["udt_name"] != "tsvector" or column["is_generated"] == "ALWAYS":
+        return ObservationSearchVectorBackfillResult(skipped=True)
+
+    table = f"{_quote_identifier(schema)}.memory_units"
+    updated = 0
+    batches = 0
+    cursor: UUID | None = None
+    for _ in range(max_batches):
+        async with conn.transaction():
+            await conn.execute("SET LOCAL lock_timeout = '5s'")
+            await conn.execute("SET LOCAL statement_timeout = '60s'")
+            rows = await conn.fetch(
+                f"""
+                WITH candidates AS (
+                    SELECT id, text
+                    FROM {table}
+                    WHERE ($1::uuid IS NULL OR id > $1)
+                      AND fact_type = 'observation' AND search_vector IS NULL
+                    ORDER BY id
+                    LIMIT $3
+                    FOR UPDATE SKIP LOCKED
+                )
+                UPDATE {table} AS m
+                SET search_vector = to_tsvector($2::regconfig, COALESCE(candidates.text, ''))
+                FROM candidates
+                WHERE m.id = candidates.id
+                RETURNING m.id
+                """,
+                cursor,
+                language,
+                batch_size,
+            )
+        count = len(rows)
+        if not count:
+            break
+        updated += count
+        batches += 1
+        cursor = max(row["id"] for row in rows)
+
+    async with conn.transaction():
+        await conn.execute("SET LOCAL statement_timeout = '60s'")
+        remaining = await conn.fetchval(
+            f"""
+            SELECT EXISTS (
+                SELECT 1 FROM {table}
+                WHERE fact_type = 'observation' AND search_vector IS NULL
+            )
+            """
+        )
+    return ObservationSearchVectorBackfillResult(updated=updated, batches=batches, remaining=bool(remaining))
+
+
+async def _run_observation_search_vector_backfill(
+    db_url: str,
+    *,
+    base_schema: str,
+    schema: str | None,
+    language: str,
+    batch_size: int,
+    max_batches: int,
+) -> dict[str, ObservationSearchVectorBackfillResult]:
+    """Run the bounded repair across the requested schemas."""
+    schemas = [schema] if schema else await _resolve_schemas(base_schema)
+    conn = await _admin_connect(db_url)
+    try:
+        results = {}
+        for target_schema in schemas:
+            results[target_schema] = await _backfill_observation_search_vector_schema(
+                conn,
+                target_schema,
+                language,
+                batch_size=batch_size,
+                max_batches=max_batches,
+            )
+        return results
+    finally:
+        await conn.close()
+
+
+@app.command(name="backfill-observation-search-vector")
+def backfill_observation_search_vector(
+    schema: str | None = typer.Option(
+        None,
+        "--schema",
+        "-s",
+        help="Limit the repair to one schema. Defaults to the base schema plus discovered tenant schemas.",
+    ),
+    batch_size: int = typer.Option(
+        _OBSERVATION_SEARCH_VECTOR_BATCH_SIZE,
+        "--batch-size",
+        min=1,
+        help="Rows claimed and committed per transaction.",
+    ),
+    max_batches: int = typer.Option(
+        _OBSERVATION_SEARCH_VECTOR_MAX_BATCHES,
+        "--max-batches",
+        min=1,
+        help="Maximum batches per schema; rerun to continue after the ceiling.",
+    ),
+) -> None:
+    """Boundedly backfill native observation search vectors.
+
+    The c3f7 migration no longer performs a large startup UPDATE. Run this
+    command after deploying the writer fix; it is safe to resume and to run
+    concurrently from more than one admin process.
+    """
+    config = HindsightConfig.from_env()
+    if not config.database_url:
+        typer.echo("Error: Database URL not configured.", err=True)
+        typer.echo("Set HINDSIGHT_API_DATABASE_URL environment variable.", err=True)
+        raise typer.Exit(1)
+    target = f"schema '{schema}'" if schema else "base schema and discovered tenant schemas"
+    typer.echo(f"Backfilling native observation search vectors in {target}...")
+    results = asyncio.run(
+        _run_observation_search_vector_backfill(
+            config.database_url,
+            base_schema=config.database_schema,
+            schema=schema,
+            language=config.text_search_extension_native_language,
+            batch_size=batch_size,
+            max_batches=max_batches,
+        )
+    )
+    total = 0
+    for target_schema, result in results.items():
+        if result.skipped:
+            typer.echo(f"  {target_schema}: skipped (search_vector is not a native tsvector)")
+        else:
+            total += result.updated
+            suffix = " (rows remain; rerun to continue)" if result.remaining else ""
+            typer.echo(f"  {target_schema}: updated {result.updated} row(s) in {result.batches} batch(es){suffix}")
+    typer.echo(f"Done: updated {total} observation(s)")
 
 
 async def _run_repair_bank(
