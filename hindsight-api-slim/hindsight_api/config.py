@@ -2732,9 +2732,7 @@ def _parse_reranker_members() -> list[RerankerMemberConfig]:
                 local_model=_member_str(base, "LOCAL_MODEL", DEFAULT_RERANKER_LOCAL_MODEL),
                 local_force_cpu=_member_bool(base, "LOCAL_FORCE_CPU", DEFAULT_RERANKER_LOCAL_FORCE_CPU),
                 local_max_concurrent=_member_int(base, "LOCAL_MAX_CONCURRENT", DEFAULT_RERANKER_LOCAL_MAX_CONCURRENT),
-                local_torch_threads=_member_int(
-                    base, "LOCAL_TORCH_THREADS", DEFAULT_RERANKER_LOCAL_TORCH_THREADS
-                ),
+                local_torch_threads=_member_int(base, "LOCAL_TORCH_THREADS", DEFAULT_RERANKER_LOCAL_TORCH_THREADS),
                 local_trust_remote_code=_member_bool(
                     base, "LOCAL_TRUST_REMOTE_CODE", DEFAULT_RERANKER_LOCAL_TRUST_REMOTE_CODE
                 ),

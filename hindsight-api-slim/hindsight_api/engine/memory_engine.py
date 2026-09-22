@@ -5465,6 +5465,7 @@ class MemoryEngine(MemoryEngineInterface):
             }
             health.update(self._pool_health_stats(backend))
             return health
+
         try:
             return await asyncio.wait_for(
                 _check_database(),
