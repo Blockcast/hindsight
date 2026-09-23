@@ -184,14 +184,19 @@ Both shapes are guarded by `hindsight-api-slim/tests/test_partial_index_plans.py
 
 ### Helm Operations
 
-Helm liveness probes must stay process-local so database pressure does not restart healthy pods: API liveness uses `/version`, worker liveness uses `/metrics`. Readiness is DB-independent as well — see **Helm Health Probes** below. The default embedded-PostgreSQL chart values intentionally cap API DB pools and worker/retain concurrency; do not raise those defaults without validating connection pressure under retain/consolidation backlog.
+Helm liveness probes must stay process-local so database pressure does not restart healthy pods: API and worker liveness both use `/health/live`, which performs no database access. Readiness is DB-independent as well — see **Helm Health Probes** below. The default embedded-PostgreSQL chart values intentionally cap API DB pools and worker/retain concurrency; do not raise those defaults without validating connection pressure under retain/consolidation backlog.
 
 ### Helm Health Probes
 
 Keep readiness probes independent of database health so database pressure does not
 cascade into Kubernetes probe failures. The API readiness probe uses `/version`,
-and the worker readiness probe uses `/metrics`; reserve `/health` for explicit
-database-aware health checks.
+and the worker readiness probe uses `/metrics`.
+
+The API serves three monitoring endpoints: `/health/live` (in-process only, never
+touches the database — point `livenessProbe` here), `/health/ready` (503 when the
+database is unreachable), and `/health` (a supported alias of `/health/ready`, so it
+is the database-aware check). `/health/live` requires a v0.9.1 or newer image;
+v0.9.0 and earlier serve `/health` only and would 404 the probe.
 
 ### Adding Database Migrations
 

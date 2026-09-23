@@ -39,8 +39,8 @@ api:
   # Liveness and readiness probes.
   # Liveness uses /health/live, which performs no database access: database
   # pressure must never restart healthy pods or remove them from the Service.
-  # Needs an image from this chart's appVersion or newer — older ones serve
-  # /health only, and would fail this probe with a 404.
+  # Needs a v0.9.1 or newer image; v0.9.0 and earlier serve /health only,
+  # and would fail this probe with a 404.
   livenessProbe:
     httpGet:
       path: /health/live
@@ -165,8 +165,8 @@ worker:
   # Liveness uses /health/live, which performs no database access. Restarting a
   # worker whose database is merely slow requeues its claimed operations with
   # retry_count incremented, so DB checks must stay out of liveness.
-  # Needs an image from this chart's appVersion or newer — older ones serve
-  # /health only, and would fail this probe with a 404.
+  # Needs a v0.9.1 or newer image; v0.9.0 and earlier serve /health only,
+  # and would fail this probe with a 404.
   livenessProbe:
     httpGet:
       path: /health/live
