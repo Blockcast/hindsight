@@ -35,6 +35,11 @@ class TestLocalSTCrossEncoder:
     def test_provider_name(self):
         assert LocalSTCrossEncoder().provider_name == "local"
 
+    def test_torch_threads_are_configurable_and_positive(self):
+        assert LocalSTCrossEncoder(torch_threads=2).torch_threads == 2
+        with pytest.raises(ValueError, match="torch_threads must be >= 1"):
+            LocalSTCrossEncoder(torch_threads=0)
+
     async def test_predict_returns_scores_in_input_order(self):
         encoder = self._make_encoder()
         # Mock returns a numpy-array-like object with .tolist()

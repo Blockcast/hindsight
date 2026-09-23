@@ -592,6 +592,7 @@ ENV_RERANKER_SEND_BANK_AS_HEADER = "HINDSIGHT_API_RERANKER_SEND_BANK_AS_HEADER"
 ENV_RERANKER_LOCAL_MODEL = "HINDSIGHT_API_RERANKER_LOCAL_MODEL"
 ENV_RERANKER_LOCAL_FORCE_CPU = "HINDSIGHT_API_RERANKER_LOCAL_FORCE_CPU"
 ENV_RERANKER_LOCAL_MAX_CONCURRENT = "HINDSIGHT_API_RERANKER_LOCAL_MAX_CONCURRENT"
+ENV_RERANKER_LOCAL_TORCH_THREADS = "HINDSIGHT_API_RERANKER_LOCAL_TORCH_THREADS"
 ENV_RERANKER_LOCAL_TRUST_REMOTE_CODE = "HINDSIGHT_API_RERANKER_LOCAL_TRUST_REMOTE_CODE"
 ENV_RERANKER_LOCAL_FP16 = "HINDSIGHT_API_RERANKER_LOCAL_FP16"
 ENV_RERANKER_LOCAL_BUCKET_BATCHING = "HINDSIGHT_API_RERANKER_LOCAL_BUCKET_BATCHING"
@@ -1258,6 +1259,10 @@ DEFAULT_RERANKER_SEND_BANK_AS_HEADER = False
 DEFAULT_RERANKER_LOCAL_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 DEFAULT_RERANKER_LOCAL_FORCE_CPU = False  # Force CPU mode for local reranker
 DEFAULT_RERANKER_LOCAL_MAX_CONCURRENT = 4  # Limit concurrent CPU-bound reranking to prevent thrashing
+# PyTorch's pools are process-wide; keep each CPU reranker call from spawning a
+# host-sized pool on a CPU-limited API worker. Operators can raise this for a
+# larger dedicated worker via HINDSIGHT_API_RERANKER_LOCAL_TORCH_THREADS.
+DEFAULT_RERANKER_LOCAL_TORCH_THREADS = 2
 DEFAULT_RERANKER_LOCAL_TRUST_REMOTE_CODE = (
     False  # Security: disabled by default, required for some models like jina-reranker-v2
 )
@@ -2582,6 +2587,7 @@ class RerankerMemberConfig:
     local_model: str
     local_force_cpu: bool
     local_max_concurrent: int
+    local_torch_threads: int
     local_trust_remote_code: bool
     local_fp16: bool
     local_bucket_batching: bool
@@ -2726,6 +2732,7 @@ def _parse_reranker_members() -> list[RerankerMemberConfig]:
                 local_model=_member_str(base, "LOCAL_MODEL", DEFAULT_RERANKER_LOCAL_MODEL),
                 local_force_cpu=_member_bool(base, "LOCAL_FORCE_CPU", DEFAULT_RERANKER_LOCAL_FORCE_CPU),
                 local_max_concurrent=_member_int(base, "LOCAL_MAX_CONCURRENT", DEFAULT_RERANKER_LOCAL_MAX_CONCURRENT),
+                local_torch_threads=_member_int(base, "LOCAL_TORCH_THREADS", DEFAULT_RERANKER_LOCAL_TORCH_THREADS),
                 local_trust_remote_code=_member_bool(
                     base, "LOCAL_TRUST_REMOTE_CODE", DEFAULT_RERANKER_LOCAL_TRUST_REMOTE_CODE
                 ),
@@ -3117,6 +3124,7 @@ class HindsightConfig:
     reranker_local_model: str
     reranker_local_force_cpu: bool
     reranker_local_max_concurrent: int
+    reranker_local_torch_threads: int
     reranker_local_trust_remote_code: bool
     reranker_local_fp16: bool
     reranker_local_bucket_batching: bool
@@ -3708,6 +3716,7 @@ class HindsightConfig:
             local_model=self.reranker_local_model,
             local_force_cpu=self.reranker_local_force_cpu,
             local_max_concurrent=self.reranker_local_max_concurrent,
+            local_torch_threads=self.reranker_local_torch_threads,
             local_trust_remote_code=self.reranker_local_trust_remote_code,
             local_fp16=self.reranker_local_fp16,
             local_bucket_batching=self.reranker_local_bucket_batching,
@@ -4498,6 +4507,11 @@ class HindsightConfig:
             in ("true", "1"),
             reranker_local_max_concurrent=int(
                 os.getenv(ENV_RERANKER_LOCAL_MAX_CONCURRENT, str(DEFAULT_RERANKER_LOCAL_MAX_CONCURRENT))
+            ),
+            reranker_local_torch_threads=_parse_positive_int(
+                ENV_RERANKER_LOCAL_TORCH_THREADS,
+                os.getenv(ENV_RERANKER_LOCAL_TORCH_THREADS),
+                DEFAULT_RERANKER_LOCAL_TORCH_THREADS,
             ),
             reranker_local_trust_remote_code=os.getenv(
                 ENV_RERANKER_LOCAL_TRUST_REMOTE_CODE, str(DEFAULT_RERANKER_LOCAL_TRUST_REMOTE_CODE)
