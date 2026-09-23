@@ -195,8 +195,8 @@ and the worker readiness probe uses `/metrics`.
 The API serves three monitoring endpoints: `/health/live` (in-process only, never
 touches the database — point `livenessProbe` here), `/health/ready` (503 when the
 database is unreachable), and `/health` (a supported alias of `/health/ready`, so it
-is the database-aware check). `/health/live` needs an image at this chart's
-`appVersion` or newer — older images serve `/health` only and would 404 the probe.
+is the database-aware check). `/health/live` requires a v0.9.1 or newer image;
+v0.9.0 and earlier serve `/health` only and would 404 the probe.
 
 ### Adding Database Migrations
 
