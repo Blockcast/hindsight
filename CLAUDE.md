@@ -205,6 +205,17 @@ migration file dispatches through `run_for_dialect`, which calls either
 `_pg_upgrade` or `_oracle_upgrade` based on the live connection. A pytest lint
 (`tests/test_migration_shape.py`) fails CI if a migration omits the dispatcher.
 
+**Keep bulk data repairs out of migrations.** Migrations run automatically on API
+startup, so a backfill over a large table's historical residue holds row locks and WAL
+pressure for the whole migration transaction — blocking startup and competing with live
+recall. Keep the migration to the schema change (a docstring may record the rollout) and
+ship the data repair as a `hindsight-admin` command that commits small
+`FOR UPDATE SKIP LOCKED` batches: that is resumable, safe to run concurrently, and paced
+by the operator rather than by pod startup. Pattern to copy:
+`backfill-observation-search-vector` in
+`hindsight-api-slim/hindsight_api/admin/cli.py`, with the now-inert migration at
+`hindsight-api-slim/hindsight_api/alembic/versions/c3f7a1b9d2e4_backfill_observation_search_vector.py`.
+
 1. **Create a new migration file** in `hindsight-api-slim/hindsight_api/alembic/versions/`:
    - File name format: `<revision_id>_<description>.py` (e.g., `f1a2b3c4d5e6_add_new_index.py`)
    - Use a unique hex revision ID (12 chars)
