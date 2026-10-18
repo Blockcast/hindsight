@@ -260,6 +260,19 @@ class TestConsolidationFailureClassification:
         assert mock_llm_config.call.call_count == 1
 
     @pytest.mark.asyncio
+    async def test_exhausted_rate_limit_propagates_instead_of_failing_the_batch(
+        self, mock_llm_config, mock_config, no_real_sleep
+    ):
+        """A 429 still rides the ladder, but must not end as a failed (bisected, stamped) batch."""
+        mock_config.consolidation_max_attempts = 3
+        mock_llm_config.call.side_effect = _AuthError(429)
+
+        with pytest.raises(_AuthError):
+            await self._run(mock_llm_config, mock_config)
+
+        assert mock_llm_config.call.call_count == 3
+
+    @pytest.mark.asyncio
     async def test_json_decode_error_is_not_re_sent(self, mock_llm_config, mock_config):
         """The provider already burned its own ladder on this; re-sending adds nothing.
 
