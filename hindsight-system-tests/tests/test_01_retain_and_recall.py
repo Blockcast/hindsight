@@ -91,14 +91,18 @@ async def test_a_retained_memory_comes_back_from_recall(client, llm, bank_id, se
     assert berlin.id != cello.id
 
     # --- scores -------------------------------------------------------------
-    # Every retrieval strategy contributed, and each component is reproducible to
-    # the bit: the embedder is a pure function of the text (see `lexical.py`), the
-    # reranker derives from the same model, and BM25 is deterministic.
-    assert berlin.scores.semantic == pytest.approx(0.43465916228227297, abs=1e-12)
+    # Every retrieval strategy contributed. The embedder is a pure function of the
+    # text (see `lexical.py`), the reranker derives from the same model, and BM25 is
+    # deterministic, so those are pinned to the bit. `semantic` is NOT: pgvector
+    # computes `1 - (a <=> b)` as a float32 reduction whose rounding depends on its
+    # SIMD path and the runner CPU — two runs that agree in float32 to the last bit
+    # (0.4346591532230377) differed by 1.3e-8 in the float64 they report
+    # (BLO-47312). 1e-6 is still far below any real embedding or logic change.
+    assert berlin.scores.semantic == pytest.approx(0.43465916228227297, abs=1e-6)
     assert berlin.scores.reranker == pytest.approx(0.37416573867739417, abs=1e-12)
     assert berlin.scores.keyword == pytest.approx(0.30000001192092896, abs=1e-12)
 
-    assert cello.scores.semantic == pytest.approx(0.4146140043322447, abs=1e-12)
+    assert cello.scores.semantic == pytest.approx(0.4146140043322447, abs=1e-6)
     assert cello.scores.reranker == pytest.approx(0.3333333333333333, abs=1e-12)
     assert cello.scores.keyword == pytest.approx(0.30000001192092896, abs=1e-12)
 
