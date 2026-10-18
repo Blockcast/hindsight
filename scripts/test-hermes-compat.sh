@@ -230,7 +230,7 @@ echo ""
 # `hermes memory setup` is a curses wizard and cannot be driven headlessly, so
 # we write the same two artifacts it writes: the provider selection in
 # config.yaml and the Hindsight provider config under $HERMES_HOME. Keep this in
-# sync with plugins/memory/hindsight/__init__.py::post_setup if Hermes changes
+# sync with hindsight-integrations/hermes/__init__.py::post_setup if Hermes changes
 # the shape.
 #
 # memory_enabled/user_profile_enabled are the flags our docs tell users to set
@@ -239,6 +239,12 @@ echo ""
 # configuration we actually document: turning the flat-file stores off must not
 # take the Hindsight provider down with it.
 echo "--- [3/5] Configuring Hermes for local_embedded Hindsight ---"
+# Hermes no longer bundles the provider: it moved to this repo
+# (hindsight-integrations/hermes) and users get it via `hermes plugins install
+# hindsight`, which pins the catalog's upstream SHA. Install it from THIS
+# checkout instead, so the gate exercises the plugin this PR ships.
+"$VENV/bin/hermes" plugins install "file://$REPO_ROOT#hindsight-integrations/hermes" \
+    --force --yes-deps --enable
 mkdir -p "$HERMES_HOME/hindsight"
 cat > "$HERMES_HOME/config.yaml" <<EOF
 memory:
@@ -288,7 +294,7 @@ echo ""
 # ---------------------------------------------------------------------------
 # 4. Runtime probe
 # ---------------------------------------------------------------------------
-# Mirrors plugins/memory/hindsight/__init__.py::_check_local_runtime — the gate
+# Mirrors hindsight-integrations/hermes/__init__.py::_check_local_runtime — the gate
 # Hermes itself runs before creating an embedded client. We import the same
 # three modules directly rather than calling their private helper so this does
 # not break when Hermes refactors internals. sentence_transformers is in the
