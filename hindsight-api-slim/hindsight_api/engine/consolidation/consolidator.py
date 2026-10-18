@@ -3297,6 +3297,19 @@ async def _consolidate_batch_with_llm(
             if attempt < max_attempts:
                 await asyncio.sleep(min(_OUTER_RETRY_INITIAL_BACKOFF * (2 ** (attempt - 1)), _OUTER_RETRY_MAX_BACKOFF))
 
+    # A rate limit that outlived the ladder is a property of the provider, not of these
+    # memories: bisection re-hits the same wall on every sub-batch and stamps each leaf
+    # consolidation_failed_at. Raise instead, so the task handler's capped-backoff retry
+    # reruns the op and the rows stay pending. Seen behind a LiteLLM single-deployment
+    # cooldown ("Try again in 60 seconds"), which sits exactly at the provider's
+    # max_backoff and so never becomes a ProviderRateLimitResetError defer.
+    if getattr(last_exc, "status_code", None) == 429:
+        logger.warning(
+            f"[CONSOLIDATION] LLM batch call for {batch_label} still rate-limited after "
+            f"{attempts_made}/{max_attempts} attempt(s); propagating so the operation is retried "
+            f"rather than bisected: {last_exc}"
+        )
+        raise last_exc
     logger.error(
         f"[CONSOLIDATION] LLM batch call failed after {attempts_made}/{max_attempts} attempt(s) for "
         f"{batch_label}, skipping batch (the caller will bisect it). Last error: {last_exc}"
