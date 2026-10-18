@@ -40,13 +40,20 @@
 # Usage: scripts/test-hermes-compat.sh [--keep] [--hermes-ref BRANCH_OR_TAG]
 #
 #   --keep         leave the temporary work dir in place for inspection
-#   --hermes-ref   Hermes branch or tag to test against (default: main). A bare
+#   --hermes-ref   Hermes branch or tag to test against (default: v2026.9.21). A bare
 #                  commit SHA will not work — the clone is --depth 1.
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-HERMES_REF="main"
+# Pinned to the last Hermes release this gate's design still describes
+# (BLO-47312). Hermes main has since (a) gated every core dependency on
+# python_version >= '3.14' and (b) moved the hindsight memory provider out of
+# its tree into a PM-managed, PyPI-resolved plugin runtime — so "co-install
+# Hindsight into Hermes' venv" is no longer how Hermes runs it, and tracking
+# main tests Hermes' refactor rather than our compatibility. Move this back to
+# main only once the gate is redesigned for the PM runtime (BLO-47316).
+HERMES_REF="v2026.9.21"
 KEEP_WORKDIR=0
 
 while [ $# -gt 0 ]; do
