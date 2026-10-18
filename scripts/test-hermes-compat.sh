@@ -40,13 +40,20 @@
 # Usage: scripts/test-hermes-compat.sh [--keep] [--hermes-ref BRANCH_OR_TAG]
 #
 #   --keep         leave the temporary work dir in place for inspection
-#   --hermes-ref   Hermes branch or tag to test against (default: main). A bare
+#   --hermes-ref   Hermes branch or tag to test against (default: v2026.9.21). A bare
 #                  commit SHA will not work — the clone is --depth 1.
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-HERMES_REF="main"
+# Pinned to the last Hermes release this gate's design still describes
+# (BLO-47312). Hermes main has since (a) gated every core dependency on
+# python_version >= '3.14' and (b) moved the hindsight memory provider out of
+# its tree into a PM-managed, PyPI-resolved plugin runtime — so "co-install
+# Hindsight into Hermes' venv" is no longer how Hermes runs it, and tracking
+# main tests Hermes' refactor rather than our compatibility. Move this back to
+# main only once the gate is redesigned for the PM runtime (BLO-47316).
+HERMES_REF="v2026.9.21"
 KEEP_WORKDIR=0
 
 while [ $# -gt 0 ]; do
@@ -179,13 +186,11 @@ if [ "$clone_ok" -ne 1 ]; then
 fi
 echo "    hermes-agent @ $(git -C "$HERMES_SRC" rev-parse --short HEAD)"
 
-# Pinned rather than taken from .python-version. Hermes main now supports
-# *only* 3.14: its requires-python still admits >=3.11 so old installs can get
-# through their updater, but every core dependency carries a
-# `python_version >= '3.14'` marker. On 3.12 Hermes therefore installs with no
-# dependencies at all and `hermes memory status` dies on `import ruamel`
-# (BLO-47312). Re-check this pin whenever Hermes moves its window again.
-uv venv --python 3.14 "$VENV" >/dev/null
+# Pinned rather than taken from .python-version: Hermes caps itself at
+# `>=3.11,<3.14` (their Rust-backed transitives have no cp314 wheels), so this
+# venv has to sit inside both projects' windows. 3.12 does; the repo default
+# would silently stop doing so the day Hindsight moves to 3.14.
+uv venv --python 3.12 "$VENV" >/dev/null
 
 DIST="$WORKDIR/dist"
 for project in hindsight-api-slim hindsight-clients/python hindsight-embed hindsight-all; do
@@ -230,7 +235,7 @@ echo ""
 # `hermes memory setup` is a curses wizard and cannot be driven headlessly, so
 # we write the same two artifacts it writes: the provider selection in
 # config.yaml and the Hindsight provider config under $HERMES_HOME. Keep this in
-# sync with hindsight-integrations/hermes/__init__.py::post_setup if Hermes changes
+# sync with plugins/memory/hindsight/__init__.py::post_setup if Hermes changes
 # the shape.
 #
 # memory_enabled/user_profile_enabled are the flags our docs tell users to set
@@ -239,12 +244,6 @@ echo ""
 # configuration we actually document: turning the flat-file stores off must not
 # take the Hindsight provider down with it.
 echo "--- [3/5] Configuring Hermes for local_embedded Hindsight ---"
-# Hermes no longer bundles the provider: it moved to this repo
-# (hindsight-integrations/hermes) and users get it via `hermes plugins install
-# hindsight`, which pins the catalog's upstream SHA. Install it from THIS
-# checkout instead, so the gate exercises the plugin this PR ships.
-"$VENV/bin/hermes" plugins install "file://$REPO_ROOT#hindsight-integrations/hermes" \
-    --force --yes-deps --enable
 mkdir -p "$HERMES_HOME/hindsight"
 cat > "$HERMES_HOME/config.yaml" <<EOF
 memory:
@@ -294,7 +293,7 @@ echo ""
 # ---------------------------------------------------------------------------
 # 4. Runtime probe
 # ---------------------------------------------------------------------------
-# Mirrors hindsight-integrations/hermes/__init__.py::_check_local_runtime — the gate
+# Mirrors plugins/memory/hindsight/__init__.py::_check_local_runtime — the gate
 # Hermes itself runs before creating an embedded client. We import the same
 # three modules directly rather than calling their private helper so this does
 # not break when Hermes refactors internals. sentence_transformers is in the
