@@ -1987,6 +1987,75 @@ class TestTaskReleaseOnStop:
         assert row["claimed_at"] is None
         assert row["retry_count"] == 1
 
+    @pytest.mark.asyncio
+    async def test_lost_retry_write_is_released_once_db_returns(self, pool, backend, clean_operations):
+        """A retry write lost to a DB restart, with the release also refused, is released
+        from the poll loop once the DB is back — not left 'processing' until restart (BLO-50515)."""
+        from hindsight_api.worker import WorkerPoller
+        from hindsight_api.worker.exceptions import RetryTaskAt
+
+        bank_id = f"test-worker-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(pool, bank_id)
+        op_id = await self._insert_pending(pool, bank_id)
+
+        async def retrying_executor(task_dict):
+            raise RetryTaskAt(retry_at=datetime.now(UTC), message="transient")
+
+        poller = WorkerPoller(backend=backend, worker_id="release-worker", executor=retrying_executor)
+
+        async def db_down(*args, **kwargs):
+            raise RuntimeError("the database system is shutting down")
+
+        poller._schedule_retry = db_down
+        real_reclaim = poller._reclaim_own_processing_tasks
+        poller._reclaim_own_processing_tasks = db_down
+
+        task = await self._claim_ours(poller, op_id)
+        await poller.execute_task(task)
+        for _ in range(100):
+            if str(op_id) in poller._unreleased_ops:
+                break
+            await asyncio.sleep(0.05)
+        assert str(op_id) in poller._unreleased_ops, "the refused release must be queued for retry"
+        row = await pool.fetchrow("SELECT status FROM async_operations WHERE operation_id = $1", op_id)
+        assert row["status"] == "processing"
+
+        await poller._retry_unreleased()  # DB still down: stays queued
+        assert str(op_id) in poller._unreleased_ops
+
+        poller._reclaim_own_processing_tasks = real_reclaim  # DB back
+        await poller._retry_unreleased()
+        assert poller._unreleased_ops == {}
+        row = await pool.fetchrow(
+            "SELECT status, worker_id, retry_count FROM async_operations WHERE operation_id = $1", op_id
+        )
+        assert row["status"] == "pending", "the row must be handed back without a restart"
+        assert row["worker_id"] is None
+        assert row["retry_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_retry_unreleased_keeps_op_still_active(self, backend):
+        """An op still in _active_tasks is skipped but stays queued, not dropped (BLO-50515)."""
+        from hindsight_api.worker import WorkerPoller
+
+        poller = WorkerPoller(backend=backend, worker_id="release-worker", executor=None)
+        called = []
+
+        async def reclaim(*args, **kwargs):
+            called.append(kwargs)
+
+        poller._reclaim_own_processing_tasks = reclaim
+        poller._unreleased_ops["op-1"] = None
+        poller._active_tasks["op-1"] = object()
+        await poller._retry_unreleased()
+        assert poller._unreleased_ops == {"op-1": None}
+        assert called == []
+
+        poller._active_tasks.pop("op-1")
+        await poller._retry_unreleased()
+        assert poller._unreleased_ops == {}
+        assert called == [{"operation_id": "op-1"}]
+
 
 class TestConcurrentWorkers:
     """Tests for concurrent worker task claiming (FOR UPDATE SKIP LOCKED)."""
