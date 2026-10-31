@@ -377,6 +377,11 @@ class WorkerPoller:
         self._last_poll_at: float | None = None
         # Track active tasks locally: operation_id -> ActiveTaskInfo
         self._active_tasks: dict[str, ActiveTaskInfo] = {}
+        # operation_id -> schema of rows this worker failed to hand back because the
+        # release write itself failed (DB restarting). Retried every poll cycle until
+        # it lands; without it the row stays 'processing' under a live worker until
+        # restart (BLO-50515).
+        self._unreleased_ops: dict[str, str | None] = {}
         # Track in-flight tasks by operation type
         self._in_flight_by_type: dict[str, int] = {}
         # Rotation offset for per-tenant fair claiming. Advances past the last
@@ -1066,7 +1071,7 @@ class WorkerPoller:
         # Create background task. The holder is passed in and bound to the
         # task's own contextvar scope inside _execute_task_inner so engine
         # code running under that task sees it via stage.set_stage().
-        bg_task = asyncio.create_task(self._execute_task_inner(task, holder))
+        bg_task = asyncio.create_task(self._execute_task_guarded(task, holder))
 
         # Track this task as active
         async with self._in_flight_lock:
@@ -1084,6 +1089,37 @@ class WorkerPoller:
 
         # Add cleanup callback
         bg_task.add_done_callback(lambda _: asyncio.create_task(self._cleanup_task(task.operation_id, operation_type)))
+
+    async def _execute_task_guarded(self, task: ClaimedTask, holder: StageHolder | None = None):
+        """Run the task; if a terminal write escapes (defer/retry/complete), release the row."""
+        try:
+            await self._execute_task_inner(task, holder)
+        except Exception:
+            logger.exception(f"Terminal write for task {task.operation_id} failed; reconciling it for re-claim")
+            await self._release_lost_write(task)
+
+    async def _release_lost_write(self, task: ClaimedTask) -> None:
+        """Hand the task's rows back; queue any the DB refused for retry from the poll loop."""
+        for operation_id in task.all_operation_ids:
+            try:
+                await self._reclaim_own_processing_tasks(task.schema, operation_id=operation_id)
+            except Exception:
+                logger.exception(f"Could not reconcile task {operation_id}; will retry from the poll loop")
+                self._unreleased_ops[operation_id] = task.schema
+
+    async def _retry_unreleased(self) -> None:
+        """Retry releases that failed earlier. Stops at the first failure (DB still down)."""
+        for operation_id, schema in list(self._unreleased_ops.items()):
+            if operation_id not in self._active_tasks:
+                try:
+                    # No-op unless the row is still 'processing' under this worker, so a
+                    # release whose commit did land, or a row another worker took, is safe.
+                    await self._reclaim_own_processing_tasks(schema, operation_id=operation_id)
+                except Exception as e:
+                    logger.warning(f"Release of task {operation_id} still failing: {format_task_error(e)}")
+                    return
+                logger.info(f"Released task {operation_id} after an earlier failed release")
+            self._unreleased_ops.pop(operation_id, None)
 
     async def _cleanup_task(self, operation_id: str, operation_type: str):
         """Remove task from tracking after completion."""
@@ -1251,11 +1287,7 @@ class WorkerPoller:
                 # recover_own_tasks only runs at startup, and no dead-worker logic
                 # applies because the worker is alive. See issue #3228.
                 logger.exception(f"Could not mark task {task.operation_id} failed; reconciling it for re-claim")
-                for operation_id in task.all_operation_ids:
-                    try:
-                        await self._reclaim_own_processing_tasks(task.schema, operation_id=operation_id)
-                    except Exception:
-                        logger.exception(f"Could not reconcile task {operation_id}; it stays 'processing'")
+                await self._release_lost_write(task)
             terminal_success = False
 
         # Record the metric outside the executor's exception scope so a metrics
@@ -1638,6 +1670,8 @@ class WorkerPoller:
 
         while not self._shutdown.is_set():
             try:
+                if self._unreleased_ops:
+                    await self._retry_unreleased()
                 # Claim a batch of tasks (respecting slot limits)
                 tasks = await self.claim_batch()
                 self._last_poll_at = time.monotonic()
