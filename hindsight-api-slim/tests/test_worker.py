@@ -252,7 +252,7 @@ class TestWorkerOperationMetrics:
         from hindsight_api.worker.exceptions import RetryTaskAt
 
         async def retry(_):
-            raise RetryTaskAt(retry_at=datetime.now(UTC), message="transient")
+            raise RetryTaskAt(retry_at=datetime.now(timezone.utc), message="transient")
 
         collector = await self._run(retry)
         collector.record_operation_result.assert_not_called()
@@ -2032,6 +2032,29 @@ class TestTaskReleaseOnStop:
         assert row["status"] == "pending", "the row must be handed back without a restart"
         assert row["worker_id"] is None
         assert row["retry_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_retry_unreleased_keeps_op_still_active(self, backend):
+        """An op still in _active_tasks is skipped but stays queued, not dropped (BLO-50515)."""
+        from hindsight_api.worker import WorkerPoller
+
+        poller = WorkerPoller(backend=backend, worker_id="release-worker", executor=None)
+        called = []
+
+        async def reclaim(*args, **kwargs):
+            called.append(kwargs)
+
+        poller._reclaim_own_processing_tasks = reclaim
+        poller._unreleased_ops["op-1"] = None
+        poller._active_tasks["op-1"] = object()
+        await poller._retry_unreleased()
+        assert poller._unreleased_ops == {"op-1": None}
+        assert called == []
+
+        poller._active_tasks.pop("op-1")
+        await poller._retry_unreleased()
+        assert poller._unreleased_ops == {}
+        assert called == [{"operation_id": "op-1"}]
 
 
 class TestConcurrentWorkers:

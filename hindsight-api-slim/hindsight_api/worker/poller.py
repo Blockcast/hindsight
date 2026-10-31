@@ -1110,15 +1110,18 @@ class WorkerPoller:
     async def _retry_unreleased(self) -> None:
         """Retry releases that failed earlier. Stops at the first failure (DB still down)."""
         for operation_id, schema in list(self._unreleased_ops.items()):
-            if operation_id not in self._active_tasks:
-                try:
-                    # No-op unless the row is still 'processing' under this worker, so a
-                    # release whose commit did land, or a row another worker took, is safe.
-                    await self._reclaim_own_processing_tasks(schema, operation_id=operation_id)
-                except Exception as e:
-                    logger.warning(f"Release of task {operation_id} still failing: {format_task_error(e)}")
-                    return
-                logger.info(f"Released task {operation_id} after an earlier failed release")
+            if operation_id in self._active_tasks:
+                # Still tracked (cleanup not run yet, or re-claimed): keep it queued. Popping
+                # here would drop a row that may still be 'processing' under this worker.
+                continue
+            try:
+                # No-op unless the row is still 'processing' under this worker, so a
+                # release whose commit did land, or a row another worker took, is safe.
+                await self._reclaim_own_processing_tasks(schema, operation_id=operation_id)
+            except Exception as e:
+                logger.warning(f"Release of task {operation_id} still failing: {format_task_error(e)}")
+                return
+            logger.info(f"Released task {operation_id} after an earlier failed release")
             self._unreleased_ops.pop(operation_id, None)
 
     async def _cleanup_task(self, operation_id: str, operation_type: str):
