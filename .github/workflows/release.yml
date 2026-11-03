@@ -7,7 +7,7 @@ on:
 
 jobs:
   release-python-packages:
-    runs-on: ubuntu-latest
+    runs-on: arc-default
     environment: pypi
     permissions:
       id-token: write
@@ -134,6 +134,7 @@ jobs:
         retention-days: 1
 
   release-typescript-client:
+    # npm trusted publishing stays on GitHub-hosted runners by policy.
     runs-on: ubuntu-latest
     environment: npm
 
@@ -183,6 +184,7 @@ jobs:
         retention-days: 1
 
   release-hindsight-all-npm:
+    # npm trusted publishing stays on GitHub-hosted runners by policy.
     runs-on: ubuntu-latest
     environment: npm
 
@@ -232,6 +234,7 @@ jobs:
         retention-days: 1
 
   release-control-plane:
+    # npm trusted publishing stays on GitHub-hosted runners by policy.
     runs-on: ubuntu-latest
     environment: npm
 
@@ -294,23 +297,27 @@ jobs:
         retention-days: 1
 
   release-rust-cli:
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
         include:
           - os: ubuntu-22.04
+            runner: arc-default
             target: x86_64-unknown-linux-gnu
             artifact_name: hindsight
             asset_name: hindsight-linux-amd64
           - os: macos-latest
+            runner: macos-latest
             target: x86_64-apple-darwin
             artifact_name: hindsight
             asset_name: hindsight-darwin-amd64
           - os: macos-latest
+            runner: macos-latest
             target: aarch64-apple-darwin
             artifact_name: hindsight
             asset_name: hindsight-darwin-arm64
           - os: ubuntu-22.04-arm
+            runner: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             artifact_name: hindsight
             asset_name: hindsight-linux-arm64
@@ -375,7 +382,7 @@ jobs:
 
   release-docker-images:
     name: Release Docker (${{ matrix.image_name }}${{ matrix.tag_suffix }})
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-dind}
     permissions:
       contents: read
       packages: write
@@ -519,7 +526,7 @@ jobs:
           --certificate-oidc-issuer https://token.actions.githubusercontent.com
 
   release-helm-chart:
-    runs-on: ubuntu-latest
+    runs-on: arc-default
     permissions:
       contents: read
       packages: write
@@ -552,7 +559,7 @@ jobs:
         retention-days: 1
 
   create-github-release:
-    runs-on: ubuntu-latest
+    runs-on: arc-default
     needs: [release-python-packages, release-typescript-client, release-hindsight-all-npm, release-control-plane, release-rust-cli, release-docker-images, release-helm-chart]
     permissions:
       contents: write

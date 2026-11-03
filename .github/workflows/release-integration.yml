@@ -7,6 +7,8 @@ on:
 
 jobs:
   publish:
+    # This dynamic release job can publish npm packages; keep its trusted
+    # publishing environment on GitHub-hosted runners by policy.
     runs-on: ubuntu-latest
     permissions:
       id-token: write  # for PyPI trusted publishing + build-provenance attestations

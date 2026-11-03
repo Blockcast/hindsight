@@ -18,6 +18,7 @@ jobs:
   windows-client-smoke:
     # Don't run on forks: the job needs the org's Vertex AI credentials.
     if: github.repository == 'vectorize-io/hindsight'
+    # ARC currently provides Linux runners only; this is intentionally hosted.
     runs-on: windows-latest
     timeout-minutes: 45
     env:

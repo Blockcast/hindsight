@@ -19,7 +19,7 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: arc-default
     steps:
       - uses: actions/checkout@v6
         with:
@@ -43,7 +43,7 @@ jobs:
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-    runs-on: ubuntu-latest
+    runs-on: arc-default
     needs: build
     steps:
       - uses: actions/deploy-pages@v5

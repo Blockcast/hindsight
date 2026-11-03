@@ -11,6 +11,7 @@ concurrency:
 
 jobs:
   detect-changes:
+    # pull_request runs fork-controlled code; keep it isolated from ARC.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:

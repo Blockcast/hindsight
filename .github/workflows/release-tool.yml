@@ -7,6 +7,7 @@ on:
 
 jobs:
   publish:
+    # npm trusted publishing stays on GitHub-hosted runners by policy.
     runs-on: ubuntu-latest
 
     steps:

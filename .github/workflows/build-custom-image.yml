@@ -27,6 +27,8 @@ permissions:
 jobs:
   build-api-image:
     name: Build & push hindsight-api (api-only) ${{ inputs.image_tag }}
+    # This workflow checks out a caller-selected ref and publishes its output;
+    # keep untrusted/fork code off the shared ARC pool.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
