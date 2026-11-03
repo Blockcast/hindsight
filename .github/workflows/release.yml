@@ -457,11 +457,23 @@ jobs:
         docker-images: true
         swap-storage: true
 
-    - name: Set up QEMU
-      uses: docker/setup-qemu-action@v4
-
-    - name: Set up Docker Buildx
+    # Use the on-prem multi-platform BuildKit services instead of loading
+    # binfmt into an arbitrary arc-dind node. The arm64 service owns its
+    # emulation setup and is reachable only from ARC runner pods.
+    - name: Set up remote multi-platform Buildx
+      id: buildx
       uses: docker/setup-buildx-action@v4
+      with:
+        driver: remote
+        endpoint: tcp://buildkit-amd64.ci.svc.cluster.local:1234
+
+    - name: Add arm64 BuildKit node
+      run: |
+        docker buildx create --append \
+          --name "${{ steps.buildx.outputs.name }}" \
+          --platform linux/arm64 \
+          tcp://buildkit-arm64.ci.svc.cluster.local:1234
+        docker buildx inspect --bootstrap
 
     - name: Log in to GitHub Container Registry
       uses: docker/login-action@v4
