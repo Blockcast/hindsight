@@ -446,17 +446,6 @@ jobs:
     steps:
     - uses: actions/checkout@v6
 
-    - name: Free Disk Space
-      uses: jlumbroso/free-disk-space@main
-      with:
-        tool-cache: true
-        android: true
-        dotnet: true
-        haskell: true
-        large-packages: true
-        docker-images: true
-        swap-storage: true
-
     # Use the on-prem multi-platform BuildKit services instead of loading
     # binfmt into an arbitrary arc-dind node. The arm64 service owns its
     # emulation setup and is reachable only from ARC runner pods.
