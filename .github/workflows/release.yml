@@ -309,7 +309,7 @@ jobs:
     - name: Install build prerequisites
       run: |
         apt-get update
-        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl git build-essential pkg-config
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl git build-essential pkg-config libssl-dev
     - uses: actions/checkout@v6
 
     - name: Install Rust
