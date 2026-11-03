@@ -7,7 +7,11 @@ on:
 
 jobs:
   release-python-packages:
-    runs-on: arc-default
+    # PyPI trusted publishing is deliberately on the isolated tools ARC lane;
+    # npm publishing remains on GitHub-hosted runners until its OIDC path moves.
+    runs-on:
+      group: default-tools
+      labels: arc-light
     environment: pypi
     permissions:
       id-token: write
@@ -302,7 +306,8 @@ jobs:
       matrix:
         include:
           - os: ubuntu-22.04
-            runner: arc-default
+            # Keep the published amd64 binary's glibc floor at Ubuntu 22.04.
+            runner: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             artifact_name: hindsight
             asset_name: hindsight-linux-amd64
@@ -526,7 +531,9 @@ jobs:
           --certificate-oidc-issuer https://token.actions.githubusercontent.com
 
   release-helm-chart:
-    runs-on: arc-default
+    runs-on:
+      group: default-tools
+      labels: arc-light
     permissions:
       contents: read
       packages: write
@@ -559,7 +566,9 @@ jobs:
         retention-days: 1
 
   create-github-release:
-    runs-on: arc-default
+    runs-on:
+      group: default-tools
+      labels: arc-light
     needs: [release-python-packages, release-typescript-client, release-hindsight-all-npm, release-control-plane, release-rust-cli, release-docker-images, release-helm-chart]
     permissions:
       contents: write

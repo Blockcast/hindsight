@@ -23,7 +23,9 @@ permissions:
 jobs:
   scan-published:
     name: Scan published ${{ matrix.image }} (${{ matrix.platform }})
-    runs-on: arc-default
+    runs-on:
+      group: default-tools
+      labels: arc-light
     timeout-minutes: 20
     strategy:
       fail-fast: false
