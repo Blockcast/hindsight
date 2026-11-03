@@ -300,29 +300,80 @@ jobs:
         path: hindsight-control-plane/*.tgz
         retention-days: 1
 
+  release-rust-cli-linux-amd64:
+    # Build against Ubuntu 22.04 in an on-prem container so the public binary
+    # keeps the same glibc floor as the previous hosted runner.
+    runs-on: {group: default-tools, labels: arc-dind}
+    container: ubuntu:22.04
+    steps:
+    - name: Install build prerequisites
+      run: |
+        apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl git build-essential pkg-config
+    - uses: actions/checkout@v6
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: x86_64-unknown-linux-gnu
+
+    - name: Build
+      working-directory: hindsight-cli
+      run: cargo build --release --target x86_64-unknown-linux-gnu
+
+    - name: Install cargo-about
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-about@0.9.1
+
+    - name: Verify cargo-about
+      run: cargo about --version
+
+    # The build above only fetches crates for this target; cargo-about resolves
+    # the graph for every target platform, so fetch for all of them (that is what
+    # `cargo fetch` without --target does) before the --offline generate.
+    - name: Fetch crate sources for the license scan
+      working-directory: hindsight-cli
+      run: cargo fetch
+
+    - name: Generate license manifest
+      working-directory: hindsight-cli
+      run: mkdir -p ../artifacts && cargo about generate --offline --manifest-path Cargo.toml --config about.toml about.hbs --output-file ../artifacts/THIRD_PARTY_LICENSES.txt
+
+    - name: Verify license files
+      run: |
+        test -s LICENSE
+        test -s artifacts/THIRD_PARTY_LICENSES.txt
+        grep -Fq "THIRD-PARTY SOFTWARE LICENSES" artifacts/THIRD_PARTY_LICENSES.txt
+
+    - name: Prepare artifact
+      run: |
+        mkdir -p artifacts
+        cp hindsight-cli/target/x86_64-unknown-linux-gnu/release/hindsight artifacts/hindsight-linux-amd64
+        cp LICENSE artifacts/LICENSE
+        chmod +x artifacts/hindsight-linux-amd64
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v7
+      with:
+        name: rust-cli-hindsight-linux-amd64
+        path: artifacts/*
+        retention-days: 1
+
   release-rust-cli:
     runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
         include:
-          - os: ubuntu-22.04
-            # Keep the published amd64 binary's glibc floor at Ubuntu 22.04.
-            runner: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-            artifact_name: hindsight
-            asset_name: hindsight-linux-amd64
-          - os: macos-latest
-            runner: macos-latest
+          - runner: macos-latest
             target: x86_64-apple-darwin
             artifact_name: hindsight
             asset_name: hindsight-darwin-amd64
-          - os: macos-latest
-            runner: macos-latest
+          - runner: macos-latest
             target: aarch64-apple-darwin
             artifact_name: hindsight
             asset_name: hindsight-darwin-arm64
-          - os: ubuntu-22.04-arm
-            runner: ubuntu-22.04-arm
+          - runner: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             artifact_name: hindsight
             asset_name: hindsight-linux-arm64
@@ -339,43 +390,10 @@ jobs:
       working-directory: hindsight-cli
       run: cargo build --release --target ${{ matrix.target }}
 
-    - name: Install cargo-about
-      if: matrix.asset_name == 'hindsight-linux-amd64'
-      uses: taiki-e/install-action@v2
-      with:
-        tool: cargo-about@0.9.1
-
-    - name: Verify cargo-about
-      if: matrix.asset_name == 'hindsight-linux-amd64'
-      run: cargo about --version
-
-    # The build above only fetches crates for this target; cargo-about resolves
-    # the graph for every target platform, so fetch for all of them (that is what
-    # `cargo fetch` without --target does) before the --offline generate.
-    - name: Fetch crate sources for the license scan
-      if: matrix.asset_name == 'hindsight-linux-amd64'
-      working-directory: hindsight-cli
-      run: cargo fetch
-
-    - name: Generate license manifest
-      if: matrix.asset_name == 'hindsight-linux-amd64'
-      working-directory: hindsight-cli
-      run: mkdir -p ../artifacts && cargo about generate --offline --manifest-path Cargo.toml --config about.toml about.hbs --output-file ../artifacts/THIRD_PARTY_LICENSES.txt
-
-    - name: Verify license files
-      if: matrix.asset_name == 'hindsight-linux-amd64'
-      run: |
-        test -s LICENSE
-        test -s artifacts/THIRD_PARTY_LICENSES.txt
-        grep -Fq "THIRD-PARTY SOFTWARE LICENSES" artifacts/THIRD_PARTY_LICENSES.txt
-
     - name: Prepare artifact
       run: |
         mkdir -p artifacts
         cp hindsight-cli/target/${{ matrix.target }}/release/${{ matrix.artifact_name }} artifacts/${{ matrix.asset_name }}
-        if [ "${{ matrix.asset_name }}" = "hindsight-linux-amd64" ]; then
-          cp LICENSE artifacts/LICENSE
-        fi
         chmod +x artifacts/${{ matrix.asset_name }}
 
     - name: Upload artifacts
@@ -569,7 +587,7 @@ jobs:
     runs-on:
       group: default-tools
       labels: arc-light
-    needs: [release-python-packages, release-typescript-client, release-hindsight-all-npm, release-control-plane, release-rust-cli, release-docker-images, release-helm-chart]
+    needs: [release-python-packages, release-typescript-client, release-hindsight-all-npm, release-control-plane, release-rust-cli-linux-amd64, release-rust-cli, release-docker-images, release-helm-chart]
     permissions:
       contents: write
 
