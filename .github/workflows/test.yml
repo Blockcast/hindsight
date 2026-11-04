@@ -11,7 +11,12 @@ concurrency:
 
 jobs:
   detect-changes:
-    runs-on: ubuntu-latest
+    # ARC runs are trusted infrastructure. Skip fork pull requests before
+    # any untrusted checkout can reach the self-hosted pool.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
     permissions:
       pull-requests: read
@@ -316,7 +321,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-lockfiles == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
     steps:
     - uses: actions/checkout@v6
@@ -332,7 +337,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
     strategy:
       matrix:
@@ -375,7 +380,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.clients-ts == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
 
     steps:
@@ -402,7 +407,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.all-npm == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
 
     steps:
@@ -434,7 +439,7 @@ jobs:
       needs.detect-changes.outputs.clients-ts == 'true' ||
       needs.detect-changes.outputs.all-npm == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
 
     steps:
@@ -490,7 +495,7 @@ jobs:
       needs.detect-changes.outputs.clients-ts == 'true' ||
       needs.detect-changes.outputs.all-npm == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
 
     steps:
@@ -552,7 +557,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-coding-agents == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 15
 
     steps:
@@ -588,7 +593,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-claude-code == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
 
     steps:
@@ -615,7 +620,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-cursor == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
 
     steps:
     - uses: actions/checkout@v6
@@ -641,7 +646,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-zed == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
 
     steps:
     - uses: actions/checkout@v6
@@ -666,7 +671,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-omo == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
 
     steps:
@@ -692,7 +697,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-cline == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
 
     steps:
@@ -729,7 +734,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-github-copilot == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
 
     steps:
@@ -768,7 +773,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-codex == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
 
     steps:
@@ -794,7 +799,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-cursor-cli == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
 
     steps:
@@ -831,7 +836,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-zcode == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
 
     steps:
@@ -868,7 +873,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-agent-plugin == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 15
 
     steps:
@@ -891,7 +896,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-ai-sdk == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
 
     steps:
@@ -922,7 +927,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-ai-sdk == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
 
     steps:
@@ -954,7 +959,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-eliza == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
 
     steps:
@@ -985,7 +990,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-opencode == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
 
     steps:
@@ -1016,7 +1021,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-eve == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
 
     steps:
@@ -1047,7 +1052,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-n8n == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
 
     steps:
@@ -1078,7 +1083,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-zapier == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
 
     steps:
@@ -1109,7 +1114,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.tools-agent-sdk == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
 
     steps:
@@ -1142,7 +1147,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-cloudflare-oauth-proxy == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
 
     steps:
@@ -1173,7 +1178,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-chat == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
 
     steps:
@@ -1204,7 +1209,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-paperclip == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
 
     steps:
@@ -1235,7 +1240,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-pipecat == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
 
     steps:
@@ -1272,7 +1277,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-google-adk == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
 
     steps:
@@ -1309,7 +1314,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-gemini-spark == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
 
     steps:
@@ -1343,7 +1348,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-roo-code == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
 
     steps:
@@ -1381,7 +1386,7 @@ jobs:
       needs.detect-changes.outputs.control-plane == 'true' ||
       needs.detect-changes.outputs.clients-ts == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
 
     steps:
@@ -1450,7 +1455,7 @@ jobs:
     # The one exception is a PR that touches only hindsight-system-tests/,
     # which the docs site cannot read from — see the filter of the same name.
     if: needs.detect-changes.outputs.outside-system-tests == 'true'
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
 
     steps:
@@ -1486,7 +1491,7 @@ jobs:
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.cli == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
     env:
       HINDSIGHT_API_LLM_PROVIDER: vertexai
@@ -1638,7 +1643,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.helm == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
 
     steps:
@@ -1660,7 +1665,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.docker == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-dind}
     timeout-minutes: 30
 
     steps:
@@ -1681,7 +1686,7 @@ jobs:
       needs.detect-changes.outputs.control-plane == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     name: Build Docker (${{ matrix.name }})
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-dind}
     timeout-minutes: 30
     strategy:
       matrix:
@@ -1784,7 +1789,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
     # Sharded with pytest-split. Splits the ~19-min pytest run across 3
     # parallel jobs, cutting critical-path wall time to ~7-8 min/shard. The
@@ -1885,7 +1890,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
     name: Core LLM tests
     env:
@@ -1977,7 +1982,7 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -2084,7 +2089,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-dind}
     timeout-minutes: 30
     env:
       HINDSIGHT_API_LLM_PROVIDER: vertexai
@@ -2225,7 +2230,7 @@ jobs:
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.clients-python == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
     env:
       HINDSIGHT_API_LLM_PROVIDER: vertexai
@@ -2337,7 +2342,7 @@ jobs:
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.clients-ts == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
     env:
       HINDSIGHT_API_LLM_PROVIDER: vertexai
@@ -2467,7 +2472,7 @@ jobs:
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.clients-python == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-dind}
     timeout-minutes: 30
     env:
       HINDSIGHT_API_LLM_PROVIDER: vertexai
@@ -2648,7 +2653,7 @@ jobs:
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.clients-ts == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-dind}
     timeout-minutes: 30
     env:
       HINDSIGHT_API_LLM_PROVIDER: vertexai
@@ -2829,7 +2834,7 @@ jobs:
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.clients-ts == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
     env:
       HINDSIGHT_API_LLM_PROVIDER: vertexai
@@ -2947,10 +2952,13 @@ jobs:
   build-rust-cli-arm64:
     needs: [detect-changes]
     if: >-
+      github.repository == 'vectorize-io/hindsight-disabled-arm-arc' &&
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.cli == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-24.04-arm
+    # No ARM ARC pool is available; skip this platform-only check rather than
+    # falling back to a metered hosted runner.
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
 
     steps:
@@ -2984,7 +2992,7 @@ jobs:
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.clients-rust == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
     env:
       HINDSIGHT_API_LLM_PROVIDER: vertexai
@@ -3100,7 +3108,7 @@ jobs:
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.clients-go == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
     env:
       HINDSIGHT_API_LLM_PROVIDER: vertexai
@@ -3215,7 +3223,7 @@ jobs:
       needs.detect-changes.outputs.integrations-openclaw == 'true' ||
       needs.detect-changes.outputs.embed == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
     env:
       HINDSIGHT_API_LLM_PROVIDER: vertexai
@@ -3347,7 +3355,7 @@ jobs:
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.integration-tests == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
     env:
       HINDSIGHT_API_LLM_PROVIDER: vertexai
@@ -3457,7 +3465,7 @@ jobs:
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.system-tests == 'true' ||
       needs.detect-changes.outputs.ci == 'true'
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 20
     name: test-system (blackbox)
 
@@ -3498,7 +3506,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-ag2 == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
 
     steps:
@@ -3535,7 +3543,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-aider == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
 
     steps:
@@ -3574,7 +3582,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-autogen == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
 
     steps:
@@ -3613,7 +3621,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-composio == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
 
     steps:
@@ -3656,7 +3664,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-continue == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
 
     steps:
@@ -3695,7 +3703,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-smolagents == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
 
     steps:
@@ -3733,7 +3741,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-dify == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
 
     steps:
@@ -3768,7 +3776,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-flowise == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
 
     steps:
     - uses: actions/checkout@v6
@@ -3799,7 +3807,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-obsidian == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
 
     steps:
     - uses: actions/checkout@v6
@@ -3833,7 +3841,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-agent-framework == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
 
     steps:
@@ -3876,7 +3884,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-copilot-cli == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
 
     steps:
@@ -3914,7 +3922,7 @@ jobs:
       needs.detect-changes.outputs.extensions-supabase-tenant == 'true' ||
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-dind}
     timeout-minutes: 30
 
     steps:
@@ -3961,7 +3969,7 @@ jobs:
       needs.detect-changes.outputs.extensions-static-keys-tenant == 'true' ||
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-dind}
     timeout-minutes: 30
 
     steps:
@@ -4007,7 +4015,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-crewai == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
 
     steps:
@@ -4045,7 +4053,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-vapi == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
 
     steps:
@@ -4083,7 +4091,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-superagent == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
 
     steps:
     - uses: actions/checkout@v6
@@ -4121,7 +4129,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-litellm == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
 
     steps:
@@ -4160,7 +4168,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-pydantic-ai == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
 
     steps:
@@ -4197,7 +4205,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-hermes == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
 
     steps:
@@ -4230,7 +4238,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-langgraph == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
 
     steps:
@@ -4269,7 +4277,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-llamaindex == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
 
     steps:
@@ -4309,7 +4317,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-haystack == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
 
     steps:
     - uses: actions/checkout@v6
@@ -4347,7 +4355,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-openai-agents == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
 
     steps:
@@ -4386,7 +4394,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-openhands == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
 
     steps:
@@ -4425,7 +4433,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-devin-desktop == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
 
     steps:
@@ -4464,7 +4472,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-claude-agent-sdk == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
 
     steps:
     - uses: actions/checkout@v6
@@ -4502,7 +4510,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.integrations-agentcore == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
 
     steps:
@@ -4540,7 +4548,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
     env:
       HINDSIGHT_API_LLM_PROVIDER: vertexai
@@ -4615,7 +4623,7 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.embed == 'true' ||
       needs.detect-changes.outputs.ci == 'true'
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 10
     steps:
     - uses: actions/checkout@v6
@@ -4653,7 +4661,7 @@ jobs:
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.embed == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
     env:
       HINDSIGHT_API_LLM_PROVIDER: vertexai
@@ -4716,12 +4724,15 @@ jobs:
     # (closes #1240).
     needs: [detect-changes]
     if: >-
+      github.repository == 'vectorize-io/hindsight-disabled-windows-arc' &&
       needs.detect-changes.outputs.has_secrets == 'true' &&
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.embed == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: windows-latest
+    # No Windows ARC pool is available; keep the job definition as a skipped
+    # contract instead of allocating a hosted runner.
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
     env:
       HINDSIGHT_API_LLM_PROVIDER: vertexai
@@ -4926,7 +4937,7 @@ jobs:
       needs.detect-changes.outputs.clients-python == 'true' ||
       needs.detect-changes.outputs.integrations-hermes == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     # 45 before the provider step was added; it stops the daemon and boots it
     # again through the plugin's own path, then waits on an LLM extraction.
     timeout-minutes: 60
@@ -4981,7 +4992,7 @@ jobs:
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.hindsight-all == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
     env:
       HINDSIGHT_API_LLM_PROVIDER: vertexai
@@ -5076,7 +5087,7 @@ jobs:
       needs.detect-changes.outputs.cli == 'true' ||
       needs.detect-changes.outputs.doc-examples == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -5225,7 +5236,7 @@ jobs:
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.dev == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
     env:
       HINDSIGHT_API_LLM_PROVIDER: vertexai
@@ -5320,7 +5331,7 @@ jobs:
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.control-plane == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 15
     steps:
     - uses: actions/checkout@v6
@@ -5363,7 +5374,7 @@ jobs:
     # hindsight-system-tests/ — no generated file in the repo is produced from
     # that package, so it cannot drift them. See the outside-system-tests filter.
     if: needs.detect-changes.outputs.outside-system-tests == 'true'
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
     env:
       UV_FROZEN: "1"
@@ -5451,7 +5462,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
     steps:
     - uses: actions/checkout@v6
@@ -5518,7 +5529,7 @@ jobs:
       needs.detect-changes.outputs.cli == 'true' ||
       needs.detect-changes.outputs.dev == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
     steps:
     - uses: actions/checkout@v6
@@ -5559,7 +5570,7 @@ jobs:
       needs.detect-changes.outputs.clients-python == 'true' ||
       needs.detect-changes.outputs.dev == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
     steps:
     - uses: actions/checkout@v6
@@ -5596,7 +5607,7 @@ jobs:
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.dev == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
     steps:
     - uses: actions/checkout@v6
@@ -5710,7 +5721,7 @@ jobs:
       - check-cli-coverage
       - check-client-coverage
       - test-system
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 30
     permissions:
       statuses: write

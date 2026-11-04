@@ -27,7 +27,7 @@ permissions:
 jobs:
   build-api-image:
     name: Build & push hindsight-api (api-only) ${{ inputs.image_tag }}
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-dind}
     steps:
       - uses: actions/checkout@v6
         with:
