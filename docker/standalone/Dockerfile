@@ -38,7 +38,7 @@ RUN apt-get update && apt-get install -y \
     g++ \
     curl \
     && rm -rf /var/lib/apt/lists/* \
-    && pip install --no-cache-dir uv
+    && pip install --no-cache-dir "uv>=0.13.4"
 
 # Copy the workspace lock and member metadata before source code so dependency
 # installation stays cacheable while matching the versions tested in CI.
@@ -174,7 +174,7 @@ RUN apt-get update && apt-get upgrade -y \
     libossp-uuid16 \
     && (apt-get install -y libicu72 2>/dev/null || apt-get install -y libicu74 2>/dev/null || apt-get install -y libicu76 2>/dev/null || true) \
     && rm -rf /var/lib/apt/lists/* \
-    && pip install --no-cache-dir uv \
+    && pip install --no-cache-dir "uv>=0.13.4" \
     && pip uninstall --yes setuptools wheel
 
 RUN useradd -m -s /bin/bash hindsight
@@ -326,7 +326,7 @@ RUN apt-get update && apt-get upgrade -y \
     libossp-uuid16 \
     && (apt-get install -y libicu72 2>/dev/null || apt-get install -y libicu74 2>/dev/null || apt-get install -y libicu76 2>/dev/null || true) \
     && rm -rf /var/lib/apt/lists/* \
-    && pip install --no-cache-dir uv \
+    && pip install --no-cache-dir "uv>=0.13.4" \
     && pip uninstall --yes setuptools wheel
 
 # This is a Python base image, but it also runs the control plane - a pre-built
