@@ -337,7 +337,9 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
-    runs-on: {group: default-tools, labels: arc-light}
+    # ML-stack install + docs/image build exceeds arc-light's 4Gi `work` emptyDir
+    # (kubelet eviction, BLO-52009); arc-dind's `work` is a 56Gi emptyDir.
+    runs-on: {group: default-tools, labels: arc-dind}
     timeout-minutes: 30
     strategy:
       matrix:
@@ -1455,7 +1457,9 @@ jobs:
     # The one exception is a PR that touches only hindsight-system-tests/,
     # which the docs site cannot read from — see the filter of the same name.
     if: needs.detect-changes.outputs.outside-system-tests == 'true'
-    runs-on: {group: default-tools, labels: arc-light}
+    # ML-stack install + docs/image build exceeds arc-light's 4Gi `work` emptyDir
+    # (kubelet eviction, BLO-52009); arc-dind's `work` is a 56Gi emptyDir.
+    runs-on: {group: default-tools, labels: arc-dind}
     timeout-minutes: 30
 
     steps:
@@ -3465,7 +3469,9 @@ jobs:
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.system-tests == 'true' ||
       needs.detect-changes.outputs.ci == 'true'
-    runs-on: {group: default-tools, labels: arc-light}
+    # ML-stack install + docs/image build exceeds arc-light's 4Gi `work` emptyDir
+    # (kubelet eviction, BLO-52009); arc-dind's `work` is a 56Gi emptyDir.
+    runs-on: {group: default-tools, labels: arc-dind}
     timeout-minutes: 20
     name: test-system (blackbox)
 
@@ -5374,7 +5380,9 @@ jobs:
     # hindsight-system-tests/ — no generated file in the repo is produced from
     # that package, so it cannot drift them. See the outside-system-tests filter.
     if: needs.detect-changes.outputs.outside-system-tests == 'true'
-    runs-on: {group: default-tools, labels: arc-light}
+    # ML-stack install + docs/image build exceeds arc-light's 4Gi `work` emptyDir
+    # (kubelet eviction, BLO-52009); arc-dind's `work` is a 56Gi emptyDir.
+    runs-on: {group: default-tools, labels: arc-dind}
     timeout-minutes: 30
     env:
       UV_FROZEN: "1"
