@@ -26,6 +26,7 @@ permissions:
 
 jobs:
   build-api-image:
+    timeout-minutes: 25
     name: Build & push hindsight-api (api-only) ${{ inputs.image_tag }}
     runs-on: {group: default-tools, labels: arc-dind}
     steps:

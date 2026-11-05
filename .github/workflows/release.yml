@@ -7,6 +7,7 @@ on:
 
 jobs:
   release-python-packages:
+    timeout-minutes: 60
     runs-on: {group: default-tools, labels: arc-light}
     environment: pypi
     permissions:
@@ -294,6 +295,7 @@ jobs:
         retention-days: 1
 
   release-rust-cli:
+    timeout-minutes: 60
     # The ARC pool is Linux-only. Build the Linux artifact here; platform
     # binaries without an on-prem runner are omitted from this release.
     runs-on: {group: default-tools, labels: arc-light}
@@ -363,6 +365,7 @@ jobs:
         retention-days: 1
 
   release-docker-images:
+    timeout-minutes: 60
     name: Release Docker (${{ matrix.image_name }}${{ matrix.tag_suffix }})
     runs-on: {group: default-tools, labels: arc-dind}
     permissions:
@@ -508,6 +511,7 @@ jobs:
           --certificate-oidc-issuer https://token.actions.githubusercontent.com
 
   release-helm-chart:
+    timeout-minutes: 60
     runs-on: {group: default-tools, labels: arc-light}
     permissions:
       contents: read
@@ -541,6 +545,7 @@ jobs:
         retention-days: 1
 
   create-github-release:
+    timeout-minutes: 60
     runs-on: {group: default-tools, labels: arc-light}
     needs: [release-python-packages, release-typescript-client, release-hindsight-all-npm, release-control-plane, release-rust-cli, release-docker-images, release-helm-chart]
     permissions:

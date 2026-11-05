@@ -16,6 +16,7 @@ permissions:
 
 jobs:
   sign:
+    timeout-minutes: 60
     name: Sign ${{ matrix.image }}:${{ inputs.version }}${{ matrix.suffix }}
     runs-on: {group: default-tools, labels: arc-dind}
     strategy:

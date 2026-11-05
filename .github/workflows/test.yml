@@ -614,6 +614,7 @@ jobs:
       run: python -m pytest tests/ -v
 
   test-cursor-integration:
+    timeout-minutes: 45
     needs: [detect-changes]
     if: >-
       github.event_name != 'pull_request_review' &&
@@ -640,6 +641,7 @@ jobs:
       run: python -m pytest tests/ -v
 
   test-zed-integration:
+    timeout-minutes: 45
     needs: [detect-changes]
     if: >-
       github.event_name != 'pull_request_review' &&
@@ -3770,6 +3772,7 @@ jobs:
       run: pytest tests -v
 
   test-flowise-integration:
+    timeout-minutes: 45
     needs: [detect-changes]
     if: >-
       github.event_name != 'pull_request_review' &&
@@ -3801,6 +3804,7 @@ jobs:
       run: npm test
 
   test-obsidian-integration:
+    timeout-minutes: 45
     needs: [detect-changes]
     if: >-
       github.event_name != 'pull_request_review' &&
@@ -4085,6 +4089,7 @@ jobs:
       run: uv run pytest tests -v
 
   test-superagent-integration:
+    timeout-minutes: 45
     needs: [detect-changes]
     if: >-
       github.event_name != 'pull_request_review' &&
@@ -4311,6 +4316,7 @@ jobs:
       run: uv run pytest tests -v -m "not requires_real_llm"
 
   test-haystack-integration:
+    timeout-minutes: 45
     needs: [detect-changes]
     if: >-
       github.event_name != 'pull_request_review' &&
@@ -4467,6 +4473,7 @@ jobs:
       run: uv run pytest tests -v -m "not requires_real_llm"
 
   test-claude-agent-sdk-integration:
+    timeout-minutes: 45
     needs: [detect-changes]
     if: >-
       (github.event_name == 'workflow_dispatch' ||
