@@ -1435,7 +1435,8 @@ jobs:
     - name: Smoke test - verify server starts
       run: |
         cd hindsight-control-plane
-        node bin/cli.js --port 9999 &
+        # ARC pods export HOSTNAME=<pod name>; cli.js binds to it, so pin loopback-reachable 0.0.0.0.
+        node bin/cli.js --port 9999 --hostname 0.0.0.0 &
         SERVER_PID=$!
         sleep 5
         if curl -sf http://localhost:9999 > /dev/null 2>&1; then
