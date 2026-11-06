@@ -232,8 +232,9 @@ import os; os.environ['HF_HUB_DOWNLOAD_TIMEOUT'] = '600'; \
 from sentence_transformers import SentenceTransformer, CrossEncoder; \
 print('Downloading embedding model...'); \
 SentenceTransformer('BAAI/bge-small-en-v1.5'); \
-print('Downloading cross-encoder model...'); \
+print('Downloading cross-encoder models...'); \
 CrossEncoder('hindsight-ai/hs-rerank-1'); \
+CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2'); \
 print('Models cached successfully')" && break; \
       if [ "$i" -lt "$MAX_RETRIES" ]; then \
         echo "Attempt $i failed, retrying in ${RETRY_DELAY}s..."; \
@@ -416,8 +417,9 @@ import os; os.environ['HF_HUB_DOWNLOAD_TIMEOUT'] = '600'; \
 from sentence_transformers import SentenceTransformer, CrossEncoder; \
 print('Downloading embedding model...'); \
 SentenceTransformer('BAAI/bge-small-en-v1.5'); \
-print('Downloading cross-encoder model...'); \
+print('Downloading cross-encoder models...'); \
 CrossEncoder('hindsight-ai/hs-rerank-1'); \
+CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2'); \
 print('Models cached successfully')" && break; \
       if [ "$i" -lt "$MAX_RETRIES" ]; then \
         echo "Attempt $i failed, retrying in ${RETRY_DELAY}s..."; \
