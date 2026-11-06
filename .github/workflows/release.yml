@@ -7,7 +7,7 @@ on:
 
 jobs:
   release-python-packages:
-    runs-on: {group: default-tools, labels: arc-light}
+    runs-on: {group: default-tools, labels: arc-default}
     environment: pypi
     permissions:
       id-token: write
@@ -296,7 +296,7 @@ jobs:
   release-rust-cli:
     # The ARC pool is Linux-only. Build the Linux artifact here; platform
     # binaries without an on-prem runner are omitted from this release.
-    runs-on: {group: default-tools, labels: arc-light}
+    runs-on: {group: default-tools, labels: arc-default}
     strategy:
       matrix:
         include:
@@ -508,7 +508,7 @@ jobs:
           --certificate-oidc-issuer https://token.actions.githubusercontent.com
 
   release-helm-chart:
-    runs-on: {group: default-tools, labels: arc-light}
+    runs-on: {group: default-tools, labels: arc-default}
     permissions:
       contents: read
       packages: write
@@ -541,7 +541,7 @@ jobs:
         retention-days: 1
 
   create-github-release:
-    runs-on: {group: default-tools, labels: arc-light}
+    runs-on: {group: default-tools, labels: arc-default}
     needs: [release-python-packages, release-typescript-client, release-hindsight-all-npm, release-control-plane, release-rust-cli, release-docker-images, release-helm-chart]
     permissions:
       contents: write

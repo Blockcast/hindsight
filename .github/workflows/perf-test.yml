@@ -69,7 +69,7 @@ concurrency:
 
 jobs:
   perf-test:
-    runs-on: {group: default-tools, labels: arc-light}
+    runs-on: {group: default-tools, labels: arc-default}
     steps:
     - uses: actions/checkout@v6
       with:
@@ -146,7 +146,7 @@ jobs:
     # hindsight-system-evals/README.md. It replaced a second in-repo copy of the
     # same two datasets, which was free to drift from the published ones.
     if: inputs.amb_skip != true
-    runs-on: {group: default-tools, labels: arc-light}
+    runs-on: {group: default-tools, labels: arc-default}
     timeout-minutes: 300
     strategy:
       # One dataset failing says nothing about the other.
@@ -255,7 +255,7 @@ jobs:
     # (serial SyncTaskBackend + embedded pg0 — no external DB / worker), and reports the
     # near-duplicate observation rate. Real LLM via VertexAI, like the other quality jobs.
     if: inputs.obs_skip != true
-    runs-on: {group: default-tools, labels: arc-light}
+    runs-on: {group: default-tools, labels: arc-default}
     env:
       HINDSIGHT_API_LLM_PROVIDER: vertexai
       HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
@@ -341,7 +341,7 @@ jobs:
     # quality eval against a stub would score the stub. That also means it needs
     # provider secrets, which is why it lives here and not in the PR workflow.
     if: inputs.system_evals_skip != true
-    runs-on: {group: default-tools, labels: arc-light}
+    runs-on: {group: default-tools, labels: arc-default}
     timeout-minutes: 60
     env:
       HINDSIGHT_EVAL_LLM_PROVIDER: vertexai
