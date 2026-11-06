@@ -50,6 +50,10 @@ from .entity_labels import (
     split_label_tags,
 )
 
+# Blockcast (BLO-7608): the retain `context` is caller-supplied and unbounded; a
+# multi-hundred-KB context turned every chunk's extraction prompt into a huge LLM call.
+MAX_RETAIN_CONTEXT_CHARS = 12_000
+
 
 def _extract_map_entities(
     entity_obj: dict,
@@ -1842,6 +1846,11 @@ def _build_user_message(
 
     sanitized_chunk = _sanitize_text(chunk)
     sanitized_context = _sanitize_text(context) if context else "none"
+    if len(sanitized_context) > MAX_RETAIN_CONTEXT_CHARS:
+        omitted = len(sanitized_context) - MAX_RETAIN_CONTEXT_CHARS
+        sanitized_context = (
+            sanitized_context[:MAX_RETAIN_CONTEXT_CHARS] + f"\n[truncated context: {omitted} chars omitted]"
+        )
 
     if event_date is not None:
         event_date = parse_datetime_flexible(event_date)
