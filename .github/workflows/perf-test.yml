@@ -69,7 +69,7 @@ concurrency:
 
 jobs:
   perf-test:
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     steps:
     - uses: actions/checkout@v6
       with:
@@ -125,7 +125,7 @@ jobs:
       with:
         name: perf-results-${{ github.sha }}
         path: hindsight-dev/perf-results.json
-        retention-days: 90
+        retention-days: 1
 
     # Publish enriched results (perf JSON + commit metadata) to the dashboard
     # repo's gh-pages branch. The static site at
@@ -146,7 +146,7 @@ jobs:
     # hindsight-system-evals/README.md. It replaced a second in-repo copy of the
     # same two datasets, which was free to drift from the published ones.
     if: inputs.amb_skip != true
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 300
     strategy:
       # One dataset failing says nothing about the other.
@@ -236,7 +236,7 @@ jobs:
       with:
         name: amb-${{ matrix.dataset }}-${{ github.sha }}
         path: ${{ github.workspace }}/.amb/outputs/
-        retention-days: 90
+        retention-days: 1
 
     - name: Publish LoComo to dashboard
       # LoComo only: the monitor's locomo series is 86 runs deep and the script
@@ -255,7 +255,7 @@ jobs:
     # (serial SyncTaskBackend + embedded pg0 — no external DB / worker), and reports the
     # near-duplicate observation rate. Real LLM via VertexAI, like the other quality jobs.
     if: inputs.obs_skip != true
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     env:
       HINDSIGHT_API_LLM_PROVIDER: vertexai
       HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
@@ -324,7 +324,7 @@ jobs:
       with:
         name: obs-results-${{ github.sha }}
         path: hindsight-dev/obs-results.json
-        retention-days: 90
+        retention-days: 1
 
     - name: Publish obs to dashboard
       if: success() && (github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch')
@@ -342,7 +342,7 @@ jobs:
     # quality eval against a stub would score the stub. That also means it needs
     # provider secrets, which is why it lives here and not in the PR workflow.
     if: inputs.system_evals_skip != true
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 60
     env:
       HINDSIGHT_EVAL_LLM_PROVIDER: vertexai
@@ -405,7 +405,7 @@ jobs:
       with:
         name: system-evals-results-${{ github.sha }}
         path: hindsight-system-evals/system-evals-results.json
-        retention-days: 90
+        retention-days: 1
 
     - name: Publish system-evals to dashboard
       # Published even when an eval fails: for a quality metric the red run IS the

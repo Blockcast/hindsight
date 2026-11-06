@@ -7,7 +7,7 @@ on:
 
 jobs:
   release-python-packages:
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     environment: pypi
     permissions:
       id-token: write
@@ -294,26 +294,15 @@ jobs:
         retention-days: 1
 
   release-rust-cli:
-    runs-on: ${{ matrix.os }}
+    # The ARC pool is Linux-only. Build the Linux artifact here; platform
+    # binaries without an on-prem runner are omitted from this release.
+    runs-on: {group: default-tools, labels: arc-light}
     strategy:
       matrix:
         include:
-          - os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
+          - target: x86_64-unknown-linux-gnu
             artifact_name: hindsight
             asset_name: hindsight-linux-amd64
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            artifact_name: hindsight
-            asset_name: hindsight-darwin-amd64
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            artifact_name: hindsight
-            asset_name: hindsight-darwin-arm64
-          - os: ubuntu-22.04-arm
-            target: aarch64-unknown-linux-gnu
-            artifact_name: hindsight
-            asset_name: hindsight-linux-arm64
 
     steps:
     - uses: actions/checkout@v6
@@ -375,7 +364,7 @@ jobs:
 
   release-docker-images:
     name: Release Docker (${{ matrix.image_name }}${{ matrix.tag_suffix }})
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-dind}
     permissions:
       contents: read
       packages: write
@@ -519,7 +508,7 @@ jobs:
           --certificate-oidc-issuer https://token.actions.githubusercontent.com
 
   release-helm-chart:
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     permissions:
       contents: read
       packages: write
@@ -552,7 +541,7 @@ jobs:
         retention-days: 1
 
   create-github-release:
-    runs-on: ubuntu-latest
+    runs-on: {group: default-tools, labels: arc-light}
     needs: [release-python-packages, release-typescript-client, release-hindsight-all-npm, release-control-plane, release-rust-cli, release-docker-images, release-helm-chart]
     permissions:
       contents: write
@@ -595,18 +584,21 @@ jobs:
         path: ./artifacts/rust-cli-linux
 
     - name: Download Rust CLI (Linux ARM)
+      continue-on-error: true
       uses: actions/download-artifact@v8
       with:
         name: rust-cli-hindsight-linux-arm64
         path: ./artifacts/rust-cli-linux-arm64
 
     - name: Download Rust CLI (macOS Intel)
+      continue-on-error: true
       uses: actions/download-artifact@v8
       with:
         name: rust-cli-hindsight-darwin-amd64
         path: ./artifacts/rust-cli-darwin-amd64
 
     - name: Download Rust CLI (macOS ARM)
+      continue-on-error: true
       uses: actions/download-artifact@v8
       with:
         name: rust-cli-hindsight-darwin-arm64
