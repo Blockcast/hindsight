@@ -19,6 +19,7 @@ concurrency:
 
 jobs:
   build:
+    timeout-minutes: 35
     runs-on: {group: default-tools, labels: arc-light}
     steps:
       - uses: actions/checkout@v6
@@ -42,6 +43,7 @@ jobs:
         with:
           path: hindsight-docs/build
   deploy:
+    timeout-minutes: 35
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

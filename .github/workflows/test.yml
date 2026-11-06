@@ -638,6 +638,7 @@ jobs:
       run: npm run build
 
   test-cursor-integration:
+    timeout-minutes: 45
     needs: [detect-changes]
     if: >-
       github.event_name != 'pull_request_review' &&
@@ -664,6 +665,7 @@ jobs:
       run: python -m pytest tests/ -v
 
   test-zed-integration:
+    timeout-minutes: 45
     needs: [detect-changes]
     if: >-
       github.event_name != 'pull_request_review' &&
@@ -3770,6 +3772,7 @@ jobs:
       run: pytest tests -v
 
   test-flowise-integration:
+    timeout-minutes: 45
     needs: [detect-changes]
     if: >-
       github.event_name != 'pull_request_review' &&
@@ -3801,6 +3804,7 @@ jobs:
       run: npm test
 
   test-obsidian-integration:
+    timeout-minutes: 45
     needs: [detect-changes]
     if: >-
       github.event_name != 'pull_request_review' &&
@@ -4089,6 +4093,7 @@ jobs:
       run: uv run pytest tests -v
 
   test-superagent-integration:
+    timeout-minutes: 45
     needs: [detect-changes]
     if: >-
       github.event_name != 'pull_request_review' &&
@@ -4315,6 +4320,7 @@ jobs:
       run: uv run pytest tests -v -m "not requires_real_llm"
 
   test-haystack-integration:
+    timeout-minutes: 45
     needs: [detect-changes]
     if: >-
       github.event_name != 'pull_request_review' &&
@@ -4471,6 +4477,7 @@ jobs:
       run: uv run pytest tests -v -m "not requires_real_llm"
 
   test-claude-agent-sdk-integration:
+    timeout-minutes: 45
     needs: [detect-changes]
     if: >-
       (github.event_name == 'workflow_dispatch' ||
@@ -4921,10 +4928,22 @@ jobs:
   # is empty there and the script skips exactly that, reporting that it did.
   test-hermes-compat:
     needs: [detect-changes]
+    # Blockcast fork: runs upstream and on workflow_dispatch, but not on this
+    # repo's pushes or PRs. It co-installs this checkout's Hindsight stack into
+    # hermes-agent@main's venv, which is unsatisfiable for reasons outside this
+    # repo: hindsight-api-slim -> google-genai needs tenacity<9.2.0, and Hermes
+    # pins tenacity==9.2.1. Upstream moved the daemon into its own uvx
+    # environment instead (vectorize-io/hindsight 91b50232). Nothing Blockcast
+    # ships uses the Hermes plugin, and this job was red on every PR from #35 on.
     if: >-
       (github.event_name == 'workflow_dispatch' ||
+      (github.repository == 'vectorize-io/hindsight' && (
+      needs.detect-changes.outputs.core == 'true' ||
+      needs.detect-changes.outputs.embed == 'true' ||
+      needs.detect-changes.outputs.hindsight-all == 'true' ||
+      needs.detect-changes.outputs.clients-python == 'true' ||
       needs.detect-changes.outputs.integrations-hermes == 'true' ||
-      needs.detect-changes.outputs.ci == 'true')
+      needs.detect-changes.outputs.ci == 'true')))
     runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 60
     permissions:
