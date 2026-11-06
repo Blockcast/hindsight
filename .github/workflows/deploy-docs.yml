@@ -19,7 +19,7 @@ concurrency:
 
 jobs:
   build:
-    runs-on: {group: default-tools, labels: arc-default}
+    runs-on: {group: default-tools, labels: arc-light}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -43,7 +43,7 @@ jobs:
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-    runs-on: {group: default-tools, labels: arc-default}
+    runs-on: {group: default-tools, labels: arc-light}
     needs: build
     steps:
       - uses: actions/deploy-pages@v5

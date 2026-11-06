@@ -20,7 +20,7 @@ jobs:
     # No Windows ARC pool is available, so this platform-only smoke test stays
     # explicitly skipped rather than falling back to a hosted runner.
     if: github.repository == 'vectorize-io/hindsight-disabled-windows-arc'
-    runs-on: {group: default-tools, labels: arc-default}
+    runs-on: {group: default-tools, labels: arc-light}
     timeout-minutes: 45
     env:
       HINDSIGHT_API_LLM_PROVIDER: vertexai
