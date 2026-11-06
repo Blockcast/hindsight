@@ -69,6 +69,7 @@ concurrency:
 
 jobs:
   perf-test:
+    timeout-minutes: 80
     runs-on: {group: default-tools, labels: arc-light}
     steps:
     - uses: actions/checkout@v6
@@ -251,6 +252,7 @@ jobs:
           "${{ github.workspace }}/.amb/outputs/locomo/hindsight-http/rag/locomo10.json"
 
   obs:
+    timeout-minutes: 80
     # Observation-dedup quality benchmark: ingests a transcript, drains consolidation
     # (serial SyncTaskBackend + embedded pg0 — no external DB / worker), and reports the
     # near-duplicate observation rate. Real LLM via VertexAI, like the other quality jobs.
