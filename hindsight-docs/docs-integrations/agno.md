@@ -8,6 +8,8 @@ description: "Add persistent memory to Agno agents using Hindsight's retain, rec
 
 Persistent memory tools for [Agno](https://github.com/agno-agi/agno) agents via Hindsight. Give your agents long-term memory with retain, recall, and reflect — using Agno's native Toolkit pattern.
 
+[View Changelog →](/changelog/integrations/agno)
+
 ## Features
 
 - **Native Toolkit** - Extends Agno's `Toolkit` base class, just like `Mem0Tools`
@@ -25,7 +27,7 @@ pip install hindsight-agno
 ## Quick Start
 
 :::tip Recommended: Hindsight Cloud
-[Sign up free](https://ui.hindsight.vectorize.io/signup) and grab an API key — no self-hosting required.
+[Sign up free](https://ui.hindsight.vectorize.io) and grab an API key — no self-hosting required.
 :::
 
 ```python

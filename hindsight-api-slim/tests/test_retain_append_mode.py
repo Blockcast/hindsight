@@ -6,9 +6,12 @@ import json
 import logging
 from datetime import datetime, timezone
 
+import httpx
 import pytest
 
-from hindsight_api.engine.memory_engine import Budget
+from hindsight_api.api import create_app
+from hindsight_api.engine.memory_engine import InvalidRetainRequestError, _is_non_retryable_task_error
+from hindsight_api.engine.response_models import Budget
 
 logger = logging.getLogger(__name__)
 
@@ -184,6 +187,39 @@ async def test_append_mode_requires_document_id(memory, request_context):
             ],
             request_context=request_context,
         )
+
+
+@pytest.mark.asyncio
+async def test_async_append_without_document_id_rejected_at_submit(memory, request_context):
+    """The queued path refuses the same item at submit time instead of failing in the worker (#5415)."""
+    bank_id = f"test_async_append_no_docid_{_ts()}"
+
+    with pytest.raises(InvalidRetainRequestError, match="update_mode='append' requires a document_id"):
+        await memory.submit_async_retain(
+            bank_id,
+            [{"content": "Some content", "update_mode": "append"}],
+            request_context=request_context,
+        )
+
+
+@pytest.mark.asyncio
+async def test_async_append_without_document_id_http_400(memory):
+    """POST /memories with async=true answers 400, the same as the sync path (#5415)."""
+    app = create_app(memory, initialize_memory=False)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        for async_ in (True, False):
+            response = await client.post(
+                f"/v1/default/banks/test_async_append_http_{_ts()}/memories",
+                json={"async": async_, "items": [{"content": "x", "update_mode": "append"}]},
+            )
+            assert response.status_code == 400, response.text
+            assert "requires a document_id" in response.json()["detail"]
+
+
+def test_invalid_retain_request_is_not_retried():
+    """A worker that still meets the error (e.g. a row queued before this check) fails it at once."""
+    assert _is_non_retryable_task_error(InvalidRetainRequestError("x")) is True
+    assert _is_non_retryable_task_error(ValueError("x")) is False
 
 
 @pytest.mark.asyncio
@@ -381,5 +417,44 @@ async def test_append_mode_conversation_arrays_produce_valid_json(memory, reques
         )
         assert len(parsed) == 6, "Should contain all 6 messages from three retains"
 
+    finally:
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+
+@pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
+async def test_append_keeps_caller_fields_in_retain_params(memory, request_context):
+    """An append must record the caller's own fields on the document.
+
+    `_build_retain_params` reads `contents_dicts[0]`, and an append onto an EXISTING
+    document makes that element a synthetic item holding the stored body. A field that
+    item does not carry is a field the document never records, so the reprocess replays
+    under the bank default instead of what the caller asked for (#4590).
+    """
+    bank_id = f"test_append_retain_params_{_ts()}"
+    document_id = "conversation-append-strategy"
+
+    try:
+        for content in (
+            "Alice works at Google as a software engineer.",
+            "Bob works at Microsoft as a data scientist.",
+        ):
+            await memory.retain_batch_async(
+                bank_id=bank_id,
+                contents=[
+                    {
+                        "content": content,
+                        "context": "team info",
+                        "document_id": document_id,
+                        "update_mode": "append",
+                        "strategy": "conversation",
+                    }
+                ],
+                request_context=request_context,
+            )
+            doc = await memory.get_document(document_id, bank_id, request_context=request_context)
+            params = doc.get("retain_params") or {}
+            assert params.get("strategy") == "conversation", f"append dropped the strategy: {params!r}"
+            assert params.get("context") == "team info", f"append dropped the context: {params!r}"
     finally:
         await memory.delete_bank(bank_id, request_context=request_context)

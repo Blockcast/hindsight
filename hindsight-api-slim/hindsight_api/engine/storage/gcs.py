@@ -2,12 +2,11 @@
 
 import logging
 import os
-from datetime import timedelta, timezone
+from datetime import timezone
 
-import obstore as obs
 from obstore.store import GCSStore
 
-from .base import FileStorage, delete_object_store_prefix
+from .base import ObstoreFileStorage
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +35,7 @@ def _make_google_auth_credential_provider():
     return _provide
 
 
-class GCSFileStorage(FileStorage):
+class GCSFileStorage(ObstoreFileStorage):
     """
     Google Cloud Storage backend.
 
@@ -77,37 +76,17 @@ class GCSFileStorage(FileStorage):
                 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = gac
         logger.info(f"Initialized GCS file storage: bucket={bucket}")
 
-    async def store(self, file_data: bytes, key: str, metadata: dict[str, str] | None = None) -> str:
-        await obs.put_async(self._store, key, file_data)
-        logger.debug(f"Stored file {key} ({len(file_data)} bytes) in GCS")
-        return key
-
-    async def retrieve(self, key: str) -> bytes:
-        try:
-            response = await obs.get_async(self._store, key)
-            # obstore returns its own Bytes buffer, not a Python `bytes`. Callers rely on
-            # the `-> bytes` return type, and handing a non-`bytes` to something strict about
-            # the type (e.g. a Starlette Response, whose render() calls `.encode()` on a
-            # non-`bytes`) fails at runtime. Copy into native bytes so the backend honours
-            # its declared contract.
-            return bytes(await response.bytes_async())
-        except Exception as e:
-            if "not found" in str(e).lower():
-                raise FileNotFoundError(f"File not found: {key}") from e
-            raise
-
-    async def delete(self, key: str) -> None:
-        await obs.delete_async(self._store, key)
-
-    async def delete_prefix(self, prefix: str) -> int:
-        return await delete_object_store_prefix(self._store, prefix)
-
-    async def exists(self, key: str) -> bool:
-        try:
-            await obs.head_async(self._store, key)
-            return True
-        except Exception:
-            return False
-
     async def get_download_url(self, key: str, expires_in: int = 3600) -> str:
-        return await obs.sign_async(self._store, "GET", key, timedelta(seconds=expires_in))
+        # Storage keys percent-encode their segments (``key_segment``), so a bank id
+        # with a space, a dot or non-ASCII is stored under an object name that
+        # literally contains ``%`` -- "Express%20AI" is the name, not an escaped
+        # "Express AI". obstore's GCS signer puts the key into the URL path as-is, so
+        # GCS decodes that ``%20`` and looks up a different object: NoSuchKey on a
+        # download whose export succeeded. Escaping ``%`` makes the path decode back to
+        # the literal name, and the signature is computed over that same path.
+        #
+        # GCS only: obstore's S3 and Azure signers already escape ``%`` (pre-escaping
+        # there would double-encode). tests/test_file_storage_signed_urls.py signs with
+        # all three and asserts the path decodes to the stored key, so a sibling that
+        # regresses -- or a fourth backend that arrives -- fails there.
+        return await super().get_download_url(key.replace("%", "%25"), expires_in)

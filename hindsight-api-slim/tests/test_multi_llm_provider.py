@@ -104,6 +104,90 @@ async def test_call_with_tools_fails_over_too():
     assert (a.calls, b.calls) == (1, 1)
 
 
+# ── cooldown ──────────────────────────────────────────────────────────────────
+
+
+async def test_failed_member_is_tried_last_until_its_cooldown_ends(monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr("hindsight_api.engine.multi_llm.time.monotonic", lambda: clock[0])
+    a = FakeMember("a", RuntimeError("quota exhausted"))
+    b = FakeMember("b", "RB")
+    chain = _failover(a, b)  # default cooldown_seconds=60
+
+    await chain.call(messages=[])
+    assert (a.calls, b.calls) == (1, 1)
+
+    # Cooling: b serves alone, a is not called.
+    clock[0] += 59
+    assert (await chain.call(messages=[])).content == "RB"
+    assert (a.calls, b.calls) == (1, 2)
+
+    # Cooldown over: a is probed first again, fails, and now cools for 120s.
+    clock[0] += 2
+    await chain.call(messages=[])
+    assert a.calls == 2
+    clock[0] += 119
+    await chain.call(messages=[])
+    assert a.calls == 2
+    clock[0] += 2
+    a.behavior = "RA"
+    assert (await chain.call(messages=[])).content == "RA"
+
+    # A success clears it: the next failure starts again at the base cooldown.
+    a.behavior = RuntimeError("down again")
+    await chain.call(messages=[])
+    clock[0] += 61
+    await chain.call(messages=[])
+    assert a.calls == 5
+
+
+async def test_cooling_member_is_still_tried_when_the_rest_fail(monkeypatch):
+    monkeypatch.setattr("hindsight_api.engine.multi_llm.time.monotonic", lambda: 1000.0)
+    a = FakeMember("a", RuntimeError("a down"))
+    b = FakeMember("b", RuntimeError("b down"))
+    chain = _failover(a, b)
+    with pytest.raises(RuntimeError):
+        await chain.call(messages=[])
+    # Both cooling; both still tried (never refuse outright), in declared order.
+    a.behavior = "RA"
+    assert (await chain.call(messages=[])).content == "RA"
+    assert (a.calls, b.calls) == (2, 1)
+
+
+async def test_concurrent_failures_do_not_stack_the_cooldown(monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr("hindsight_api.engine.multi_llm.time.monotonic", lambda: clock[0])
+    release = asyncio.Event()
+
+    class SlowFailing(FakeMember):
+        async def call(self, **kwargs):
+            self.calls += 1
+            await release.wait()
+            raise RuntimeError("down")
+
+    a = SlowFailing("a", None)
+    b = FakeMember("b", "RB")
+    chain = _failover(a, b)
+    # Ten requests in flight on a fail together: still one 60s cooldown, not 60*2^9.
+    pending = [asyncio.create_task(chain.call(messages=[])) for _ in range(10)]
+    await asyncio.sleep(0)
+    release.set()
+    await asyncio.gather(*pending)
+    assert a.calls == 10
+    clock[0] += 61
+    await chain.call(messages=[])
+    assert a.calls == 11
+
+
+async def test_cooldown_zero_keeps_trying_every_member():
+    a = FakeMember("a", RuntimeError("down"))
+    b = FakeMember("b", "RB")
+    chain = MultiLLMProvider([a, b], LLMStrategyConfig(mode="failover", cooldown_seconds=0))
+    for _ in range(3):
+        await chain.call(messages=[])
+    assert (a.calls, b.calls) == (3, 3)
+
+
 # ── error classification ──────────────────────────────────────────────────────
 
 
@@ -200,3 +284,60 @@ async def test_verify_connection_strict_primary_soft_secondary():
     b = FakeMember("b", RuntimeError("down"))
     await _failover(a, b).verify_connection()
     assert a.verified == 1 and b.verified == 1
+
+
+# ── prompt caching (#5123) ───────────────────────────────────────────────────
+
+
+def _caching_member(name: str, *, caches: bool, fails: bool = False):
+    """A real ``LLMProvider`` over a fake impl that records the cache handle it is called with."""
+    from hindsight_api.engine.llm_wrapper import LLMProvider
+
+    member = LLMProvider(provider="mock", api_key="", base_url="", model=name, max_retries=0)
+    impl = member._provider_impl
+    impl.seen_prefix = "unset"
+
+    async def get_or_create_cached_prefix(**kwargs):
+        return f"{name}-cache"
+
+    async def call(**kwargs):
+        impl.seen_prefix = kwargs.get("cached_prefix")
+        if fails:
+            raise RuntimeError(f"{name} down")
+        return LLMCallResult(content="ok", usage=TokenUsage())
+
+    impl.supports_prompt_caching = lambda: caches
+    impl.get_or_create_cached_prefix = get_or_create_cached_prefix
+    impl.call = call
+    return member, impl
+
+
+async def test_fallback_member_builds_its_own_prompt_cache():
+    """The member that serves the call caches its own prefix, not the primary's."""
+    from hindsight_api.engine.llm_interface import PromptCachePrefix
+
+    primary, primary_impl = _caching_member("codex", caches=False, fails=True)
+    gemini, gemini_impl = _caching_member("gemini", caches=True)
+
+    await _failover(primary, gemini).call(
+        messages=[{"role": "system", "content": "s"}],
+        prompt_cache=PromptCachePrefix(system_instruction="s"),
+    )
+
+    assert primary_impl.seen_prefix is None  # non-caching primary is never handed a handle
+    assert gemini_impl.seen_prefix == "gemini-cache"
+
+
+async def test_caching_primary_handle_never_reaches_fallback_member():
+    from hindsight_api.engine.llm_interface import PromptCachePrefix
+
+    primary, primary_impl = _caching_member("gemini", caches=True, fails=True)
+    other, other_impl = _caching_member("openai", caches=False)
+
+    await _failover(primary, other).call(
+        messages=[{"role": "system", "content": "s"}],
+        prompt_cache=PromptCachePrefix(system_instruction="s"),
+    )
+
+    assert primary_impl.seen_prefix == "gemini-cache"
+    assert other_impl.seen_prefix is None

@@ -49,6 +49,9 @@ interface DshSession {
   readonly events?: readonly DshSessionEvent[];
   /** Public accessor on DeepSeek Harness alpha.4+ (replaces the removed `events` property). */
   snapshotEvents?(): readonly DshSessionEvent[];
+  /** How many leading events a FORK copied from its parent (`session/fork`); 0 or absent otherwise.
+   *  Persisted with the session, so it survives a restart. */
+  readonly inheritedEventCount?: number;
 }
 
 interface DshAgent {
@@ -59,7 +62,7 @@ interface DshAgent {
 interface DshUserMessage {
   role: "user";
   content: { type: string; text?: string }[];
-  source: { kind: string; plugin?: string; form?: string };
+  source: { kind: string; form?: string };
   id?: string;
 }
 
@@ -141,6 +144,19 @@ export function dshSessionEvents(
   return session.snapshotEvents?.() ?? session.events ?? [];
 }
 
+/**
+ * The events this session produced itself — what its write-back saves. A fork saves only its new
+ * turns (#5940): the prefix it inherited is the parent's conversation, which the parent already
+ * stores, and the child's first write-back used to send all of it again under its own document,
+ * re-extracting history the bank already held. The full log is still what the model sees, so
+ * everything else (the injection dedupe below) reads `dshSessionEvents`.
+ */
+export function ownEvents(
+  session: Pick<DshSession, "snapshotEvents" | "events" | "inheritedEventCount">
+): readonly DshSessionEvent[] {
+  return dshSessionEvents(session).slice(session.inheritedEventCount ?? 0);
+}
+
 /** Where a session is working. dsh records it on the session header; a session without one is rare. */
 function workspaceRoot(agent: DshAgent): string {
   return agent.session.header.cwd || process.cwd();
@@ -173,8 +189,7 @@ function workspaceFor(root: string): Workspace | undefined {
   // memory, so unlike opencode there is nothing to refetch over HTTP.
   core.setTranscriptSource(async (sessionId) => {
     const agent = liveAgents.get(sessionId);
-    // alpha.4+ removed Session.events; snapshotEvents() is the public accessor.
-    return agent ? readDshEvents(dshSessionEvents(agent.session)) : [];
+    return agent ? readDshEvents(ownEvents(agent.session)) : [];
   });
   const workspace: Workspace = { core, root };
   workspaces.set(root, workspace);
@@ -185,8 +200,8 @@ function workspaceFor(root: string): Workspace | undefined {
  * Start this repo's cold-check + background seed once.
  *
  * Fire-and-forget by design: `agent/session-start` is an emit that no extension point awaits, and
- * the Web UI must not wait on a network round-trip to open a session. The first prompt tolerates an
- * empty knowledge preamble until this resolves.
+ * the Web UI must not wait on a network round-trip to open a session. Nothing the first prompt
+ * needs comes from here — it builds its own knowledge preamble from that session's page list.
  */
 function ensureSeeded(workspace: Workspace): void {
   workspace.seeded ??= workspace.core.seedIfCold(workspace.root);
@@ -206,7 +221,8 @@ function workspaceForAgent(agent: DshAgent): Workspace | undefined {
  * The human text in this step's claimed batch.
  *
  * `agent/pre-step` fires before EVERY step, including tool continuations that claimed no new input,
- * and other plugins contribute their own `kind: 'plugin'` messages to the same batch. Only a
+ * and other plugins contribute their own context messages to the same batch (V3 hosts tag them
+ * `kind: 'plugin'`, V4 hosts use a producer-owned kind such as `time-context`). Only a
  * `kind: 'user'` message is a prompt worth recalling on.
  */
 function promptOf(messages: readonly DshUserMessage[]): string {
@@ -223,17 +239,37 @@ function promptOf(messages: readonly DshUserMessage[]): string {
  * Build the injected memory message.
  *
  * `form: 'recall'` is dsh's own vocabulary for retrieved context, so its UI renders the block as
- * recalled material rather than as something the user typed, and `plugin: 'hindsight'` names us in
- * the durable log. Neither is what keeps the block out of a write-back — transcript-dsh.ts drops
- * every plugin-sourced message, ours included.
+ * recalled material rather than as something the user typed. Session format V4 requires injected
+ * messages to use a producer-owned source kind; `plugin:hindsight` is the canonical fallback name
+ * for an unregistered plugin. The non-user source also keeps the block out of a write-back.
  */
 function injectionMessage(text: string): DshUserMessage {
   return {
     id: randomUUID(),
     role: "user",
     content: [{ type: "text", text }],
-    source: { kind: "plugin", plugin: HINDSIGHT_PLUGIN, form: "recall" },
+    source: { kind: `plugin:${HINDSIGHT_PLUGIN}`, form: "recall" },
   };
+}
+
+/**
+ * The text of the last memory block this session's history carries, if any.
+ *
+ * dsh keeps every injected message in the history it sends, so re-appending an unchanged block (the
+ * per-turn roster) only stacks identical copies (#5026). This used to be remembered in a map keyed
+ * by session id, which a fork (new id, inherited history) and a restart (empty map) both reset while
+ * the block was still in the history — so the next unchanged recall appended a second copy (#5940).
+ * Reading it off the history itself is what the model will actually see.
+ */
+export function lastInjectedText(events: readonly DshSessionEvent[]): string | undefined {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i];
+    if (event?.type !== "user/message") continue;
+    const message = event.data as Partial<DshUserMessage> | undefined;
+    if (message?.source?.kind !== `plugin:${HINDSIGHT_PLUGIN}`) continue;
+    return (message.content ?? []).map((block) => block.text ?? "").join("\n");
+  }
+  return undefined;
 }
 
 // ── the lifecycle, testable without a dsh host ──────────────────────────────────
@@ -272,6 +308,10 @@ export function createDshHooks(resolve: (agent: DshAgent) => Workspace | undefin
       const injection = workspace.core.getInjection(sessionId);
       if (!injection) {
         diag(HARNESS, "inject_empty", { session: sessionId });
+        return decision;
+      }
+      if (injection === lastInjectedText(dshSessionEvents(agent.session))) {
+        diag(HARNESS, "inject_unchanged", { session: sessionId });
         return decision;
       }
       diag(HARNESS, "inject_ok", { session: sessionId, chars: injection.length });

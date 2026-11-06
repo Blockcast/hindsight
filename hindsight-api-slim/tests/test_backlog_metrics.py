@@ -100,6 +100,10 @@ def _rows_for(sql):
 
 
 @pytest.mark.asyncio
+# The backlog gauge reads `memory_units` directly here, asserting the SQL text and the fake
+# pool's statement list. A store that owns its memories answers the same gauge from its own
+# count, so there is no SQL to assert on (#4969).
+@pytest.mark.memory_backend_incompatible
 async def test_refresh_backlog_aggregates_queue_and_consolidation():
     collector = _collector(include_bank_id=False)
     collector._db_pool = _FakePool(lambda sql, *a: _rows_for(sql))
@@ -117,6 +121,10 @@ async def test_refresh_backlog_aggregates_queue_and_consolidation():
 
 
 @pytest.mark.asyncio
+# The backlog gauge reads `memory_units` directly here, asserting the SQL text and the fake
+# pool's statement list. A store that owns its memories answers the same gauge from its own
+# count, so there is no SQL to assert on (#4969).
+@pytest.mark.memory_backend_incompatible
 async def test_refresh_backlog_uses_index_matched_predicates_not_filter_scan():
     """Backlog/failed must be two separate COUNT(*) queries whose WHERE matches
     a partial-index predicate exactly (no FILTER over a full-table scan), and
@@ -144,6 +152,10 @@ async def test_refresh_backlog_uses_index_matched_predicates_not_filter_scan():
 
 
 @pytest.mark.asyncio
+# The backlog gauge reads `memory_units` directly here, asserting the SQL text and the fake
+# pool's statement list. A store that owns its memories answers the same gauge from its own
+# count, so there is no SQL to assert on (#4969).
+@pytest.mark.memory_backend_incompatible
 async def test_backlog_count_runs_with_seqscan_disabled():
     """`consolidated_at IS NULL` is true for a large fraction of the table, so
     the planner misjudges selectivity and won't use the partial index without a
@@ -159,6 +171,10 @@ async def test_backlog_count_runs_with_seqscan_disabled():
 
 
 @pytest.mark.asyncio
+# The backlog gauge reads `memory_units` directly here, asserting the SQL text and the fake
+# pool's statement list. A store that owns its memories answers the same gauge from its own
+# count, so there is no SQL to assert on (#4969).
+@pytest.mark.memory_backend_incompatible
 async def test_refresh_backlog_per_bank_labels_and_group_by_when_enabled():
     """With metrics_include_bank_id on, bank_id enters the cache key and the
     SQL switches to GROUP BY bank_id."""
@@ -248,3 +264,39 @@ def test_backlog_gauges_not_registered_when_flag_disabled():
     assert "hindsight.consolidation.backlog" not in names
     assert "hindsight.consolidation.failed" not in names
     assert collector._backlog_task is None
+
+
+@pytest.mark.asyncio
+async def test_refresh_backlog_counts_each_schema_under_its_own_schema():
+    """A store-owned backend derives where a bank's memories live from the request schema, so
+    the gauge must set it per schema: left unset, every schema's banks resolve against the
+    default schema and the store cannot find them."""
+    from hindsight_api.schema_context import get_current_schema
+
+    # Each schema holds one bank with a backlog; the store only finds a bank under its own schema.
+    banks = {"tenant_a": "bank_a", "tenant_b": "bank_b"}
+
+    class _SchemaScopedStore:
+        def _count(self, schema):
+            if get_current_schema() != schema:
+                raise LookupError(f"bank of {schema} looked up under {get_current_schema()}")
+            return {banks[schema]: 5}
+
+        async def count_consolidation_backlog(self, *, conn, schema, per_bank, bank_ids):
+            return self._count(schema)
+
+        async def count_consolidation_failed(self, *, conn, schema, per_bank, bank_ids):
+            return self._count(schema)
+
+    def fetch(sql, *a):
+        if "information_schema.tables" in sql:
+            return [{"table_schema": s} for s in banks]
+        return []
+
+    collector = _collector(include_bank_id=True)
+    collector._db_pool = _FakePool(fetch)
+    with patch("hindsight_api.engine.memories.get_memories", return_value=_SchemaScopedStore()):
+        await collector._refresh_backlog()
+
+    assert collector._consolidation_backlog == {("tenant_a", "bank_a"): 5, ("tenant_b", "bank_b"): 5}
+    assert collector._consolidation_failed == {("tenant_a", "bank_a"): 5, ("tenant_b", "bank_b"): 5}

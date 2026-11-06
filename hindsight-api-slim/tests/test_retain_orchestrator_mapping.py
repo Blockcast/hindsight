@@ -15,7 +15,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from hindsight_api.engine.retain import embedding_utils, entity_processing, link_creation, link_utils, orchestrator
+from hindsight_api.engine.memories.pg import links as link_utils
+from hindsight_api.engine.retain import embedding_utils, entity_processing, link_creation, orchestrator
 from hindsight_api.engine.retain.orchestrator import (
     _map_results_to_contents,
     _pre_resolve_phase1,
@@ -225,7 +226,19 @@ class TestEmbeddingsBatchLengthGuarantee:
         with pytest.raises(RuntimeError, match="embedding 1 has dimension 2; expected 3"):
             asyncio.run(embedding_utils.generate_embeddings_batch(backend, ["a", "b"]))
 
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+    def test_raises_when_backend_returns_non_finite_embedding(self, bad):
+        backend = MagicMock()
+        backend.dimension = 3
+        backend.encode_documents = AsyncMock(return_value=[[0.1, 0.2, 0.3], [0.4, bad, bad]])
 
+        with pytest.raises(RuntimeError, match=r"embedding 1 contains 2 non-finite value\(s\) \(NaN/Inf\) of 3"):
+            asyncio.run(embedding_utils.generate_embeddings_batch(backend, ["a", "b"]))
+
+
+# The semantic-link ANN is Postgres's: a store that owns its memories derives those edges
+# itself, so the engine never computes a threshold to propagate.
+@pytest.mark.memory_backend_incompatible
 class TestSemanticLinkThresholdPropagation:
     @pytest.mark.asyncio
     async def test_phase1_ann_uses_resolved_semantic_link_threshold(self, monkeypatch):

@@ -176,7 +176,7 @@
       "description": "No-MCP long-term memory for ZCode (Z.ai's GLM desktop coding agent) via Hindsight hooks. Recalls relevant context before each prompt and retains conversations after each turn.",
       "type": "official",
       "by": "hindsight",
-      "category": "coding-agent",
+      "category": "legacy",
       "link": "/sdks/integrations/zcode",
       "icon": "/img/icons/zcode.svg"
     },
@@ -189,16 +189,6 @@
       "category": "framework",
       "link": "/sdks/integrations/claude-agent-sdk",
       "icon": "/img/icons/claude-agent-sdk.png"
-    },
-    {
-      "id": "grok-build",
-      "name": "Grok Build",
-      "description": "Automatic long-term memory for Grok Build (xAI) via Hindsight hooks. Captures every conversation, recalls relevant context on every prompt.",
-      "type": "official",
-      "by": "hindsight",
-      "category": "coding-agent",
-      "link": "/sdks/integrations/grok-build",
-      "icon": "/img/icons/grok-build.svg"
     },
     {
       "id": "codex",
@@ -423,7 +413,7 @@
     {
       "id": "eve",
       "name": "Eve",
-      "description": "Automatic long-term memory for Vercel Eve agents. Memory is injected before each turn and retained after, with no model tool-calling.",
+      "description": "Memory provider for Vercel Eve agents. Scoped recall before each turn, automatic capture after, and a reflect tool — no model tool-calling required.",
       "type": "official",
       "by": "hindsight",
       "category": "framework",
@@ -561,6 +551,16 @@
       "icon": "/img/icons/obsidian.svg"
     },
     {
+      "id": "openbot",
+      "name": "OpenBot",
+      "description": "Give your OpenBot teammates persistent long-term memory that outlives a single thread and is shared across the whole team — connect Hindsight's MCP server to any OpenBot agent.",
+      "type": "official",
+      "by": "hindsight",
+      "category": "mcp",
+      "link": "/sdks/integrations/openbot",
+      "icon": "/img/icons/openbot.png"
+    },
+    {
       "id": "hindclaw",
       "name": "HindClaw",
       "description": "Production memory infrastructure for AI agents \u2014 server-side access control via Hindsight extensions, Terraform provider for users/groups/banks/permissions, and an OpenClaw plugin with auto-managed embed.",
@@ -589,6 +589,26 @@
       "category": "tool",
       "link": "/sdks/integrations/gemini-spark",
       "icon": "/img/icons/gemini.svg"
+    },
+    {
+      "id": "grok-bot",
+      "name": "Grok Bot",
+      "description": "Long-term memory for Grok Bot and Cursor. Each Bot keeps its own memory bank plus a shared one, carries state between routine runs, and reads the banks your other AI tools write to. Connects with OAuth; no API key.",
+      "type": "official",
+      "by": "hindsight",
+      "category": "tool",
+      "link": "/sdks/integrations/grok-bot",
+      "icon": "/img/icons/grok-build.svg"
+    },
+    {
+      "id": "meta-muse",
+      "name": "Meta Muse",
+      "description": "Bring the memory from your other AI tools into Meta Muse. Muse signs in to Hindsight with OAuth, keeps its own memory bank, and reads the banks your other agents write to \u2014 recall, retain and reflect over MCP.",
+      "type": "official",
+      "by": "hindsight",
+      "category": "tool",
+      "link": "/sdks/integrations/meta-muse",
+      "icon": "/img/icons/mcp.png"
     },
     {
       "id": "outsystems",
@@ -659,6 +679,26 @@
       "category": "framework",
       "link": "https://github.com/agentguard-ai/tealtiger/tree/main/packages/tealtiger-hindsight",
       "icon": "/img/icons/tealtiger.png"
+    },
+    {
+      "id": "notion-to-hindsight-sync",
+      "name": "Notion Sync",
+      "description": "Syncs Notion databases into Hindsight so agents can recall your notes. Runs on Cloudflare Workers with incremental sync and deletion handling.",
+      "type": "community",
+      "by": "Nyrest",
+      "category": "tool",
+      "link": "https://github.com/Nyrest/notion-to-hindsight-sync",
+      "icon": "/img/icons/notion.svg"
+    },
+    {
+      "id": "hindsight-ingestion",
+      "name": "Hindsight Ingestion",
+      "description": "Syncs documents from Notion, SiYuan, S3, WebDAV, Google Drive, OneDrive, email, SQL, the file system and more into Hindsight. Self-hosted with Docker, with incremental and multimodal sync.",
+      "type": "community",
+      "by": "Nyrest",
+      "category": "tool",
+      "link": "https://github.com/Nyrest/hindsight-ingestion",
+      "icon": "/img/icons/hindsight-ingestion.svg"
     }
   ]
 }

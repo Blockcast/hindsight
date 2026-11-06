@@ -23,7 +23,6 @@ money and needs network. The default model is ``gemini-2.5-flash`` (override wit
 ``HINDSIGHT_GEMINI_EVAL_MODEL``); explicit caching needs a >=2,048-token prefix.
 """
 
-import asyncio
 import os
 import uuid
 
@@ -33,6 +32,7 @@ from hindsight_api import MemoryEngine, RequestContext
 from hindsight_api.engine.consolidation.consolidator import run_consolidation_job
 from hindsight_api.engine.llm_trace import LLMRequestEntry
 from hindsight_api.engine.llm_wrapper import LLMConfig
+from tests.llm_trace_drain import drain_traces
 
 _GEMINI_API_KEY = os.getenv("HINDSIGHT_GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 _RUN = os.getenv("HINDSIGHT_RUN_GEMINI_EVALS") == "1" and bool(_GEMINI_API_KEY)
@@ -128,23 +128,6 @@ async def _gemini_engine(memory_no_llm_verify: MemoryEngine) -> MemoryEngine:
     return memory_no_llm_verify
 
 
-async def _drain_traces(mem: MemoryEngine) -> None:
-    """Wait for the recorder's fire-and-forget trace writes to land.
-
-    record_llm_call schedules each INSERT as a detached asyncio task tracked in
-    ``_pending`` (bucketed by trace_id). Gather them so the rows are queryable.
-    Loop a few times because consolidation's attach_memory_ids can spawn a
-    follow-up write after the first drain.
-    """
-    await mem.wait_for_background_tasks()
-    rec = mem._llm_recorder
-    for _ in range(10):
-        pending = [t for bucket in rec._pending.values() for t in bucket if not t.done()]
-        if not pending:
-            break
-        await asyncio.gather(*pending, return_exceptions=True)
-
-
 def _report(scope: str, rows: list[LLMRequestEntry]) -> float:
     """Print the cached/input token ratio for a scope and return it.
 
@@ -191,12 +174,12 @@ class TestGeminiCacheRatioPerOperation:
         ``min_ratio`` is per-operation because the achievable ratio differs by
         design: retain re-sends a pure fixed prefix (~90%); consolidation's prefix
         is fixed but the facts/observations payload is large (~30%); reflect rolls
-        a step-by-step cache forward — each ``auto`` turn reuses the previous
+        a step-by-step cache forward — each free turn reuses the previous
         turn's FULL input (system + tools + all prior tool results) at the cached
         rate and re-sends only its own new results, so each retrieved payload is
         billed fresh exactly once. The forced retrieval turns still can't cache
         (Gemini forbids ``cached_content`` with a per-request ``tool_config``), so
-        on a short reflect the ratio is bounded by the forced:auto mix (~25-30%)
+        on a short reflect the ratio is bounded by the forced:free mix (~25-30%)
         and climbs on longer loops. The universal guarantee in explicit mode is
         that caching engaged (cached_tokens > 0).
         """
@@ -225,7 +208,7 @@ class TestGeminiCacheRatioPerOperation:
                 request_context=request_context,
                 document_id=f"doc-{i}",
             )
-        await _drain_traces(mem)
+        await drain_traces(mem)
 
         rows = await self._fetch(mem, bank_id, request_context, "retain_extract_facts")
         self._assert("retain_extract_facts", rows, min_calls=_CHUNKS, min_ratio=0.5)
@@ -234,7 +217,7 @@ class TestGeminiCacheRatioPerOperation:
 
     async def test_reflect_tool_loop_cached_ratio(self, memory_no_llm_verify, request_context):
         """Reflect runs an agentic tool loop with a step-by-step rolling cache: each
-        ``auto`` turn reuses the previous turn's full input (system + tools + all
+        free turn reuses the previous turn's full input (system + tools + all
         prior tool results) and sends only its own new results (scope
         ``reflect_tool_call``). The per-reflect caches are deleted when it ends."""
         mem = await _gemini_engine(memory_no_llm_verify)
@@ -255,7 +238,7 @@ class TestGeminiCacheRatioPerOperation:
             query="Who were the early pioneers of computing in these memories, and what is each one known for?",
             request_context=request_context,
         )
-        await _drain_traces(mem)
+        await drain_traces(mem)
 
         rows = await self._fetch(mem, bank_id, request_context, "reflect_tool_call")
         if not rows:
@@ -269,8 +252,8 @@ class TestGeminiCacheRatioPerOperation:
             pytest.skip("reflect made no SUCCESSFUL reflect_tool_call iterations for this seed")
         # Floor guards the step-by-step cache: the old static system+tools prefix
         # scored ~9% here; rolling the whole conversation forward lifts it well past
-        # that. Modest floor because the exact ratio depends on how many auto turns
-        # the seed drives (more auto turns → higher).
+        # that. Modest floor because the exact ratio depends on how many free turns
+        # the seed drives (more free turns → higher).
         self._assert("reflect_tool_call", rows, min_calls=1, min_ratio=0.15)
 
         await mem.delete_bank(bank_id, request_context=request_context)
@@ -292,7 +275,7 @@ class TestGeminiCacheRatioPerOperation:
         await mem.wait_for_background_tasks()
 
         await run_consolidation_job(mem, bank_id, request_context)
-        await _drain_traces(mem)
+        await drain_traces(mem)
 
         rows = await self._fetch(mem, bank_id, request_context, "consolidation")
         if not rows:

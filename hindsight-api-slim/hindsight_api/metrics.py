@@ -16,12 +16,13 @@ import importlib
 import logging
 import os
 import random
-import re
 
 _resource_mod = importlib.import_module("resource") if importlib.util.find_spec("resource") else None
 import threading
 import time
 from contextlib import contextmanager
+from contextvars import ContextVar
+from enum import StrEnum
 from typing import TYPE_CHECKING, Callable, NamedTuple
 
 from opentelemetry import metrics
@@ -30,42 +31,95 @@ from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.view import ExplicitBucketHistogramAggregation, View
 from opentelemetry.sdk.resources import Resource
 
+from hindsight_api.operation_runs import add_phase
+from hindsight_api.schema_context import _current_schema, get_current_schema
+
 if TYPE_CHECKING:
     import asyncpg
 
 
 def _get_tenant() -> str:
     """Get current tenant (schema) from context for metrics labeling."""
-    # Import here to avoid circular imports
-    from hindsight_api.engine.memory_engine import get_current_schema
-
     return get_current_schema()
 
 
-def _is_client_cancellation(exc: BaseException) -> bool:
-    """Whether *exc* is a client-disconnect cancellation rather than a failure.
+#: The memories backend serving the operation in progress, set by ``record_operation`` for the
+#: length of the operation so phase metrics recorded inside it carry the same label without
+#: threading a bank id down to every call site. Empty outside an operation.
+_current_memories_backend: ContextVar[str] = ContextVar("hindsight_metrics_memories_backend", default="")
 
-    An abandoned recall/reflect raises OperationCancelledError (issue #2122);
-    the HTTP layer re-raises it as ``HTTPException(499) from exc`` (see
-    api/http.py run_cancellable_on_disconnect). The exception itself, or any
-    link in its ``__cause__`` chain, being an OperationCancelledError marks it
-    as a cancellation. Matching on the cause chain rather than a bare status
-    code avoids misclassifying an unrelated 499 as a cancellation. Per the
-    engine contract a cancellation is "not a failure to retry or report"
-    (cancellation.OperationCancelledError), so it must not be counted against
-    ``hindsight.operation.total``.
+
+def memories_backend_for(bank_id: str) -> str:
+    """The ``memories_backend`` label for a bank: the name the memories extension gives the store
+    serving it, or "" -- the default -- for no label, which leaves existing series untouched.
+    Only a metric attribute, so it never raises: an unresolvable store also yields ""."""
+    try:
+        from hindsight_api.engine.memories import get_memories
+
+        return get_memories().backend_name_for(bank_id) or ""
+    except Exception:
+        return ""
+
+
+def _backend_attrs(backend: str) -> dict[str, str]:
+    return {"memories_backend": backend} if backend else {}
+
+
+class OperationOutcome(StrEnum):
+    """How an operation ended: the ``success`` label on ``hindsight.operation.*``.
+
+    Only ``FAILURE`` counts toward an operation's failure rate. The values are the
+    label strings themselves; ``true``/``false`` are kept from when the label was a bool.
     """
-    # Imported lazily to avoid import-time coupling (cf. _get_tenant above).
+
+    SUCCESS = "true"
+    FAILURE = "false"
+    # The client disconnected before a recall/reflect finished (#2122).
+    CANCELLED = "cancelled"
+    # The operation was refused before it did any work (OperationValidationError): an
+    # OperationValidatorExtension rejected it, or the caller's tag scope does not allow it.
+    REJECTED = "rejected"
+
+
+def _outcome_of_error(exc: BaseException) -> OperationOutcome:
+    """The outcome of an operation that raised *exc*: a failure, unless it was not one.
+
+    Two errors are not failures of the operation, and are counted outside the failure
+    rate on ``hindsight.operation.total``:
+
+    - **Cancelled.** An abandoned recall/reflect raises OperationCancelledError (issue
+      #2122); the HTTP layer re-raises it as ``HTTPException(499) from exc`` (see
+      api/http.py run_cancellable_on_disconnect). The hard-cancel path
+      (run_task_cancellable_on_disconnect) has no such error to re-raise, so it chains a
+      fresh one; before #5946 it raised a bare 499 and every hard disconnect counted as a
+      failure. Per the engine contract a cancellation is "not a failure to retry or
+      report" (cancellation.OperationCancelledError).
+    - **Rejected.** An OperationValidatorExtension that refuses an operation (over quota,
+      a policy refusal, ...), like the engine's tag-scope checks, raises
+      OperationValidationError before it does any work, and the HTTP layer returns its
+      status code. The server decided not to run it. Counted as a failure, one client
+      that keeps calling after it has been refused drives the operation's failure rate
+      to its share of the traffic.
+
+    Either error is matched anywhere in the ``__cause__`` chain, so a route that re-raises
+    it as an HTTPException ``from`` it is still recognised. Matching on the cause chain
+    rather than a bare status code keeps an unrelated 499 or 402 a failure.
+    """
+    # Imported lazily to avoid import-time coupling (cf. _get_tenant above): both
+    # modules are heavier than this one and must not be loaded by importing metrics.
     from hindsight_api.cancellation import OperationCancelledError
+    from hindsight_api.extensions.operation_validator import OperationValidationError
 
     cause: BaseException | None = exc
     seen: set[int] = set()  # guard against a cyclic __cause__ chain
     while cause is not None and id(cause) not in seen:
         if isinstance(cause, OperationCancelledError):
-            return True
+            return OperationOutcome.CANCELLED
+        if isinstance(cause, OperationValidationError):
+            return OperationOutcome.REJECTED
         seen.add(id(cause))
         cause = cause.__cause__
-    return False
+    return OperationOutcome.FAILURE
 
 
 # Custom bucket boundaries for operation duration (in seconds)
@@ -136,27 +190,6 @@ def get_token_bucket(token_count: int) -> str:
         return "10k-50k"
     else:
         return "50k+"
-
-
-# Template unbounded id segments before a path is used as the low-cardinality
-# "endpoint" metric label. A raw per-bank path segment (e.g. user-123) would
-# otherwise create one never-evicted OTel series per bank.
-_METRIC_BANK_SEGMENT_RE = re.compile(r"(/banks/)[^/]+")
-_METRIC_UUID_RE = re.compile(r"/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
-_METRIC_NUMERIC_ID_RE = re.compile(r"/\d+(?=/|$)")
-
-
-def normalize_http_endpoint(path: str) -> str:
-    """Template high-cardinality id segments in an HTTP path for safe metric labeling.
-
-    Collapses the "/banks/<id>" segment (any bank id, including non-numeric ones like
-    "user-123"), UUIDs, and numeric ids to placeholders so the "endpoint" metric label
-    has bounded cardinality. Analogous to get_token_bucket for token counts.
-    """
-    path = _METRIC_BANK_SEGMENT_RE.sub(r"\g<1>{bank_id}", path)
-    path = _METRIC_UUID_RE.sub("/{id}", path)
-    path = _METRIC_NUMERIC_ID_RE.sub("/{id}", path)
-    return path
 
 
 logger = logging.getLogger(__name__)
@@ -263,13 +296,14 @@ class MetricsCollectorBase:
         self,
         operation: str,
         bank_id: str,
-        success: bool,
+        outcome: OperationOutcome,
         duration: float,
         source: str = "api",
         budget: str | None = None,
         max_tokens: int | None = None,
+        memories_backend: str | None = None,
     ):
-        """Record a single completed operation with an explicit success label."""
+        """Record a single completed operation with an explicit outcome (see OperationOutcome)."""
         raise NotImplementedError
 
     def record_llm_call(
@@ -376,11 +410,12 @@ class NoOpMetricsCollector(MetricsCollectorBase):
         self,
         operation: str,
         bank_id: str,
-        success: bool,
+        outcome: OperationOutcome,
         duration: float,
         source: str = "api",
         budget: str | None = None,
         max_tokens: int | None = None,
+        memories_backend: str | None = None,
     ):
         """No-op operation result recording."""
         pass
@@ -414,13 +449,14 @@ class NoOpMetricsCollector(MetricsCollectorBase):
         pass
 
     def record_retain_phase(self, phase: str, seconds: float, calls: int = 1, store: str = ""):
-        pass
+        add_phase(f"retain.{phase}", seconds)
 
     def record_validator_phase(self, operation: str, hook: str, seconds: float):
         pass
 
     def record_recall_phase(self, phase: str, seconds: float, *, diagnostic: bool = False):
-        pass
+        if not diagnostic:
+            add_phase(f"recall.{phase}", seconds)
 
     def record_loop_stall(self, stall_seconds: float):
         """No-op loop-stall recording."""
@@ -447,6 +483,7 @@ class MetricsCollector(MetricsCollectorBase):
         from .config import get_config
 
         self._include_bank_id = get_config().metrics_include_bank_id
+        self._include_tenant = get_config().metrics_include_tenant
         self._record_diagnostic_phases = get_config().recall_diagnostic_phases
         self._recall_phase_sample_every = get_config().recall_phase_sample_every
 
@@ -648,6 +685,16 @@ class MetricsCollector(MetricsCollectorBase):
         self._consolidation_failed: dict[_BacklogKey, int] = {}
         self._backlog_task: "asyncio.Task | None" = None
 
+    def _tenant_attrs(self) -> dict[str, str]:
+        """The ``tenant`` (schema) label, gated behind ``metrics_include_tenant`` (off by default).
+
+        Per-tenant labels are high-cardinality: a deployment accrues one series set per schema,
+        which multiplies through every histogram bucket and can overwhelm the metrics backend on
+        a deployment with many tenants. Off by default, opt-in for small deployments — mirroring
+        ``metrics_include_bank_id``.
+        """
+        return {"tenant": _get_tenant()} if self._include_tenant else {}
+
     @contextmanager
     def record_operation(
         self,
@@ -672,56 +719,59 @@ class MetricsCollector(MetricsCollectorBase):
             budget: Optional budget level (low, mid, high)
             max_tokens: Optional max tokens for the operation
         """
-        start_time = time.time()
-        success = True
-        cancelled = False
+        start_time = time.perf_counter()
+        outcome = OperationOutcome.SUCCESS
+        # Resolved once, and published for the length of the operation so the recall phases
+        # recorded inside it carry the same backend label. (Retain phases label their store
+        # themselves, in timed_retain.)
+        backend = memories_backend_for(bank_id)
+        backend_token = _current_memories_backend.set(backend)
         try:
             yield
         except Exception as exc:
-            # A client disconnect cancels the operation cooperatively (#2122),
-            # raised as OperationCancelledError and re-raised by the HTTP layer
-            # as HTTPException(499) from it. An abandoned request is neither a
-            # success nor a failure, so it is excluded from the metric entirely
-            # rather than inflating either the failure or the success rate on
-            # hindsight.operation.total.
-            if _is_client_cancellation(exc):
-                cancelled = True
-            else:
-                success = False
+            # Not every error is a failure of the operation: a client disconnect is recorded
+            # as "cancelled" and a validator refusal as "rejected" (see _outcome_of_error).
+            # Both are still counted, with their duration, but outside the failure rate.
+            # Before #6126 a cancellation was dropped from the metric entirely (#2185),
+            # which left no way to see how often clients gave up, or how long they waited.
+            outcome = _outcome_of_error(exc)
             raise
         finally:
-            if not cancelled:
-                self.record_operation_result(
-                    operation,
-                    bank_id,
-                    success=success,
-                    duration=time.time() - start_time,
-                    source=source,
-                    budget=budget,
-                    max_tokens=max_tokens,
-                )
+            _current_memories_backend.reset(backend_token)
+            self.record_operation_result(
+                operation,
+                bank_id,
+                outcome=outcome,
+                duration=time.perf_counter() - start_time,
+                source=source,
+                budget=budget,
+                max_tokens=max_tokens,
+                memories_backend=backend,
+            )
 
     def record_operation_result(
         self,
         operation: str,
         bank_id: str,
-        success: bool,
+        outcome: OperationOutcome,
         duration: float,
         source: str = "api",
         budget: str | None = None,
         max_tokens: int | None = None,
+        memories_backend: str | None = None,
     ):
-        """Record a single completed operation (duration + count) with a success label.
+        """Record a single completed operation (duration + count) with its outcome.
 
         Direct (non-context-manager) recording for code paths that need explicit
-        success control rather than the exception-based ``record_operation`` — e.g.
+        outcome control rather than the exception-based ``record_operation`` — e.g.
         the async worker, where deferrals/retries are not terminal outcomes and must
         not be counted as completions.
         """
         attributes = {
             "operation": operation,
             "source": source,
-            "tenant": _get_tenant(),
+            **self._tenant_attrs(),
+            **_backend_attrs(memories_backend_for(bank_id) if memories_backend is None else memories_backend),
         }
         if self._include_bank_id:
             attributes["bank_id"] = bank_id
@@ -729,7 +779,7 @@ class MetricsCollector(MetricsCollectorBase):
             attributes["budget"] = budget
         if max_tokens:
             attributes["max_tokens"] = str(max_tokens)
-        attributes["success"] = str(success).lower()
+        attributes["success"] = outcome.value
 
         # Record duration
         self.operation_duration.record(duration, attributes)
@@ -745,7 +795,7 @@ class MetricsCollector(MetricsCollectorBase):
         until it is reprocessed.
         """
         attributes = {
-            "tenant": _get_tenant(),
+            **self._tenant_attrs(),
             "outcome": "facts" if memory_unit_count > 0 else "no_facts",
         }
         if self._include_bank_id:
@@ -789,7 +839,7 @@ class MetricsCollector(MetricsCollectorBase):
             "model": model,
             "scope": scope,
             "success": str(success).lower(),
-            "tenant": _get_tenant(),
+            **self._tenant_attrs(),
         }
 
         # Record duration
@@ -841,7 +891,7 @@ class MetricsCollector(MetricsCollectorBase):
             endpoint: Request endpoint path
             status_code_getter: Callable that returns the status code after request completes
         """
-        start_time = time.time()
+        start_time = time.perf_counter()
         base_attributes = {"method": method, "endpoint": endpoint}
 
         # Track in-progress
@@ -850,18 +900,15 @@ class MetricsCollector(MetricsCollectorBase):
         try:
             yield
         finally:
-            duration = time.time() - start_time
+            duration = time.perf_counter() - start_time
             status_code = status_code_getter()
             status_class = f"{status_code // 100}xx"
-
-            # Get tenant from context (may be set during request processing)
-            tenant = _get_tenant()
 
             attributes = {
                 **base_attributes,
                 "status_code": str(status_code),
                 "status_class": status_class,
-                "tenant": tenant,
+                **self._tenant_attrs(),
             }
 
             # Record duration and count
@@ -878,7 +925,8 @@ class MetricsCollector(MetricsCollectorBase):
     def record_retain_phase(self, phase: str, seconds: float, calls: int = 1, store: str = ""):
         """Record one phase of a retain. `store` labels which memories backend served it, so a
         store-owned bank's profile is separable from a Postgres one on the same deployment."""
-        attrs = {"phase": phase, "tenant": _get_tenant()}
+        add_phase(f"retain.{phase}", seconds)
+        attrs = {"phase": phase, **self._tenant_attrs()}
         if store:
             attrs["store"] = store
         self.retain_phase_duration.record(seconds, attrs)
@@ -886,7 +934,7 @@ class MetricsCollector(MetricsCollectorBase):
 
     def record_validator_phase(self, operation: str, hook: str, seconds: float):
         """Record one operation-validator hook. `hook` is "pre" or "post"."""
-        attrs = {"operation": operation, "hook": hook, "tenant": _get_tenant()}
+        attrs = {"operation": operation, "hook": hook, **self._tenant_attrs()}
         self.validator_phase_duration.record(seconds, attrs)
 
     def record_recall_phase(self, phase: str, seconds: float, *, diagnostic: bool = False):
@@ -896,6 +944,9 @@ class MetricsCollector(MetricsCollectorBase):
         per-arm timing inside `parallel_retrieval`, say — so a consumer summing phases into a
         request total can exclude them instead of double-counting.
         """
+        if not diagnostic:
+            # Every recall's phases, whatever the sampling below: the run is per recall.
+            add_phase(f"recall.{phase}", seconds)
         if diagnostic and not self._record_diagnostic_phases:
             return
         # Opt-in sampling: ~10 phases per recall each go through OTel's aggregation, which was
@@ -904,7 +955,12 @@ class MetricsCollector(MetricsCollectorBase):
         # absolute counts scale by 1/N. Default 1 records every call, exactly as before.
         if self._recall_phase_sample_every > 1 and random.random() * self._recall_phase_sample_every >= 1.0:
             return
-        attrs = {"phase": phase, "tenant": _get_tenant(), "diagnostic": str(bool(diagnostic)).lower()}
+        attrs = {
+            "phase": phase,
+            **self._tenant_attrs(),
+            **_backend_attrs(_current_memories_backend.get()),
+            "diagnostic": str(bool(diagnostic)).lower(),
+        }
         # One instrument, not two: the histogram already carries `_count` for this attribute set,
         # so the parallel counter was recording the same measurement a second time — and OTel's
         # consume_measurement path, not the record call, is what costs.
@@ -927,7 +983,7 @@ class MetricsCollector(MetricsCollectorBase):
         signature — and is bounded by the exception types the LLM layer can raise.
         """
         self.consolidation_batch_failures.add(
-            1, {"failure_class": failure_class, "error_type": error_type, "tenant": _get_tenant()}
+            1, {"failure_class": failure_class, "error_type": error_type, **self._tenant_attrs()}
         )
 
     def _setup_process_metrics(self):
@@ -1210,7 +1266,7 @@ class MetricsCollector(MetricsCollectorBase):
         failed: dict[_BacklogKey, int] = {}
         per_bank = self._include_bank_id
         bank_sel = "bank_id, " if per_bank else ""
-        bank_grp = " GROUP BY bank_id" if per_bank else ""
+        from .engine.memories import get_memories
 
         async with self._db_pool.acquire() as conn:
             # memory_units is the central per-tenant table; its presence marks a
@@ -1241,61 +1297,46 @@ class MetricsCollector(MetricsCollectorBase):
                 except Exception:
                     logger.debug("Async-ops queue query failed for schema %s", schema, exc_info=True)
 
-                # Consolidation backlog + stranded counts. Two separate COUNT(*)
-                # queries rather than one with two FILTERs — each WHERE matches a
-                # partial-index predicate exactly:
-                #   idx_memory_units_unconsolidated        WHERE consolidated_at IS NULL ...
-                #   idx_memory_units_consolidation_failed  WHERE consolidation_failed_at IS NOT NULL ...
-                # GROUP BY bank_id still composes — bank_id is each index's lead column.
+                # Consolidation backlog + stranded counts, from the memories store: a bank whose
+                # memories live outside Postgres has none in `memory_units`, so counting that
+                # table alone read 0 for it and its backlog alert never fired (#4969). Postgres
+                # counts the whole schema in two queries, each matching a partial index (see
+                # pg/admin.py); a store that owns its memories counts the schema's banks, which
+                # it is handed lazily so the Postgres path never lists them.
                 #
-                # The backlog gauge is disjoint from the failed gauge: it carries the
-                # consolidator's own `consolidation_failed_at IS NULL` (see
-                # reads.find_unconsolidated), so a permanently failed fact does not hold
-                # the backlog above zero forever and "backlog > 0 for N minutes" stays an
-                # alertable condition. That extra term is not in the partial index's
-                # predicate, so it is a cheap recheck on the rows the index already
-                # returned — the failed set is tiny by construction.
-                #
-                # The backlog count runs with seqscan disabled in a scoped
-                # transaction. The partial index matches its predicate, but
-                # `consolidated_at IS NULL` is true for a large fraction of the
-                # table (every observation has a null consolidated_at), so the
-                # planner misjudges selectivity and otherwise seq-scans the whole
-                # (largest) table on every refresh — verified on a 114k-row table
-                # via EXPLAIN: seq scan ~92 ms vs index scan ~0.1 ms. SET LOCAL
-                # forces the index path and resets at transaction end. The failed
-                # count below needs no such nudge: `consolidation_failed_at IS NOT
-                # NULL` is rare, so its index is chosen on cost.
-                try:
-                    async with conn.transaction():
-                        await conn.execute("SET LOCAL enable_seqscan = off")
-                        rows = await conn.fetch(
-                            f"SELECT {bank_sel}COUNT(*) AS count "
-                            f'FROM "{schema}".memory_units '
-                            "WHERE consolidated_at IS NULL AND consolidation_failed_at IS NULL "
-                            "AND fact_type IN ('experience', 'world')"
-                            f"{bank_grp}"
-                        )
-                    for row in rows:
-                        bank = row["bank_id"] if per_bank else None
-                        key = _BacklogKey(schema, bank)
-                        backlog[key] = backlog.get(key, 0) + int(row["count"])
-                except Exception:
-                    logger.debug("Consolidation backlog query failed for schema %s", schema, exc_info=True)
+                # The backlog gauge is disjoint from the failed gauge: a permanently failed fact
+                # does not hold the backlog above zero forever, so "backlog > 0 for N minutes"
+                # stays an alertable condition.
+                async def _schema_bank_ids(schema: str = schema) -> list[str]:
+                    rows = await conn.fetch(f'SELECT bank_id FROM "{schema}".banks')
+                    return [row["bank_id"] for row in rows]
 
+                # A store-owned backend derives where a bank's memories live from the request
+                # schema, so set it as a request would; left unset, every schema's banks resolve
+                # against the default schema and drop out of these gauges.
+                token = _current_schema.set(schema)
                 try:
-                    rows = await conn.fetch(
-                        f"SELECT {bank_sel}COUNT(*) AS count "
-                        f'FROM "{schema}".memory_units '
-                        "WHERE consolidation_failed_at IS NOT NULL AND fact_type IN ('experience', 'world')"
-                        f"{bank_grp}"
-                    )
-                    for row in rows:
-                        bank = row["bank_id"] if per_bank else None
-                        key = _BacklogKey(schema, bank)
-                        failed[key] = failed.get(key, 0) + int(row["count"])
-                except Exception:
-                    logger.debug("Consolidation failed query failed for schema %s", schema, exc_info=True)
+                    try:
+                        counts = await get_memories().count_consolidation_backlog(
+                            conn=conn, schema=schema, per_bank=per_bank, bank_ids=_schema_bank_ids
+                        )
+                        for bank, count in counts.items():
+                            key = _BacklogKey(schema, bank)
+                            backlog[key] = backlog.get(key, 0) + count
+                    except Exception:
+                        logger.debug("Consolidation backlog query failed for schema %s", schema, exc_info=True)
+
+                    try:
+                        counts = await get_memories().count_consolidation_failed(
+                            conn=conn, schema=schema, per_bank=per_bank, bank_ids=_schema_bank_ids
+                        )
+                        for bank, count in counts.items():
+                            key = _BacklogKey(schema, bank)
+                            failed[key] = failed.get(key, 0) + count
+                    except Exception:
+                        logger.debug("Consolidation failed query failed for schema %s", schema, exc_info=True)
+                finally:
+                    _current_schema.reset(token)
 
         self._async_ops_counts = async_ops
         self._consolidation_backlog = backlog

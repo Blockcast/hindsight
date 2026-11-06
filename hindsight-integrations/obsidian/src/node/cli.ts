@@ -18,6 +18,12 @@ import { parseArgs } from "node:util";
 import { HindsightClient } from "../client";
 import { SyncEngine, type ReconcileSummary, type SyncConfig } from "../sync";
 import type { Transport } from "../transport";
+import {
+  OBSERVATION_SCOPES,
+  type ObservationScopes,
+  TIMESTAMP_SOURCES,
+  type TimestampSource,
+} from "../types";
 import { fetchTransport } from "./fetch-transport";
 import { FsVault } from "./fs-vault";
 import {
@@ -38,6 +44,8 @@ export interface CliOptions {
   exclude: string[];
   vaultName: string;
   prefixDocId: boolean;
+  observationScopes?: ObservationScopes;
+  timestampFrom?: TimestampSource;
   indexPath: string;
   watch: boolean;
   /** Destination the sync index is bound to (issue #3257). */
@@ -58,6 +66,13 @@ Options:
   --exclude <folder>    Skip this folder (repeatable)
   --vault-name <name>   Vault name for tags/ids (default: the vault dir name)
   --prefix-doc-id       Prefix document ids with the vault name (multi-vault banks)
+  --observation-scopes <mode>
+                        Observation consolidation: combined, shared, per_tag,
+                        or all_combinations (default: server behavior)
+  --timestamp-from <src>
+                        Date facts by the note's "created" time (default) or
+                        its "updated" time (frontmatter updated/modified, else
+                        file mtime) — use updated for living documents
   --index <file>        Sync-index JSON path (default: a per-target file under
                         ~/.hindsight/obsidian/, scoped to bank + API + vault)
   --watch               Keep running and sync changes as they happen
@@ -69,6 +84,18 @@ export class UsageError extends Error {}
 
 /** Thrown for `--help`; its message is printed to stdout (exit 0). */
 export class HelpRequested extends Error {}
+
+function parseObservationScopes(value: string | undefined): ObservationScopes | undefined {
+  if (value === undefined) return undefined;
+  if (OBSERVATION_SCOPES.includes(value as ObservationScopes)) return value as ObservationScopes;
+  throw new UsageError(`--observation-scopes must be one of: ${OBSERVATION_SCOPES.join(", ")}`);
+}
+
+function parseTimestampFrom(value: string | undefined): TimestampSource | undefined {
+  if (value === undefined) return undefined;
+  if (TIMESTAMP_SOURCES.includes(value as TimestampSource)) return value as TimestampSource;
+  throw new UsageError(`--timestamp-from must be one of: ${TIMESTAMP_SOURCES.join(", ")}`);
+}
 
 /** Parse argv into fully-resolved options (applying env fallbacks + defaults). */
 export function parseCliArgs(argv: string[]): CliOptions {
@@ -84,6 +111,8 @@ export function parseCliArgs(argv: string[]): CliOptions {
       exclude: { type: "string", multiple: true },
       "vault-name": { type: "string" },
       "prefix-doc-id": { type: "boolean", default: false },
+      "observation-scopes": { type: "string" },
+      "timestamp-from": { type: "string" },
       index: { type: "string" },
       watch: { type: "boolean", default: false },
       help: { type: "boolean", default: false },
@@ -104,6 +133,8 @@ export function parseCliArgs(argv: string[]): CliOptions {
   const vaultName = values["vault-name"] || basename(vault);
   const apiUrl = values["api-url"] || process.env.HINDSIGHT_API_URL || "";
   if (!apiUrl) throw new UsageError("--api-url is required (or set HINDSIGHT_API_URL)");
+  const observationScopes = parseObservationScopes(values["observation-scopes"]);
+  const timestampFrom = parseTimestampFrom(values["timestamp-from"]);
 
   const identity: IndexIdentity = {
     apiOrigin: canonicalApiOrigin(apiUrl),
@@ -122,6 +153,8 @@ export function parseCliArgs(argv: string[]): CliOptions {
     exclude: values.exclude ?? [],
     vaultName,
     prefixDocId: values["prefix-doc-id"] ?? false,
+    observationScopes,
+    timestampFrom,
     indexPath: values.index || defaultIndexPath(identity),
     watch: values.watch ?? false,
     identity,
@@ -135,6 +168,8 @@ export function buildConfig(opts: CliOptions): SyncConfig {
     excludeFolders: opts.exclude,
     vaultName: opts.vaultName,
     prefixDocId: opts.prefixDocId,
+    observationScopes: opts.observationScopes,
+    timestampFrom: opts.timestampFrom,
   };
 }
 

@@ -12,7 +12,7 @@ When you call **reflect**, Hindsight runs an agentic loop that autonomously sear
 Learn about disposition-driven reasoning in the [Reflect Architecture](../reflect.md) guide.
 > **💡 Prerequisites**
 >
-Make sure you've completed the [Quick Start](./quickstart) to install the client and start the server.
+Make sure you've completed the [Quick Start](./quickstart.md) to install the client and start the server.
 ## Basic Usage
 
 ### Python
@@ -36,7 +36,10 @@ hindsight memory reflect my-bank "What do you know about Alice?"
 ### Go
 
 ```go
-# Section 'reflect-basic' not found in api/reflect.go
+client.MemoryAPI.Reflect(ctx, "my-bank").
+	ReflectRequest(hindsight.ReflectRequest{
+		Query: "What should I know about Alice?",
+	}).Execute()
 ```
 
 ---
@@ -79,7 +82,12 @@ hindsight memory reflect my-bank "Summarize my week" --budget high --max-tokens 
 ### Go
 
 ```go
-# Section 'reflect-with-params' not found in api/reflect.go
+budgetMid := hindsight.MID
+client.MemoryAPI.Reflect(ctx, "my-bank").
+	ReflectRequest(hindsight.ReflectRequest{
+		Query:  "We're considering a hybrid work policy. What do you think about remote work?",
+		Budget: &budgetMid,
+	}).Execute()
 ```
 
 ### max_tokens
@@ -169,7 +177,29 @@ rm -f schema.json
 ### Go
 
 ```go
-# Section 'reflect-structured-output' not found in api/reflect.go
+// Define JSON schema for structured output
+responseSchema := map[string]interface{}{
+	"type": "object",
+	"properties": map[string]interface{}{
+		"recommendation": map[string]interface{}{"type": "string"},
+		"confidence":     map[string]interface{}{"type": "string", "enum": []string{"low", "medium", "high"}},
+		"key_factors":    map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
+		"risks":          map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
+	},
+	"required": []string{"recommendation", "confidence", "key_factors"},
+}
+
+structuredResponse, _, _ := client.MemoryAPI.Reflect(ctx, "my-bank").
+	ReflectRequest(hindsight.ReflectRequest{
+		Query:          "Should we hire Alice for the ML team lead position?",
+		ResponseSchema: responseSchema,
+	}).Execute()
+
+// Access structured output
+if out := structuredResponse.GetStructuredOutput(); out != nil {
+	fmt.Println("Recommendation:", out["recommendation"])
+	fmt.Println("Key factors:", out["key_factors"])
+}
 ```
 
 ### tags
@@ -181,7 +211,7 @@ into the reflect prompt.
 
 `tags` defaults to `null`, `tags_match` defaults to `any`, and `tag_groups`
 defaults to `null`. For non-empty tags, raw facts, observations, and mental
-models use the same matching modes as [recall tags](./recall#tags). Directives
+models use the same matching modes as [recall tags](./recall.md#tags). Directives
 have one additional rule: untagged directives are global and remain eligible
 whenever a tag scope is supplied, including with a strict or exact match.
 
@@ -196,7 +226,7 @@ whenever a tag scope is supplied, including with a strict or exact match.
 | Non-empty `tag_groups`, default top-level `tags_match` | Data matching the compound expression | Models matching the compound expression | Matching tagged directives plus untagged/global directives |
 
 A `tag_groups` leaf may set `resolve: "fuzzy"`, as in
-[recall](./recall#fuzzy-leaves); reflect resolves it once, before the agentic
+[recall](./recall.md#fuzzy-leaves); reflect resolves it once, before the agentic
 loop starts, so every tool it runs filters on the same tags.
 
 The first row is intentionally asymmetric: an unscoped reflect can search all
@@ -247,7 +277,14 @@ hindsight memory reflect my-bank "What feedback did the user give?" \
 ### Go
 
 ```go
-# Section 'reflect-with-tags' not found in api/reflect.go
+// Filter reflection to only consider memories for a specific user
+tagsMatch := "any_strict"
+client.MemoryAPI.Reflect(ctx, "my-bank").
+	ReflectRequest(hindsight.ReflectRequest{
+		Query:     "What does this user think about our product?",
+		Tags:      []string{"user:alice"},
+		TagsMatch: &tagsMatch,
+	}).Execute()
 ```
 
 #### Common scope examples
@@ -342,7 +379,22 @@ hindsight memory reflect my-bank "Tell me about Alice" --include-facts
 ### Go
 
 ```go
-# Section 'reflect-sources' not found in api/reflect.go
+// include.facts enables the based_on field in the response
+sourcesResponse, _, _ := client.MemoryAPI.Reflect(ctx, "my-bank").
+	ReflectRequest(hindsight.ReflectRequest{
+		Query: "Tell me about Alice",
+		Include: &hindsight.ReflectIncludeOptions{
+			Facts: map[string]interface{}{}, // empty map enables fact inclusion
+		},
+	}).Execute()
+
+fmt.Println("Response:", sourcesResponse.GetText())
+fmt.Println("\nBased on:")
+if basedOn := sourcesResponse.GetBasedOn(); basedOn.Memories != nil {
+	for _, fact := range basedOn.GetMemories() {
+		fmt.Printf("  - [%s] %s\n", fact.GetType(), fact.GetText())
+	}
+}
 ```
 
 #### include.tool_calls
@@ -364,11 +416,24 @@ canonical "Robert Smith"), but they can be more than half the serialized tool
 payload; setting `false` keeps the same observations and ranking with a much
 smaller context. Defaults to `true`.
 
-Both options can be defaulted for a whole bank with the
+### reflect_search_mental_models_max_tokens
+
+Token budget for the mental models (knowledge pages) that the agent's
+`search_mental_models` tool returns in full, packed in rank order. The
+best-ranked page always comes back in full, even when it alone is over the
+budget; the others that do not fit come back as a short snippet, and the model
+can open them with `read_mental_models`. Raise it for banks with long pages or
+answers spread across several pages; lower it to cut the reflect context.
+Defaults to `16000`.
+
+All three options can be defaulted for a whole bank with the
 `reflect_default_options` config key (see
-[Configuration](../configuration.md)), and set per mental model through the
-refresh trigger's fields of the same name. An explicit value on the request
-always wins.
+[Configuration](../configuration.md)); an explicit value on the request always
+wins. A mental-model refresh is configured separately and does **not** read
+`reflect_default_options` — set the trigger's fields of the same name, or the
+bank's `knowledge_page_default_trigger`, instead (see
+[Mental Models](./mental-models.md)). A refresh always gets only the
+best-ranked page in full and the others as snippets, to keep its cost down.
 
 ---
 
@@ -411,7 +476,7 @@ Reflect answers from evidence it gathered, so a run that could not gather it doe
 
 - **A retrieval tool raised.** The database, the embedder or the reranker was unavailable. One failure in a batch fails the run: an answer written around a tool that never returned is indistinguishable from one over a bank that genuinely holds nothing on the topic, and callers store it as a real answer.
 - **The model produced no answer.** The `done` call arrived empty, or the final synthesis returned nothing.
-- **The model or transport cannot drive tool calls.** Reflect is driven entirely by structured tool calls; a transport that silently drops the tool definitions fails loudly so you can switch to a tool-calling-capable model.
+- **The model cannot follow the response schema.** Every reflect turn is a call the model makes as a reply to a JSON schema — "one of these functions, with its arguments", or a named function on the forced searches; native tool calling is not used, on any provider. Without a decision model, a model with enough evidence says so with `answer_ready` and is then asked for the answer, so it is written once. A model whose replies never parse as a call fails loudly so you can switch to a stronger one.
 - **The provider kept failing.** A non-context-overflow LLM error is retried once inside the loop and then given up on.
 
 A **successful retrieval that returns nothing is not a failure**: the bank genuinely has nothing on the topic, and reflect says so in its answer.

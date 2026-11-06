@@ -6,16 +6,13 @@
  * "your hook never fired" signal, so a silently mis-wired hook is otherwise indistinguishable from
  * an agent with no memory.
  */
+import { isAbsolute } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import type { RuntimeCore } from "../core/runtime";
 import type { ToolSpec } from "../core/knowledge-tools";
 import { wireOpencode2Runtime } from "./opencode2";
 
 type PromptHook = (input: { sessionID: string; prompt?: { text?: string } }) => Promise<void>;
-type ContextHook = (input: {
-  sessionID: string;
-  system: { type: string; text: string }[];
-}) => Promise<void>;
 type ToolDraft = { add(tool: Record<string, unknown>): void };
 
 /**
@@ -31,14 +28,16 @@ function fakeContext() {
   const skills: Record<string, any>[] = [];
   let subscribeSignal: AbortSignal | undefined;
   const contextCalls: string[] = [];
+  const synthetics: Record<string, unknown>[] = [];
   const pending: unknown[] = [];
   let waiting: (() => void) | undefined;
   return {
     tools,
     skills,
     contextCalls,
+    synthetics,
+    hooks,
     prompt: () => hooks.prompt as PromptHook,
-    context: () => hooks.context as ContextHook,
     /** Deliver events to the adapter's subscription, then let its loop drain. */
     async emit(...events: unknown[]) {
       for (const e of events) {
@@ -61,6 +60,10 @@ function fakeContext() {
         context: async ({ sessionID }: { sessionID: string }) => {
           contextCalls.push(sessionID);
           return [{ type: "user", text: "hi" }];
+        },
+        synthetic: async (input: Record<string, unknown>) => {
+          synthetics.push(input);
+          return { id: "msg_synthetic", type: "synthetic" };
         },
       },
       tool: {
@@ -137,6 +140,9 @@ describe("opencode2 adapter", () => {
     expect(fake.skills).toHaveLength(1);
     expect(fake.skills[0].id).toBe("hindsight-coding-agent");
     expect(fake.skills[0].name).toBe("hindsight-coding-agent");
+    expect(fake.skills[0].path).toMatch(/skill[\\/]SKILL\.md$/);
+    // opencode v2 requires an absolute `path`; a draft without one disables the plugin (#4732).
+    expect(isAbsolute(fake.skills[0].path)).toBe(true);
     expect(fake.skills[0].description).toContain("Hindsight");
     expect(fake.skills[0].content).toContain("Hindsight Coding-Agent Memory");
     // Frontmatter is split out, not handed to the host as part of the body.
@@ -171,25 +177,41 @@ describe("opencode2 adapter", () => {
     expect(core.onPrompt).toHaveBeenCalledWith("ses_1", "why do we retry?");
   });
 
-  it("pushes this turn's injection into the system prompt, keyed by session", async () => {
+  it("adds this turn's injection as a synthetic message, never to the system prompt", async () => {
+    // The block changes between turns, so a system prompt carrying it broke the provider's prefix
+    // cache (#5914). No `context` hook means nothing of ours can reach the system prompt.
     const fake = fakeContext();
     const core = fakeCore();
     await wireOpencode2Runtime(core, fake.ctx);
-    const system = [{ type: "text", text: "you are opencode" }];
-    await fake.context()({ sessionID: "ses_1", system });
+    await fake.prompt()({ sessionID: "ses_1", prompt: { text: "why do we retry?" } });
     expect(core.getInjection).toHaveBeenCalledWith("ses_1");
-    expect(system).toEqual([
-      { type: "text", text: "you are opencode" },
-      { type: "text", text: "<hindsight_memories>remember</hindsight_memories>" },
+    expect(fake.synthetics).toEqual([
+      {
+        sessionID: "ses_1",
+        text: "<hindsight_memories>remember</hindsight_memories>",
+        description: "Hindsight memory",
+        resume: false,
+      },
     ]);
+    expect(fake.hooks.context).toBeUndefined();
   });
 
-  it("leaves the system prompt untouched when there is nothing to inject", async () => {
+  it("adds no message when there is nothing to inject", async () => {
     const fake = fakeContext();
     await wireOpencode2Runtime(fakeCore({ getInjection: () => undefined }), fake.ctx);
-    const system: { type: string; text: string }[] = [];
-    await fake.context()({ sessionID: "ses_1", system });
-    expect(system).toEqual([]);
+    await fake.prompt()({ sessionID: "ses_1", prompt: { text: "hi" } });
+    expect(fake.synthetics).toEqual([]);
+  });
+
+  it("keeps the prompt going when the host rejects the synthetic message", async () => {
+    const fake = fakeContext();
+    (fake.ctx as unknown as { session: { synthetic: unknown } }).session.synthetic = async () => {
+      throw new Error("no synthetic");
+    };
+    await wireOpencode2Runtime(fakeCore(), fake.ctx);
+    await expect(
+      fake.prompt()({ sessionID: "ses_1", prompt: { text: "hi" } })
+    ).resolves.toBeUndefined();
   });
 
   it("writes back on BOTH idle signals and ignores everything else", async () => {

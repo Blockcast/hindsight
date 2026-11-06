@@ -1,8 +1,12 @@
 import { describe, expect, it } from "vitest";
 import type { TransportTurn } from "./chat";
 import {
+  MAX_CURSOR_PATHS,
   PENDING_MAX_AGE_MS,
   PENDING_MAX_BYTES,
+  advancePaths,
+  advanceSegments,
+  bankTurns,
   fingerprintTurns,
   memoryCursorStore,
   planRetain,
@@ -96,6 +100,90 @@ describe("planRetain", () => {
     });
   });
 
+  it("appends when the session comes back to a bank it already wrote to (#5812)", () => {
+    // The old bank holds the session's earlier stretch; replacing would clobber it, and the turns
+    // written to the other bank in between must not be sent here at all.
+    const all = turns(5);
+    const cursor = {
+      ...cursorFor(all, 3),
+      bank: "other-repo",
+      segments: [
+        { bank: BANK, from: 0 },
+        { bank: "other-repo", from: 2 },
+      ],
+    };
+    expect(planRetain(all, cursor, SUPPORTED)).toEqual({ mode: "append", fromTurn: 3 });
+  });
+
+  it("appends a continuation FILE whole instead of replacing the document with it", () => {
+    // Codex writes a later segment of the same task into a new rollout under the same session id
+    // (#4493). Its turns are not a continuation of the prefix we wrote — they are the turns that
+    // come AFTER it — so a replace would drop everything the earlier file contributed.
+    const fileA = turns(4);
+    const cursor = { ...cursorFor(fileA, 4), paths: ["/rollouts/a.jsonl"] };
+    const fileB = turns(2, 100);
+    expect(planRetain(fileB, cursor, { ...SUPPORTED, path: "/rollouts/b.jsonl" })).toEqual({
+      mode: "append",
+      fromTurn: 0,
+    });
+    // Equal-or-larger continuation with a different prefix: same answer, it is still a segment.
+    expect(planRetain(turns(6, 100), cursor, { ...SUPPORTED, path: "/rollouts/b.jsonl" })).toEqual({
+      mode: "append",
+      fromTurn: 0,
+    });
+  });
+
+  it("does not re-append a continuation file that was already written", () => {
+    const fileB = turns(2, 100);
+    const cursor = { ...cursorFor(fileB, 2), paths: ["/rollouts/a.jsonl", "/rollouts/b.jsonl"] };
+    expect(planRetain(fileB, cursor, { ...SUPPORTED, path: "/rollouts/b.jsonl" })).toEqual({
+      mode: "skip",
+    });
+    // And the next turns in that same file append from where it left off, not from zero.
+    expect(planRetain(turns(4, 100), cursor, { ...SUPPORTED, path: "/rollouts/b.jsonl" })).toEqual({
+      mode: "append",
+      fromTurn: 2,
+    });
+  });
+
+  it("does not re-append an earlier file whose hook arrives after the session moved on", () => {
+    // A -> B retained, then a late Stop for A (a delayed hook, or a second process still writing the
+    // earlier rollout). Against the latest path alone every alternation reads as a brand-new segment
+    // and appends the whole file again, without bound. A is a file we already wrote, so it is not a
+    // segment: this replaces, exactly as it did before #4493.
+    const fileA = turns(4);
+    const cursor = {
+      ...cursorFor(turns(2, 100), 2),
+      paths: ["/rollouts/a.jsonl", "/rollouts/b.jsonl"],
+    };
+    expect(planRetain(fileA, cursor, { ...SUPPORTED, path: "/rollouts/a.jsonl" })).toEqual({
+      mode: "replace",
+    });
+  });
+
+  it("does not duplicate a resumed transcript that copies the earlier turns", () => {
+    // A new file that REPEATS the retained prefix is an ordinary extension, not a new segment.
+    const fileA = turns(4);
+    const cursor = { ...cursorFor(fileA, 4), paths: ["/rollouts/a.jsonl"] };
+    expect(planRetain(turns(6), cursor, { ...SUPPORTED, path: "/rollouts/b.jsonl" })).toEqual({
+      mode: "append",
+      fromTurn: 4,
+    });
+  });
+
+  it("remembers the files already written, newest last and bounded", () => {
+    expect(advancePaths(["/a"], "/b")).toEqual(["/a", "/b"]);
+    // Re-writing a file we already hold moves it to the end rather than listing it twice, since it
+    // is the one the cursor's turns/fingerprint now describe.
+    expect(advancePaths(["/a", "/b"], "/a")).toEqual(["/b", "/a"]);
+    // No file (the persistent-plugin runtime) leaves the list alone.
+    expect(advancePaths(["/a"], undefined)).toEqual(["/a"]);
+    // A session that keeps moving cannot grow the cursor file without bound.
+    const many = Array.from({ length: MAX_CURSOR_PATHS + 5 }, (_, i) => `/f${i}`);
+    const capped = many.reduce<string[] | undefined>((acc, p) => advancePaths(acc, p), undefined);
+    expect(capped).toEqual(many.slice(-MAX_CURSOR_PATHS));
+  });
+
   it("skips when nothing was added since the last write", () => {
     const all = turns(4);
     expect(planRetain(all, cursorFor(all, 4), SUPPORTED)).toEqual({ mode: "skip" });
@@ -128,5 +216,22 @@ describe("memoryCursorStore", () => {
     store.write("b", { turns: 7, fingerprint: "g", bank: "b1" });
     expect(store.read("a")).toEqual({ turns: 2, fingerprint: "f", bank: "b1" });
     expect(store.read("b")).toEqual({ turns: 7, fingerprint: "g", bank: "b1" });
+  });
+});
+
+describe("advanceSegments / bankTurns", () => {
+  it("opens a stretch where the last write-back stopped, and gives each bank only its stretches", () => {
+    const all = turns(6);
+    const a = advanceSegments({ ...cursorFor(all, 2), bank: "a" }, "b");
+    expect(a).toEqual([
+      { bank: "a", from: 0 },
+      { bank: "b", from: 2 },
+    ]);
+    const back = advanceSegments({ ...cursorFor(all, 4), bank: "b", segments: a }, "a");
+    expect(bankTurns(all, back, "a")).toEqual([turn(0), turn(1), turn(4), turn(5)]);
+    expect(bankTurns(all, back, "b")).toEqual([turn(2), turn(3)]);
+    // No move, no segments: the whole transcript is the bank's.
+    expect(advanceSegments({ ...cursorFor(all, 2), bank: "a" }, "a")).toBeUndefined();
+    expect(bankTurns(all, undefined, "a")).toEqual(all);
   });
 });

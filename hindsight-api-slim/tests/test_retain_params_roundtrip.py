@@ -13,7 +13,7 @@ source of truth for what gets replayed.
 """
 
 import re
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +57,18 @@ def test_absent_fields_are_not_invented():
 def test_event_date_is_normalised_for_json():
     p = _params(content="x", event_date=datetime(2026, 1, 2, 3, 4, 5))
     assert p["event_date"] == "2026-01-02T03:04:05"
+
+
+def test_unknown_event_date_survives_the_round_trip():
+    """timestamp "unset" arrives as event_date=None. Dropping it made the replay
+    look like "no date supplied", which _build_contents dates with utcnow() (#5473)."""
+    item = {"content": "An undated note", "event_date": None}
+    p = _params(**item)
+    assert "event_date" in p and p["event_date"] is None
+    replayed = orch._build_contents([{"content": item["content"], **p}], None, UTC)[0]
+    assert replayed.event_date is None
+    # An omitted date still means "now", and stays omitted.
+    assert "event_date" not in _params(content="x")
 
 
 def test_a_new_field_round_trips_without_being_listed():
@@ -121,6 +133,9 @@ class _StubEngine:
         self.submitted: list[tuple[dict[str, Any], str | None]] = []
 
     async def _authenticate_tenant(self, request_context) -> None:
+        return None
+
+    async def _require_writable(self, bank_id, request_context, **kwargs) -> None:
         return None
 
     async def get_document(self, document_id, bank_id, request_context=None):

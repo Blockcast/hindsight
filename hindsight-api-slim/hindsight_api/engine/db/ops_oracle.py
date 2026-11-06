@@ -8,6 +8,7 @@ columns can't appear in GROUP BY).
 import json
 import uuid as uuid_mod
 from datetime import UTC, datetime
+from typing import cast
 
 from .base import DatabaseConnection
 from .ops import (
@@ -17,16 +18,59 @@ from .ops import (
     TagListingParts,
     UpdatedWindow,
     bank_serialization_sql,
-    document_serialization_sql,
+    key_serialization_sql,
     memory_unit_columns,
 )
 from .result import DictResultRow as ResultRow
+from .result import ResultRow as DatabaseResultRow
 
 ORACLE_IN_LIST_LIMIT = 1000
 
 
 class OracleOps(DataAccessOps):
     """Oracle-specific data access operations."""
+
+    async def fetch_reconcilable_batch_parents(self, conn: DatabaseConnection, table: str) -> list[DatabaseResultRow]:
+        # Same anti-join as PostgreSQL (see PostgreSQLOps for why it is an
+        # anti-join and why over-inclusive is the safe direction), with three
+        # Oracle-only details:
+        #   * operation_id is stored as RAW(16), so the CTE renders it back to
+        #     canonical dashed UUID text to compare against what the children
+        #     wrote into result_metadata. HEXTORAW on the child side would raise
+        #     on any value that is not 32 hex digits.
+        #   * `$.type()` keeps JSON_VALUE on an object root: a child whose
+        #     result_metadata is an array or scalar yields no match instead of an
+        #     error.
+        #   * COLLATE BINARY pins the comparison case-sensitive. A session with
+        #     NLS_COMP=LINGUISTIC and a case-insensitive NLS_SORT would otherwise
+        #     match an upper-cased UUID that the locked recheck's exact JSON
+        #     comparison rejects, which would strand the parent.
+        return await conn.fetch(
+            f"""
+            WITH pending_parents AS (
+                SELECT operation_id, bank_id, LOWER(RAWTOHEX(operation_id)) AS uuid_hex
+                FROM {table}
+                WHERE operation_type = 'batch_retain'
+                  AND status = 'pending'
+                  AND task_payload IS NULL
+            )
+            SELECT parent.operation_id, parent.bank_id
+            FROM pending_parents parent
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM {table} child
+                WHERE child.bank_id = parent.bank_id
+                  AND child.status NOT IN ('completed', 'failed')
+                  AND JSON_VALUE(child.result_metadata, '$.type()') = 'object'
+                  AND JSON_VALUE(child.result_metadata, '$.parent_operation_id') COLLATE BINARY =
+                      SUBSTR(parent.uuid_hex, 1, 8) || '-' ||
+                      SUBSTR(parent.uuid_hex, 9, 4) || '-' ||
+                      SUBSTR(parent.uuid_hex, 13, 4) || '-' ||
+                      SUBSTR(parent.uuid_hex, 17, 4) || '-' ||
+                      SUBSTR(parent.uuid_hex, 21, 12)
+            )
+            """
+        )
 
     async def bulk_upsert_chunks(
         self,
@@ -263,7 +307,8 @@ class OracleOps(DataAccessOps):
                 orig_name,
             )
             if row:
-                results.append(row)
+                # `fetchrow` hands back the base row type; these tables are read as dicts.
+                results.append(cast(ResultRow, row))
         return results
 
     async def bulk_reassert_entities(
@@ -392,6 +437,7 @@ class OracleOps(DataAccessOps):
         queue_table: str,
         entities_table: str,
         ue_table: str,
+        units_table: str,
         bank_id: str,
         unit_ids: list,
     ) -> int:
@@ -402,6 +448,18 @@ class OracleOps(DataAccessOps):
         # express the whole thing as one statement the way the PG side does —
         # MERGE has no RETURNING to hang the second write off — so it stays two
         # executemany calls over this one result.
+        #
+        # The memories are locked first, so two transactions retiring one memory
+        # cannot both debit its postings (#6229, see the PG side for why the
+        # memory row is the lock that matters). One row per statement, in
+        # ascending id order: an Oracle SELECT ... FOR UPDATE locks every row it
+        # matches when the cursor opens, and ORDER BY does not govern that
+        # order, so a multi-row lock could take overlapping sets in different
+        # orders and cycle. Same per-row loop as bulk_reassert_entities.
+        # ponytail: one round trip per memory; a PL/SQL block if bulk deletes on
+        # Oracle get slow.
+        for unit_id in sorted(str(u) for u in unit_ids):
+            await conn.fetchrow(f"SELECT id FROM {units_table} WHERE id = $1 FOR UPDATE", unit_id)
         rows = await conn.fetch(
             f"""
             SELECT entity_id, COUNT(*) AS n
@@ -587,7 +645,7 @@ class OracleOps(DataAccessOps):
                 uid,
             )
             if row:
-                rows.append(row)
+                rows.append(cast(ResultRow, row))
         return rows
 
     async def fetch_temporal_neighbors(
@@ -648,7 +706,7 @@ class OracleOps(DataAccessOps):
                 half_limit,
                 uid,
             )
-            rows.extend(unit_rows)
+            rows.extend(cast("list[ResultRow]", unit_rows))
         return rows
 
     def build_entity_expansion_cte(
@@ -1321,7 +1379,7 @@ class OracleOps(DataAccessOps):
         if claimed_ids:
             return await conn.fetch(
                 f"""
-                SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id
+                SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id, o.created_at
                 FROM {table} o
                 WHERE o.status = 'pending'
                   AND o.task_payload IS NOT NULL
@@ -1338,7 +1396,7 @@ class OracleOps(DataAccessOps):
             )
         return await conn.fetch(
             f"""
-            SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id
+            SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id, o.created_at
             FROM {table} o
             WHERE o.status = 'pending'
               AND o.task_payload IS NOT NULL
@@ -1379,7 +1437,7 @@ class OracleOps(DataAccessOps):
         extra = " AND ".join(conditions)
         return await conn.fetch(
             f"""
-            SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id
+            SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id, o.created_at
             FROM {table} o
             WHERE o.status = 'pending'
               AND o.task_payload IS NOT NULL
@@ -1421,7 +1479,7 @@ class OracleOps(DataAccessOps):
         extra_clause = (" AND " + " AND ".join(conditions)) if conditions else ""
         return await conn.fetch(
             f"""
-            SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id
+            SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id, o.created_at
             FROM {table} o
             WHERE o.status = 'pending'
               AND o.task_payload IS NOT NULL
@@ -1439,14 +1497,14 @@ class OracleOps(DataAccessOps):
         """Claim rows of one operation type against that type's reserved pool."""
         return await conn.fetch(
             f"""
-            SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id
+            SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id, o.created_at
             FROM {table} o
             WHERE o.status = 'pending'
               AND o.task_payload IS NOT NULL
               AND o.operation_type = $1
               AND (o.next_retry_at IS NULL OR o.next_retry_at <= NOW())
               AND {bank_serialization_sql(table, "o")}
-              AND {document_serialization_sql(table, "o")}
+              AND {key_serialization_sql(table, "o")}
             ORDER BY o.created_at
             LIMIT $2
             FOR UPDATE SKIP LOCKED
@@ -1477,7 +1535,7 @@ class OracleOps(DataAccessOps):
         if claimed_ids:
             return await conn.fetch(
                 f"""
-                SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id
+                SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id, o.created_at
                 FROM {table} o
                 WHERE o.status = 'pending'
                   AND o.task_payload IS NOT NULL
@@ -1485,7 +1543,7 @@ class OracleOps(DataAccessOps):
                   AND (o.next_retry_at IS NULL OR o.next_retry_at <= NOW())
                   AND o.operation_id != ALL($1::uuid[])
                   AND {bank_serialization_sql(table, "o")}
-                  AND {document_serialization_sql(table, "o")}
+                  AND {key_serialization_sql(table, "o")}
                 ORDER BY o.created_at
                 LIMIT $2
                 FOR UPDATE SKIP LOCKED
@@ -1495,14 +1553,14 @@ class OracleOps(DataAccessOps):
             )
         return await conn.fetch(
             f"""
-            SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id
+            SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id, o.created_at
             FROM {table} o
             WHERE o.status = 'pending'
               AND o.task_payload IS NOT NULL
               AND o.operation_type != 'consolidation'
               AND (o.next_retry_at IS NULL OR o.next_retry_at <= NOW())
               AND {bank_serialization_sql(table, "o")}
-              AND {document_serialization_sql(table, "o")}
+              AND {key_serialization_sql(table, "o")}
             ORDER BY o.created_at
             LIMIT $1
             FOR UPDATE SKIP LOCKED

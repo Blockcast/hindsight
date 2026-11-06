@@ -10,6 +10,36 @@ For the source code, see [`hindsight-integrations/paperclip`](https://github.com
 
 ← [Back to main changelog](../index.md)
 
+## [0.4.2](https://github.com/vectorize-io/hindsight/tree/integrations/paperclip/v0.4.2)
+
+[Commits in this release →](https://github.com/vectorize-io/hindsight/commits/integrations/paperclip/v0.4.2)
+
+**Improvements**
+
+- Paperclip integration requests now include an integration-specific User-Agent for clearer identification and diagnostics.<span style={{color: "var(--ifm-color-emphasis-500)", margin: "0 0.3em"}}>·</span><a href="https://github.com/nicoloboschi" target="_blank" rel="noopener noreferrer" style={{color: "var(--ifm-color-primary)", textDecoration: "none", display: "inline-flex", alignItems: "center", gap: "4px", verticalAlign: "middle"}}>@nicoloboschi</a><span style={{color: "var(--ifm-color-emphasis-500)", margin: "0 0.3em"}}>·</span><a href="https://github.com/vectorize-io/hindsight/commit/5d4f5cfcd" target="_blank" rel="noopener noreferrer" style={{fontFamily: "var(--ifm-font-family-monospace, monospace)", fontSize: "0.85em", color: "var(--ifm-color-emphasis-600)"}}>5d4f5cfcd</a>
+
+## [0.4.1](https://github.com/vectorize-io/hindsight/tree/integrations/paperclip/v0.4.1)
+
+[Commits in this release →](https://github.com/vectorize-io/hindsight/commits/integrations/paperclip/v0.4.1)
+
+**Bug Fixes**
+
+- The enabledAgentIds allowlist is now enforced on the hindsight_recall and hindsight_retain tools, not just the automatic recall and retention. An agent left out of the list can no longer reach its memory bank by calling the tools directly.<span style={{color: "var(--ifm-color-emphasis-500)", margin: "0 0.3em"}}>·</span><a href="https://github.com/benfrank241" target="_blank" rel="noopener noreferrer" style={{color: "var(--ifm-color-primary)", textDecoration: "none", display: "inline-flex", alignItems: "center", gap: "4px", verticalAlign: "middle"}}>@benfrank241</a><span style={{color: "var(--ifm-color-emphasis-500)", margin: "0 0.3em"}}>·</span><a href="https://github.com/vectorize-io/hindsight/commit/d4cabadb8" target="_blank" rel="noopener noreferrer" style={{fontFamily: "var(--ifm-font-family-monospace, monospace)", fontSize: "0.85em", color: "var(--ifm-color-emphasis-600)"}}>d4cabadb8</a>
+- The autoRetain setting is now labelled for what it does. It gates retention of issue comments; it was previously described as retaining agent run output when a run completes, which the plugin does not do.<span style={{color: "var(--ifm-color-emphasis-500)", margin: "0 0.3em"}}>·</span><a href="https://github.com/benfrank241" target="_blank" rel="noopener noreferrer" style={{color: "var(--ifm-color-primary)", textDecoration: "none", display: "inline-flex", alignItems: "center", gap: "4px", verticalAlign: "middle"}}>@benfrank241</a><span style={{color: "var(--ifm-color-emphasis-500)", margin: "0 0.3em"}}>·</span><a href="https://github.com/vectorize-io/hindsight/commit/d4cabadb8" target="_blank" rel="noopener noreferrer" style={{fontFamily: "var(--ifm-font-family-monospace, monospace)", fontSize: "0.85em", color: "var(--ifm-color-emphasis-600)"}}>d4cabadb8</a>
+
+## [0.4.0](https://github.com/vectorize-io/hindsight/tree/integrations/paperclip/v0.4.0)
+
+[Commits in this release →](https://github.com/vectorize-io/hindsight/commits/integrations/paperclip/v0.4.0)
+
+**Improvements**
+
+- The Hindsight request timeout can now be configured for the Paperclip integration.<span style={{color: "var(--ifm-color-emphasis-500)", margin: "0 0.3em"}}>·</span><a href="https://github.com/sdfantini-cs" target="_blank" rel="noopener noreferrer" style={{color: "var(--ifm-color-primary)", textDecoration: "none", display: "inline-flex", alignItems: "center", gap: "4px", verticalAlign: "middle"}}>@sdfantini-cs</a><span style={{color: "var(--ifm-color-emphasis-500)", margin: "0 0.3em"}}>·</span><a href="https://github.com/vectorize-io/hindsight/commit/82dcec054" target="_blank" rel="noopener noreferrer" style={{fontFamily: "var(--ifm-font-family-monospace, monospace)", fontSize: "0.85em", color: "var(--ifm-color-emphasis-600)"}}>82dcec054</a>
+
+**Bug Fixes**
+
+- Paperclip now resolves the Hindsight Cloud API key correctly from configured secret references.<span style={{color: "var(--ifm-color-emphasis-500)", margin: "0 0.3em"}}>·</span><a href="https://github.com/qveys" target="_blank" rel="noopener noreferrer" style={{color: "var(--ifm-color-primary)", textDecoration: "none", display: "inline-flex", alignItems: "center", gap: "4px", verticalAlign: "middle"}}>@qveys</a><span style={{color: "var(--ifm-color-emphasis-500)", margin: "0 0.3em"}}>·</span><a href="https://github.com/vectorize-io/hindsight/commit/ac1962e6f" target="_blank" rel="noopener noreferrer" style={{fontFamily: "var(--ifm-font-family-monospace, monospace)", fontSize: "0.85em", color: "var(--ifm-color-emphasis-600)"}}>ac1962e6f</a>
+- The hindsight_recall tool now uses the query provided by the agent.<span style={{color: "var(--ifm-color-emphasis-500)", margin: "0 0.3em"}}>·</span><a href="https://github.com/sdfantini-cs" target="_blank" rel="noopener noreferrer" style={{color: "var(--ifm-color-primary)", textDecoration: "none", display: "inline-flex", alignItems: "center", gap: "4px", verticalAlign: "middle"}}>@sdfantini-cs</a><span style={{color: "var(--ifm-color-emphasis-500)", margin: "0 0.3em"}}>·</span><a href="https://github.com/vectorize-io/hindsight/commit/82dcec054" target="_blank" rel="noopener noreferrer" style={{fontFamily: "var(--ifm-font-family-monospace, monospace)", fontSize: "0.85em", color: "var(--ifm-color-emphasis-600)"}}>82dcec054</a>
+
 ## [0.3.0](https://github.com/vectorize-io/hindsight/tree/integrations/paperclip/v0.3.0)
 
 **Features**

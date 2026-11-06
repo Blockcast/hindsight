@@ -4,8 +4,14 @@ import { useState, useEffect, useRef, useMemo, type ReactNode } from "react";
 import { useTranslations } from "next-intl";
 import { useBank } from "@/lib/bank-context";
 import { useFeatures } from "@/lib/features-context";
-import { client } from "@/lib/api";
+import { client, type BankAliasEntry } from "@/lib/api";
 import { PreviewPromptButton } from "@/components/prompt-preview-dialog";
+import { TagFilterInput } from "@/components/tag-filter-input";
+import type {
+  ConsolidationStrategiesPreview,
+  StrategyRulePreview,
+  StrategyScopePreview,
+} from "@/lib/api";
 import {
   MentalModelTriggerFields,
   TriggerSummary,
@@ -39,6 +45,19 @@ import {
   observationsSlice,
   reconcileObservationsEdits,
   type ObservationsEdits,
+  type ConsolidationSettings,
+  type ConsolidationStrategy,
+  type ObservationScopes,
+  type ObservationScopesMode,
+  type ScopePattern,
+  type StrategyTagsMatch,
+  OBSERVATION_SCOPES_MODES,
+  compactStrategy,
+  scopesLabel,
+  scopesToText,
+  strategyOverridesSomething,
+  suggestedTags,
+  textToScopes,
 } from "@/lib/observations-config";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -64,7 +83,8 @@ import {
 import { Switch } from "@/components/ui/switch";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
-import { AlertCircle, Plus, Trash2, ChevronDown, ChevronRight } from "lucide-react";
+import { AlertCircle, Plus, Trash2, ChevronDown, ChevronLeft, ChevronRight } from "lucide-react";
+import { IdChip } from "@/components/ui/facet-chip";
 import { Spinner } from "@/components/ui/spinner";
 import { Card } from "@/components/ui/card";
 
@@ -94,6 +114,10 @@ type StrategiesEdits = {
 
 type MCPEdits = {
   mcp_enabled_tools: string[] | null;
+  // The IANA zone a time with no UTC offset is read in. null = inherit the
+  // server default; read from the overrides so saving the tool list never
+  // pins the bank to whatever zone the server happens to resolve today.
+  default_timezone: string | null;
 };
 
 type GeminiSafetySetting = {
@@ -124,11 +148,12 @@ type MentalModelsEdits = {
 };
 
 // The bank's default reflect options (reflect_default_options). Stored as one
-// object, edited as two fields; null means "not set", so reflect falls back to
+// object, edited as three fields; null means "not set", so reflect falls back to
 // the shipped default.
 type ReflectOptionsEdits = {
   reflect_search_observations_max_tokens: number | null;
   reflect_search_observations_include_entities: boolean | null;
+  reflect_search_mental_models_max_tokens: number | null;
 };
 
 // The server's built-in knowledge-page trigger (MemoryEngine.KNOWLEDGE_PAGE_DEFAULT_TRIGGER).
@@ -158,6 +183,7 @@ type RecallEdits = {
   enable_temporal_retrieval: boolean | null;
   enable_graph_retrieval: boolean | null;
   enable_reranking: boolean | null;
+  recall_prefer_observations: boolean | null;
 };
 
 // ─── Gemini safety settings catalogue ────────────────────────────────────────
@@ -341,9 +367,10 @@ function strategiesSlice(config: Record<string, any>): StrategiesEdits {
   };
 }
 
-function mcpSlice(config: Record<string, any>): MCPEdits {
+function mcpSlice(config: Record<string, any>, overrides: Record<string, any>): MCPEdits {
   return {
     mcp_enabled_tools: config.mcp_enabled_tools ?? null,
+    default_timezone: overrides.default_timezone ?? null,
   };
 }
 
@@ -387,6 +414,11 @@ function ReflectOptionsSummary({ options }: { options: ReflectOptionsEdits }) {
     options.reflect_search_observations_include_entities === false
       ? t("reflectObservationsEntitiesOff")
       : t("reflectObservationsEntitiesOn"),
+    options.reflect_search_mental_models_max_tokens != null
+      ? t("reflectMentalModelsMaxTokensChip", {
+          tokens: options.reflect_search_mental_models_max_tokens,
+        })
+      : t("reflectMentalModelsMaxTokensChipDefault"),
   ];
   return (
     <div className="flex flex-wrap gap-1.5">
@@ -408,6 +440,7 @@ function reflectOptionsSlice(overrides: Record<string, any>): ReflectOptionsEdit
     reflect_search_observations_max_tokens: opts.reflect_search_observations_max_tokens ?? null,
     reflect_search_observations_include_entities:
       opts.reflect_search_observations_include_entities ?? null,
+    reflect_search_mental_models_max_tokens: opts.reflect_search_mental_models_max_tokens ?? null,
   };
 }
 
@@ -417,6 +450,7 @@ function recallSlice(overrides: Record<string, any>): RecallEdits {
     enable_temporal_retrieval: overrides.enable_temporal_retrieval ?? null,
     enable_graph_retrieval: overrides.enable_graph_retrieval ?? null,
     enable_reranking: overrides.enable_reranking ?? null,
+    recall_prefer_observations: overrides.recall_prefer_observations ?? null,
   };
 }
 
@@ -459,7 +493,7 @@ export function BankConfigView() {
   );
   const [reflectOptionsSaving, setReflectOptionsSaving] = useState(false);
   const [reflectOptionsError, setReflectOptionsError] = useState<string | null>(null);
-  const [mcpEdits, setMcpEdits] = useState<MCPEdits>(mcpSlice({}));
+  const [mcpEdits, setMcpEdits] = useState<MCPEdits>(mcpSlice({}, {}));
   const [geminiEdits, setGeminiEdits] = useState<GeminiEdits>(geminiSlice({}));
   const [auditEdits, setAuditEdits] = useState<AuditEdits>(auditSlice({}));
   const [docStorageEdits, setDocStorageEdits] = useState<DocStorageEdits>(docStorageSlice({}));
@@ -512,8 +546,8 @@ export function BankConfigView() {
     [reflectEdits, baseProfile]
   );
   const mcpDirty = useMemo(
-    () => JSON.stringify(mcpEdits) !== JSON.stringify(mcpSlice(baseConfig)),
-    [mcpEdits, baseConfig]
+    () => JSON.stringify(mcpEdits) !== JSON.stringify(mcpSlice(baseConfig, baseOverrides)),
+    [mcpEdits, baseConfig, baseOverrides]
   );
   const geminiDirty = useMemo(
     () => JSON.stringify(geminiEdits) !== JSON.stringify(geminiSlice(baseConfig)),
@@ -562,7 +596,7 @@ export function BankConfigView() {
       setObservationsEdits(observationsSlice(cfg, overrides));
       setReflectEdits(prof);
       setReflectOptionsForm(reflectOptionsSlice(cfg));
-      setMcpEdits(mcpSlice(cfg));
+      setMcpEdits(mcpSlice(cfg, overrides));
       setGeminiEdits(geminiSlice(cfg));
       setAuditEdits(auditSlice(overrides));
       setDocStorageEdits(docStorageSlice(overrides));
@@ -665,8 +699,20 @@ export function BankConfigView() {
     setMcpSaving(true);
     setMcpError(null);
     try {
-      await client.updateBankConfig(bankId, mcpEdits);
-      setBaseConfig((prev) => ({ ...prev, ...mcpEdits }));
+      const response = await client.updateBankConfig(bankId, mcpEdits);
+      // The resolved zone comes back from the server: a cleared override falls
+      // back to a server default this page does not otherwise know.
+      setBaseConfig((prev) => ({
+        ...prev,
+        mcp_enabled_tools: mcpEdits.mcp_enabled_tools,
+        default_timezone: response.config?.default_timezone,
+      }));
+      setBaseOverrides((prev) => {
+        const next = { ...prev };
+        if (mcpEdits.default_timezone === null) delete next.default_timezone;
+        else next.default_timezone = mcpEdits.default_timezone;
+        return next;
+      });
     } catch (err: any) {
       setMcpError(err.message || t("mcpFailedToSave"));
     } finally {
@@ -726,6 +772,7 @@ export function BankConfigView() {
           "enable_temporal_retrieval",
           "enable_graph_retrieval",
           "enable_reranking",
+          "recall_prefer_observations",
         ] as const) {
           if (recallEdits[key] === null) delete next[key];
           else next[key] = recallEdits[key];
@@ -929,24 +976,6 @@ export function BankConfigView() {
               </SelectContent>
             </Select>
           </FieldRow>
-          <TextareaRow
-            label={t("missionLabel")}
-            description={t("observationsMissionDescription")}
-            value={observationsEdits.observations_mission ?? ""}
-            onChange={(v) =>
-              setObservationsEdits((prev) => ({ ...prev, observations_mission: v || null }))
-            }
-            placeholder={t("observationsMissionPlaceholder")}
-            rows={3}
-            action={
-              <PreviewPromptButton
-                operation="consolidation"
-                onSaved={(field, value) =>
-                  setObservationsEdits((prev) => ({ ...prev, [field]: value }) as ObservationsEdits)
-                }
-              />
-            }
-          />
           <FieldRow label={t("llmBatchSizeLabel")} description={t("llmBatchSizeDescription")}>
             <Input
               type="number"
@@ -964,61 +993,28 @@ export function BankConfigView() {
               placeholder={t("serverDefault")}
             />
           </FieldRow>
-          <FieldRow
-            label={t("sourceFactsMaxTokensLabel")}
-            description={t("sourceFactsMaxTokensDescription")}
-          >
-            <Input
-              type="number"
-              min={-1}
-              value={observationsEdits.consolidation_source_facts_max_tokens ?? ""}
-              onChange={(e) =>
-                setObservationsEdits((prev) => ({
-                  ...prev,
-                  consolidation_source_facts_max_tokens: e.target.value
-                    ? parseInt(e.target.value, 10)
-                    : null,
-                }))
-              }
-              placeholder={t("serverDefault")}
-            />
-          </FieldRow>
-          <FieldRow
-            label={t("sourceFactsMaxTokensPerObservationLabel")}
-            description={t("sourceFactsMaxTokensPerObservationDescription")}
-          >
-            <Input
-              type="number"
-              min={-1}
-              value={observationsEdits.consolidation_source_facts_max_tokens_per_observation ?? ""}
-              onChange={(e) =>
-                setObservationsEdits((prev) => ({
-                  ...prev,
-                  consolidation_source_facts_max_tokens_per_observation: e.target.value
-                    ? parseInt(e.target.value, 10)
-                    : null,
-                }))
-              }
-              placeholder={t("serverDefault")}
-            />
-          </FieldRow>
-          <FieldRow
-            label={t("maxObservationsPerScopeLabel")}
-            description={t("maxObservationsPerScopeDescription")}
-          >
-            <Input
-              type="number"
-              min={-1}
-              value={observationsEdits.max_observations_per_scope ?? ""}
-              onChange={(e) =>
-                setObservationsEdits((prev) => ({
-                  ...prev,
-                  max_observations_per_scope: e.target.value ? parseInt(e.target.value, 10) : null,
-                }))
-              }
-              placeholder={t("serverDefault")}
-            />
-          </FieldRow>
+          <DefaultObservationScopesRow
+            value={observationsEdits.default_observation_scopes}
+            onChange={(next) =>
+              setObservationsEdits((prev) => ({ ...prev, default_observation_scopes: next }))
+            }
+          />
+          <ConsolidationStrategiesPanel
+            defaults={observationsEdits}
+            onDefaultChange={(patch) => setObservationsEdits((prev) => ({ ...prev, ...patch }))}
+            strategies={observationsEdits.consolidation_strategies}
+            onStrategiesChange={(next) =>
+              setObservationsEdits((prev) => ({ ...prev, consolidation_strategies: next }))
+            }
+            defaultAction={
+              <PreviewPromptButton
+                operation="consolidation"
+                onSaved={(field, value) =>
+                  setObservationsEdits((prev) => ({ ...prev, [field]: value }) as ObservationsEdits)
+                }
+              />
+            }
+          />
         </ConfigSection>
 
         {/* Reflect Section */}
@@ -1122,6 +1118,28 @@ export function BankConfigView() {
                       <SelectItem value="false">{t("reflectObservationsEntitiesOff")}</SelectItem>
                     </SelectContent>
                   </Select>
+                </div>
+                <div className="space-y-2">
+                  <div>
+                    <p className="text-sm font-medium">{t("reflectMentalModelsMaxTokensLabel")}</p>
+                    <p className="text-xs text-muted-foreground mt-0.5">
+                      {t("reflectMentalModelsMaxTokensDescription")}
+                    </p>
+                  </div>
+                  <Input
+                    type="number"
+                    min={1}
+                    value={reflectOptionsForm.reflect_search_mental_models_max_tokens ?? ""}
+                    onChange={(e) =>
+                      setReflectOptionsForm((prev) => ({
+                        ...prev,
+                        reflect_search_mental_models_max_tokens: e.target.value
+                          ? parseInt(e.target.value, 10)
+                          : null,
+                      }))
+                    }
+                    placeholder={t("serverDefault")}
+                  />
                 </div>
               </div>
               {reflectOptionsError && (
@@ -1285,23 +1303,43 @@ export function BankConfigView() {
           </Dialog>
         </ConfigSection>
 
-        {/* MCP Tools Section */}
+        {/* Memory Bank Section — aliases, bank timezone, MCP tool access */}
         <ConfigSection
-          title={t("mcpToolsTitle")}
-          description={t("mcpToolsDescription")}
+          title={t("clientsTitle")}
+          description={t("clientsDescription")}
           error={mcpError}
           dirty={mcpDirty}
           saving={mcpSaving}
           onSave={saveMCP}
         >
+          <BankAliasRows bankId={bankId} />
+          <FieldRow label={t("defaultTimezoneLabel")} description={t("defaultTimezoneDescription")}>
+            <Input
+              list="bank-config-timezones"
+              value={mcpEdits.default_timezone ?? ""}
+              onChange={(e) =>
+                setMcpEdits((prev) => ({
+                  ...prev,
+                  default_timezone: e.target.value.trim() || null,
+                }))
+              }
+              placeholder={baseConfig.default_timezone ?? "UTC"}
+            />
+            <datalist id="bank-config-timezones">
+              {Intl.supportedValuesOf("timeZone").map((zone) => (
+                <option key={zone} value={zone} />
+              ))}
+            </datalist>
+          </FieldRow>
           <FieldRow label={t("restrictToolsLabel")} description={t("restrictToolsDescription")}>
             <div className="flex items-center gap-2 justify-end">
               <Switch
                 checked={mcpEdits.mcp_enabled_tools !== null}
                 onCheckedChange={(restricted) =>
-                  setMcpEdits({
+                  setMcpEdits((prev) => ({
+                    ...prev,
                     mcp_enabled_tools: restricted ? [...ALL_TOOLS] : null,
-                  })
+                  }))
                 }
               />
               <Label className="text-xs text-muted-foreground">
@@ -1312,7 +1350,7 @@ export function BankConfigView() {
           {mcpEdits.mcp_enabled_tools !== null && (
             <ToolSelector
               selected={mcpEdits.mcp_enabled_tools}
-              onChange={(tools) => setMcpEdits({ mcp_enabled_tools: tools })}
+              onChange={(tools) => setMcpEdits((prev) => ({ ...prev, mcp_enabled_tools: tools }))}
             />
           )}
         </ConfigSection>
@@ -1405,6 +1443,7 @@ export function BankConfigView() {
               ["enable_temporal_retrieval", "recallTemporalRetrieval"],
               ["enable_graph_retrieval", "recallGraphRetrieval"],
               ["enable_reranking", "recallReranking"],
+              ["recall_prefer_observations", "recallPreferObservations"],
             ] as const
           ).map(([field, key]) => (
             <FieldRow key={field} label={t(`${key}Label`)} description={t(`${key}Description`)}>
@@ -1422,7 +1461,15 @@ export function BankConfigView() {
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value={INHERIT_SENTINEL}>{t("recallServerDefault")}</SelectItem>
+                  <SelectItem value={INHERIT_SENTINEL}>
+                    {/* Without a bank override the resolved config IS the inherited
+                        default; with one, the server value is not exposed. */}
+                    {field in baseOverrides
+                      ? t("recallServerDefault")
+                      : t("recallServerDefaultState", {
+                          state: baseConfig[field] ? t("enabled") : t("disabled"),
+                        })}
+                  </SelectItem>
                   <SelectItem value="true">{t("enabled")}</SelectItem>
                   <SelectItem value="false">{t("disabled")}</SelectItem>
                 </SelectContent>
@@ -1931,7 +1978,8 @@ function ConfigSection({
   error: string | null;
   dirty: boolean;
   saving: boolean;
-  onSave: () => void;
+  /** Omit for a section whose controls apply immediately — it then has no Save footer. */
+  onSave?: () => void;
   /** Rendered opposite the heading — used by Retain for the prompt tester. */
   action?: ReactNode;
 }) {
@@ -1955,20 +2003,209 @@ function ConfigSection({
             </Alert>
           </div>
         )}
-        <div className="px-6 py-4 flex justify-end border-t border-border/40">
-          <Button size="sm" disabled={!dirty || saving} onClick={onSave}>
-            {saving ? (
-              <>
-                <Spinner size="sm" className="mr-2" />
-                {t("saving")}
-              </>
-            ) : (
-              t("saveChanges")
-            )}
-          </Button>
-        </div>
+        {onSave && (
+          <div className="px-6 py-4 flex justify-end border-t border-border/40">
+            <Button size="sm" disabled={!dirty || saving} onClick={onSave}>
+              {saving ? (
+                <>
+                  <Spinner size="sm" className="mr-2" />
+                  {t("saving")}
+                </>
+              ) : (
+                t("saveChanges")
+              )}
+            </Button>
+          </div>
+        )}
       </Card>
     </section>
+  );
+}
+
+// ─── BankAliasRows (the ids that reach this bank) ────────────────────────────
+
+/**
+ * The bank's aliases — extra ids that reach it, beside its own.
+ *
+ * Rows rather than a section of its own: it lives inside Access, next to the MCP
+ * tool list, because both answer "how do clients get at this bank" — one is which
+ * ids reach it, the other is what they may call once they do.
+ *
+ * Unlike its neighbours these rows are NOT part of the section's form: each add
+ * and remove is its own request, applied immediately, so the section's Save
+ * button neither covers nor waits for them. Its own errors therefore render here
+ * instead of in the section's error slot.
+ */
+/** Sentinel for "no alias is shown" — Radix Select cannot hold an empty value,
+ *  and the bank's own id is deliberately not one of the alias options. */
+const OWN_ID = "__own_id__";
+
+function BankAliasRows({ bankId }: { bankId: string | null }) {
+  const t = useTranslations("bankAliases");
+  const [aliases, setAliases] = useState<BankAliasEntry[]>([]);
+  const [draft, setDraft] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  // Removal is the one destructive action here: the id stops routing the moment
+  // it commits, so anything still calling it starts failing.
+  const [pendingRemove, setPendingRemove] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!bankId) return;
+    client
+      .listBankAliases(bankId)
+      .then((d) => setAliases(d.aliases ?? []))
+      .catch((e) => {
+        console.error("Failed to load bank aliases:", e);
+        setError(t("loadFailed"));
+      });
+  }, [bankId, t]);
+
+  const add = async () => {
+    const alias = draft.trim();
+    if (!alias || !bankId) return;
+    setBusy(true);
+    setError(null);
+    try {
+      // The response carries the whole list, so the chips show the server's view
+      // rather than a locally appended guess.
+      setAliases((await client.createBankAlias(bankId, alias)).aliases ?? []);
+      setDraft("");
+    } catch (e) {
+      // Usually the name is already taken (409); that message names it.
+      setError(e instanceof Error ? e.message : t("addFailed"));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /** Show the bank as `choice`, or as its own id when `choice` is OWN_ID. */
+  const promote = async (choice: string) => {
+    if (!bankId) return;
+    setError(null);
+    const current = aliases.find((a) => a.primary)?.alias ?? null;
+    try {
+      // The whole list comes back either way, so the demoted and promoted rows
+      // update in the same render — the UI never shows two as shown.
+      const next =
+        choice === OWN_ID
+          ? current && (await client.setBankAliasPrimary(bankId, current, false))
+          : await client.setBankAliasPrimary(bankId, choice, true);
+      if (next) setAliases(next.aliases ?? []);
+    } catch (e) {
+      console.error("Failed to set primary bank alias:", e);
+      setError(t("primaryFailed"));
+    }
+  };
+
+  const remove = async (alias: string) => {
+    if (!bankId) return;
+    setError(null);
+    try {
+      setAliases((await client.deleteBankAlias(bankId, alias)).aliases ?? []);
+    } catch (e) {
+      console.error("Failed to remove bank alias:", e);
+      setError(t("removeFailed"));
+    } finally {
+      setPendingRemove(null);
+    }
+  };
+
+  if (!bankId) return null;
+
+  return (
+    <>
+      <FieldRow
+        label={t("title")}
+        description={t.rich("description", {
+          bankId,
+          // Italic, not the code style used for the aliases themselves: this one
+          // names the bank you are already looking at, rather than an id to type.
+          name: (chunks) => <em>{chunks}</em>,
+        })}
+      >
+        <div className="flex gap-2">
+          <Input
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                add();
+              }
+            }}
+            placeholder={t("placeholder")}
+            className="h-8 text-sm"
+            disabled={busy}
+          />
+          <Button size="sm" variant="outline" onClick={add} disabled={busy || !draft.trim()}>
+            {t("add")}
+          </Button>
+        </div>
+      </FieldRow>
+      {aliases.length > 0 && (
+        <FieldRow label={t("shownAsLabel")} description={t("shownAsDescription", { bankId })}>
+          <Select
+            value={aliases.find((a) => a.primary)?.alias ?? OWN_ID}
+            onValueChange={(v) => promote(v)}
+          >
+            <SelectTrigger className="w-full h-8 text-sm">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {/* Always offered, and the default: a bank need not be shown as an
+                  alias, and this is how you put it back to its own id. */}
+              <SelectItem value={OWN_ID}>{bankId}</SelectItem>
+              {aliases.map((entry) => (
+                <SelectItem key={entry.alias} value={entry.alias}>
+                  {entry.alias}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </FieldRow>
+      )}
+      {(aliases.length > 0 || error) && (
+        <div className="px-6 py-3 flex flex-wrap items-center gap-1.5">
+          {aliases.map((entry) => (
+            <IdChip
+              key={entry.alias}
+              id={entry.alias}
+              size="xs"
+              // Marks the one the bank is shown as. Promotion lives in the "Shown
+              // as" row rather than on the chip: the chip shell renders a button
+              // instead of the ✕ when given an onClick, so a clickable chip would
+              // quietly lose its remove control.
+              active={entry.primary}
+              title={entry.primary ? t("primaryTitle") : undefined}
+              onRemove={() => setPendingRemove(entry.alias)}
+              removeLabel={t("removeAria", { alias: entry.alias })}
+            />
+          ))}
+          {error && <p className="text-xs text-destructive">{error}</p>}
+        </div>
+      )}
+
+      <AlertDialog
+        open={pendingRemove !== null}
+        onOpenChange={(open) => !open && setPendingRemove(null)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t("removeTitle", { alias: pendingRemove ?? "" })}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {t("removeConfirm", { alias: pendingRemove ?? "", bankId })}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t("cancel")}</AlertDialogCancel>
+            <AlertDialogAction onClick={() => pendingRemove && remove(pendingRemove)}>
+              {t("remove")}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </>
   );
 }
 
@@ -2038,6 +2275,77 @@ function TextareaRow({
   );
 }
 
+// ─── DefaultObservationScopesRow ───────────────────────────────────────────────
+
+const CUSTOM_SCOPES = "custom";
+
+/** The bank's `default_observation_scopes`: a mode, or custom scopes typed one per line.
+ *  Applied at retain to items that send no `observation_scopes` of their own. */
+function DefaultObservationScopesRow({
+  value,
+  onChange,
+}: {
+  value: ObservationScopes | null;
+  onChange: (next: ObservationScopes | null) => void;
+}) {
+  const t = useTranslations("bankConfig");
+  // The text is kept as typed: re-deriving it from the parsed scopes on every keystroke
+  // would eat the comma or newline the user is about to follow with a tag.
+  const [customText, setCustomText] = useState(() =>
+    Array.isArray(value) ? scopesToText(value) : ""
+  );
+  useEffect(() => {
+    if (Array.isArray(value) && JSON.stringify(textToScopes(customText)) !== JSON.stringify(value))
+      setCustomText(scopesToText(value));
+  }, [value]);
+
+  const selected = value === null ? INHERIT_SENTINEL : Array.isArray(value) ? CUSTOM_SCOPES : value;
+  return (
+    <>
+      <FieldRow
+        label={t("defaultObservationScopesLabel")}
+        description={t("defaultObservationScopesDescription")}
+      >
+        <Select
+          value={selected}
+          onValueChange={(v) => {
+            if (v === INHERIT_SENTINEL) onChange(null);
+            else if (v === CUSTOM_SCOPES) onChange(textToScopes(customText));
+            else onChange(v as ObservationScopesMode);
+          }}
+        >
+          <SelectTrigger>
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value={INHERIT_SENTINEL}>{t("serverDefault")}</SelectItem>
+            {OBSERVATION_SCOPES_MODES.map((mode) => (
+              <SelectItem key={mode} value={mode}>
+                {mode}
+              </SelectItem>
+            ))}
+            <SelectItem value={CUSTOM_SCOPES}>{t("observationScopesCustom")}</SelectItem>
+          </SelectContent>
+        </Select>
+      </FieldRow>
+      {selected === CUSTOM_SCOPES && (
+        <div className="px-6 pb-4">
+          <Textarea
+            value={customText}
+            onChange={(e) => {
+              setCustomText(e.target.value);
+              onChange(textToScopes(e.target.value));
+            }}
+            placeholder={t("observationScopesCustomPlaceholder")}
+            rows={3}
+            className="font-mono text-sm"
+          />
+        </div>
+      )}
+    </>
+  );
+}
+
 // ─── TraitRow (stacked layout with 1–5 selector) ──────────────────────────────
 
 function TraitRow({
@@ -2091,6 +2399,693 @@ function TraitRow({
 }
 
 // ─── GeminiSafetyEditor ───────────────────────────────────────────────────────
+
+// ─── ScopesEditor ─────────────────────────────────────────────────────────────
+
+/** A strategy's rules: which observation scopes it applies to.
+ *
+ * Laid out as sentence-style filter rules (the pattern email and issue-tracker
+ * filters use): each rule reads "Scopes that have [all of these tags ▾]" followed
+ * by the tags, rules are separated by a literal "or", and each shows a one-line
+ * summary of the existing scopes it matches, expandable to examples.
+ *
+ * History: this started as a textarea ("one scope per line, commas between
+ * tags"), which hid the AND/OR logic entirely. A second version drew boxes but
+ * stacked a label, a two-button toggle and a sentence restating the toggle in
+ * every box, plus a permanent row of match chips — correct, but too dense to read.
+ *
+ * The match summaries come from the server (`rulePreviews`, see the panel), not
+ * from matching in the browser: an earlier version matched a client-side copy of
+ * the scope list with a TypeScript port of fnmatch, which silently capped at the
+ * first 1000 scopes and was a second implementation to keep in sync.
+ *
+ * Tags are picked with the app's standard `TagFilterInput`, as in the document
+ * and mental-model filters. Empty rules are kept while being filled in; the
+ * server ignores them.
+ */
+function ScopesEditor({
+  value,
+  onChange,
+  rulePreviews,
+  complete,
+  selfIndex,
+  labelFor,
+}: {
+  value: ScopePattern[];
+  onChange: (scopes: ScopePattern[]) => void;
+  /** Server preview per rule, aligned by index; undefined while loading. */
+  rulePreviews: StrategyRulePreview[] | undefined;
+  complete: boolean;
+  selfIndex: number;
+  labelFor: (index: number) => string;
+}) {
+  const t = useTranslations("bankConfig");
+  const { currentBank } = useBank();
+
+  // The bank's real tags (same search the tag filters use) plus a `key:*`
+  // wildcard per tag key — the pattern a strategy almost always wants.
+  const fetchSuggestions = async (q: string): Promise<string[]> => {
+    const bankTags = currentBank
+      ? (await client.listTags(currentBank, q ? `${q}*` : undefined, 20)).items.map((i) => i.tag)
+      : [];
+    return suggestedTags([bankTags])
+      .filter((tag) => tag.startsWith(q))
+      .slice(0, 20);
+  };
+
+  const setPattern = (index: number, patch: Partial<ScopePattern>) =>
+    onChange(value.map((pattern, i) => (i === index ? { ...pattern, ...patch } : pattern)));
+
+  // A pasted "a, b" arrives as one tag; split it so it becomes two chips.
+  const setTags = (index: number, tags: string[]) =>
+    setPattern(index, {
+      tags: [
+        ...new Set(
+          tags
+            .flatMap((tag) => tag.split(","))
+            .map((tag) => tag.trim())
+            .filter(Boolean)
+        ),
+      ],
+    });
+
+  return (
+    <div className="space-y-3">
+      {value.map((pattern, index) => {
+        const tags = pattern.tags;
+        const mode = pattern.tags_match ?? "all";
+        const preview = rulePreviews?.[index];
+        return (
+          <div key={index}>
+            {index > 0 && (
+              <div className="flex items-center gap-3 pb-3">
+                <div className="h-px flex-1 bg-border" />
+                <span className="rounded-full border border-border px-2.5 py-0.5 text-xs font-medium text-muted-foreground">
+                  {t("consolidationStrategiesOr")}
+                </span>
+                <div className="h-px flex-1 bg-border" />
+              </div>
+            )}
+            <div className="rounded-lg border border-border bg-card p-4 space-y-3">
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex flex-wrap items-center gap-2 text-sm">
+                  <span>{t("consolidationStrategiesRuleSentence")}</span>
+                  <Select
+                    value={mode}
+                    onValueChange={(next) =>
+                      setPattern(index, { tags_match: next as StrategyTagsMatch })
+                    }
+                  >
+                    <SelectTrigger className="h-8 w-auto gap-1.5 text-sm font-medium">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="all">{t("consolidationStrategiesModeAll")}</SelectItem>
+                      <SelectItem value="exact">{t("consolidationStrategiesModeExact")}</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  <span className="text-xs text-muted-foreground">
+                    {mode === "exact"
+                      ? t("consolidationStrategiesModeExactNote")
+                      : t("consolidationStrategiesModeAllNote")}
+                  </span>
+                </div>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-8 w-8 shrink-0 p-0 text-muted-foreground hover:text-destructive"
+                  aria-label={t("consolidationStrategiesRemoveRule")}
+                  title={t("consolidationStrategiesRemoveRule")}
+                  onClick={() => onChange(value.filter((_, i) => i !== index))}
+                >
+                  <Trash2 className="h-4 w-4" />
+                </Button>
+              </div>
+
+              <TagFilterInput
+                value={tags}
+                onChange={(next) => setTags(index, next)}
+                fetchSuggestions={fetchSuggestions}
+                placeholder={t("consolidationStrategiesAddTagPlaceholder")}
+                inline
+              />
+
+              {tags.length > 0 && (
+                <MatchSummary
+                  matchCount={preview?.match_count}
+                  takenCount={preview?.taken_count ?? 0}
+                  samples={preview?.samples ?? []}
+                  complete={complete}
+                  selfIndex={selfIndex}
+                  labelFor={labelFor}
+                />
+              )}
+            </div>
+          </div>
+        );
+      })}
+      <Button variant="outline" size="sm" onClick={() => onChange([...value, { tags: [] }])}>
+        <Plus className="h-4 w-4" />
+        {t("consolidationStrategiesAddRule")}
+      </Button>
+    </div>
+  );
+}
+
+// ─── MatchSummary ─────────────────────────────────────────────────────────────
+
+/** "Matches 4 existing scopes · 1 handled by an earlier strategy — Show".
+ *
+ * A summary first, examples on demand: a permanent row of chips (an earlier
+ * version) was the densest part of the editor. Counts and examples come from the
+ * server preview; `complete: false` means the bank has more scopes than the
+ * preview scans, so the count is shown as "at least". With `selfIndex` set,
+ * examples an earlier strategy wins are struck through with the winner named —
+ * strategies are never combined, so this rule has no effect on them.
+ */
+function MatchSummary({
+  matchCount,
+  takenCount = 0,
+  samples,
+  complete,
+  selfIndex,
+  labelFor,
+  emptyText,
+}: {
+  /** undefined while the preview is loading. */
+  matchCount: number | undefined;
+  takenCount?: number;
+  samples: StrategyScopePreview[];
+  complete: boolean;
+  selfIndex?: number;
+  labelFor?: (index: number) => string;
+  emptyText?: string;
+}) {
+  const t = useTranslations("bankConfig");
+  const [open, setOpen] = useState(false);
+  const globalLabel = t("consolidationStrategiesGlobalScope");
+
+  if (matchCount === undefined) {
+    return <p className="text-xs text-muted-foreground">{t("consolidationStrategiesChecking")}</p>;
+  }
+  if (matchCount === 0) {
+    return (
+      <p className="text-xs text-muted-foreground">
+        {emptyText ?? t("consolidationStrategiesMatchesNone")}
+      </p>
+    );
+  }
+
+  return (
+    <div className="space-y-2">
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
+        <span className="font-medium">
+          {complete
+            ? t("consolidationStrategiesMatchesCount", { count: matchCount })
+            : t("consolidationStrategiesMatchesCountAtLeast", { count: matchCount })}
+        </span>
+        {takenCount > 0 && (
+          <span className="text-amber-700 dark:text-amber-400">
+            · {t("consolidationStrategiesMatchesTaken", { count: takenCount })}
+          </span>
+        )}
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          className="text-primary hover:underline"
+          aria-expanded={open}
+        >
+          {open ? t("consolidationStrategiesHide") : t("consolidationStrategiesShow")}
+        </button>
+      </div>
+      {open && (
+        <ul className="space-y-1">
+          {samples.map((sample) => {
+            const owned = selfIndex === undefined || sample.handled_by === selfIndex;
+            const winnerName =
+              sample.handled_by !== null && labelFor ? labelFor(sample.handled_by) : t("default");
+            return (
+              <li
+                key={sample.tags.join("\u0000") || "__global__"}
+                className="flex flex-wrap items-center gap-2 text-xs"
+              >
+                <span
+                  className={`rounded-md border border-border px-1.5 py-0.5 font-mono ${
+                    owned ? "bg-muted/40" : "text-muted-foreground line-through"
+                  }`}
+                >
+                  {scopeChipLabel(sample.tags, globalLabel)}
+                </span>
+                <span className="text-muted-foreground">
+                  {t("consolidationStrategiesObservationCount", { count: sample.count })}
+                </span>
+                {!owned && (
+                  <span className="text-amber-700 dark:text-amber-400">
+                    {t("consolidationStrategiesHandledBy", { name: winnerName })}
+                  </span>
+                )}
+              </li>
+            );
+          })}
+          {matchCount > samples.length && (
+            <li className="text-xs text-muted-foreground">
+              {t("consolidationStrategiesMoreScopes", { count: matchCount - samples.length })}
+            </li>
+          )}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+// ─── ConsolidationStrategiesPanel ─────────────────────────────────────────────
+
+function scopeChipLabel(tags: string[], globalLabel: string): string {
+  return tags.length ? tags.join(" + ") : globalLabel;
+}
+
+/** Per-scope consolidation settings, laid out like the retain strategies.
+ *
+ * The "Default" tab is the bank-level mission, cap and source-facts limits: they
+ * apply to every scope no strategy claims, and fill in whatever a strategy leaves
+ * empty. Each other tab is one `consolidation_strategies` entry, labelled by the
+ * scopes it claims (the scopes are its name — there is no separate one).
+ *
+ * Each rule shows the bank's *existing* scopes it covers, so the effect of a glob
+ * is visible before saving. That comes from the server's preview endpoint, asked
+ * again 400ms after the last edit. Order matters on the server (first claiming
+ * strategy wins, whole), so tabs read left to right in that order.
+ *
+ * Unlike the retain panel there is no local copy of the list: strategies have no
+ * name to keep unique, so the stored array is the state and tabs are addressed by
+ * position.
+ */
+function ConsolidationStrategiesPanel({
+  defaults,
+  onDefaultChange,
+  strategies,
+  onStrategiesChange,
+  defaultAction,
+}: {
+  defaults: ConsolidationSettings;
+  onDefaultChange: (patch: Partial<ConsolidationSettings>) => void;
+  strategies: ConsolidationStrategy[] | null;
+  onStrategiesChange: (next: ConsolidationStrategy[] | null) => void;
+  /** Rendered next to the Default mission — the "Preview prompt" button. */
+  defaultAction?: ReactNode;
+}) {
+  const t = useTranslations("bankConfig");
+  const tCommon = useTranslations("common");
+  const { currentBank } = useBank();
+  const list = strategies ?? [];
+
+  // Server preview of which existing scopes each rule matches, for the list as
+  // currently edited (unsaved). Debounced so typing a tag does not send a request
+  // per keystroke; a response for an older draft is dropped.
+  const [preview, setPreview] = useState<ConsolidationStrategiesPreview | null>(null);
+  const draftKey = JSON.stringify(list);
+  useEffect(() => {
+    if (!currentBank) return;
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      client
+        .previewConsolidationStrategies(currentBank, JSON.parse(draftKey))
+        .then((result) => {
+          if (!cancelled) setPreview(result);
+        })
+        .catch(() => {
+          if (!cancelled) setPreview(null);
+        });
+    }, 400);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [currentBank, draftKey]);
+  const [selected, setSelected] = useState<number | "default">("default");
+  const [pendingDelete, setPendingDelete] = useState<number | null>(null);
+  // A save or reset can shorten the list under an open tab.
+  const active = selected === "default" ? null : (list[selected] ?? null);
+  const selectedTab = active ? selected : "default";
+
+  const store = (next: ConsolidationStrategy[]) =>
+    onStrategiesChange(next.length ? next.map(compactStrategy) : null);
+
+  const add = () => {
+    store([...list, { scopes: [{ tags: [] }] }]);
+    setSelected(list.length);
+  };
+
+  const update = (index: number, patch: Partial<ConsolidationStrategy>) =>
+    store(list.map((s, i) => (i === index ? { ...s, ...patch } : s)));
+
+  const remove = (index: number) => {
+    store(list.filter((_, i) => i !== index));
+    setSelected("default");
+  };
+
+  const globalLabel = t("consolidationStrategiesGlobalScope");
+  const andWord = t("consolidationStrategiesAnd");
+  const orWord = t("consolidationStrategiesOr");
+  // Referenced with its priority number: two strategies can share a label (both
+  // "company:*"), and "uses company:*" would not say which of them wins.
+  const labelFor = (index: number) =>
+    `#${index + 1} ${
+      scopesLabel(list[index]?.scopes ?? [], andWord, orWord) ||
+      t("consolidationStrategiesNoScopeTab")
+    }`;
+
+  // Tab order is priority order (first claiming strategy wins), so it must be
+  // changeable without deleting and re-creating strategies.
+  const move = (from: number, to: number) => {
+    const next = [...list];
+    const [moved] = next.splice(from, 1);
+    next.splice(to, 0, moved);
+    store(next);
+    setSelected(to);
+  };
+
+  return (
+    <div>
+      <div className="px-6 pt-6 pb-4 space-y-2">
+        <p className="text-sm font-semibold">{t("consolidationStrategiesTitle")}</p>
+        <p className="text-sm text-muted-foreground">{t("consolidationStrategiesLead")}</p>
+        {/* The rules, one click away instead of a paragraph above the tabs. */}
+        <details className="group">
+          <summary className="inline-flex cursor-pointer list-none items-center gap-1 text-xs font-medium text-primary hover:underline [&::-webkit-details-marker]:hidden">
+            <ChevronRight className="h-3.5 w-3.5 transition-transform group-open:rotate-90" />
+            {t("consolidationStrategiesHowTitle")}
+          </summary>
+          <ul className="mt-2 ml-5 list-disc space-y-1.5 text-xs text-muted-foreground">
+            <li>{t("consolidationStrategiesHowScopes")}</li>
+            <li>{t("consolidationStrategiesHowRules")}</li>
+            <li>{t("consolidationStrategiesHowPriority")}</li>
+            <li>{t("consolidationStrategiesHowDefault")}</li>
+          </ul>
+        </details>
+      </div>
+
+      {/* Tab bar — same look as RetainStrategiesPanel. */}
+      <div className="border-b border-border px-6 flex items-stretch gap-1 flex-wrap">
+        <button
+          type="button"
+          onClick={() => setSelected("default")}
+          className={`relative py-3 px-4 text-sm font-semibold transition-colors border-b-2 border-transparent -mb-px ${
+            selectedTab === "default"
+              ? "text-foreground"
+              : "text-muted-foreground hover:text-foreground hover:border-border"
+          }`}
+        >
+          {t("default")}
+          {selectedTab === "default" && (
+            <div className="absolute bottom-[-2px] left-0 right-0 h-0.5 bg-primary-gradient" />
+          )}
+        </button>
+
+        {list.map((strategy, index) => {
+          const label = scopesLabel(strategy.scopes, andWord, orWord);
+          return (
+            <div
+              key={index}
+              className={`relative flex items-center gap-2 py-3 px-4 text-sm font-semibold transition-colors border-b-2 border-transparent -mb-px cursor-pointer ${
+                selectedTab === index
+                  ? "text-foreground"
+                  : "text-muted-foreground hover:text-foreground hover:border-border"
+              }`}
+              onClick={() => setSelected(index)}
+            >
+              {selectedTab === index && (
+                <div className="absolute bottom-[-2px] left-0 right-0 h-0.5 bg-primary-gradient" />
+              )}
+              <span className="text-xs font-normal text-muted-foreground tabular-nums">
+                {index + 1}
+              </span>
+              <span className="font-mono max-w-[220px] truncate" title={label}>
+                {label || (
+                  <span className="italic font-normal opacity-50">
+                    {t("consolidationStrategiesNoScopeTab")}
+                  </span>
+                )}
+              </span>
+              <button
+                type="button"
+                aria-label={t("consolidationStrategiesRemove", { name: label || "—" })}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setPendingDelete(index);
+                }}
+                className="opacity-40 hover:opacity-100 hover:text-destructive transition-opacity text-base leading-none"
+              >
+                ×
+              </button>
+            </div>
+          );
+        })}
+
+        <button
+          type="button"
+          onClick={add}
+          className="py-3 px-3 text-sm text-muted-foreground hover:text-primary transition-colors flex items-center gap-1.5"
+        >
+          <Plus className="h-3.5 w-3.5" />
+          {t("addStrategy")}
+        </button>
+      </div>
+
+      {active === null ? (
+        <div>
+          <div className="px-6 py-5 space-y-2 border-b border-border/40">
+            <SectionHeading
+              title={t("consolidationStrategiesDefaultTitle")}
+              description={t("consolidationStrategiesDefaultLead")}
+            />
+            <MatchSummary
+              matchCount={preview?.default.match_count}
+              samples={preview?.default.samples ?? []}
+              complete={preview?.complete ?? true}
+              emptyText={t("consolidationStrategiesDefaultCoversNone")}
+            />
+          </div>
+          <ConsolidationSettingsForm
+            values={defaults}
+            onChange={onDefaultChange}
+            missionAction={defaultAction}
+          />
+        </div>
+      ) : (
+        <div>
+          <div className="px-6 py-5 space-y-4 border-b border-border/40">
+            <div className="flex flex-wrap items-start justify-between gap-4">
+              <SectionHeading
+                title={`1 · ${t("consolidationStrategiesWhichScopes")}`}
+                description={t("consolidationStrategiesWhichScopesLead")}
+              />
+              {/* Priority is tab order (first matching strategy wins). */}
+              <div className="flex items-center gap-1 text-xs text-muted-foreground">
+                <span className="mr-1">
+                  {t("consolidationStrategiesPriority", {
+                    position: (selectedTab as number) + 1,
+                    total: list.length,
+                  })}
+                </span>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 w-7 p-0"
+                  disabled={selectedTab === 0}
+                  aria-label={t("consolidationStrategiesMoveEarlier")}
+                  title={t("consolidationStrategiesMoveEarlier")}
+                  onClick={() => move(selectedTab as number, (selectedTab as number) - 1)}
+                >
+                  <ChevronLeft className="h-4 w-4" />
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 w-7 p-0"
+                  disabled={selectedTab === list.length - 1}
+                  aria-label={t("consolidationStrategiesMoveLater")}
+                  title={t("consolidationStrategiesMoveLater")}
+                  onClick={() => move(selectedTab as number, (selectedTab as number) + 1)}
+                >
+                  <ChevronRight className="h-4 w-4" />
+                </Button>
+              </div>
+            </div>
+            <ScopesEditor
+              value={active.scopes}
+              onChange={(scopes) => update(selectedTab as number, { scopes })}
+              rulePreviews={preview?.strategies[selectedTab as number]?.rules}
+              complete={preview?.complete ?? true}
+              selfIndex={selectedTab as number}
+              labelFor={labelFor}
+            />
+            {!active.scopes.some((pattern) => pattern.tags.length > 0) && (
+              <p className="text-xs text-amber-700 dark:text-amber-400">
+                {t("consolidationStrategiesNoScopes")}
+              </p>
+            )}
+          </div>
+          <div className="px-6 pt-5">
+            <SectionHeading
+              title={`2 · ${t("consolidationStrategiesSettingsTitle")}`}
+              description={t("consolidationStrategiesSettingsLead")}
+            />
+            {!strategyOverridesSomething(active) && (
+              <p className="mt-2 text-xs text-amber-700 dark:text-amber-400">
+                {t("consolidationStrategiesOverridesNothing")}
+              </p>
+            )}
+          </div>
+          <ConsolidationSettingsForm
+            values={active}
+            onChange={(patch) => update(selectedTab as number, patch)}
+            inherited={defaults}
+          />
+        </div>
+      )}
+
+      <AlertDialog
+        open={pendingDelete !== null}
+        onOpenChange={(open) => {
+          if (!open) setPendingDelete(null);
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {t("deleteStrategyTitle", {
+                name:
+                  (pendingDelete !== null &&
+                    scopesLabel(list[pendingDelete]?.scopes ?? [], andWord, orWord)) ||
+                  t("consolidationStrategiesNoScopeTab"),
+              })}
+            </AlertDialogTitle>
+            <AlertDialogDescription>{t("deleteStrategyDescription")}</AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{tCommon("cancel")}</AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              onClick={() => {
+                if (pendingDelete !== null) {
+                  remove(pendingDelete);
+                  setPendingDelete(null);
+                }
+              }}
+            >
+              {tCommon("delete")}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </div>
+  );
+}
+
+function SectionHeading({ title, description }: { title: string; description?: string }) {
+  return (
+    <div className="space-y-0.5">
+      <p className="text-sm font-semibold">{title}</p>
+      {description && <p className="text-xs text-muted-foreground">{description}</p>}
+    </div>
+  );
+}
+
+// ─── ConsolidationSettingsForm ────────────────────────────────────────────────
+
+/** The four per-scope settings, for the Default tab or a strategy tab.
+ *
+ * With `inherited` set (a strategy tab), an empty field means "use Default", and
+ * its placeholder shows the value that will actually apply — so nobody has to
+ * flip back to the Default tab to know what a blank field does.
+ */
+function ConsolidationSettingsForm({
+  values,
+  onChange,
+  inherited,
+  missionAction,
+}: {
+  values: Partial<ConsolidationSettings>;
+  onChange: (patch: Partial<ConsolidationSettings>) => void;
+  inherited?: ConsolidationSettings;
+  missionAction?: ReactNode;
+}) {
+  const t = useTranslations("bankConfig");
+
+  const placeholderFor = (key: keyof ConsolidationSettings): string => {
+    if (!inherited) return t("serverDefault");
+    const value = inherited[key];
+    if (value === null || value === undefined || value === "") {
+      return t("consolidationStrategiesInheritedServerDefault");
+    }
+    // -1 is how every one of these limits spells "no limit".
+    const shown = value === -1 ? t("consolidationStrategiesUnlimited") : String(value);
+    return t("consolidationStrategiesInheritedValue", { value: shown });
+  };
+
+  const numberField = (
+    key:
+      | "max_observations_per_scope"
+      | "consolidation_source_facts_max_tokens"
+      | "consolidation_source_facts_max_tokens_per_observation",
+    label: string,
+    description: string
+  ) => (
+    <FieldRow label={label} description={description}>
+      <Input
+        type="number"
+        min={-1}
+        value={values[key] ?? ""}
+        onChange={(e) => onChange({ [key]: e.target.value ? parseInt(e.target.value, 10) : null })}
+        placeholder={placeholderFor(key)}
+      />
+    </FieldRow>
+  );
+
+  return (
+    <div>
+      <TextareaRow
+        label={t("missionLabel")}
+        description={
+          inherited
+            ? t("consolidationStrategyMissionDescription")
+            : t("observationsMissionDescription")
+        }
+        value={values.observations_mission ?? ""}
+        onChange={(v) => onChange({ observations_mission: v || null })}
+        placeholder={
+          inherited ? placeholderFor("observations_mission") : t("observationsMissionPlaceholder")
+        }
+        rows={3}
+        action={missionAction}
+      />
+      {/* The bank-level descriptions say "blank = server default"; in a strategy tab
+          blank means "inherit from Default", so those tabs get their own wording. */}
+      {numberField(
+        "max_observations_per_scope",
+        t("maxObservationsPerScopeLabel"),
+        inherited
+          ? t("consolidationStrategyMaxObservationsDescription")
+          : t("maxObservationsPerScopeDescription")
+      )}
+      {numberField(
+        "consolidation_source_facts_max_tokens",
+        t("sourceFactsMaxTokensLabel"),
+        inherited
+          ? t("consolidationStrategySourceFactsDescription")
+          : t("sourceFactsMaxTokensDescription")
+      )}
+      {numberField(
+        "consolidation_source_facts_max_tokens_per_observation",
+        t("sourceFactsMaxTokensPerObservationLabel"),
+        inherited
+          ? t("consolidationStrategySourceFactsPerObservationDescription")
+          : t("sourceFactsMaxTokensPerObservationDescription")
+      )}
+    </div>
+  );
+}
 
 function GeminiSafetyEditor({
   value,

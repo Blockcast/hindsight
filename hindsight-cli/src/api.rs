@@ -56,7 +56,12 @@ where
         }
         ClientError::InvalidResponsePayload(bytes, src) => {
             let body = String::from_utf8_lossy(&bytes);
-            anyhow::anyhow!("Invalid response payload ({}): {}", src, body)
+            anyhow::anyhow!(
+                "{}: {}\nResponse was: {}",
+                crate::errors::INVALID_RESPONSE_PAYLOAD,
+                src,
+                body
+            )
         }
         other => anyhow::anyhow!("{}", other),
     }
@@ -136,6 +141,21 @@ pub struct MemoryPutResult {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FileRetainResult {
     pub operation_ids: Vec<String>,
+}
+
+/// Tag filter for the knowledge-base tree and search, with recall's semantics.
+#[derive(Debug, Default)]
+pub struct KnowledgeTagFilter {
+    pub tags: Vec<String>,
+    pub tags_match: Option<types::TagsMatch>,
+    /// JSON-encoded `tag_groups`, passed through as the query param the server parses.
+    pub tag_groups: Option<String>,
+}
+
+impl KnowledgeTagFilter {
+    fn tags(&self) -> Option<&Vec<String>> {
+        (!self.tags.is_empty()).then_some(&self.tags)
+    }
 }
 
 #[derive(Clone)]
@@ -509,6 +529,29 @@ impl ApiClient {
         })
     }
 
+    pub fn get_document_history(
+        &self,
+        agent_id: &str,
+        document_id: &str,
+        limit: i32,
+        offset: i32,
+    ) -> Result<types::DocumentHistoryResponse> {
+        self.runtime.block_on(async {
+            let response = self
+                .client
+                .get_document_history(
+                    agent_id,
+                    document_id,
+                    std::num::NonZeroU64::new(limit.max(1) as u64),
+                    Some(offset as u64),
+                    None, // authorization
+                )
+                .humanized()
+                .await?;
+            Ok(response.into_inner())
+        })
+    }
+
     pub fn delete_document(
         &self,
         agent_id: &str,
@@ -618,6 +661,9 @@ impl ApiClient {
                     limit.map(|l| l as u64),
                     offset.map(|o| o as u64),
                     None,
+                    None,
+                    None,
+                    None,
                 )
                 .humanized()
                 .await?;
@@ -634,7 +680,7 @@ impl ApiClient {
         self.runtime.block_on(async {
             let response = self
                 .client
-                .get_entity(bank_id, entity_id, None)
+                .get_entity(bank_id, entity_id, None, None, None, None)
                 .humanized()
                 .await?;
             Ok(response.into_inner())
@@ -917,7 +963,7 @@ impl ApiClient {
         self.runtime.block_on(async {
             let response = self
                 .client
-                .list_mental_models(bank_id, Some(detail), None, None, None, None, None)
+                .list_mental_models(bank_id, Some(detail), None, None, None, None, None, None)
                 .humanized()
                 .await?;
             Ok(response.into_inner())
@@ -993,12 +1039,17 @@ impl ApiClient {
         &self,
         bank_id: &str,
         mental_model_id: &str,
+        full: bool,
         _verbose: bool,
     ) -> Result<types::AsyncOperationSubmitResponse> {
+        // `full` forces a one-off full refresh; the model's stored mode is untouched.
+        let body = types::RefreshMentalModelRequest {
+            mode: full.then(|| "full".to_string()),
+        };
         self.runtime.block_on(async {
             let response = self
                 .client
-                .refresh_mental_model(bank_id, mental_model_id, None)
+                .refresh_mental_model(bank_id, mental_model_id, None, &body)
                 .humanized()
                 .await?;
             Ok(response.into_inner())
@@ -1042,12 +1093,19 @@ impl ApiClient {
     pub fn get_knowledge_base_tree(
         &self,
         bank_id: &str,
+        filter: &KnowledgeTagFilter,
         _verbose: bool,
     ) -> Result<types::KnowledgeTreeResponse> {
         self.runtime.block_on(async {
             let response = self
                 .client
-                .get_knowledge_base_tree(bank_id, None)
+                .get_knowledge_base_tree(
+                    bank_id,
+                    filter.tag_groups.as_deref(),
+                    filter.tags(),
+                    filter.tags_match,
+                    None,
+                )
                 .humanized()
                 .await?;
             Ok(response.into_inner())
@@ -1107,12 +1165,21 @@ impl ApiClient {
         bank_id: &str,
         query: &types::Q,
         limit: Option<std::num::NonZeroU64>,
+        filter: &KnowledgeTagFilter,
         _verbose: bool,
     ) -> Result<types::KnowledgePageSearchResponse> {
         self.runtime.block_on(async {
             let response = self
                 .client
-                .search_knowledge_base(bank_id, limit, query, None)
+                .search_knowledge_base(
+                    bank_id,
+                    limit,
+                    query,
+                    filter.tag_groups.as_deref(),
+                    filter.tags(),
+                    filter.tags_match,
+                    None,
+                )
                 .humanized()
                 .await?;
             Ok(response.into_inner())
@@ -1243,6 +1310,79 @@ impl ApiClient {
             let response = self
                 .client
                 .delete_directive(bank_id, directive_id, None)
+                .humanized()
+                .await?;
+            Ok(response.into_inner())
+        })
+    }
+
+    // --- Bank Alias Methods ---
+
+    pub fn list_bank_aliases(
+        &self,
+        bank_id: &str,
+        _verbose: bool,
+    ) -> Result<types::BankAliasesResponse> {
+        self.runtime.block_on(async {
+            let response = self
+                .client
+                .list_bank_aliases(bank_id, None)
+                .humanized()
+                .await?;
+            Ok(response.into_inner())
+        })
+    }
+
+    pub fn create_bank_alias(
+        &self,
+        bank_id: &str,
+        alias: &str,
+        _verbose: bool,
+    ) -> Result<types::BankAliasesResponse> {
+        self.runtime.block_on(async {
+            let request = types::CreateBankAliasRequest {
+                alias: alias.to_string(),
+                // Added separately with `alias primary`, so creating one never
+                // silently changes which id the bank is displayed under.
+                primary: false,
+            };
+            let response = self
+                .client
+                .create_bank_alias(bank_id, None, &request)
+                .humanized()
+                .await?;
+            Ok(response.into_inner())
+        })
+    }
+
+    pub fn set_bank_alias_primary(
+        &self,
+        bank_id: &str,
+        alias: &str,
+        primary: bool,
+        _verbose: bool,
+    ) -> Result<types::BankAliasesResponse> {
+        self.runtime.block_on(async {
+            let request = types::SetBankAliasPrimaryRequest { primary };
+            let response = self
+                .client
+                .set_bank_alias_primary(bank_id, alias, None, &request)
+                .humanized()
+                .await?;
+            Ok(response.into_inner())
+        })
+    }
+
+    pub fn delete_bank_alias(
+        &self,
+        bank_id: &str,
+        alias: &str,
+        _verbose: bool,
+    ) -> Result<types::BankAliasesResponse> {
+        self.runtime.block_on(async {
+            let response = self
+                .client
+                .delete_bank_alias(bank_id, alias, None)
                 .humanized()
                 .await?;
             Ok(response.into_inner())
@@ -1408,6 +1548,22 @@ impl ApiClient {
         })
     }
 
+    pub fn get_audit_log(
+        &self,
+        bank_id: &str,
+        log_id: &str,
+        _verbose: bool,
+    ) -> Result<types::AuditLogEntry> {
+        self.runtime.block_on(async {
+            let response = self
+                .client
+                .get_audit_log(bank_id, log_id, None)
+                .humanized()
+                .await?;
+            Ok(response.into_inner())
+        })
+    }
+
     pub fn audit_log_stats(
         &self,
         bank_id: &str,
@@ -1487,10 +1643,16 @@ impl ApiClient {
         bank_id: &str,
         document_id: &str,
         tags: Option<Vec<String>>,
+        observation_scopes: Option<serde_json::Value>,
         _verbose: bool,
     ) -> Result<types::UpdateDocumentResponse> {
         self.runtime.block_on(async {
-            let request = types::UpdateDocumentRequest { tags };
+            // Through serde so the CLI does not depend on the generated union's variant names.
+            let request: types::UpdateDocumentRequest =
+                serde_json::from_value(serde_json::json!({
+                    "tags": tags,
+                    "observation_scopes": observation_scopes,
+                }))?;
             let response = self
                 .client
                 .update_document(bank_id, document_id, None, &request)

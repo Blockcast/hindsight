@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { localizeApiErrorPayload } from "@/lib/i18n/api-errors";
 import { dataplaneBankUrl, getDataplaneHeaders } from "@/lib/hindsight-client";
+import { appendTagFilter, readTagFilter } from "@/lib/tag-filter-params";
 
 export async function GET(request: NextRequest) {
   try {
@@ -19,7 +20,9 @@ export async function GET(request: NextRequest) {
     if (!q || !q.trim()) {
       return NextResponse.json({ results: [], total: 0 }, { status: 200 });
     }
-    const path = `/knowledge-base/search?q=${encodeURIComponent(q)}&limit=${encodeURIComponent(limit)}`;
+    const query = new URLSearchParams({ q, limit });
+    appendTagFilter(query, readTagFilter(request.nextUrl.searchParams));
+    const path = `/knowledge-base/search?${query}`;
     const response = await fetch(dataplaneBankUrl(bankId, path), {
       headers: getDataplaneHeaders(),
     });

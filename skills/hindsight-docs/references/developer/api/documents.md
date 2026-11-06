@@ -7,7 +7,7 @@ Track and manage document sources in your memory bank. Documents provide traceab
 
 > **💡 Prerequisites**
 >
-Make sure you've completed the [Quick Start](./quickstart) and understand [how retain works](./retain).
+Make sure you've completed the [Quick Start](./quickstart.md) and understand [how retain works](./retain.md).
 ## What Are Documents?
 
 Documents are containers for retained content. They help you:
@@ -27,7 +27,7 @@ When you retain content, Hindsight splits it into chunks before extracting facts
 
 > **💡 Include Chunks in Recall**
 >
-Use `include_chunks=True` in your recall calls to get the original text chunks alongside fact results. See [Recall](./recall) for details.
+Use `include_chunks=True` in your recall calls to get the original text chunks alongside fact results. See [Recall](./recall.md) for details.
 ## Retain with Document ID
 
 Associate retained content with a document:
@@ -73,16 +73,26 @@ await client.retainBatch('my-bank', [
 
 ```bash
 # Retain content with document ID
-hindsight memory retain my-bank "Meeting notes content..." --doc-id notes-2024-03-15
+hindsight memory retain "$BANK_ID" "Meeting notes content..." --doc-id notes-2024-03-15
 
 # Batch retain from files
-hindsight memory retain-files my-bank docs/
+hindsight memory retain-files "$BANK_ID" docs/
 ```
 
 ### Go
 
 ```go
-# Section 'document-retain' not found in api/documents.go
+// Retain with document ID
+docID := "meeting-2024-03-15"
+client.MemoryAPI.RetainMemories(ctx, "my-bank").
+	RetainRequest(hindsight.RetainRequest{
+		Items: []hindsight.MemoryItem{
+			{
+				Content:    hindsight.TextContent("Alice presented the Q4 roadmap..."),
+				DocumentId: *hindsight.NewNullableString(&docID),
+			},
+		},
+	}).Execute()
 ```
 
 ## Update Documents
@@ -125,16 +135,37 @@ await client.retain('my-bank', 'Project deadline: April 15 (extended)', {
 
 ```bash
 # Original
-hindsight memory retain my-bank "Project deadline: March 31" --doc-id project-plan
+hindsight memory retain "$BANK_ID" "Project deadline: March 31" --doc-id project-plan
 
 # Update
-hindsight memory retain my-bank "Project deadline: April 15 (extended)" --doc-id project-plan
+hindsight memory retain "$BANK_ID" "Project deadline: April 15 (extended)" --doc-id project-plan
 ```
 
 ### Go
 
 ```go
-# Section 'document-update' not found in api/documents.go
+// Original
+planDoc := "project-plan"
+client.MemoryAPI.RetainMemories(ctx, "my-bank").
+	RetainRequest(hindsight.RetainRequest{
+		Items: []hindsight.MemoryItem{
+			{
+				Content:    hindsight.TextContent("Project deadline: March 31"),
+				DocumentId: *hindsight.NewNullableString(&planDoc),
+			},
+		},
+	}).Execute()
+
+// Update (deletes old facts, creates new ones)
+client.MemoryAPI.RetainMemories(ctx, "my-bank").
+	RetainRequest(hindsight.RetainRequest{
+		Items: []hindsight.MemoryItem{
+			{
+				Content:    hindsight.TextContent("Project deadline: April 15 (extended)"),
+				DocumentId: *hindsight.NewNullableString(&planDoc),
+			},
+		},
+	}).Execute()
 ```
 
 ## Get Document
@@ -188,13 +219,18 @@ console.log(`Created: ${doc.created_at}`);
 ### CLI
 
 ```bash
-hindsight document get my-bank meeting-2024-03-15
+hindsight document get "$BANK_ID" notes-2024-03-15
 ```
 
 ### Go
 
 ```go
-# Section 'document-get' not found in api/documents.go
+doc, _, err := client.DocumentsAPI.GetDocument(ctx, "my-bank", "meeting-2024-03-15").Execute()
+if err != nil {
+	log.Fatalf("Failed to get document: %v", err)
+}
+fmt.Printf("Document ID: %s\n", doc.GetId())
+fmt.Printf("Memory units: %d\n", doc.GetMemoryUnitCount())
 ```
 
 ## Update Document
@@ -206,49 +242,84 @@ The `tags` array **replaces** the document's tags — it is not merged into them
 ### Python
 
 ```python
-# Original
-client.retain(
-    bank_id="my-bank",
-    content="Project deadline: March 31",
-    document_id="project-plan"
-)
+from hindsight_client_api import ApiClient, Configuration
+from hindsight_client_api.api import DocumentsApi
+from hindsight_client_api.models import UpdateDocumentRequest
 
-# Update (deletes old facts, creates new ones)
-client.retain(
-    bank_id="my-bank",
-    content="Project deadline: April 15 (extended)",
-    document_id="project-plan"
-)
+async def update_document_example():
+    config = Configuration(host="http://localhost:8888")
+    api_client = ApiClient(config)
+    api = DocumentsApi(api_client)
+
+    # Fix tags on a document retained with the wrong scope
+    result = await api.update_document(
+        bank_id="my-bank",
+        document_id="meeting-2024-03-15",
+        update_document_request=UpdateDocumentRequest(tags=["team-a", "team-b"]),
+    )
+    print(f"Updated: {result.success}")
+
+    # Remove all tags (make document visible everywhere)
+    await api.update_document(
+        bank_id="my-bank",
+        document_id="meeting-2024-03-15",
+        update_document_request=UpdateDocumentRequest(tags=[]),
+    )
+
+asyncio.run(update_document_example())
 ```
 
 ### Node.js
 
 ```javascript
-// Original
-await client.retain('my-bank', 'Project deadline: March 31', {
-    document_id: 'project-plan'
+// Fix tags on a document retained with the wrong scope
+const { data: updateResult, error: updateError } = await sdk.updateDocument({
+    client: apiClient,
+    path: { bank_id: 'my-bank', document_id: 'meeting-2024-03-15-section-1' },
+    body: { tags: ['team-a', 'team-b'] }
 });
 
-// Update
-await client.retain('my-bank', 'Project deadline: April 15 (extended)', {
-    document_id: 'project-plan'
+if (updateError) {
+    throw new Error(`Failed to update tags: ${JSON.stringify(updateError)}`);
+}
+
+console.log(`Updated: ${updateResult.success}`);
+
+// Remove all tags (make document visible everywhere)
+await sdk.updateDocument({
+    client: apiClient,
+    path: { bank_id: 'my-bank', document_id: 'meeting-2024-03-15-section-1' },
+    body: { tags: [] }
 });
 ```
 
 ### CLI
 
 ```bash
-# Replace tags with new values
-hindsight document update-tags my-bank meeting-2024-03-15 --tags team-a --tags team-b
+# Replace tags with new values (comma-separated)
+hindsight document update "$BANK_ID" notes-2024-03-15 --tags team-a,team-b
 
-# Remove all tags
-hindsight document update-tags my-bank meeting-2024-03-15
+# Remove all tags (make document visible everywhere)
+hindsight document update "$BANK_ID" notes-2024-03-15 --tags ""
 ```
 
 ### Go
 
 ```go
-# Section 'document-update' not found in api/documents.go
+// Replace the document's tags (the full set it should end up with)
+updateResult, _, err := client.DocumentsAPI.UpdateDocument(ctx, "my-bank", "meeting-2024-03-15").
+	UpdateDocumentRequest(hindsight.UpdateDocumentRequest{Tags: []string{"team-a", "team-b"}}).
+	Execute()
+if err != nil {
+	log.Fatalf("Failed to update document: %v", err)
+}
+fmt.Printf("Updated: %v\n", updateResult.GetSuccess())
+
+// Remove all tags (make document visible everywhere). Pass an empty slice, not nil:
+// a nil slice is left out of the request, and the server rejects an update with no tags.
+client.DocumentsAPI.UpdateDocument(ctx, "my-bank", "meeting-2024-03-15").
+	UpdateDocumentRequest(hindsight.UpdateDocumentRequest{Tags: []string{}}).
+	Execute()
 ```
 
 > **ℹ️ Observations are re-consolidated**
@@ -299,13 +370,13 @@ console.log(`Deleted ${deleteResult.memory_units_deleted} memories`);
 ### CLI
 
 ```bash
-hindsight document delete my-bank meeting-2024-03-15
+hindsight document delete "$BANK_ID" notes-2024-03-15
 ```
 
 ### Go
 
 ```go
-# Section 'document-delete' not found in api/documents.go
+client.DocumentsAPI.DeleteDocument(ctx, "my-bank", "meeting-2024-03-15").Execute()
 ```
 
 > **⚠️ Warning**
@@ -406,29 +477,37 @@ console.log(`Page items: ${page.items.length}`);
 
 ```bash
 # List all documents
-hindsight document list my-bank
+hindsight document list "$BANK_ID"
 
 # Filter by ID substring
-hindsight document list my-bank --q report
-
-# Filter by tags
-hindsight document list my-bank --tags team-a --tags team-b
+hindsight document list "$BANK_ID" --query notes
 ```
 
 ### Go
 
 ```go
-# Section 'document-list' not found in api/documents.go
+// List all documents
+docs, _, err := client.DocumentsAPI.ListDocuments(ctx, "my-bank").Execute()
+if err != nil {
+	log.Fatalf("Failed to list documents: %v", err)
+}
+for _, d := range docs.Items {
+	fmt.Printf("%s: %d memories\n", d.Id, d.GetMemoryUnitCount())
+}
 ```
 
 ### Filtering Options
 
 | Parameter | Description |
 |---|---|
-| `q` | Case-insensitive substring match on document ID. `report` matches `report-2024`, `annual-report`, etc. |
+| `q` | Case-insensitive substring match on document ID or document text. `report` matches `report-2024`, `annual-report`, or any document whose text contains `report`. Not indexed: meant for browsing and inspecting a bank, not for high-volume or latency-sensitive lookups (use recall for those). |
 | `tags` | Filter by document tags. Accepts multiple values. |
 | `tags_match` | How to match tags (default: `any_strict`). See below. |
 | `limit` / `offset` | Pagination. Default limit is 100. |
+
+When `q` is set, each returned row carries `matched_fields`: `["id"]`, `["original_text"]`, or both, so a caller can tell why a document matched.
+
+A `q` search counts at most 1,000 matches. Past that, `total` is a lower bound, `total_is_estimate` is `true`, and pages stop at the cap. Narrow the search, or add a tag or time filter, to reach the rest. Some storage backends match `q` approximately — `matched_fields` always says what matched.
 
 **`tags_match` modes:**
 
@@ -438,6 +517,109 @@ hindsight document list my-bank --tags team-a --tags team-b
 | `any` | Same as `any_strict` but also includes untagged documents. |
 | `all_strict` | Document must have **all** specified tags. Untagged docs excluded. |
 | `all` | Same as `all_strict` but also includes untagged documents. |
+
+## Document History
+
+Every change to a document is recorded with what it did: each retain, append and reprocess (facts added and removed), each fact edit, invalidation, restore and delete, each per-fact observation clear, each tag change, and each consolidation run (observations created, updated and removed, filed under every document their source facts came from).
+
+Observations are rebuilt rather than versioned, so when a change deletes one, this history is the only place its id is still recorded. Each event stores ids and counts only, never text, and each id list is capped at 100. The control plane shows this as the **History** tab of a document.
+
+The history is rebuilt from the bank's [operations](./operations.md), which carry these events, so two limits apply:
+
+- It reaches back only as far as operations are kept (`HINDSIGHT_API_OPERATION_RETENTION_DAYS`, unlimited by default).
+- A change that ran without an operation is not in it: a synchronous retain (`async: false`), or a fact edit, delete or tag change while auto-consolidation is off. A fact edit, delete or tag change is recorded on the consolidation operation it queues, next to the rebuild it causes. Clearing every observation in the bank is not listed.
+
+### Python
+
+```python
+async def document_history_example():
+    api = DocumentsApi(ApiClient(Configuration(host="http://localhost:8888")))
+
+    # What each retain, fact edit and consolidation did to this document, newest first
+    history = await api.get_document_history(bank_id="my-bank", document_id="meeting-2024-03-15", limit=50)
+    for event in history.items:
+        print(
+            f"{event.created_at} {event.kind}: +{event.facts_added}/-{event.facts_removed} facts, "
+            f"observations removed: {event.observations_removed.ids}"
+        )
+
+asyncio.run(document_history_example())
+```
+
+### Node.js
+
+```javascript
+// What each retain, fact edit and consolidation did to this document, newest first
+const { data: history, error: historyError } = await sdk.getDocumentHistory({
+    client: apiClient,
+    path: { bank_id: 'my-bank', document_id: 'meeting-2024-03-15-section-1' },
+    query: { limit: 50 }
+});
+
+if (historyError) {
+    throw new Error(`Failed to get document history: ${JSON.stringify(historyError)}`);
+}
+
+for (const event of history.items) {
+    console.log(`${event.created_at} ${event.kind}: removed ${event.observations_removed.ids.join(', ')}`);
+}
+```
+
+### CLI
+
+```bash
+# What each retain, fact edit and consolidation did to this document, newest first
+hindsight document history "$BANK_ID" notes-2024-03-15 --limit 50
+```
+
+### Go
+
+```go
+// What each retain, fact edit and consolidation did to this document, newest first
+history, _, err := client.DocumentsAPI.GetDocumentHistory(ctx, "my-bank", "meeting-2024-03-15").Limit(50).Execute()
+if err != nil {
+	log.Fatalf("Failed to get document history: %v", err)
+}
+for _, event := range history.GetItems() {
+	removed := event.GetObservationsRemoved()
+	fmt.Printf("%s: +%d facts, observations removed: %v\n", event.GetKind(), event.GetFactsAdded(), removed.GetIds())
+}
+```
+
+```json
+{
+  "document_id": "call-2026-10-01",
+  "total": 2,
+  "limit": 50,
+  "offset": 0,
+  "items": [
+    {
+      "document_id": "call-2026-10-01",
+      "kind": "consolidation",
+      "created_at": "2026-10-19T10:02:11Z",
+      "operation_id": "ce29121a-…",
+      "fact_id": null,
+      "facts_added": 0,
+      "facts_removed": 0,
+      "observations_created": { "count": 0, "ids": [] },
+      "observations_updated": { "count": 2, "ids": ["9545…", "c51c…"] },
+      "observations_removed": { "count": 0, "ids": [] }
+    },
+    {
+      "document_id": "call-2026-10-01",
+      "kind": "fact_edited",
+      "created_at": "2026-10-19T10:01:50Z",
+      "operation_id": "ce29121a-…",
+      "fact_id": "41ab…",
+      "facts_added": 0,
+      "facts_removed": 0,
+      "observations_created": { "count": 0, "ids": [] },
+      "observations_updated": { "count": 0, "ids": [] },
+      "observations_removed": { "count": 1, "ids": ["2098…"] }
+    }
+  ]
+}
+```
 
 ## Document Response Format
 
@@ -460,5 +642,5 @@ hindsight document list my-bank --tags team-a --tags team-b
 
 ## Next Steps
 
-- [**Operations**](./operations) — Monitor background tasks
-- [**Memory Banks**](./memory-banks) — Configure bank settings
+- [**Operations**](./operations.md) — Monitor background tasks
+- [**Memory Banks**](./memory-banks.md) — Configure bank settings

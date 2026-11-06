@@ -4,6 +4,7 @@ import { useState, useEffect, useMemo } from "react";
 import { useTranslations } from "next-intl";
 import { client, MentalModel, MentalModelDryRunRefreshResult } from "@/lib/api";
 import { useBank } from "@/lib/bank-context";
+import { useRefreshAttempts } from "@/lib/use-refresh-attempts";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
@@ -25,13 +26,26 @@ import {
   MoreVertical,
   Eraser,
   Pencil,
+  Download,
   RefreshCw,
+  RotateCcw,
   Trash2,
   AlertTriangle,
 } from "lucide-react";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Spinner } from "@/components/ui/spinner";
 import { toast } from "sonner";
 import { CompactMarkdown } from "./compact-markdown";
+import { downloadMarkdown, mentalModelDownload, printPage } from "@/lib/page-download";
 import { StalenessBadge } from "./staleness-badge";
 import { CronSchedulePreview } from "./cron-schedule-preview";
 import { NextRefresh } from "./next-refresh";
@@ -46,6 +60,7 @@ import { DirectiveDetailModal } from "./directive-detail-modal";
 import { formatAbsoluteDateTime as formatDateTime, formatRelativeTime } from "@/lib/relative-time";
 import { useTheme } from "@/lib/theme-context";
 import { TagChip } from "@/components/ui/facet-chip";
+import { AttachmentStrip, type RetainedAttachment } from "@/components/ui/inline-attachment-text";
 
 const DIFF_PALETTE = {
   light: {
@@ -73,6 +88,8 @@ type BasedOnFact = {
   text: string;
   type?: string;
   context?: string | null;
+  /** Images behind this fact, resolved by the API on read (not stored with the model). */
+  attachments?: RetainedAttachment[];
 };
 
 type ReflectResponseSnapshot = {
@@ -97,6 +114,9 @@ export type HistoryEntry = {
 };
 
 const isFailureEntry = (e: HistoryEntry) => e.kind === "refresh_failed";
+
+/** How often the modal re-reads the bank's in-flight refreshes; a retry gap is 60s. */
+const MODAL_ATTEMPT_POLL_MS = 12000;
 
 /** Consecutive attempts that failed the same way, as one entry on the timeline. */
 export type FailureGroup = { entry: HistoryEntry; attempts: number; oldest: string };
@@ -141,7 +161,14 @@ export function groupFailures(history: HistoryEntry[]): FailureGroup[] {
  * Kept out of the History tab on purpose: that tab is a version browser, and a
  * refusal to write produces no version — interleaving the two made the failures
  * read as versions and buried the diffs under repetitions of one outage. */
-function RefreshErrorTimeline({ groups }: { groups: FailureGroup[] }) {
+function RefreshErrorTimeline({
+  groups,
+  paused,
+}: {
+  groups: FailureGroup[];
+  /** True while the model's last refresh is a failed one, so nothing re-runs it by itself. */
+  paused: boolean;
+}) {
   const t = useTranslations("mentalModelDetailModal");
   const reasonLabels: Record<RefreshFailureReason, string> = {
     retrieval_failed: t("failureReasonRetrievalFailed"),
@@ -162,6 +189,14 @@ function RefreshErrorTimeline({ groups }: { groups: FailureGroup[] }) {
   return (
     <div className="space-y-1">
       <p className="text-sm text-muted-foreground pb-2">{t("errorsIntro")}</p>
+      {/* The state, not just the log: after the retries a model stops being picked up
+          by its own trigger, and the tab that shows the failures is where someone
+          finds out why nothing has refreshed since (#4532). */}
+      {paused && (
+        <p className="text-sm font-medium text-red-700 dark:text-red-400 pb-2">
+          {t("errorsPausedNotice")}
+        </p>
+      )}
       <ol className="relative border-l border-border ml-2">
         {groups.map((g, i) => (
           <li key={`${g.entry.changed_at}-${i}`} className="relative pl-6 pb-5 last:pb-0">
@@ -238,10 +273,12 @@ const FACT_TYPE_ORDER = ["observation", "experience", "world", "directives", "me
 
 function BasedOnList({
   based_on,
+  bankId,
   onViewMemory,
   onViewDirective,
 }: {
   based_on: Record<string, BasedOnFact[]> | undefined;
+  bankId?: string | null;
   onViewMemory?: (id: string) => void;
   onViewDirective?: (id: string) => void;
 }) {
@@ -289,14 +326,21 @@ function BasedOnList({
                     key={fact.id || i}
                     className="group flex items-start gap-3 px-3 py-2 hover:bg-muted/30"
                   >
-                    <p className="text-sm text-foreground leading-relaxed flex-1 min-w-0">
+                    <div className="text-sm text-foreground leading-relaxed flex-1 min-w-0">
                       {fact.text}
                       {fact.context && (
                         <span className="block text-xs text-muted-foreground italic mt-0.5">
                           {fact.context}
                         </span>
                       )}
-                    </p>
+                      {bankId && (
+                        <AttachmentStrip
+                          bankId={bankId}
+                          attachments={fact.attachments}
+                          className="mt-2"
+                        />
+                      )}
+                    </div>
                     {canView && (
                       <button
                         className="text-xs text-muted-foreground hover:text-foreground opacity-0 group-hover:opacity-100 transition-opacity shrink-0 mt-0.5"
@@ -787,11 +831,15 @@ export function MentalModelDetailModal({
 }: MentalModelDetailModalProps) {
   const t = useTranslations("mentalModelDetailModal");
   const { currentBank } = useBank();
+  // Same source the list uses: while the worker still has attempts left the model
+  // is not paused yet, and the two surfaces must not disagree about that (#4532).
+  const refreshAttempts = useRefreshAttempts(currentBank, MODAL_ATTEMPT_POLL_MS);
   const [mentalModel, setMentalModel] = useState<MentalModel | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<"content" | "configuration" | "history">(initialTab);
   const [refreshing, setRefreshing] = useState(false);
+  const [confirmFullRefresh, setConfirmFullRefresh] = useState(false);
   const [reloading, setReloading] = useState(false);
   const [viewMemoryId, setViewMemoryId] = useState<string | null>(null);
   const [viewDirectiveId, setViewDirectiveId] = useState<string | null>(null);
@@ -805,6 +853,11 @@ export function MentalModelDetailModal({
     [history]
   );
   const failureGroups = useMemo(() => groupFailures(history ?? []), [history]);
+  // Paused is the end state, not the first failed attempt: while an attempt is
+  // still queued or running the worker has not given up on this model yet.
+  const refreshPaused = Boolean(
+    mentalModel?.last_refresh_failed_at && !refreshAttempts.has(mentalModel.id)
+  );
   const [loadingHistory, setLoadingHistory] = useState(false);
   const [dryRunning, setDryRunning] = useState(false);
   const [dryRunResult, setDryRunResult] = useState<MentalModelDryRunRefreshResult | null>(null);
@@ -884,13 +937,13 @@ export function MentalModelDetailModal({
     }
   };
 
-  const handleRefresh = async () => {
+  const handleRefresh = async (mode?: "full") => {
     if (!currentBank || !mentalModel) return;
     setRefreshing(true);
     const originalRefreshedAt = mentalModel.last_refreshed_at;
 
     try {
-      await client.refreshMentalModel(currentBank, mentalModel.id);
+      await client.refreshMentalModel(currentBank, mentalModel.id, mode ? { mode } : undefined);
 
       const pollInterval = 1000;
       const maxAttempts = 120;
@@ -954,11 +1007,21 @@ export function MentalModelDetailModal({
                   <RefreshCw className={`h-3.5 w-3.5 ${reloading ? "animate-spin" : ""}`} />
                 </Button>
               )}
-              {mentalModel?.trigger?.refresh_after_consolidation && (
-                <span className="flex items-center gap-1 px-2 py-0.5 rounded-full bg-green-500/10 text-green-600 dark:text-green-400 text-xs font-medium">
-                  <Zap className="w-3 h-3" />
-                  {t("autoRefresh")}
+              {/* The auto-refresh promise is only true while refreshes work: a model
+                  whose last one failed is skipped by its trigger until one succeeds,
+                  so it says so here instead of showing a green badge (#4532). */}
+              {refreshPaused ? (
+                <span className="flex items-center gap-1 px-2 py-0.5 rounded-full bg-red-500/10 text-red-600 dark:text-red-400 text-xs font-medium">
+                  <AlertTriangle className="w-3 h-3" />
+                  {t("refreshPaused")}
                 </span>
+              ) : (
+                mentalModel?.trigger?.refresh_after_consolidation && (
+                  <span className="flex items-center gap-1 px-2 py-0.5 rounded-full bg-green-500/10 text-green-600 dark:text-green-400 text-xs font-medium">
+                    <Zap className="w-3 h-3" />
+                    {t("autoRefresh")}
+                  </span>
+                )
               )}
             </DialogTitle>
           </DialogHeader>
@@ -1026,9 +1089,34 @@ export function MentalModelDetailModal({
                         {t("actionEdit")}
                       </DropdownMenuItem>
                     )}
-                    <DropdownMenuItem onClick={handleRefresh} disabled={refreshing}>
+                    <DropdownMenuItem onClick={() => handleRefresh()} disabled={refreshing}>
                       <RefreshCw className="h-4 w-4 mr-2" />
                       {t("actionRefreshManually")}
+                    </DropdownMenuItem>
+                    {/* Only a delta model has anything to gain: a full-mode one already
+                        rewrites from scratch on every refresh. */}
+                    {mentalModel.trigger?.mode === "delta" && (
+                      <DropdownMenuItem
+                        onClick={() => setConfirmFullRefresh(true)}
+                        disabled={refreshing}
+                      >
+                        <RotateCcw className="h-4 w-4 mr-2" />
+                        {t("actionFullRefresh")}
+                      </DropdownMenuItem>
+                    )}
+                    <DropdownMenuItem
+                      onClick={() => printPage(mentalModelDownload(mentalModel))}
+                      disabled={!mentalModel.content}
+                    >
+                      <Download className="h-4 w-4 mr-2" />
+                      {t("actionDownloadPdf")}
+                    </DropdownMenuItem>
+                    <DropdownMenuItem
+                      onClick={() => downloadMarkdown(mentalModelDownload(mentalModel))}
+                      disabled={!mentalModel.content}
+                    >
+                      <Download className="h-4 w-4 mr-2" />
+                      {t("actionDownloadMarkdown")}
                     </DropdownMenuItem>
                     <DropdownMenuItem onClick={handleDryRun} disabled={dryRunning}>
                       <FlaskConical
@@ -1056,6 +1144,22 @@ export function MentalModelDetailModal({
                     )}
                   </DropdownMenuContent>
                 </DropdownMenu>
+                <AlertDialog open={confirmFullRefresh} onOpenChange={setConfirmFullRefresh}>
+                  <AlertDialogContent>
+                    <AlertDialogHeader>
+                      <AlertDialogTitle>{t("fullRefreshDialogTitle")}</AlertDialogTitle>
+                      <AlertDialogDescription>
+                        {t("fullRefreshDialogDescription")}
+                      </AlertDialogDescription>
+                    </AlertDialogHeader>
+                    <AlertDialogFooter>
+                      <AlertDialogCancel>{t("cancel")}</AlertDialogCancel>
+                      <AlertDialogAction onClick={() => handleRefresh("full")}>
+                        {t("fullRefreshDialogConfirm")}
+                      </AlertDialogAction>
+                    </AlertDialogFooter>
+                  </AlertDialogContent>
+                </AlertDialog>
               </div>
 
               <div className="flex-1 overflow-y-auto mt-4">
@@ -1106,6 +1210,7 @@ export function MentalModelDetailModal({
                     {mentalModel.reflect_response ? (
                       <BasedOnList
                         based_on={basedOn}
+                        bankId={currentBank}
                         onViewMemory={(id) => setViewMemoryId(id)}
                         onViewDirective={(id) => setViewDirectiveId(id)}
                       />
@@ -1127,7 +1232,7 @@ export function MentalModelDetailModal({
                       <Spinner size="md" variant="jump" />
                     </div>
                   ) : (
-                    <RefreshErrorTimeline groups={failureGroups} />
+                    <RefreshErrorTimeline groups={failureGroups} paused={refreshPaused} />
                   )}
                 </TabsContent>
 
@@ -1148,7 +1253,11 @@ export function MentalModelDetailModal({
                       onViewDirective={(id) => setViewDirectiveId(id)}
                     />
                   ) : (
-                    <p className="text-sm text-muted-foreground italic">{t("noHistory")}</p>
+                    <p className="text-sm text-muted-foreground italic">
+                      {/* A model that has only ever failed has no versions, and "no history"
+                          read as "nothing ever happened" — point at the tab that has it. */}
+                      {failureGroups.length > 0 ? t("noHistoryOnlyFailures") : t("noHistory")}
+                    </p>
                   )}
                 </TabsContent>
               </div>
@@ -1300,6 +1409,20 @@ function ConfigurationTab({ mentalModel }: { mentalModel: MentalModel }) {
           label={t("labelNextRefresh")}
           value={<NextRefresh trigger={mentalModel.trigger} />}
         />
+        {(mentalModel.last_full_refreshed_at || mentalModel.trigger?.full_refresh_cron) && (
+          <Metadata
+            label={t("labelLastFullRefresh")}
+            value={
+              mentalModel.last_full_refreshed_at ? (
+                <span title={formatDateTime(mentalModel.last_full_refreshed_at)}>
+                  {formatRelativeTime(mentalModel.last_full_refreshed_at)}
+                </span>
+              ) : (
+                <span className="text-muted-foreground italic text-sm">{t("valueNever")}</span>
+              )
+            }
+          />
+        )}
         <Metadata label={t("labelMaxTokens")} value={mentalModel.max_tokens.toLocaleString()} />
       </InfoCard>
 
@@ -1344,6 +1467,36 @@ function ConfigurationTab({ mentalModel }: { mentalModel: MentalModel }) {
           }
         />
         {trigger.refresh_cron && <CronSchedulePreview cron={trigger.refresh_cron} />}
+        {trigger.mode === "delta" && (
+          <Metadata
+            label={t("labelFullRefreshCron")}
+            value={
+              trigger.full_refresh_cron ? (
+                <Pill
+                  label={trigger.full_refresh_cron}
+                  color="bg-blue-500/10 text-blue-600 dark:text-blue-400"
+                />
+              ) : (
+                <Pill label={t("pillDisabled")} />
+              )
+            }
+          />
+        )}
+        {trigger.mode === "delta" && trigger.full_refresh_cron && (
+          <CronSchedulePreview cron={trigger.full_refresh_cron} />
+        )}
+        <Metadata
+          label={t("labelMinRefreshInterval")}
+          value={
+            trigger.min_refresh_interval_seconds != null
+              ? `${trigger.min_refresh_interval_seconds.toLocaleString()}${t("secondsSuffix")}`
+              : t("minRefreshIntervalDefault")
+          }
+        />
+        <Metadata
+          label={t("labelKeepTrace")}
+          value={trigger.keep_trace ? t("valueYes") : t("valueNo")}
+        />
         <Metadata
           label={t("labelFactTypes")}
           value={
@@ -1382,7 +1535,7 @@ function ConfigurationTab({ mentalModel }: { mentalModel: MentalModel }) {
         )}
       </InfoCard>
 
-      <InfoCard title={t("recallParamsTitle")} icon={<Settings className="w-3.5 h-3.5" />}>
+      <InfoCard title={t("reflectParamsTitle")} icon={<Settings className="w-3.5 h-3.5" />}>
         <Metadata
           label={t("labelIncludeChunks")}
           value={
@@ -1412,6 +1565,28 @@ function ConfigurationTab({ mentalModel }: { mentalModel: MentalModel }) {
         <Metadata
           label={t("labelTagsMatch")}
           value={trigger.tags_match ? <Pill label={trigger.tags_match} /> : t("tagsMatchDefault")}
+        />
+        <Metadata
+          label={t("labelBudget")}
+          value={trigger.budget ? <Pill label={trigger.budget} /> : t("budgetDefault")}
+        />
+        <Metadata
+          label={t("labelObservationsMaxTokens")}
+          value={
+            trigger.reflect_search_observations_max_tokens != null
+              ? trigger.reflect_search_observations_max_tokens.toLocaleString()
+              : t("observationsMaxTokensDefault")
+          }
+        />
+        <Metadata
+          label={t("labelObservationEntities")}
+          value={
+            trigger.reflect_search_observations_include_entities == null
+              ? t("observationEntitiesDefault")
+              : trigger.reflect_search_observations_include_entities
+                ? t("valueYes")
+                : t("valueNo")
+          }
         />
       </InfoCard>
 

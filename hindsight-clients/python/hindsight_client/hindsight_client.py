@@ -7,16 +7,20 @@ easy-to-use interface on top of the auto-generated OpenAPI client.
 
 import asyncio
 import json
+import math
 import random
 import warnings
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime
 from importlib import metadata
 from pathlib import Path
-from collections.abc import Awaitable, Callable
 from typing import Any, Literal
+from urllib.parse import quote
+
+import aiohttp
+from yarl import URL
 
 import hindsight_client_api
 from hindsight_client_api.exceptions import ApiException
@@ -43,6 +47,7 @@ DEFAULT_USER_AGENT = f"hindsight-client-python/{_CLIENT_VERSION}"
 #: refused with 422 rather than silently dropping the attachments.
 ContentBlock = dict[str, Any]
 from hindsight_client_api.api import (
+    audit_api,
     bank_transfer_api,
     banks_api,
     directives_api,
@@ -69,6 +74,7 @@ from hindsight_client_api.models.list_memory_units_response import ListMemoryUni
 from hindsight_client_api.models.recall_response import RecallResponse
 from hindsight_client_api.models.reflect_include_options import ReflectIncludeOptions
 from hindsight_client_api.models.reflect_response import ReflectResponse
+from hindsight_client_api.models.refresh_mental_model_request import RefreshMentalModelRequest
 from hindsight_client_api.models.retain_response import RetainResponse
 from hindsight_client_api.models.tool_calls_include_options import ToolCallsIncludeOptions
 from hindsight_client_api.models.version_response import VersionResponse
@@ -125,9 +131,7 @@ def _trigger_input(trigger: dict[str, Any]) -> Any:
 
     model = mental_model_trigger_input.MentalModelTriggerInput
     unnamed_defaults = {
-        name: None
-        for name, field in model.model_fields.items()
-        if name not in trigger and field.default is not None
+        name: None for name, field in model.model_fields.items() if name not in trigger and field.default is not None
     }
     return model(**unnamed_defaults, **trigger)
 
@@ -183,7 +187,8 @@ def _retry_after_seconds(e: "ApiException") -> float | None:
     if raw is None:
         return None
     try:
-        return max(0.0, float(raw))
+        seconds = float(raw)
+        return max(0.0, seconds) if math.isfinite(seconds) else None
     except (TypeError, ValueError):
         # HTTP-date form; the fallback backoff is a better answer than parsing dates.
         return None
@@ -272,25 +277,30 @@ class Hindsight:
             base_url: The base URL of the Hindsight API server
             api_key: Optional API key for authentication (sent as Bearer token)
             timeout: Request timeout in seconds (default: 300.0)
-            user_agent: Override the default ``User-Agent`` header. Integrations
-                should set this to identify themselves (e.g.
-                ``"hindsight-crewai/1.2.0"``). Defaults to
-                ``hindsight-client-python/<version>``.
+            user_agent: Product token placed in front of the client's own in the
+                ``User-Agent`` header. Integrations should set this to identify
+                themselves (e.g. ``"hindsight-crewai/1.2.0"`` is sent as
+                ``"hindsight-crewai/1.2.0 hindsight-client-python/<version>"``).
+                Defaults to ``hindsight-client-python/<version>`` alone.
             max_attempts: Total attempts for *idempotent* calls (recall, reflect)
                 when the server reports it is at capacity (429/503). 1 disables
                 retrying. Waits honour ``Retry-After`` and are jittered; writes are
                 never retried here.
         """
+        # Generated routes already start with a slash, like the handwritten bank
+        # routes. Normalize once so a URL copied with a trailing slash works for both.
+        base_url = base_url.rstrip("/")
         config = hindsight_client_api.Configuration(host=base_url, access_token=api_key)
         self._api_client = hindsight_client_api.ApiClient(config)
-        self._api_client.user_agent = user_agent or DEFAULT_USER_AGENT
+        # Prefix rather than replace, so the server still learns the client version behind an
+        # integration. Before, a caller's value replaced the default and the version was lost.
+        self._api_client.user_agent = f"{user_agent} {DEFAULT_USER_AGENT}" if user_agent else DEFAULT_USER_AGENT
         self._timeout = timeout
         self._max_attempts = max(1, max_attempts)
         # Per-client RNG so jitter is injectable in tests and independent of any
         # seeding the calling application does to the global `random` module.
         self._retry_rng = random.Random()
-        self._base_url = base_url.rstrip("/")
-        self._api_key = api_key
+        self._base_url = base_url
         self._retain_suspended: ContextVar[bool] = ContextVar("retain_suspended", default=False)
         if api_key:
             self._api_client.set_default_header("Authorization", f"Bearer {api_key}")
@@ -305,6 +315,7 @@ class Hindsight:
         self._operations_api = operations_api.OperationsApi(self._api_client)
         self._webhooks_api = webhooks_api.WebhooksApi(self._api_client)
         self._monitoring_api = monitoring_api.MonitoringApi(self._api_client)
+        self._audit_api = audit_api.AuditApi(self._api_client)
         self._document_transfer_api = document_transfer_api.DocumentTransferApi(self._api_client)
         self._bank_transfer_api = bank_transfer_api.BankTransferApi(self._api_client)
 
@@ -402,6 +413,11 @@ class Hindsight:
         """Low-level Monitoring API — health check, version, metrics."""
         return self._monitoring_api
 
+    @property
+    def audit(self) -> audit_api.AuditApi:
+        """Low-level Audit API — list a bank's audit log, get one entry with its bodies."""
+        return self._audit_api
+
     def __enter__(self):
         """Context manager entry."""
         return self
@@ -456,7 +472,7 @@ class Hindsight:
         self,
         bank_id: str,
         content: str | list[ContentBlock],
-        timestamp: datetime | None = None,
+        timestamp: datetime | str | None = None,
         context: str | None = None,
         document_id: str | None = None,
         metadata: dict[str, str] | None = None,
@@ -466,6 +482,10 @@ class Hindsight:
         update_mode: str | None = None,
         retain_async: bool = False,
         operation_id: str | None = None,
+        observation_scopes: Literal["per_tag", "combined", "all_combinations", "shared"]
+        | list[list[str]]
+        | None = None,
+        strategy: str | None = None,
     ) -> RetainResponse:
         """
         Store a single memory (sync wrapper — prefer :meth:`aretain` in async code).
@@ -476,7 +496,7 @@ class Hindsight:
                 content blocks so an image sits inline where it actually appears —
                 see :data:`ContentBlock`. The block form needs a vision-capable
                 retain LLM server-side.
-            timestamp: Optional event timestamp
+            timestamp: Optional event timestamp (datetime, ISO string, or "unset" for timeless content)
             context: Optional context description
             document_id: Optional document ID for grouping
             metadata: Optional user-defined metadata
@@ -487,6 +507,8 @@ class Hindsight:
             update_mode: How to handle existing documents ('replace' or 'append')
             retain_async: If True, process asynchronously in background (default: False)
             operation_id: Optional caller-supplied UUID for idempotent async retries; ignored by sync retain
+            observation_scopes: Observation grouping mode or explicit tag scopes, as in retain_batch items
+            strategy: Named extraction strategy configured on the bank
 
         Returns:
             RetainResponse with success status
@@ -503,6 +525,10 @@ class Hindsight:
             item["resolve_entities"] = resolve_entities
         if update_mode is not None:
             item["update_mode"] = update_mode
+        if observation_scopes is not None:
+            item["observation_scopes"] = observation_scopes
+        if strategy is not None:
+            item["strategy"] = strategy
         batch_kwargs: dict[str, Any] = {
             "bank_id": bank_id,
             "items": [item],
@@ -603,7 +629,7 @@ class Hindsight:
         file_data = []
         for file_path in files:
             path = Path(file_path)
-            file_data.append((path.name, path.read_bytes()))
+            file_data.append((path.name, await asyncio.to_thread(path.read_bytes)))
 
         meta = files_metadata or [{"context": context} if context else {} for _ in files]
 
@@ -631,7 +657,8 @@ class Hindsight:
         tags: list[str] | None = None,
         tags_match: Literal["any", "all", "any_strict", "all_strict", "exact"] = "any",
         tag_groups: list[dict[str, Any]] | None = None,
-        prefer_observations: bool = False,
+        prefer_observations: bool | None = None,
+        rerank: dict[str, bool | None] | None = None,
         min_scores: dict[str, float] | None = None,
         temporal_window: dict[str, Any] | None = None,
     ) -> RecallResponse:
@@ -660,8 +687,14 @@ class Hindsight:
             tag_groups: Optional list of tag group filters for advanced boolean tag matching.
             prefer_observations: When recalling raw facts ("world"/"experience") together with
                 "observation", drop any raw fact a returned observation was consolidated from, so the
-                observation supersedes it (no duplicate content). Disabled by default; no effect unless
-                "observation" and at least one raw type are both in ``types``.
+                observation supersedes it (no duplicate content). No effect unless "observation" and at
+                least one raw type are both in ``types``. ``None`` (default) uses the bank's
+                ``recall_prefer_observations`` config.
+            rerank: What a decision model set up for recall does beyond ordering, e.g.
+                ``{"prune": True, "dedup": True}``. ``prune`` drops the results it judges no help
+                instead of only ranking them last; ``dedup`` drops a result repeating a better-ranked
+                one, at the cost of one more decision-model request. A key left out (or ``None``) uses
+                the bank's ``recall_decision_model_prune`` / ``recall_decision_model_dedup`` config.
             min_scores: Optional per-stage score floors, e.g. ``{"semantic": 0.2, "final": 0.5}``.
                 ``semantic`` and ``keyword`` are retrieval-level cutoffs; ``reranker`` and ``final``
                 are applied to the scored results after reranking. Any omitted stage imposes no floor.
@@ -694,6 +727,7 @@ class Hindsight:
                 tags_match=tags_match,
                 tag_groups=tag_groups,
                 prefer_observations=prefer_observations,
+                rerank=rerank,
                 min_scores=min_scores,
                 temporal_window=temporal_window,
             )
@@ -719,6 +753,7 @@ class Hindsight:
         exclude_mental_model_ids: list[str] | None = None,
         reflect_search_observations_max_tokens: int | None = None,
         reflect_search_observations_include_entities: bool | None = None,
+        reflect_search_mental_models_max_tokens: int | None = None,
     ) -> ReflectResponse:
         """
         Generate a contextual answer based on bank identity and memories (sync wrapper — prefer :meth:`areflect` in async code).
@@ -756,6 +791,10 @@ class Hindsight:
             reflect_search_observations_include_entities: Whether search_observations attaches
                 resolved entity names, which can be over half the tool payload. None uses the
                 bank default (enabled).
+            reflect_search_mental_models_max_tokens: Token budget for the mental models the
+                agent's search_mental_models calls return in full. The best-ranked one is always in
+                full; the rest that do not fit come back as a snippet. None uses the bank's
+                reflect_default_options, then the shipped default.
 
         Returns:
             ReflectResponse with answer text, optionally facts used, optionally a 'trace' with
@@ -782,6 +821,7 @@ class Hindsight:
                 exclude_mental_model_ids=exclude_mental_model_ids,
                 reflect_search_observations_max_tokens=reflect_search_observations_max_tokens,
                 reflect_search_observations_include_entities=reflect_search_observations_include_entities,
+                reflect_search_mental_models_max_tokens=reflect_search_mental_models_max_tokens,
             )
         )
 
@@ -796,6 +836,11 @@ class Hindsight:
         end_date: str | None = None,
         limit: int = 100,
         offset: int = 0,
+        tags: list[str] | None = None,
+        tags_match: str | None = None,
+        document_id: str | None = None,
+        state: Literal["valid", "invalidated"] | None = None,
+        consolidation_state: Literal["failed", "pending", "done"] | None = None,
     ) -> ListMemoryUnitsResponse:
         """
         List memory units with pagination (sync wrapper — prefer :meth:`alist_memories` in async code).
@@ -813,6 +858,11 @@ class Hindsight:
                 end_date=end_date,
                 limit=limit,
                 offset=offset,
+                tags=tags,
+                tags_match=tags_match,
+                document_id=document_id,
+                state=state,
+                consolidation_state=consolidation_state,
             )
         )
 
@@ -827,6 +877,11 @@ class Hindsight:
         end_date: str | None = None,
         limit: int = 100,
         offset: int = 0,
+        tags: list[str] | None = None,
+        tags_match: str | None = None,
+        document_id: str | None = None,
+        state: Literal["valid", "invalidated"] | None = None,
+        consolidation_state: Literal["failed", "pending", "done"] | None = None,
     ) -> ListMemoryUnitsResponse:
         """List memory units with pagination (async — preferred over :meth:`list_memories`).
 
@@ -839,6 +894,13 @@ class Hindsight:
         ``[start_date, end_date)`` given as ISO-8601 strings. Memories carrying no
         value on that axis are excluded, so ``total`` counts the window rather than
         the bank.
+
+        tags / tags_match filter by the memories' tags ('any', 'all', 'any_strict',
+        'all_strict', 'exact'; the server defaults to 'any').
+
+        document_id restricts results to one retained document. state selects
+        valid or invalidated facts; consolidation_state selects failed, pending,
+        or done consolidation. Omitted filters preserve the server defaults.
         """
         return await self._memory_api.list_memories(
             bank_id=bank_id,
@@ -850,6 +912,11 @@ class Hindsight:
             end_date=end_date,
             limit=limit,
             offset=offset,
+            tags=tags,
+            tags_match=tags_match,
+            document_id=document_id,
+            state=state,
+            consolidation_state=consolidation_state,
             _request_timeout=self._timeout,
         )
 
@@ -959,8 +1026,6 @@ class Hindsight:
         enable_reranking: bool | None = None,
         background: str | None = None,
     ) -> BankProfileResponse:
-        import aiohttp
-
         body: dict[str, Any] = {}
         if name is not None:
             body["name"] = name
@@ -1008,9 +1073,10 @@ class Hindsight:
         if enable_reranking is not None:
             body["enable_reranking"] = enable_reranking
 
-        url = f"{self._base_url}/v1/default/banks/{bank_id}"
-        headers = {"Authorization": f"Bearer {self._api_key}"} if self._api_key else {}
-        async with aiohttp.ClientSession() as session:
+        url = f"{self._base_url}/v1/default/banks/{quote(bank_id, safe='')}"
+        # Keep integration attribution and configured headers consistent with generated calls.
+        headers = self._api_client.default_headers.copy()
+        async with aiohttp.ClientSession(trust_env=True) as session:
             async with session.put(
                 url, json=body, headers=headers, timeout=aiohttp.ClientTimeout(total=self._timeout)
             ) as resp:
@@ -1197,7 +1263,7 @@ class Hindsight:
         self,
         bank_id: str,
         content: str | list[ContentBlock],
-        timestamp: datetime | None = None,
+        timestamp: datetime | str | None = None,
         context: str | None = None,
         document_id: str | None = None,
         metadata: dict[str, str] | None = None,
@@ -1207,6 +1273,10 @@ class Hindsight:
         update_mode: str | None = None,
         retain_async: bool = False,
         operation_id: str | None = None,
+        observation_scopes: Literal["per_tag", "combined", "all_combinations", "shared"]
+        | list[list[str]]
+        | None = None,
+        strategy: str | None = None,
     ) -> RetainResponse:
         """
         Store a single memory (async — preferred over :meth:`retain`).
@@ -1217,7 +1287,7 @@ class Hindsight:
                 content blocks so an image sits inline where it actually appears —
                 see :data:`ContentBlock`. The block form needs a vision-capable
                 retain LLM server-side.
-            timestamp: Optional event timestamp
+            timestamp: Optional event timestamp (datetime, ISO string, or "unset" for timeless content)
             context: Optional context description
             document_id: Optional document ID for grouping
             metadata: Optional user-defined metadata
@@ -1228,6 +1298,8 @@ class Hindsight:
             update_mode: How to handle existing documents ('replace' or 'append')
             retain_async: If True, process asynchronously in background (default: False)
             operation_id: Optional caller-supplied UUID for idempotent async retries; ignored by sync retain
+            observation_scopes: Observation grouping mode or explicit tag scopes, as in retain_batch items
+            strategy: Named extraction strategy configured on the bank
 
         Returns:
             RetainResponse with success status
@@ -1244,6 +1316,10 @@ class Hindsight:
             item["resolve_entities"] = resolve_entities
         if update_mode is not None:
             item["update_mode"] = update_mode
+        if observation_scopes is not None:
+            item["observation_scopes"] = observation_scopes
+        if strategy is not None:
+            item["strategy"] = strategy
         batch_kwargs: dict[str, Any] = {
             "bank_id": bank_id,
             "items": [item],
@@ -1273,7 +1349,8 @@ class Hindsight:
         tags: list[str] | None = None,
         tags_match: Literal["any", "all", "any_strict", "all_strict", "exact"] = "any",
         tag_groups: list[dict[str, Any]] | None = None,
-        prefer_observations: bool = False,
+        prefer_observations: bool | None = None,
+        rerank: dict[str, bool | None] | None = None,
         min_scores: dict[str, float] | None = None,
         temporal_window: dict[str, Any] | None = None,
     ) -> RecallResponse:
@@ -1307,8 +1384,14 @@ class Hindsight:
 
             prefer_observations: When recalling raw facts ("world"/"experience") together with
                 "observation", drop any raw fact a returned observation was consolidated from, so the
-                observation supersedes it (no duplicate content). Disabled by default; no effect unless
-                "observation" and at least one raw type are both in ``types``.
+                observation supersedes it (no duplicate content). No effect unless "observation" and at
+                least one raw type are both in ``types``. ``None`` (default) uses the bank's
+                ``recall_prefer_observations`` config.
+            rerank: What a decision model set up for recall does beyond ordering, e.g.
+                ``{"prune": True, "dedup": True}``. ``prune`` drops the results it judges no help
+                instead of only ranking them last; ``dedup`` drops a result repeating a better-ranked
+                one, at the cost of one more decision-model request. A key left out (or ``None``) uses
+                the bank's ``recall_decision_model_prune`` / ``recall_decision_model_dedup`` config.
             min_scores: Optional per-stage score floors, e.g. ``{"semantic": 0.2, "final": 0.5}``.
                 ``semantic`` and ``keyword`` are retrieval-level cutoffs; ``reranker`` and ``final``
                 are applied to the scored results after reranking. Any omitted stage imposes no floor.
@@ -1360,10 +1443,19 @@ class Hindsight:
                 # Fail loud instead of silently dropping a misspelled floor, which
                 # would make the caller believe filtering is active when it is not.
                 raise ValueError(
-                    f"Unknown min_scores keys: {sorted(unknown)}. "
-                    f"Allowed keys: {sorted(allowed_min_scores)}."
+                    f"Unknown min_scores keys: {sorted(unknown)}. Allowed keys: {sorted(allowed_min_scores)}."
                 )
             min_scores_obj = MinScores.from_dict(min_scores)
+
+        rerank_obj = None
+        if rerank is not None:
+            from hindsight_client_api.models.rerank_options import RerankOptions
+
+            unknown_rerank = set(rerank) - {"prune", "dedup"}
+            if unknown_rerank:
+                # Fail loud, as for min_scores: a misspelled key would leave the bank's default on.
+                raise ValueError(f"Unknown rerank keys: {sorted(unknown_rerank)}. Allowed keys: ['dedup', 'prune'].")
+            rerank_obj = RerankOptions.from_dict(rerank)
 
         temporal_window_obj = None
         if temporal_window is not None:
@@ -1375,6 +1467,7 @@ class Hindsight:
             query=query,
             types=types,
             prefer_observations=prefer_observations,
+            rerank=rerank_obj,
             budget=budget,
             max_tokens=max_tokens,
             trace=trace,
@@ -1413,6 +1506,7 @@ class Hindsight:
         exclude_mental_model_ids: list[str] | None = None,
         reflect_search_observations_max_tokens: int | None = None,
         reflect_search_observations_include_entities: bool | None = None,
+        reflect_search_mental_models_max_tokens: int | None = None,
     ) -> ReflectResponse:
         """
         Generate a contextual answer based on bank identity and memories (async — preferred over :meth:`reflect`).
@@ -1450,6 +1544,10 @@ class Hindsight:
             reflect_search_observations_include_entities: Whether search_observations attaches
                 resolved entity names, which can be over half the tool payload. None uses the
                 bank default (enabled).
+            reflect_search_mental_models_max_tokens: Token budget for the mental models the
+                agent's search_mental_models calls return in full. The best-ranked one is always in
+                full; the rest that do not fit come back as a snippet. None uses the bank's
+                reflect_default_options, then the shipped default.
 
         Returns:
             ReflectResponse with answer text, optionally facts used, optionally a 'trace' with
@@ -1490,6 +1588,7 @@ class Hindsight:
             exclude_mental_model_ids=exclude_mental_model_ids,
             reflect_search_observations_max_tokens=reflect_search_observations_max_tokens,
             reflect_search_observations_include_entities=reflect_search_observations_include_entities,
+            reflect_search_mental_models_max_tokens=reflect_search_mental_models_max_tokens,
         )
 
         return await _retry_on_capacity(
@@ -1575,6 +1674,7 @@ class Hindsight:
         detail: Literal["metadata", "content", "full"] | None = None,
         limit: int | None = None,
         offset: int | None = None,
+        exclude_knowledge_pages: bool | None = None,
     ):
         """
         List all mental models in a bank (sync wrapper — prefer :meth:`alist_mental_models` in async code).
@@ -1589,6 +1689,7 @@ class Hindsight:
                 detail=detail,
                 limit=limit,
                 offset=offset,
+                exclude_knowledge_pages=exclude_knowledge_pages,
             )
         )
 
@@ -1600,6 +1701,7 @@ class Hindsight:
         detail: Literal["metadata", "content", "full"] | None = None,
         limit: int | None = None,
         offset: int | None = None,
+        exclude_knowledge_pages: bool | None = None,
     ):
         """
         List all mental models in a bank (async — preferred over :meth:`list_mental_models`).
@@ -1615,6 +1717,8 @@ class Hindsight:
                 text, or read a single model with get_mental_model.
             limit: Maximum number of mental models to return
             offset: Number of mental models to skip (for pagination)
+            exclude_knowledge_pages: Leave out the models that hold knowledge page
+                content, listing standalone mental models only (server default: false)
 
         Returns:
             ListMentalModelsResponse with items
@@ -1626,6 +1730,7 @@ class Hindsight:
             detail=detail,
             limit=limit,
             offset=offset,
+            exclude_knowledge_pages=exclude_knowledge_pages,
             _request_timeout=self._timeout,
         )
 
@@ -1666,27 +1771,33 @@ class Hindsight:
             bank_id, mental_model_id, detail=detail, _request_timeout=self._timeout
         )
 
-    def refresh_mental_model(self, bank_id: str, mental_model_id: str):
+    def refresh_mental_model(self, bank_id: str, mental_model_id: str, mode: Literal["full"] | None = None):
         """
         Refresh a mental model (sync wrapper — prefer :meth:`arefresh_mental_model` in async code).
 
         See :meth:`arefresh_mental_model` for the full argument and return documentation.
         """
-        return _run_async(self.arefresh_mental_model(bank_id=bank_id, mental_model_id=mental_model_id))
+        return _run_async(self.arefresh_mental_model(bank_id=bank_id, mental_model_id=mental_model_id, mode=mode))
 
-    async def arefresh_mental_model(self, bank_id: str, mental_model_id: str):
+    async def arefresh_mental_model(self, bank_id: str, mental_model_id: str, mode: Literal["full"] | None = None):
         """
         Refresh a mental model (async — preferred over :meth:`refresh_mental_model`).
 
         Args:
             bank_id: The memory bank ID
             mental_model_id: The mental model ID
+            mode: "full" regenerates the content from scratch this once, whatever the
+                model's trigger mode is; the trigger is not changed. None runs the
+                model's own mode.
 
         Returns:
             RefreshMentalModelResponse with operation_id
         """
         return await self._mental_models_api.refresh_mental_model(
-            bank_id, mental_model_id, _request_timeout=self._timeout
+            bank_id,
+            mental_model_id,
+            refresh_mental_model_request=RefreshMentalModelRequest(mode=mode) if mode else None,
+            _request_timeout=self._timeout,
         )
 
     def dry_run_refresh_mental_model(self, bank_id: str, mental_model_id: str):
@@ -1854,15 +1965,29 @@ class Hindsight:
 
     # Knowledge base methods
 
-    def get_knowledge_base_tree(self, bank_id: str):
+    def get_knowledge_base_tree(
+        self,
+        bank_id: str,
+        tags: list[str] | None = None,
+        tags_match: str | None = None,
+        tag_groups: list[dict[str, Any]] | None = None,
+    ):
         """
         Get the knowledge base as a nested folder/page tree (sync wrapper — prefer :meth:`aget_knowledge_base_tree` in async code).
 
         See :meth:`aget_knowledge_base_tree` for the full argument and return documentation.
         """
-        return _run_async(self.aget_knowledge_base_tree(bank_id=bank_id))
+        return _run_async(
+            self.aget_knowledge_base_tree(bank_id=bank_id, tags=tags, tags_match=tags_match, tag_groups=tag_groups)
+        )
 
-    async def aget_knowledge_base_tree(self, bank_id: str):
+    async def aget_knowledge_base_tree(
+        self,
+        bank_id: str,
+        tags: list[str] | None = None,
+        tags_match: str | None = None,
+        tag_groups: list[dict[str, Any]] | None = None,
+    ):
         """
         Get the knowledge base as a nested folder/page tree (async — preferred over :meth:`get_knowledge_base_tree`).
 
@@ -1870,11 +1995,23 @@ class Hindsight:
 
         Args:
             bank_id: The memory bank ID
+            tags: Only return pages carrying these tags, matched per ``tags_match`` (recall semantics).
+                Folders are kept only on the path to a matching page.
+            tags_match: 'any', 'all', 'any_strict', 'all_strict' or 'exact' (server default 'any',
+                which also returns untagged pages)
+            tag_groups: Compound boolean tag filter, same shape as recall's ``tag_groups``
 
         Returns:
             KnowledgeTreeResponse with roots
         """
-        return await self._knowledge_base_api.get_knowledge_base_tree(bank_id, _request_timeout=self._timeout)
+        return await self._knowledge_base_api.get_knowledge_base_tree(
+            bank_id,
+            tags=tags,
+            tags_match=tags_match,
+            # Sent as one JSON query param: the endpoint is a GET, and a boolean tree has no flat form.
+            tag_groups=json.dumps(tag_groups) if tag_groups else None,
+            _request_timeout=self._timeout,
+        )
 
     def create_knowledge_folder(self, bank_id: str, name: str, parent_id: str | None = None):
         """
@@ -2006,15 +2143,35 @@ class Hindsight:
         """
         return await self._knowledge_base_api.get_knowledge_page(bank_id, page_id, _request_timeout=self._timeout)
 
-    def search_knowledge_base(self, bank_id: str, q: str, limit: int | None = None):
+    def search_knowledge_base(
+        self,
+        bank_id: str,
+        q: str,
+        limit: int | None = None,
+        tags: list[str] | None = None,
+        tags_match: str | None = None,
+        tag_groups: list[dict[str, Any]] | None = None,
+    ):
         """
         Hybrid search over knowledge pages (sync wrapper — prefer :meth:`asearch_knowledge_base` in async code).
 
         See :meth:`asearch_knowledge_base` for the full argument and return documentation.
         """
-        return _run_async(self.asearch_knowledge_base(bank_id=bank_id, q=q, limit=limit))
+        return _run_async(
+            self.asearch_knowledge_base(
+                bank_id=bank_id, q=q, limit=limit, tags=tags, tags_match=tags_match, tag_groups=tag_groups
+            )
+        )
 
-    async def asearch_knowledge_base(self, bank_id: str, q: str, limit: int | None = None):
+    async def asearch_knowledge_base(
+        self,
+        bank_id: str,
+        q: str,
+        limit: int | None = None,
+        tags: list[str] | None = None,
+        tags_match: str | None = None,
+        tag_groups: list[dict[str, Any]] | None = None,
+    ):
         """
         Hybrid search over knowledge pages (async — preferred over :meth:`search_knowledge_base`).
 
@@ -2022,12 +2179,22 @@ class Hindsight:
             bank_id: The memory bank ID
             q: Search query
             limit: Maximum results to return (1-50, defaults to 10 server-side)
+            tags: Only return pages carrying these tags, matched per ``tags_match`` (recall semantics)
+            tags_match: 'any', 'all', 'any_strict', 'all_strict' or 'exact' (server default 'any',
+                which also returns untagged pages)
+            tag_groups: Compound boolean tag filter, same shape as recall's ``tag_groups``
 
         Returns:
             KnowledgePageSearchResponse with ranked results
         """
         return await self._knowledge_base_api.search_knowledge_base(
-            bank_id, q, limit=limit, _request_timeout=self._timeout
+            bank_id,
+            q,
+            limit=limit,
+            tags=tags,
+            tags_match=tags_match,
+            tag_groups=json.dumps(tag_groups) if tag_groups else None,
+            _request_timeout=self._timeout,
         )
 
     def update_knowledge_node(
@@ -2458,27 +2625,51 @@ class Hindsight:
         """
         loop = asyncio.get_event_loop()
         deadline = loop.time() + timeout
+        timeout_message = f"Export operation {operation_id} did not complete within {timeout}s"
         while True:
-            status = await self._operations_api.get_operation_status(
-                bank_id, operation_id, _request_timeout=self._timeout
-            )
+            # The deadline bounds the in-flight status request and the sleep
+            # too, so a slow poll or a long poll_interval can't overrun it.
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise TimeoutError(timeout_message)
+            try:
+                status = await asyncio.wait_for(
+                    self._operations_api.get_operation_status(bank_id, operation_id, _request_timeout=self._timeout),
+                    remaining,
+                )
+            except asyncio.TimeoutError:
+                raise TimeoutError(timeout_message) from None
             if status.status == "completed":
                 break
             if status.status in ("failed", "cancelled"):
                 raise RuntimeError(f"Export operation {operation_id} {status.status}: {status.error_message}")
-            if loop.time() >= deadline:
-                raise TimeoutError(f"Export operation {operation_id} did not complete within {timeout}s")
+            # Sleeping out a budget that can't fit another poll just burns the
+            # remainder, and on a coarse clock (Windows wakes up to ~16ms early)
+            # it can leave enough slack for a second poll the caller didn't ask for.
+            if deadline - loop.time() <= poll_interval:
+                raise TimeoutError(timeout_message)
             await asyncio.sleep(poll_interval)
 
         meta = status.result_metadata or {}
         download_url = meta.get("download_url")
         if not download_url:
             raise RuntimeError(f"Export operation {operation_id} completed without a download_url")
+        if download_url.lower().startswith(("https://", "http://")):
+            # Object stores return signed URLs. Preserve their query string and
+            # keep Hindsight's configured auth headers off the storage request.
+            # trust_env matches the generated client, so HTTP(S)_PROXY also
+            # reaches the storage host.
+            async with aiohttp.ClientSession(trust_env=True) as session:
+                async with session.get(
+                    URL(download_url, encoded=True), timeout=aiohttp.ClientTimeout(total=self._timeout)
+                ) as response:
+                    response.raise_for_status()
+                    return await response.read()
         # Fetch the server-provided download_url directly (it carries the raw,
         # slash-bearing storage key). Going through the generated download_file
         # would percent-encode the slashes to %2F, which fronting proxies often
-        # reject. param_serialize applies the client's auth headers; call_api
-        # returns the raw response whose bytes we read (the typed return is
+        # reject. For the API-relative URL, param_serialize applies the client's
+        # auth headers; call_api returns raw bytes (the typed return is
         # `object`, which can't model an application/zip body).
         request = self._api_client.param_serialize(
             method="GET",
@@ -2487,7 +2678,11 @@ class Hindsight:
             auth_settings=[],
         )
         response = await self._api_client.call_api(*request, _request_timeout=self._timeout)
-        return bytes(await response.read())
+        archive = await response.read()
+        # Called only for its status check: it raises ApiException on a non-2XX download, which
+        # would otherwise hand the error body back as the archive.
+        self._api_client.response_deserialize(response, response_types_map={"2XX": "bytearray"})
+        return bytes(archive)
 
     # Directives methods
 
@@ -2721,11 +2916,10 @@ class Hindsight:
         return await self._aget_bank_config(bank_id)
 
     async def _aget_bank_config(self, bank_id: str) -> dict[str, Any]:
-        import aiohttp
-
-        url = f"{self._base_url}/v1/default/banks/{bank_id}/config"
-        headers = {"Authorization": f"Bearer {self._api_key}"} if self._api_key else {}
-        async with aiohttp.ClientSession() as session:
+        url = f"{self._base_url}/v1/default/banks/{quote(bank_id, safe='')}/config"
+        # Keep integration attribution and configured headers consistent with generated calls.
+        headers = self._api_client.default_headers.copy()
+        async with aiohttp.ClientSession(trust_env=True) as session:
             async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=self._timeout)) as resp:
                 resp.raise_for_status()
                 return await resp.json()
@@ -2748,6 +2942,7 @@ class Hindsight:
         retain_strategies: dict[str, Any] | None = None,
         retain_chunk_batch_size: int | None = None,
         store_document_text: bool | None = None,
+        default_timezone: str | None = None,
         # Entity settings
         entity_labels: list[dict[str, Any]] | None = None,
         entities_allow_free_form: bool | None = None,
@@ -2756,12 +2951,18 @@ class Hindsight:
         observations_mission: str | None = None,
         max_observations_per_scope: int | None = None,
         observation_scope_limits: list[dict[str, Any]] | None = None,
+        consolidation_strategies: list[dict[str, Any]] | None = None,
+        default_observation_scopes: str | list[list[str]] | None = None,
         enable_auto_consolidation: bool | None = None,
+        consolidation_use_decision_model: bool | None = None,
         consolidation_llm_parallelism: int | None = None,
         consolidation_max_memories_per_round: int | None = None,
         mental_model_min_refresh_interval_seconds: int | None = None,
         knowledge_page_default_trigger: dict[str, Any] | None = None,
         reflect_default_options: dict[str, Any] | None = None,
+        reflect_use_decision_model: bool | None = None,
+        mental_model_refresh_use_decision_model: bool | None = None,
+        mental_model_delta_use_decision_model: bool | None = None,
         enable_text_search: bool | None = None,
         enable_temporal_retrieval: bool | None = None,
         enable_graph_retrieval: bool | None = None,
@@ -2772,6 +2973,9 @@ class Hindsight:
         # Recall settings
         recall_max_tokens: int | None = None,
         recall_include_chunks: bool | None = None,
+        recall_prefer_observations: bool | None = None,
+        recall_decision_model_prune: bool | None = None,
+        recall_decision_model_dedup: bool | None = None,
         recall_chunks_max_tokens: int | None = None,
         recall_budget_function: str | None = None,
         recall_budget_fixed_low: int | None = None,
@@ -2814,18 +3018,25 @@ class Hindsight:
                 retain_strategies=retain_strategies,
                 retain_chunk_batch_size=retain_chunk_batch_size,
                 store_document_text=store_document_text,
+                default_timezone=default_timezone,
                 entity_labels=entity_labels,
                 entities_allow_free_form=entities_allow_free_form,
                 enable_observations=enable_observations,
                 observations_mission=observations_mission,
                 max_observations_per_scope=max_observations_per_scope,
                 observation_scope_limits=observation_scope_limits,
+                consolidation_strategies=consolidation_strategies,
+                default_observation_scopes=default_observation_scopes,
                 enable_auto_consolidation=enable_auto_consolidation,
+                consolidation_use_decision_model=consolidation_use_decision_model,
                 consolidation_llm_parallelism=consolidation_llm_parallelism,
                 consolidation_max_memories_per_round=consolidation_max_memories_per_round,
                 mental_model_min_refresh_interval_seconds=mental_model_min_refresh_interval_seconds,
                 knowledge_page_default_trigger=knowledge_page_default_trigger,
                 reflect_default_options=reflect_default_options,
+                reflect_use_decision_model=reflect_use_decision_model,
+                mental_model_refresh_use_decision_model=mental_model_refresh_use_decision_model,
+                mental_model_delta_use_decision_model=mental_model_delta_use_decision_model,
                 enable_text_search=enable_text_search,
                 enable_temporal_retrieval=enable_temporal_retrieval,
                 enable_graph_retrieval=enable_graph_retrieval,
@@ -2835,6 +3046,9 @@ class Hindsight:
                 consolidation_source_facts_max_tokens_per_observation=consolidation_source_facts_max_tokens_per_observation,
                 recall_max_tokens=recall_max_tokens,
                 recall_include_chunks=recall_include_chunks,
+                recall_prefer_observations=recall_prefer_observations,
+                recall_decision_model_prune=recall_decision_model_prune,
+                recall_decision_model_dedup=recall_decision_model_dedup,
                 recall_chunks_max_tokens=recall_chunks_max_tokens,
                 recall_budget_function=recall_budget_function,
                 recall_budget_fixed_low=recall_budget_fixed_low,
@@ -2873,6 +3087,7 @@ class Hindsight:
         retain_strategies: dict[str, Any] | None = None,
         retain_chunk_batch_size: int | None = None,
         store_document_text: bool | None = None,
+        default_timezone: str | None = None,
         # Entity settings
         entity_labels: list[dict[str, Any]] | None = None,
         entities_allow_free_form: bool | None = None,
@@ -2881,12 +3096,18 @@ class Hindsight:
         observations_mission: str | None = None,
         max_observations_per_scope: int | None = None,
         observation_scope_limits: list[dict[str, Any]] | None = None,
+        consolidation_strategies: list[dict[str, Any]] | None = None,
+        default_observation_scopes: str | list[list[str]] | None = None,
         enable_auto_consolidation: bool | None = None,
+        consolidation_use_decision_model: bool | None = None,
         consolidation_llm_parallelism: int | None = None,
         consolidation_max_memories_per_round: int | None = None,
         mental_model_min_refresh_interval_seconds: int | None = None,
         knowledge_page_default_trigger: dict[str, Any] | None = None,
         reflect_default_options: dict[str, Any] | None = None,
+        reflect_use_decision_model: bool | None = None,
+        mental_model_refresh_use_decision_model: bool | None = None,
+        mental_model_delta_use_decision_model: bool | None = None,
         enable_text_search: bool | None = None,
         enable_temporal_retrieval: bool | None = None,
         enable_graph_retrieval: bool | None = None,
@@ -2897,6 +3118,9 @@ class Hindsight:
         # Recall settings
         recall_max_tokens: int | None = None,
         recall_include_chunks: bool | None = None,
+        recall_prefer_observations: bool | None = None,
+        recall_decision_model_prune: bool | None = None,
+        recall_decision_model_dedup: bool | None = None,
         recall_chunks_max_tokens: int | None = None,
         recall_budget_function: str | None = None,
         recall_budget_fixed_low: int | None = None,
@@ -2943,6 +3167,7 @@ class Hindsight:
             retain_strategies: Named strategy definitions (dict of strategy name to config).
             retain_chunk_batch_size: Number of chunks per sub-batch in chunks extraction mode.
             store_document_text: Persist the original document text alongside extracted facts.
+            default_timezone: IANA zone (e.g. ``"Europe/Rome"``) a retain time with no UTC offset is read in.
             entity_labels: Controlled vocabulary for entity labels — a list of label-group
                 dicts, each with a ``key`` and a ``type``: ``"value"``/``"multi-values"`` pick
                 from the group's declared ``values``, while ``"text"``/``"multi-text"`` are
@@ -2951,15 +3176,27 @@ class Hindsight:
                 filterable via ``tags``/``tags_match`` at recall.
             entities_allow_free_form: Whether to allow entity types outside entity_labels (default: True).
             max_observations_per_scope: Cap on observations retained per scope (-1 for unlimited).
-            observation_scope_limits: Per-scope observation caps, overriding max_observations_per_scope.
+            observation_scope_limits: Deprecated; use consolidation_strategies. Per-scope observation caps.
+            consolidation_strategies: Per-scope consolidation settings (mission, observation cap).
+            default_observation_scopes: observation_scopes for retained items that send none
+                ("combined" when unset); e.g. ``[["topic:*"]]`` scopes by each memory's topic tags.
             enable_auto_consolidation: Consolidate automatically after retain() rather than on demand.
+            consolidation_use_decision_model: When the server has a decision model, let it settle
+                restatements, new facts and chatter before the consolidation LLM call.
             consolidation_llm_parallelism: Concurrent LLM calls during consolidation.
             consolidation_max_memories_per_round: Memories consolidated per round.
             mental_model_min_refresh_interval_seconds: Debounce between mental-model refreshes.
             reflect_default_options: Default reflect options for this bank, applied whenever a
                 reflect request (or a mental model's trigger) leaves the option unset:
-                reflect_search_observations_max_tokens and
-                reflect_search_observations_include_entities.
+                reflect_search_observations_max_tokens,
+                reflect_search_observations_include_entities and
+                reflect_search_mental_models_max_tokens.
+            reflect_use_decision_model: When the server has a decision model, reflect lets it
+                prune the evidence and decide when to stop (fewer LLM calls). False keeps agent turns.
+            mental_model_refresh_use_decision_model: The same, for knowledge-page refreshes.
+            mental_model_delta_use_decision_model: When the server has a decision model, a delta
+                knowledge-page refresh asks it which new memories could change the page instead
+                of running reflect. False keeps reflect.
             knowledge_page_default_trigger: Trigger fields merged over the built-in default for new
                 knowledge pages, e.g. {"refresh_cron": "0 * * * *"}.
             enable_observations: Toggle automatic observation consolidation after retain().
@@ -2976,6 +3213,9 @@ class Hindsight:
                 individual observation in the consolidation prompt.
             recall_max_tokens: Token budget for facts returned by recall.
             recall_include_chunks: Include source chunks in recall results.
+            recall_prefer_observations: Default ``prefer_observations`` for recall requests that omit it.
+            recall_decision_model_prune: Default ``prune`` for recall requests that omit it.
+            recall_decision_model_dedup: Default ``dedup`` for recall requests that omit it.
             recall_chunks_max_tokens: Token budget for those chunks.
             recall_budget_function: How the per-query result budget is derived: 'fixed' or 'adaptive'.
             recall_budget_fixed_low: Fixed budget for low-breadth queries.
@@ -3013,18 +3253,25 @@ class Hindsight:
                 "retain_strategies": retain_strategies,
                 "retain_chunk_batch_size": retain_chunk_batch_size,
                 "store_document_text": store_document_text,
+                "default_timezone": default_timezone,
                 "entity_labels": entity_labels,
                 "entities_allow_free_form": entities_allow_free_form,
                 "enable_observations": enable_observations,
                 "observations_mission": observations_mission,
                 "max_observations_per_scope": max_observations_per_scope,
                 "observation_scope_limits": observation_scope_limits,
+                "consolidation_strategies": consolidation_strategies,
+                "default_observation_scopes": default_observation_scopes,
                 "enable_auto_consolidation": enable_auto_consolidation,
+                "consolidation_use_decision_model": consolidation_use_decision_model,
                 "consolidation_llm_parallelism": consolidation_llm_parallelism,
                 "consolidation_max_memories_per_round": consolidation_max_memories_per_round,
                 "mental_model_min_refresh_interval_seconds": mental_model_min_refresh_interval_seconds,
                 "knowledge_page_default_trigger": knowledge_page_default_trigger,
                 "reflect_default_options": reflect_default_options,
+                "reflect_use_decision_model": reflect_use_decision_model,
+                "mental_model_refresh_use_decision_model": mental_model_refresh_use_decision_model,
+                "mental_model_delta_use_decision_model": mental_model_delta_use_decision_model,
                 "enable_text_search": enable_text_search,
                 "enable_temporal_retrieval": enable_temporal_retrieval,
                 "enable_graph_retrieval": enable_graph_retrieval,
@@ -3034,6 +3281,9 @@ class Hindsight:
                 "consolidation_source_facts_max_tokens_per_observation": consolidation_source_facts_max_tokens_per_observation,
                 "recall_max_tokens": recall_max_tokens,
                 "recall_include_chunks": recall_include_chunks,
+                "recall_prefer_observations": recall_prefer_observations,
+                "recall_decision_model_prune": recall_decision_model_prune,
+                "recall_decision_model_dedup": recall_decision_model_dedup,
                 "recall_chunks_max_tokens": recall_chunks_max_tokens,
                 "recall_budget_function": recall_budget_function,
                 "recall_budget_fixed_low": recall_budget_fixed_low,
@@ -3057,11 +3307,10 @@ class Hindsight:
         return await self._aupdate_bank_config(bank_id, updates)
 
     async def _aupdate_bank_config(self, bank_id: str, updates: dict[str, Any]) -> dict[str, Any]:
-        import aiohttp
-
-        url = f"{self._base_url}/v1/default/banks/{bank_id}/config"
-        headers = {"Authorization": f"Bearer {self._api_key}"} if self._api_key else {}
-        async with aiohttp.ClientSession() as session:
+        url = f"{self._base_url}/v1/default/banks/{quote(bank_id, safe='')}/config"
+        # Keep integration attribution and configured headers consistent with generated calls.
+        headers = self._api_client.default_headers.copy()
+        async with aiohttp.ClientSession(trust_env=True) as session:
             async with session.patch(
                 url, json={"updates": updates}, headers=headers, timeout=aiohttp.ClientTimeout(total=self._timeout)
             ) as resp:
@@ -3091,11 +3340,10 @@ class Hindsight:
         return await self._areset_bank_config(bank_id)
 
     async def _areset_bank_config(self, bank_id: str) -> dict[str, Any]:
-        import aiohttp
-
-        url = f"{self._base_url}/v1/default/banks/{bank_id}/config"
-        headers = {"Authorization": f"Bearer {self._api_key}"} if self._api_key else {}
-        async with aiohttp.ClientSession() as session:
+        url = f"{self._base_url}/v1/default/banks/{quote(bank_id, safe='')}/config"
+        # Keep integration attribution and configured headers consistent with generated calls.
+        headers = self._api_client.default_headers.copy()
+        async with aiohttp.ClientSession(trust_env=True) as session:
             async with session.delete(url, headers=headers, timeout=aiohttp.ClientTimeout(total=self._timeout)) as resp:
                 resp.raise_for_status()
                 return await resp.json()

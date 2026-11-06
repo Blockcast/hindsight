@@ -3,7 +3,7 @@
 Hindsight can be deployed in several ways depending on your infrastructure and requirements.
 
 :::tip Don't want to manage infrastructure?
-**[Hindsight Cloud](https://ui.hindsight.vectorize.io/signup)** is a fully managed service that handles all infrastructure, scaling, and maintenance — [sign up here](https://ui.hindsight.vectorize.io/signup).
+**[Hindsight Cloud](https://ui.hindsight.vectorize.io)** is a fully managed service that handles all infrastructure, scaling, and maintenance — [sign up here](https://ui.hindsight.vectorize.io).
 :::
 
 ## Supported Platforms
@@ -77,7 +77,8 @@ Run everything in one container with embedded PostgreSQL:
 ```bash
 export OPENAI_API_KEY=sk-xxx
 
-docker run -it --pull always --name hindsight --restart unless-stopped --shm-size=1g -p 8888:8888 -p 9999:9999 \
+docker run -it --pull always --name hindsight --restart unless-stopped --shm-size=1g --stop-timeout 75 \
+  -p 8888:8888 -p 9999:9999 \
   -e HINDSIGHT_API_LLM_API_KEY=$OPENAI_API_KEY \
   -v hindsight-data:/home/hindsight/.pg0 \
   ghcr.io/vectorize-io/hindsight:latest
@@ -109,7 +110,7 @@ All published images are [signed with Cosign](#verifying-image-signatures) — v
 :::tip Set a stable `HINDSIGHT_API_WORKER_ID` in production
 The worker uses the container hostname as its identity, which Docker sets to the container ID by default. That value changes on every restart, so any task that was being processed when the container went down stays parked under the old ID with no way for the new container to recognize it as its own.
 
-Set `HINDSIGHT_API_WORKER_ID` to a stable value (e.g., `-e HINDSIGHT_API_WORKER_ID=hindsight-prod`) so the worker keeps the same identity across restarts. This is recommended even for single-container deployments. For diagnosis and recovery commands, see [Admin CLI - Recovering stuck operations](./admin-cli#recovering-stuck-or-zombie-operations).
+Set `HINDSIGHT_API_WORKER_ID` to a stable value (e.g., `-e HINDSIGHT_API_WORKER_ID=hindsight-prod`) so the worker keeps the same identity across restarts. This is recommended even for single-container deployments. Also give the container time to hand its tasks back on shutdown: it needs up to 60 seconds, and Docker kills it after 10 by default. That is why the command above passes `--stop-timeout 75` (in Compose, `stop_grace_period: 75s`). For diagnosis and recovery commands, see [Admin CLI - Recovering stuck operations](./admin-cli#recovering-stuck-or-zombie-operations).
 :::
 
 ### Docker Image Variants
@@ -422,12 +423,12 @@ client.retain(bank_id="alice", content="Alice prefers concise answers.")
 results = client.recall(bank_id="alice", query="How should I respond to Alice?")
 ```
 
-See the [Python SDK](../sdks/python.md) for the full API reference.
+See the [Python SDK](../sdks/python.mdx) for the full API reference.
 
 ---
 
 ## Next Steps
 
-- [Configuration](./configuration.md) — Environment variables and settings
+- [Configuration](./configuration.mdx) — Environment variables and settings
 - [Models](./models.mdx) — ML models and providers
 - [Monitoring](./monitoring.md) — Metrics and observability

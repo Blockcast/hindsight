@@ -116,7 +116,7 @@ enum Commands {
     #[command(subcommand)]
     Webhook(WebhookCommands),
 
-    /// Inspect audit logs (list, stats)
+    /// Inspect audit logs (list, get, stats)
     #[command(subcommand)]
     Audit(AuditCommands),
 
@@ -299,6 +299,12 @@ enum BankCommands {
         yes: bool,
     },
 
+    /// Manage the extra ids this bank also answers to
+    Alias {
+        #[command(subcommand)]
+        command: BankAliasCommands,
+    },
+
     /// Trigger consolidation to create/update observations
     Consolidate {
         /// Bank ID
@@ -450,6 +456,50 @@ enum BankCommands {
 }
 
 #[derive(Subcommand)]
+enum BankAliasCommands {
+    /// List the ids that also reach this bank
+    List {
+        /// Bank ID
+        bank_id: String,
+    },
+
+    /// Add an id that also reaches this bank
+    Add {
+        /// Bank ID
+        bank_id: String,
+
+        /// The extra id. Must not already name a bank or another alias.
+        alias: String,
+    },
+
+    /// Show this bank under one of its aliases instead of its own id
+    Primary {
+        /// Bank ID
+        bank_id: String,
+
+        /// The alias to present the bank under
+        alias: String,
+
+        /// Go back to showing the bank's own id
+        #[arg(long)]
+        clear: bool,
+    },
+
+    /// Stop an id reaching this bank (the bank and its memories are untouched)
+    Remove {
+        /// Bank ID
+        bank_id: String,
+
+        /// The alias to detach
+        alias: String,
+
+        /// Skip confirmation prompt
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum MemoryCommands {
     /// List memory units with pagination
     List {
@@ -460,7 +510,7 @@ enum MemoryCommands {
         #[arg(short = 't', long)]
         fact_type: Option<String>,
 
-        /// Full-text search query
+        /// Substring filter on memory text and context (unindexed scan, for browsing; use recall to search)
         #[arg(short = 'q', long)]
         query: Option<String>,
 
@@ -526,9 +576,9 @@ enum MemoryCommands {
         #[arg(long)]
         query_timestamp: Option<String>,
 
-        /// Prefer observations: drop raw facts a returned observation was consolidated from (no effect unless observation + a raw type are both recalled)
-        #[arg(long)]
-        prefer_observations: bool,
+        /// Prefer observations: drop raw facts a returned observation was consolidated from (no effect unless observation + a raw type are both recalled). Bare flag = true, `--prefer-observations=false` to turn off; omitted = bank default
+        #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+        prefer_observations: Option<bool>,
 
         /// Start of the time window to search over (ISO 8601; no offset means UTC). Requires --window-end
         #[arg(long)]
@@ -723,6 +773,23 @@ enum DocumentCommands {
         document_id: String,
     },
 
+    /// Show what each change did to a document's facts and observations (rebuilt from operations)
+    History {
+        /// Bank ID
+        bank_id: String,
+
+        /// Document ID
+        document_id: String,
+
+        /// Maximum number of operations to read
+        #[arg(short = 'l', long, default_value = "50")]
+        limit: i32,
+
+        /// Offset for pagination, in operations
+        #[arg(short = 's', long, default_value = "0")]
+        offset: i32,
+    },
+
     /// Delete a document and all its memory units
     Delete {
         /// Bank ID
@@ -732,7 +799,7 @@ enum DocumentCommands {
         document_id: String,
     },
 
-    /// Update a document (currently only supports replacing tags)
+    /// Update a document's tags or observation scopes without re-extracting it
     Update {
         /// Bank ID
         bank_id: String,
@@ -740,9 +807,15 @@ enum DocumentCommands {
         /// Document ID
         document_id: String,
 
-        /// New tag list (comma-separated). Triggers observation invalidation + re-consolidation.
+        /// New tag list (comma-separated); `--tags ""` removes every tag. Triggers observation
+        /// invalidation + re-consolidation.
         #[arg(long, value_delimiter = ',')]
-        tags: Vec<String>,
+        tags: Option<Vec<String>>,
+
+        /// New observation scopes: per_tag, combined, all_combinations, shared, or a JSON list
+        /// of tag lists (e.g. '[["user:alice"]]'). Memories whose scopes move are re-consolidated.
+        #[arg(long)]
+        observation_scopes: Option<String>,
     },
 }
 
@@ -943,6 +1016,15 @@ enum AuditCommands {
         offset: Option<u64>,
     },
 
+    /// Show one audit log entry with its full request and response
+    Get {
+        /// Bank ID
+        bank_id: String,
+
+        /// Audit log entry ID (from `audit list`)
+        log_id: String,
+    },
+
     /// Show audit log statistics bucketed over time
     Stats {
         /// Bank ID
@@ -1084,6 +1166,13 @@ enum MentalModelCommands {
         #[arg(long)]
         trigger_refresh_cron: Option<String>,
 
+        /// Cron expression (UTC, 5-field, e.g. '0 3 * * 0') for a scheduled
+        /// FULL refresh of a delta model: on this schedule the content is
+        /// rewritten from scratch, independent of the other triggers and
+        /// without changing the mode. Empty string removes the schedule
+        #[arg(long)]
+        trigger_full_refresh_cron: Option<String>,
+
         /// Minimum seconds between two automatic refreshes (0 disables the floor)
         #[arg(long)]
         trigger_min_refresh_interval_seconds: Option<u64>,
@@ -1123,6 +1212,11 @@ enum MentalModelCommands {
 
         /// Mental model ID
         mental_model_id: String,
+
+        /// Rewrite the content from scratch this once (a full refresh), whatever
+        /// the model's mode; the mode itself is not changed
+        #[arg(long)]
+        full: bool,
     },
 
     /// Preview a refresh without changing the mental model
@@ -1150,6 +1244,19 @@ enum KnowledgeBaseCommands {
     Tree {
         /// Bank ID
         bank_id: String,
+
+        /// Only pages carrying these tags (comma-separated, e.g. user:alice,team)
+        #[arg(long, value_delimiter = ',')]
+        tags: Vec<String>,
+
+        /// Tag matching mode: any, all, any_strict, all_strict, exact (default: any,
+        /// which also returns untagged pages)
+        #[arg(long)]
+        tags_match: Option<String>,
+
+        /// Compound tag filter as JSON, same shape as recall's tag_groups
+        #[arg(long)]
+        tag_groups: Option<String>,
     },
 
     /// Create a folder
@@ -1219,6 +1326,19 @@ enum KnowledgeBaseCommands {
         /// Maximum results to return (1-50)
         #[arg(long)]
         limit: Option<u64>,
+
+        /// Only pages carrying these tags (comma-separated, e.g. user:alice,team)
+        #[arg(long, value_delimiter = ',')]
+        tags: Vec<String>,
+
+        /// Tag matching mode: any, all, any_strict, all_strict, exact (default: any,
+        /// which also returns untagged pages)
+        #[arg(long)]
+        tags_match: Option<String>,
+
+        /// Compound tag filter as JSON, same shape as recall's tag_groups
+        #[arg(long)]
+        tag_groups: Option<String>,
     },
 
     /// Rename/move a node, or update a page's options
@@ -1300,7 +1420,7 @@ enum DirectiveCommands {
 
         /// Priority — higher-priority directives are injected first
         #[arg(long, default_value = "0")]
-        priority: i64,
+        priority: i32,
     },
 
     /// Update a directive
@@ -1325,7 +1445,7 @@ enum DirectiveCommands {
 
         /// New priority (higher = injected first)
         #[arg(long)]
-        priority: Option<i64>,
+        priority: Option<i32>,
     },
 
     /// Delete a directive
@@ -1479,6 +1599,38 @@ fn run() -> Result<()> {
             BankCommands::Delete { bank_id, yes } => {
                 commands::bank::delete(&client, &bank_id, yes, verbose, output_format)
             }
+            BankCommands::Alias { command } => match command {
+                BankAliasCommands::List { bank_id } => {
+                    commands::bank::alias_list(&client, &bank_id, verbose, output_format)
+                }
+                BankAliasCommands::Add { bank_id, alias } => {
+                    commands::bank::alias_add(&client, &bank_id, &alias, verbose, output_format)
+                }
+                BankAliasCommands::Primary {
+                    bank_id,
+                    alias,
+                    clear,
+                } => commands::bank::alias_primary(
+                    &client,
+                    &bank_id,
+                    &alias,
+                    !clear,
+                    verbose,
+                    output_format,
+                ),
+                BankAliasCommands::Remove {
+                    bank_id,
+                    alias,
+                    yes,
+                } => commands::bank::alias_remove(
+                    &client,
+                    &bank_id,
+                    &alias,
+                    yes,
+                    verbose,
+                    output_format,
+                ),
+            },
             BankCommands::Consolidate {
                 bank_id,
                 wait,
@@ -1742,6 +1894,19 @@ fn run() -> Result<()> {
                 bank_id,
                 document_id,
             } => commands::document::get(&client, &bank_id, &document_id, verbose, output_format),
+            DocumentCommands::History {
+                bank_id,
+                document_id,
+                limit,
+                offset,
+            } => commands::document::history(
+                &client,
+                &bank_id,
+                &document_id,
+                limit,
+                offset,
+                output_format,
+            ),
             DocumentCommands::Delete {
                 bank_id,
                 document_id,
@@ -1752,13 +1917,17 @@ fn run() -> Result<()> {
                 bank_id,
                 document_id,
                 tags,
+                observation_scopes,
             } => {
-                let tag_opt = if tags.is_empty() { None } else { Some(tags) };
+                // `--tags ""` parses as one empty tag; drop blanks so it clears the set
+                // instead of storing "".
+                let tags = tags.map(|t| t.into_iter().filter(|tag| !tag.is_empty()).collect());
                 commands::document::update(
                     &client,
                     &bank_id,
                     &document_id,
-                    tag_opt,
+                    tags,
+                    observation_scopes,
                     verbose,
                     output_format,
                 )
@@ -1891,6 +2060,7 @@ fn run() -> Result<()> {
                 trigger_refresh_after_consolidation,
                 trigger_mode,
                 trigger_refresh_cron,
+                trigger_full_refresh_cron,
                 trigger_min_refresh_interval_seconds,
                 trigger_tags_match,
                 trigger_keep_trace,
@@ -1907,6 +2077,7 @@ fn run() -> Result<()> {
                     mode: trigger_mode,
                     refresh_after_consolidation: trigger_refresh_after_consolidation,
                     refresh_cron: trigger_refresh_cron,
+                    full_refresh_cron: trigger_full_refresh_cron,
                     min_refresh_interval_seconds: trigger_min_refresh_interval_seconds,
                     tags_match: trigger_tags_match,
                     keep_trace: trigger_keep_trace,
@@ -1930,10 +2101,12 @@ fn run() -> Result<()> {
             MentalModelCommands::Refresh {
                 bank_id,
                 mental_model_id,
+                full,
             } => commands::mental_model::refresh(
                 &client,
                 &bank_id,
                 &mental_model_id,
+                full,
                 verbose,
                 output_format,
             ),
@@ -1961,9 +2134,18 @@ fn run() -> Result<()> {
 
         // Knowledge base commands
         Commands::KnowledgeBase(kb_cmd) => match kb_cmd {
-            KnowledgeBaseCommands::Tree { bank_id } => {
-                commands::knowledge_base::tree(&client, &bank_id, verbose, output_format)
-            }
+            KnowledgeBaseCommands::Tree {
+                bank_id,
+                tags,
+                tags_match,
+                tag_groups,
+            } => commands::knowledge_base::tree(
+                &client,
+                &bank_id,
+                &commands::knowledge_base::tag_filter(tags, tags_match, tag_groups)?,
+                verbose,
+                output_format,
+            ),
             KnowledgeBaseCommands::CreateFolder {
                 bank_id,
                 name,
@@ -2011,11 +2193,15 @@ fn run() -> Result<()> {
                 bank_id,
                 query,
                 limit,
+                tags,
+                tags_match,
+                tag_groups,
             } => commands::knowledge_base::search(
                 &client,
                 &bank_id,
                 &query,
                 limit,
+                &commands::knowledge_base::tag_filter(tags, tags_match, tag_groups)?,
                 verbose,
                 output_format,
             ),
@@ -2200,6 +2386,9 @@ fn run() -> Result<()> {
                 verbose,
                 output_format,
             ),
+            AuditCommands::Get { bank_id, log_id } => {
+                commands::audit::get(&client, &bank_id, &log_id, verbose, output_format)
+            }
             AuditCommands::Stats {
                 bank_id,
                 action,

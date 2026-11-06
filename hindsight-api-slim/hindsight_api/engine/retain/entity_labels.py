@@ -104,6 +104,23 @@ def _migrate_label_group(raw: dict) -> dict:
     return patched
 
 
+def migrate_entity_labels_input(value: Any) -> Any:
+    """Pydantic ``mode='before'`` hook: migrate legacy entity-label dicts before ``LabelGroup`` validation.
+
+    Keeps the request boundary accepting the legacy ``free_values``/``multi_value`` shape (translated to
+    the ``type`` field) that ``parse_entity_labels`` already tolerates on the storage-read side, so typing
+    the field as ``list[LabelGroup]`` (which publishes the schema in OpenAPI) does not drop those keys.
+
+    Also unwraps the ``{"attributes": [...]}`` envelope that ``parse_entity_labels`` accepts and the
+    config API stores, so a bank configured that way still exports its labels (#6057).
+    """
+    if isinstance(value, dict) and "attributes" in value:
+        value = value["attributes"]
+    if isinstance(value, list):
+        return [_migrate_label_group(item) if isinstance(item, dict) else item for item in value]
+    return value
+
+
 def _build_map_fields_model(fields: dict[str, MapField], model_name: str) -> type[BaseModel] | None:
     """
     Build a dynamic Pydantic model for a set of map fields (recursive).
@@ -324,6 +341,31 @@ def label_tag_keys(labels_cfg: "EntityLabelsConfig | dict | list | None") -> set
             return set()
         labels_cfg = parsed
     return {g.key.lower() for g in labels_cfg.attributes if g.tag and g.key}
+
+
+def label_tag_candidates(labels_cfg: "EntityLabelsConfig | dict | list | None") -> list[str]:
+    """Every tag the ``tag: true`` label groups could add to a fact, for a write-scope check.
+
+    A closed vocabulary yields one ``key:value`` per allowed value. An open one (text,
+    multi-text, map) can yield any value, so it is represented as ``key:*`` — which only a
+    caller allowed to write ``key:*`` (or ``*``) passes.
+    """
+    if labels_cfg is None:
+        return []
+    if not isinstance(labels_cfg, EntityLabelsConfig):
+        parsed = parse_entity_labels(labels_cfg)
+        if parsed is None:
+            return []
+        labels_cfg = parsed
+    out: list[str] = []
+    for group in labels_cfg.attributes:
+        if not (group.tag and group.key):
+            continue
+        if group.type in ("text", "multi-text", "map"):
+            out.append(f"{group.key}:*")
+        else:
+            out.extend(f"{group.key}:{v.value}" for v in group.values if v.value)
+    return out
 
 
 def split_label_tags(tags: "list[str] | None", keys: "set[str] | None") -> list[str]:

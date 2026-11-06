@@ -27,6 +27,7 @@ jobs:
       clients-rust: ${{ steps.filter.outputs.clients-rust }}
       clients-go: ${{ steps.filter.outputs.clients-go }}
       control-plane: ${{ steps.filter.outputs.control-plane }}
+      figures: ${{ steps.filter.outputs.figures }}
       cli: ${{ steps.filter.outputs.cli }}
       docker: ${{ steps.filter.outputs.docker }}
       helm: ${{ steps.filter.outputs.helm }}
@@ -43,18 +44,13 @@ jobs:
       integrations-agent-framework: ${{ steps.filter.outputs.integrations-agent-framework }}
       integrations-composio: ${{ steps.filter.outputs.integrations-composio }}
       integrations-chat: ${{ steps.filter.outputs.integrations-chat }}
-      integrations-claude-code: ${{ steps.filter.outputs.integrations-claude-code }}
       integrations-coding-agents: ${{ steps.filter.outputs.integrations-coding-agents }}
-      integrations-cline: ${{ steps.filter.outputs.integrations-cline }}
-      integrations-codex: ${{ steps.filter.outputs.integrations-codex }}
       integrations-github-copilot: ${{ steps.filter.outputs.integrations-github-copilot }}
       integrations-continue: ${{ steps.filter.outputs.integrations-continue }}
-      integrations-cursor-cli: ${{ steps.filter.outputs.integrations-cursor-cli }}
-      integrations-zcode: ${{ steps.filter.outputs.integrations-zcode }}
       integrations-agent-plugin: ${{ steps.filter.outputs.integrations-agent-plugin }}
-      integrations-copilot-cli: ${{ steps.filter.outputs.integrations-copilot-cli }}
       extensions-supabase-tenant: ${{ steps.filter.outputs.extensions-supabase-tenant }}
       extensions-static-keys-tenant: ${{ steps.filter.outputs.extensions-static-keys-tenant }}
+      extensions-bank-llm-routing: ${{ steps.filter.outputs.extensions-bank-llm-routing }}
       integrations-crewai: ${{ steps.filter.outputs.integrations-crewai }}
       integrations-litellm: ${{ steps.filter.outputs.integrations-litellm }}
       integrations-pydantic-ai: ${{ steps.filter.outputs.integrations-pydantic-ai }}
@@ -65,7 +61,6 @@ jobs:
       integrations-langgraph: ${{ steps.filter.outputs.integrations-langgraph }}
       integrations-llamaindex: ${{ steps.filter.outputs.integrations-llamaindex }}
       integrations-paperclip: ${{ steps.filter.outputs.integrations-paperclip }}
-      integrations-opencode: ${{ steps.filter.outputs.integrations-opencode }}
       integrations-eve: ${{ steps.filter.outputs.integrations-eve }}
       integrations-cursor: ${{ steps.filter.outputs.integrations-cursor }}
       integrations-zed: ${{ steps.filter.outputs.integrations-zed }}
@@ -83,13 +78,14 @@ jobs:
       integrations-claude-agent-sdk: ${{ steps.filter.outputs.integrations-claude-agent-sdk }}
       integrations-dify: ${{ steps.filter.outputs.integrations-dify }}
       integrations-gemini-spark: ${{ steps.filter.outputs.integrations-gemini-spark }}
+      integrations-meta-muse: ${{ steps.filter.outputs.integrations-meta-muse }}
+      integrations-grok-bot: ${{ steps.filter.outputs.integrations-grok-bot }}
       integrations-vapi: ${{ steps.filter.outputs.integrations-vapi }}
       integrations-flowise: ${{ steps.filter.outputs.integrations-flowise }}
       integrations-google-adk: ${{ steps.filter.outputs.integrations-google-adk }}
       integrations-obsidian: ${{ steps.filter.outputs.integrations-obsidian }}
       integrations-omo: ${{ steps.filter.outputs.integrations-omo }}
       integrations-haystack: ${{ steps.filter.outputs.integrations-haystack }}
-      tools-agent-sdk: ${{ steps.filter.outputs.tools-agent-sdk }}
       integrations-roo-code: ${{ steps.filter.outputs.integrations-roo-code }}
       dev: ${{ steps.filter.outputs.dev }}
       ci: ${{ steps.filter.outputs.ci }}
@@ -98,7 +94,7 @@ jobs:
       # sets them; a fork/mirror that runs hindsight with self-hosted (local)
       # embeddings won't have them, so secret-dependent jobs skip cleanly
       # instead of failing on empty keys. (Was: same-repo-PR heuristic, which
-      # wrongly assumed same-repo ⇒ secrets exist.)
+      # wrongly assumed same-repo => secrets exist.)
       has_secrets: ${{ steps.secrets.outputs.has }}
     steps:
     - uses: actions/checkout@v6
@@ -152,6 +148,11 @@ jobs:
             # Same reason as clients-rust above: the CLI compiles against the
             # progenitor-generated client, so an OpenAPI change alone can break it.
             - 'hindsight-docs/static/openapi.json'
+          figures:
+            - 'hindsight-docs/figures/**'
+            - 'scripts/docs_skill_figures.py'
+            # The Giotto pin lives here: a new Giotto can stop a figure from drawing.
+            - 'hindsight-docs/package.json'
           docker:
             - 'docker/**'
           helm:
@@ -205,26 +206,18 @@ jobs:
             - 'hindsight-integrations/composio/**'
           integrations-chat:
             - 'hindsight-integrations/chat/**'
-          integrations-claude-code:
-            - 'hindsight-integrations/claude-code/**'
           integrations-coding-agents:
             - 'hindsight-integrations/coding-agents/**'
-          integrations-cline:
-            - 'hindsight-integrations/cline/**'
-          integrations-codex:
-            - 'hindsight-integrations/codex/**'
           integrations-github-copilot:
             - 'hindsight-integrations/github-copilot/**'
           integrations-continue:
             - 'hindsight-integrations/continue/**'
-          integrations-cursor-cli:
-            - 'hindsight-integrations/cursor-cli/**'
-          integrations-copilot-cli:
-            - 'hindsight-integrations/copilot-cli/**'
           extensions-supabase-tenant:
             - 'hindsight-extensions/supabase-tenant/**'
           extensions-static-keys-tenant:
             - 'hindsight-extensions/static-keys-tenant/**'
+          extensions-bank-llm-routing:
+            - 'hindsight-extensions/bank-llm-routing/**'
           integrations-crewai:
             - 'hindsight-integrations/crewai/**'
           integrations-litellm:
@@ -233,6 +226,7 @@ jobs:
             - 'hindsight-integrations/pydantic-ai/**'
           integrations-hermes:
             - 'hindsight-integrations/hermes/**'
+            - 'scripts/test-hermes-compat.sh'
           integrations-ag2:
             - 'hindsight-integrations/ag2/**'
           integrations-autogen:
@@ -247,16 +241,12 @@ jobs:
             - 'hindsight-integrations/haystack/**'
           integrations-paperclip:
             - 'hindsight-integrations/paperclip/**'
-          integrations-opencode:
-            - 'hindsight-integrations/opencode/**'
           integrations-eve:
             - 'hindsight-integrations/eve/**'
           integrations-cursor:
             - 'hindsight-integrations/cursor/**'
           integrations-zed:
             - 'hindsight-integrations/zed/**'
-          integrations-zcode:
-            - 'hindsight-integrations/zcode/**'
           integrations-agent-plugin:
             - 'hindsight-integrations/agent-plugin/**'
           integrations-n8n:
@@ -289,6 +279,12 @@ jobs:
             - 'hindsight-integrations/dify/**'
           integrations-gemini-spark:
             - 'hindsight-integrations/gemini-spark/**'
+          integrations-meta-muse:
+            - 'hindsight-integrations/meta-muse/**'
+          integrations-grok-bot:
+            - 'hindsight-integrations/grok-bot/**'
+            - '.cursor-plugin/**'
+            - 'hindsight-api-slim/hindsight_api/mcp_tools.py'
           integrations-vapi:
             - 'hindsight-integrations/vapi/**'
           integrations-flowise:
@@ -299,12 +295,11 @@ jobs:
             - 'hindsight-integrations/obsidian/**'
           integrations-omo:
             - 'hindsight-integrations/omo/**'
-          tools-agent-sdk:
-            - 'hindsight-tools/hindsight-agent-sdk/**'
           integrations-roo-code:
             - 'hindsight-integrations/roo-code/**'
           dev:
             - 'hindsight-dev/**'
+            - 'scripts/dev/**'
           ci:
             - '.github/**'
 
@@ -330,6 +325,53 @@ jobs:
 
     - name: Check integration lockfiles resolve from the npm registry
       run: ./scripts/check-integration-lockfiles.sh
+
+  typecheck-api:
+    # `ty check` over hindsight-api-slim. Green today, and it stays green: the rules it enforces
+    # are listed in `[tool.ty.rules]`, with the ones not yet clean marked "ignore" there rather
+    # than silenced here, so this job and a local `uv run ty check` always agree.
+    #
+    # Today that is `invalid-argument-type` -- a call passing the wrong type to a declared
+    # parameter. Python does not enforce annotations and a dataclass does not validate at
+    # construction, so without this such a call runs fine until the value is used, which can be
+    # in another process entirely.
+    needs: [detect-changes]
+    if: >-
+      (github.event_name == 'workflow_dispatch' ||
+      needs.detect-changes.outputs.core == 'true' ||
+      needs.detect-changes.outputs.ci == 'true')
+    # `uv sync --all-extras` pulls the ML stack (torch) and exceeds arc-light's
+    # 4Gi `work` emptyDir (BLO-52009); arc-dind's `work` is a 56Gi emptyDir.
+    runs-on: {group: default-tools, labels: arc-dind}
+    timeout-minutes: 15
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event.pull_request.head.sha || '' }}
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v7
+      with:
+        enable-cache: true
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version-file: ".python-version"
+
+    # Same install as `test-api`, `--all-extras` included, and that is load-bearing rather than
+    # copy-paste: a checker only knows a third-party call's types if the package is installed.
+    # Without the extras, `mlx`, `oracledb` and the parser stack resolve to `Unknown`, every call
+    # into them becomes unverifiable, and the rule passes by knowing nothing -- which looks
+    # identical to passing by being correct.
+    - name: Install dependencies
+      working-directory: ./hindsight-api-slim
+      run: uv sync --frozen --all-extras --index-strategy unsafe-best-match
+
+    - name: ty check
+      working-directory: ./hindsight-api-slim
+      run: uv run ty check
 
   build-api-python-versions:
     needs: [detect-changes]
@@ -375,6 +417,16 @@ jobs:
         VIRTUAL_ENV=.venv-smoke uv pip install .
         .venv-smoke/bin/python -m compileall -q hindsight_api
         .venv-smoke/bin/python -c "import hindsight_api, hindsight_api.main, hindsight_api.config; from hindsight_api.engine import memory_engine, llm_wrapper; print('import OK')"
+
+    # The step above resolves fresh, so it never sees the workspace lock. Dev
+    # setups and packagers (e.g. uv2nix) install from uv.lock, which once pinned
+    # a dependency with no wheel for 3.14 (#5709). Install from the lock too.
+    - name: Install from uv.lock on Python ${{ matrix.python-version }}
+      env:
+        UV_PROJECT_ENVIRONMENT: ${{ github.workspace }}/.venv-locked
+      run: |
+        uv sync --frozen --python ${{ matrix.python-version }} --package hindsight-api-slim
+        .venv-locked/bin/python -c "import hindsight_api.main, onnxruntime, magika, markitdown, asyncpg; print('locked import OK')"
 
   build-typescript-client:
     needs: [detect-changes]
@@ -470,8 +522,6 @@ jobs:
     - name: Build hindsight-all-npm (openclaw dep)
       run: npm run build --workspace=hindsight-all-npm
 
-    - name: Build hindsight-agent-sdk (openclaw dep)
-      run: npm run build --workspace=hindsight-tools/hindsight-agent-sdk
 
     - name: Install openclaw dependencies
       working-directory: ./hindsight-integrations/openclaw
@@ -536,8 +586,6 @@ jobs:
     - name: Build hindsight-all-npm (openclaw dep)
       run: npm run build --workspace=hindsight-all-npm
 
-    - name: Build hindsight-agent-sdk (openclaw dep)
-      run: npm run build --workspace=hindsight-tools/hindsight-agent-sdk
 
     - name: Install openclaw dependencies
       working-directory: ./hindsight-integrations/openclaw
@@ -588,32 +636,6 @@ jobs:
     - name: Build
       working-directory: ./hindsight-integrations/coding-agents
       run: npm run build
-
-  test-claude-code-integration:
-    needs: [detect-changes]
-    if: >-
-      (github.event_name == 'workflow_dispatch' ||
-      needs.detect-changes.outputs.integrations-claude-code == 'true' ||
-      needs.detect-changes.outputs.ci == 'true')
-    runs-on: {group: default-tools, labels: arc-light}
-    timeout-minutes: 30
-
-    steps:
-    - uses: actions/checkout@v6
-      with:
-        ref: ${{ github.event.pull_request.head.sha || '' }}
-
-    - name: Set up Python
-      uses: actions/setup-python@v6
-      with:
-        python-version: '3.11'
-
-    - name: Install pytest
-      run: pip install pytest
-
-    - name: Run tests
-      working-directory: ./hindsight-integrations/claude-code
-      run: python -m pytest tests/ -v
 
   test-cursor-integration:
     timeout-minutes: 45
@@ -695,43 +717,6 @@ jobs:
       working-directory: ./hindsight-integrations/omo
       run: python -m pytest tests/ -v
 
-  test-cline-integration:
-    needs: [detect-changes]
-    if: >-
-      (github.event_name == 'workflow_dispatch' ||
-      needs.detect-changes.outputs.integrations-cline == 'true' ||
-      needs.detect-changes.outputs.ci == 'true')
-    runs-on: {group: default-tools, labels: arc-light}
-    timeout-minutes: 30
-
-    steps:
-    - uses: actions/checkout@v6
-      with:
-        ref: ${{ github.event.pull_request.head.sha || '' }}
-
-    - name: Install uv
-      uses: astral-sh/setup-uv@v7
-      with:
-        enable-cache: true
-        prune-cache: false
-
-    - name: Set up Python
-      uses: actions/setup-python@v6
-      with:
-        python-version-file: ".python-version"
-
-    - name: Build cline integration
-      working-directory: ./hindsight-integrations/cline
-      run: uv build
-
-    - name: Install dependencies
-      working-directory: ./hindsight-integrations/cline
-      run: uv sync --frozen
-
-    - name: Run tests
-      working-directory: ./hindsight-integrations/cline
-      run: uv run pytest tests -v
-
   test-github-copilot-integration:
     needs: [detect-changes]
     if: >-
@@ -770,106 +755,6 @@ jobs:
       # PR CI runs only the deterministic bucket; the real-LLM E2E bucket
       # (requires_real_llm) needs a live Hindsight server and runs separately.
       run: uv run pytest tests -v -m "not requires_real_llm"
-
-  test-codex-integration:
-    needs: [detect-changes]
-    if: >-
-      (github.event_name == 'workflow_dispatch' ||
-      needs.detect-changes.outputs.integrations-codex == 'true' ||
-      needs.detect-changes.outputs.ci == 'true')
-    runs-on: {group: default-tools, labels: arc-light}
-    timeout-minutes: 30
-
-    steps:
-    - uses: actions/checkout@v6
-      with:
-        ref: ${{ github.event.pull_request.head.sha || '' }}
-
-    - name: Set up Python
-      uses: actions/setup-python@v6
-      with:
-        python-version: '3.11'
-
-    - name: Install pytest
-      run: pip install pytest
-
-    - name: Run tests
-      working-directory: ./hindsight-integrations/codex
-      run: python -m pytest tests/ -v
-
-  test-cursor-cli-integration:
-    needs: [detect-changes]
-    if: >-
-      (github.event_name == 'workflow_dispatch' ||
-      needs.detect-changes.outputs.integrations-cursor-cli == 'true' ||
-      needs.detect-changes.outputs.ci == 'true')
-    runs-on: {group: default-tools, labels: arc-light}
-    timeout-minutes: 30
-
-    steps:
-    - uses: actions/checkout@v6
-      with:
-        ref: ${{ github.event.pull_request.head.sha || '' }}
-
-    - name: Install uv
-      uses: astral-sh/setup-uv@v7
-      with:
-        enable-cache: true
-        prune-cache: false
-
-    - name: Set up Python
-      uses: actions/setup-python@v6
-      with:
-        python-version-file: ".python-version"
-
-    - name: Build cursor-cli integration
-      working-directory: ./hindsight-integrations/cursor-cli
-      run: uv build
-
-    - name: Install dependencies
-      working-directory: ./hindsight-integrations/cursor-cli
-      run: uv sync --frozen
-
-    - name: Run tests
-      working-directory: ./hindsight-integrations/cursor-cli
-      run: uv run pytest tests -v
-
-  test-zcode-integration:
-    needs: [detect-changes]
-    if: >-
-      (github.event_name == 'workflow_dispatch' ||
-      needs.detect-changes.outputs.integrations-zcode == 'true' ||
-      needs.detect-changes.outputs.ci == 'true')
-    runs-on: {group: default-tools, labels: arc-light}
-    timeout-minutes: 30
-
-    steps:
-    - uses: actions/checkout@v6
-      with:
-        ref: ${{ github.event.pull_request.head.sha || '' }}
-
-    - name: Install uv
-      uses: astral-sh/setup-uv@v7
-      with:
-        enable-cache: true
-        prune-cache: false
-
-    - name: Set up Python
-      uses: actions/setup-python@v6
-      with:
-        python-version-file: ".python-version"
-
-    - name: Build zcode integration
-      working-directory: ./hindsight-integrations/zcode
-      run: uv build
-
-    - name: Install dependencies
-      working-directory: ./hindsight-integrations/zcode
-      run: uv sync --frozen
-
-    - name: Run tests
-      working-directory: ./hindsight-integrations/zcode
-      run: uv run pytest tests -v
 
   test-agent-plugin-integration:
     needs: [detect-changes]
@@ -988,37 +873,6 @@ jobs:
       working-directory: ./hindsight-integrations/eliza
       run: npm run build
 
-  test-opencode-integration:
-    needs: [detect-changes]
-    if: >-
-      (github.event_name == 'workflow_dispatch' ||
-      needs.detect-changes.outputs.integrations-opencode == 'true' ||
-      needs.detect-changes.outputs.ci == 'true')
-    runs-on: {group: default-tools, labels: arc-light}
-    timeout-minutes: 30
-
-    steps:
-    - uses: actions/checkout@v6
-      with:
-        ref: ${{ github.event.pull_request.head.sha || '' }}
-
-    - name: Set up Node.js
-      uses: actions/setup-node@v6
-      with:
-        node-version: '22'
-
-    - name: Install dependencies
-      working-directory: ./hindsight-integrations/opencode
-      run: npm ci
-
-    - name: Run tests
-      working-directory: ./hindsight-integrations/opencode
-      run: npm test
-
-    - name: Build
-      working-directory: ./hindsight-integrations/opencode
-      run: npm run build
-
   test-eve-integration:
     needs: [detect-changes]
     if: >-
@@ -1111,39 +965,6 @@ jobs:
     - name: Run tests
       working-directory: ./hindsight-integrations/zapier
       run: npm test
-
-  test-hindsight-agent-sdk:
-    needs: [detect-changes]
-    if: >-
-      (github.event_name == 'workflow_dispatch' ||
-      needs.detect-changes.outputs.tools-agent-sdk == 'true' ||
-      needs.detect-changes.outputs.ci == 'true')
-    runs-on: {group: default-tools, labels: arc-light}
-    timeout-minutes: 30
-
-    steps:
-    - uses: actions/checkout@v6
-      with:
-        ref: ${{ github.event.pull_request.head.sha || '' }}
-
-    - name: Set up Node.js
-      uses: actions/setup-node@v6
-      with:
-        node-version: '22'
-        cache: 'npm'
-        cache-dependency-path: package-lock.json
-
-    - name: Install root workspace dependencies
-      run: npm ci
-
-    - name: Build hindsight-client (agent-sdk dep)
-      run: npm run build --workspace=hindsight-clients/typescript
-
-    - name: Run tests
-      run: npm test --workspace=hindsight-tools/hindsight-agent-sdk
-
-    - name: Build
-      run: npm run build --workspace=hindsight-tools/hindsight-agent-sdk
 
   test-cloudflare-oauth-proxy-integration:
     needs: [detect-changes]
@@ -1345,6 +1166,66 @@ jobs:
       working-directory: ./hindsight-integrations/gemini-spark
       run: uv run pytest tests -v
 
+  test-meta-muse-integration:
+    needs: [detect-changes]
+    if: >-
+      (github.event_name == 'workflow_dispatch' ||
+      needs.detect-changes.outputs.integrations-meta-muse == 'true' ||
+      needs.detect-changes.outputs.ci == 'true')
+    runs-on: {group: default-tools, labels: arc-light}
+    timeout-minutes: 30
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event.pull_request.head.sha || '' }}
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v7
+      with:
+        enable-cache: true
+        prune-cache: false
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version-file: ".python-version"
+
+    - name: Install dependencies
+      working-directory: ./hindsight-integrations/meta-muse
+      run: uv sync --frozen
+
+    - name: Run tests
+      working-directory: ./hindsight-integrations/meta-muse
+      run: uv run pytest tests -v
+
+  test-grok-bot-integration:
+    needs: [detect-changes]
+    if: >-
+      (github.event_name == 'workflow_dispatch' ||
+      needs.detect-changes.outputs.integrations-grok-bot == 'true' ||
+      needs.detect-changes.outputs.ci == 'true')
+    runs-on: {group: default-tools, labels: arc-light}
+    timeout-minutes: 30
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event.pull_request.head.sha || '' }}
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version-file: ".python-version"
+
+    # The plugin is manifests and skills — no Python package of its own.
+    - name: Install pytest
+      run: pip install pytest pydantic
+
+    - name: Run tests
+      working-directory: ./hindsight-integrations/grok-bot
+      run: python -m pytest tests -v
+
   test-roo-code-integration:
     needs: [detect-changes]
     if: >-
@@ -1451,6 +1332,36 @@ jobs:
           exit 1
         fi
 
+  test-figures:
+    needs: [detect-changes]
+    if: needs.detect-changes.outputs.figures == 'true'
+    runs-on: {group: default-tools, labels: arc-light}
+    timeout-minutes: 10
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event.pull_request.head.sha || '' }}
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v6
+      with:
+        node-version: '22'
+
+    # The docs figures are Giotto diagrams; export each one with the Giotto the docs pin, so a
+    # figure that no longer draws fails here instead of in the browser.
+    - name: Export every figure
+      run: |
+        PIN=$(node -p "require('./hindsight-docs/package.json').dependencies.giotto")
+        for f in hindsight-docs/figures/*.json; do
+          echo "$f"
+          npx --yes --package "$PIN" giotto export "$f" /tmp/figure.svg
+        done
+
+    # The docs skill turns each figure into its narration by reading the figure files.
+    - name: Check every figure renders as text for the docs skill
+      run: python3 scripts/docs_skill_figures.py --check-all
+
   build-docs:
     needs: [detect-changes]
     # Keep the production docs build as an unconditional PR check. OpenAPI
@@ -1487,8 +1398,12 @@ jobs:
     - name: Install dependencies
       run: npm ci --workspace=hindsight-docs
 
+    # Include the unreleased docs/ tree too: without it CI only builds the released
+    # snapshots, and a broken page under docs/ would surface only at release time.
     - name: Build docs
       run: npm run build --workspace=hindsight-docs
+      env:
+        INCLUDE_CURRENT_VERSION: 'true'
 
   test-rust-cli:
     needs: [detect-changes]
@@ -1592,7 +1507,7 @@ jobs:
       uses: actions/cache@v5
       with:
         path: ~/.cache/huggingface
-        key: ${{ runner.os }}-huggingface-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
+        key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
         restore-keys: |
           ${{ runner.os }}-huggingface-
 
@@ -1604,7 +1519,7 @@ jobs:
         print('Downloading embedding model...')
         SentenceTransformer('BAAI/bge-small-en-v1.5')
         print('Downloading cross-encoder model...')
-        CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+        CrossEncoder('hindsight-ai/hs-rerank-1')
         print('Models downloaded successfully')
         "
 
@@ -1665,6 +1580,59 @@ jobs:
 
     - name: Lint Helm chart
       run: helm lint helm/hindsight
+
+    # Default values leave extraObjects empty, so render both entry forms
+    # (map and templated string) to prove they reach the output.
+    - name: Render extraObjects
+      run: |
+        out=$(helm template rel helm/hindsight -s templates/extra-objects.yaml --set-json 'extraObjects=[
+          {"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"{{ include \"hindsight.fullname\" . }}-map"}},
+          "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {{ include \"hindsight.fullname\" . }}-str\ndata:\n  port: \"{{ .Values.api.service.port }}\""
+        ]')
+        echo "$out"
+        grep -q "name: 'rel-hindsight-map'" <<<"$out"
+        grep -q "name: rel-hindsight-str" <<<"$out"
+        grep -q 'port: "8888"' <<<"$out"
+
+    - name: Render revisionHistoryLimit and Gateway API
+      run: |
+        # Unset by default: Kubernetes keeps its own default.
+        if helm template rel helm/hindsight | grep -q revisionHistoryLimit; then exit 1; fi
+        # The component value (0 included) wins over the global one.
+        out=$(helm template rel helm/hindsight --set revisionHistoryLimit=5 --set api.revisionHistoryLimit=0 -s templates/api-deployment.yaml -s templates/controlplane-deployment.yaml)
+        grep -q 'revisionHistoryLimit: 0' <<<"$out"
+        grep -q 'revisionHistoryLimit: 5' <<<"$out"
+        out=$(helm template rel helm/hindsight -s templates/httproute.yaml --set gatewayApi.enabled=true --set-json 'gatewayApi.parentRefs=[{"name":"gw","namespace":"gwapi"}]')
+        echo "$out"
+        grep -q 'kind: HTTPRoute' <<<"$out"
+        grep -q 'name: rel-hindsight-api' <<<"$out"
+        grep -q 'name: rel-hindsight-control-plane' <<<"$out"
+        # Enabled without a Gateway to attach to is a render error.
+        if helm template rel helm/hindsight --set gatewayApi.enabled=true >/dev/null 2>&1; then exit 1; fi
+
+    - name: Render api command, startupProbe, strategy and automountServiceAccountToken
+      run: |
+        # Unset by default: the default render has none of them.
+        out=$(helm template rel helm/hindsight -s templates/api-deployment.yaml)
+        if grep -qE '^ +(command|startupProbe|strategy|automountServiceAccountToken):' <<<"$out"; then exit 1; fi
+        out=$(helm template rel helm/hindsight -s templates/api-deployment.yaml \
+          --set api.strategy.type=Recreate --set api.automountServiceAccountToken=false \
+          --set-json 'api.command=["sh","-c","/app/start-all.sh"]' \
+          --set-json 'api.startupProbe={"httpGet":{"path":"/health/live","port":8888}}')
+        echo "$out"
+        grep -q 'type: Recreate' <<<"$out"
+        grep -q 'automountServiceAccountToken: false' <<<"$out"
+        grep -q '/app/start-all.sh' <<<"$out"
+        grep -q 'startupProbe:' <<<"$out"
+
+    - name: Render terminationGracePeriodSeconds
+      run: |
+        # 60s by default on both pods that run workers: the API drains in-flight
+        # tasks for 30s, cancels the rest, then hands them back (#6068).
+        out=$(helm template rel helm/hindsight --set worker.enabled=true -s templates/api-deployment.yaml -s templates/worker-statefulset.yaml)
+        test "$(grep -c 'terminationGracePeriodSeconds: 60' <<<"$out")" = 2
+        out=$(helm template rel helm/hindsight -s templates/api-deployment.yaml --set api.terminationGracePeriodSeconds=90)
+        grep -q 'terminationGracePeriodSeconds: 90' <<<"$out"
 
   test-standalone-start-script:
     needs: [detect-changes]
@@ -1771,14 +1739,15 @@ jobs:
     # credentials at all, so the credential step stays gated on the variant
     # while the smoke test itself is gated on `smoke`.
     - name: Setup GCP credentials for smoke test
-      if: matrix.variant == 'slim' && matrix.smoke
+      if: matrix.variant == 'slim' && matrix.smoke && needs.detect-changes.outputs.has_secrets == 'true'
       run: |
         printf '%s' '${{ secrets.GCP_VERTEXAI_CREDENTIALS }}' > /tmp/gcp-credentials.json
         PROJECT_ID=$(jq -r '.project_id' /tmp/gcp-credentials.json)
         echo "HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$PROJECT_ID" >> $GITHUB_ENV
 
     - name: Smoke test - verify container starts
-      if: matrix.smoke
+      # Slim smoke needs the cloud keys; cp-only needs none.
+      if: matrix.smoke && (matrix.variant != 'slim' || needs.detect-changes.outputs.has_secrets == 'true')
       env:
         HINDSIGHT_API_LLM_PROVIDER: vertexai
         HINDSIGHT_API_LLM_MODEL: google/gemini-2.5-flash-lite
@@ -1867,7 +1836,7 @@ jobs:
       uses: actions/cache@v5
       with:
         path: ~/.cache/huggingface
-        key: ${{ runner.os }}-huggingface-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
+        key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
         restore-keys: |
           ${{ runner.os }}-huggingface-
 
@@ -1879,7 +1848,7 @@ jobs:
         print('Downloading embedding model...')
         SentenceTransformer('BAAI/bge-small-en-v1.5')
         print('Downloading cross-encoder model...')
-        CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+        CrossEncoder('hindsight-ai/hs-rerank-1')
         print('Models downloaded successfully')
         "
 
@@ -1889,6 +1858,31 @@ jobs:
       # pytest-split filters at collection (before xdist takes over), so it
       # composes cleanly with the `-n 8 --dist loadgroup` baked into addopts.
       run: uv run --with pytest-split pytest tests -v -m "not hs_llm_mat and not hs_llm_core" --splits 3 --group ${{ matrix.shard }}
+
+    # The eight workers share one embedded Postgres, so this job's two recurring
+    # red shapes are both lock contention: `deadlock detected`, whose own message
+    # ends "See server log for query details", and a pile of unrelated tests all
+    # failing `Timeout (>300.0s)` in the same second behind one AccessExclusiveLock.
+    # Neither is diagnosable from the pytest output alone, and the server log used
+    # to die with the runner — which is why this class has been re-diagnosed by
+    # inference in #3406, #3543, #4407 and #4414. Keep the log instead.
+    # Copied into the workspace first: `upload-artifact` globs but does not expand
+    # `~`, so pointing it at the pg0 instance dir uploads nothing.
+    - name: Collect Postgres server log
+      if: failure()
+      run: |
+        mkdir -p pg-server-log
+        cp -r ~/.pg0/instances/*/data/log/. pg-server-log/ 2>/dev/null || true
+        ls -la pg-server-log/ || true
+
+    - name: Upload Postgres server log on failure
+      if: failure()
+      uses: actions/upload-artifact@v7
+      with:
+        name: pg-server-log-shard-${{ matrix.shard }}
+        path: pg-server-log/
+        if-no-files-found: warn
+        retention-days: 7
 
   test-api-llm-core:
     needs: [detect-changes]
@@ -1953,7 +1947,7 @@ jobs:
       uses: actions/cache@v5
       with:
         path: ~/.cache/huggingface
-        key: ${{ runner.os }}-huggingface-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
+        key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
         restore-keys: |
           ${{ runner.os }}-huggingface-
 
@@ -1963,7 +1957,7 @@ jobs:
         uv run python -c "
         from sentence_transformers import SentenceTransformer, CrossEncoder
         SentenceTransformer('BAAI/bge-small-en-v1.5')
-        CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+        CrossEncoder('hindsight-ai/hs-rerank-1')
         print('Models downloaded successfully')
         "
 
@@ -2001,7 +1995,7 @@ jobs:
             model: gemini-2.5-flash-lite
             api_key_secret: GEMINI_API_KEY
           - provider: openai
-            model: gpt-4.1-nano
+            model: gpt-6-luna
             api_key_secret: OPENAI_API_KEY
           - provider: groq
             model: openai/gpt-oss-20b
@@ -2009,7 +2003,7 @@ jobs:
           - provider: bedrock
             model: us.amazon.nova-2-lite-v1:0
           - provider: litellmrouter
-            model: gpt-4.1-nano
+            model: gpt-6-luna
             # Single-deployment chain over OpenAI — verifies the Router-backed
             # call path works end-to-end. Built from secrets in the step below.
     name: LLM acceptance (${{ matrix.provider }}/${{ matrix.model }})
@@ -2056,7 +2050,7 @@ jobs:
       uses: actions/cache@v5
       with:
         path: ~/.cache/huggingface
-        key: ${{ runner.os }}-huggingface-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
+        key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
         restore-keys: |
           ${{ runner.os }}-huggingface-
 
@@ -2066,7 +2060,7 @@ jobs:
         uv run python -c "
         from sentence_transformers import SentenceTransformer, CrossEncoder
         SentenceTransformer('BAAI/bge-small-en-v1.5')
-        CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+        CrossEncoder('hindsight-ai/hs-rerank-1')
         "
 
     - name: Build litellmrouter config
@@ -2207,7 +2201,7 @@ jobs:
       uses: actions/cache@v5
       with:
         path: ~/.cache/huggingface
-        key: ${{ runner.os }}-huggingface-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
+        key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
         restore-keys: |
           ${{ runner.os }}-huggingface-
 
@@ -2219,7 +2213,7 @@ jobs:
         print('Downloading embedding model...')
         SentenceTransformer('BAAI/bge-small-en-v1.5')
         print('Downloading cross-encoder model...')
-        CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+        CrossEncoder('hindsight-ai/hs-rerank-1')
         print('Models downloaded successfully')
         "
 
@@ -2289,7 +2283,7 @@ jobs:
       uses: actions/cache@v5
       with:
         path: ~/.cache/huggingface
-        key: ${{ runner.os }}-huggingface-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
+        key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
         restore-keys: |
           ${{ runner.os }}-huggingface-
 
@@ -2301,7 +2295,7 @@ jobs:
         print('Downloading embedding model...')
         SentenceTransformer('BAAI/bge-small-en-v1.5')
         print('Downloading cross-encoder model...')
-        CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+        CrossEncoder('hindsight-ai/hs-rerank-1')
         print('Models downloaded successfully')
         "
 
@@ -2406,7 +2400,7 @@ jobs:
       uses: actions/cache@v5
       with:
         path: ~/.cache/huggingface
-        key: ${{ runner.os }}-huggingface-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
+        key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
         restore-keys: |
           ${{ runner.os }}-huggingface-
 
@@ -2418,7 +2412,7 @@ jobs:
         print('Downloading embedding model...')
         SentenceTransformer('BAAI/bge-small-en-v1.5')
         print('Downloading cross-encoder model...')
-        CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+        CrossEncoder('hindsight-ai/hs-rerank-1')
         print('Models downloaded successfully')
         "
 
@@ -2593,7 +2587,7 @@ jobs:
       uses: actions/cache@v5
       with:
         path: ~/.cache/huggingface
-        key: ${{ runner.os }}-huggingface-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
+        key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
         restore-keys: |
           ${{ runner.os }}-huggingface-
 
@@ -2605,7 +2599,7 @@ jobs:
         print('Downloading embedding model...')
         SentenceTransformer('BAAI/bge-small-en-v1.5')
         print('Downloading cross-encoder model...')
-        CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+        CrossEncoder('hindsight-ai/hs-rerank-1')
         print('Models downloaded successfully')
         "
 
@@ -2779,7 +2773,7 @@ jobs:
       uses: actions/cache@v5
       with:
         path: ~/.cache/huggingface
-        key: ${{ runner.os }}-huggingface-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
+        key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
         restore-keys: |
           ${{ runner.os }}-huggingface-
 
@@ -2791,7 +2785,7 @@ jobs:
         print('Downloading embedding model...')
         SentenceTransformer('BAAI/bge-small-en-v1.5')
         print('Downloading cross-encoder model...')
-        CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+        CrossEncoder('hindsight-ai/hs-rerank-1')
         print('Models downloaded successfully')
         "
 
@@ -2904,7 +2898,7 @@ jobs:
       uses: actions/cache@v5
       with:
         path: ~/.cache/huggingface
-        key: ${{ runner.os }}-huggingface-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
+        key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
         restore-keys: |
           ${{ runner.os }}-huggingface-
 
@@ -2916,7 +2910,7 @@ jobs:
         print('Downloading embedding model...')
         SentenceTransformer('BAAI/bge-small-en-v1.5')
         print('Downloading cross-encoder model...')
-        CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+        CrossEncoder('hindsight-ai/hs-rerank-1')
         print('Models downloaded successfully')
         "
 
@@ -3055,7 +3049,7 @@ jobs:
       uses: actions/cache@v5
       with:
         path: ~/.cache/huggingface
-        key: ${{ runner.os }}-huggingface-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
+        key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
         restore-keys: |
           ${{ runner.os }}-huggingface-
 
@@ -3067,7 +3061,7 @@ jobs:
         print('Downloading embedding model...')
         SentenceTransformer('BAAI/bge-small-en-v1.5')
         print('Downloading cross-encoder model...')
-        CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+        CrossEncoder('hindsight-ai/hs-rerank-1')
         print('Models downloaded successfully')
         "
 
@@ -3165,7 +3159,7 @@ jobs:
       uses: actions/cache@v5
       with:
         path: ~/.cache/huggingface
-        key: ${{ runner.os }}-huggingface-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
+        key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
         restore-keys: |
           ${{ runner.os }}-huggingface-
 
@@ -3177,7 +3171,7 @@ jobs:
         print('Downloading embedding model...')
         SentenceTransformer('BAAI/bge-small-en-v1.5')
         print('Downloading cross-encoder model...')
-        CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+        CrossEncoder('hindsight-ai/hs-rerank-1')
         print('Models downloaded successfully')
         "
 
@@ -3283,7 +3277,7 @@ jobs:
       uses: actions/cache@v5
       with:
         path: ~/.cache/huggingface
-        key: ${{ runner.os }}-huggingface-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
+        key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
         restore-keys: |
           ${{ runner.os }}-huggingface-
 
@@ -3295,7 +3289,7 @@ jobs:
         print('Downloading embedding model...')
         SentenceTransformer('BAAI/bge-small-en-v1.5')
         print('Downloading cross-encoder model...')
-        CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+        CrossEncoder('hindsight-ai/hs-rerank-1')
         print('Models downloaded successfully')
         "
 
@@ -3311,8 +3305,6 @@ jobs:
     - name: Build hindsight-all-npm (openclaw dep)
       run: npm run build --workspace=hindsight-all-npm
 
-    - name: Build hindsight-agent-sdk (openclaw dep)
-      run: npm run build --workspace=hindsight-tools/hindsight-agent-sdk
 
     - name: Install openclaw integration dependencies
       working-directory: ./hindsight-integrations/openclaw
@@ -3409,7 +3401,7 @@ jobs:
       uses: actions/cache@v5
       with:
         path: ~/.cache/huggingface
-        key: ${{ runner.os }}-huggingface-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
+        key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
         restore-keys: |
           ${{ runner.os }}-huggingface-
 
@@ -3421,7 +3413,7 @@ jobs:
         print('Downloading embedding model...')
         SentenceTransformer('BAAI/bge-small-en-v1.5')
         print('Downloading cross-encoder model...')
-        CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+        CrossEncoder('hindsight-ai/hs-rerank-1')
         print('Models downloaded successfully')
         "
 
@@ -3471,6 +3463,7 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.system-tests == 'true' ||
+      needs.detect-changes.outputs.extensions-bank-llm-routing == 'true' ||
       needs.detect-changes.outputs.ci == 'true'
     # ML-stack install + docs/image build exceeds arc-light's 4Gi `work` emptyDir
     # (kubelet eviction, BLO-52009); arc-dind's `work` is a 56Gi emptyDir.
@@ -3889,43 +3882,6 @@ jobs:
       # (requires_real_llm) needs a live Hindsight server and runs separately.
       run: uv run pytest tests -v -m "not requires_real_llm"
 
-  test-copilot-cli-integration:
-    needs: [detect-changes]
-    if: >-
-      (github.event_name == 'workflow_dispatch' ||
-      needs.detect-changes.outputs.integrations-copilot-cli == 'true' ||
-      needs.detect-changes.outputs.ci == 'true')
-    runs-on: {group: default-tools, labels: arc-light}
-    timeout-minutes: 30
-
-    steps:
-    - uses: actions/checkout@v6
-      with:
-        ref: ${{ github.event.pull_request.head.sha || '' }}
-
-    - name: Install uv
-      uses: astral-sh/setup-uv@v7
-      with:
-        enable-cache: true
-        prune-cache: false
-
-    - name: Set up Python
-      uses: actions/setup-python@v6
-      with:
-        python-version-file: ".python-version"
-
-    - name: Build copilot-cli integration
-      working-directory: ./hindsight-integrations/copilot-cli
-      run: uv build
-
-    - name: Install dependencies
-      working-directory: ./hindsight-integrations/copilot-cli
-      run: uv sync --frozen
-
-    - name: Run tests
-      working-directory: ./hindsight-integrations/copilot-cli
-      run: uv run pytest tests -v
-
   test-extension-supabase-tenant:
     needs: [detect-changes]
     if: >-
@@ -4019,6 +3975,47 @@ jobs:
           -f hindsight-extensions/static-keys-tenant/Dockerfile \
           --build-arg HINDSIGHT_IMAGE=ghcr.io/vectorize-io/hindsight:latest-slim \
           -t hindsight-with-static-keys .
+
+  test-extension-bank-llm-routing:
+    needs: [detect-changes]
+    if: >-
+      (github.event_name == 'workflow_dispatch' ||
+      needs.detect-changes.outputs.extensions-bank-llm-routing == 'true' ||
+      needs.detect-changes.outputs.core == 'true' ||
+      needs.detect-changes.outputs.ci == 'true')
+    runs-on: {group: default-tools, labels: arc-light}
+    timeout-minutes: 30
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event.pull_request.head.sha || '' }}
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v7
+      with:
+        enable-cache: true
+        prune-cache: false
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version-file: ".python-version"
+
+    # No --frozen: the lock is not checked in, because tool.uv.sources resolves
+    # hindsight-api-slim from the local checkout and its dependency tree moves
+    # with core.
+    - name: Install dependencies
+      working-directory: ./hindsight-extensions/bank-llm-routing
+      run: uv sync
+
+    - name: Run tests
+      working-directory: ./hindsight-extensions/bank-llm-routing
+      run: uv run pytest tests -v
+
+    # No image build yet: the Dockerfile builds on the published image, which predates
+    # the LLM_REQUEST slot, so its import check cannot pass until the next release.
+    # ponytail: add the `docker build` step from test-extension-static-keys-tenant once a release ships the slot.
 
   test-crewai-integration:
     needs: [detect-changes]
@@ -4917,30 +4914,18 @@ jobs:
           fi
         done || true
 
-  # Compatibility gate against hermes-agent's *main* branch.
+  # Compatibility gate: hermes-agent's *main* branch + this branch's Hermes
+  # plugin, installed the way a Hermes user installs it — Hermes' installer,
+  # `hermes plugins install hindsight` from the catalog (patched to point at
+  # this checkout), `hermes update`, then a turn through the MemoryProvider
+  # contract on an embedded daemon. See scripts/test-hermes-compat.sh.
   #
-  # `hermes memory setup` installs `hindsight-all` into Hermes' own venv to run
-  # memory in local_embedded mode, and Hermes exact-pins every direct dependency
-  # (`==X.Y.Z`) as a deliberate supply-chain policy — they will not loosen a pin
-  # for us. So any version range Hindsight declares that excludes one of their
-  # pins makes the two impossible to co-install for every Hermes user on
-  # embedded memory. That was #3251: our `cryptography>=48.0.1` / `pillow>=12.3.0`
-  # against their `==46.0.7` / `==12.2.0`, which left `pip check` permanently
-  # broken. Both sides bump on their own schedule, so this needs a standing gate
-  # rather than a one-off fix; tracking main surfaces the next collision while
-  # it is still cheap to fix on either side.
+  # Only the plugin reaches Hermes users from this repo: its hindsight-client /
+  # hindsight-embed come from PyPI, so core and client changes don't trigger it.
   #
-  # It also exercises the memory provider itself, which moved out of the Hermes
-  # tree into hindsight-integrations/hermes: the script drops Hermes' bundled
-  # copy (bundled wins on a name collision, so leaving it would test their code
-  # instead of ours), installs this checkout's plugin, and round-trips a turn
-  # through the MemoryProvider contract. That makes this the only gate covering
-  # the plugin against a real Hermes, hence the integrations-hermes trigger.
-  #
-  # Deliberately not gated on has_secrets — the resolution, wiring, runtime and
-  # daemon-boot checks need no credentials, so this runs on fork PRs too. Only
-  # the retain/recall round-trips need an LLM; the key below is empty on fork
-  # PRs and the script skips exactly those, reporting that it did.
+  # Deliberately not gated on has_secrets — everything but the retain/recall
+  # round-trip needs no credentials, so this runs on fork PRs too; the key below
+  # is empty there and the script skips exactly that, reporting that it did.
   test-hermes-compat:
     needs: [detect-changes]
     # Blockcast fork: runs upstream and on workflow_dispatch, but not on this
@@ -4960,8 +4945,6 @@ jobs:
       needs.detect-changes.outputs.integrations-hermes == 'true' ||
       needs.detect-changes.outputs.ci == 'true')))
     runs-on: {group: default-tools, labels: arc-light}
-    # 45 before the provider step was added; it stops the daemon and boots it
-    # again through the plugin's own path, then waits on an LLM extraction.
     timeout-minutes: 60
     permissions:
       contents: read
@@ -4977,13 +4960,14 @@ jobs:
         enable-cache: true
         prune-cache: false
 
-    # hindsight-all pulls the local-ml extra, so the embedded daemon can load
-    # sentence-transformers models. Cache them like the test-embed job does.
+    # The embedded daemon (uvx hindsight-api) loads local sentence-transformers
+    # models. Keyed on the plugin's pyproject: its hindsight-embed range decides
+    # which hindsight-api release runs. Cache them like the test-embed job does.
     - name: Cache HuggingFace models
       uses: actions/cache@v5
       with:
         path: ~/.cache/huggingface
-        key: ${{ runner.os }}-huggingface-hermes-compat-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
+        key: ${{ runner.os }}-huggingface-hermes-compat-${{ hashFiles('hindsight-integrations/hermes/pyproject.toml') }}
         restore-keys: |
           ${{ runner.os }}-huggingface-hermes-compat-
           ${{ runner.os }}-huggingface-
@@ -5195,7 +5179,7 @@ jobs:
       uses: actions/cache@v5
       with:
         path: ~/.cache/huggingface
-        key: ${{ runner.os }}-huggingface-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
+        key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
         restore-keys: |
           ${{ runner.os }}-huggingface-
 
@@ -5207,7 +5191,7 @@ jobs:
         print('Downloading embedding model...')
         SentenceTransformer('BAAI/bge-small-en-v1.5')
         print('Downloading reranker model...')
-        CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+        CrossEncoder('hindsight-ai/hs-rerank-1')
         print('Models downloaded successfully')
         "
 
@@ -5296,7 +5280,7 @@ jobs:
       uses: actions/cache@v5
       with:
         path: ~/.cache/huggingface
-        key: ${{ runner.os }}-huggingface-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
+        key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
         restore-keys: |
           ${{ runner.os }}-huggingface-
 
@@ -5316,7 +5300,7 @@ jobs:
         print('Downloading embedding model...')
         SentenceTransformer('BAAI/bge-small-en-v1.5')
         print('Downloading cross-encoder model...')
-        CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+        CrossEncoder('hindsight-ai/hs-rerank-1')
         print('Models downloaded successfully')
         "
 
@@ -5668,17 +5652,11 @@ jobs:
       - build-typescript-client
       - build-openclaw-integration
       - smoke-openclaw-install
-      - test-claude-code-integration
       - test-cursor-integration
-      - test-cline-integration
       - test-github-copilot-integration
-      - test-codex-integration
-      - test-cursor-cli-integration
-      - test-zcode-integration
       - test-agent-plugin-integration
       - build-ai-sdk-integration
       - test-ai-sdk-integration-deno
-      - test-opencode-integration
       - test-eve-integration
       - test-omo-integration
       - test-cloudflare-oauth-proxy-integration
@@ -5686,10 +5664,13 @@ jobs:
       - test-paperclip-integration
       - test-pipecat-integration
       - test-gemini-spark-integration
+      - test-meta-muse-integration
+      - test-grok-bot-integration
       - test-vapi-integration
       - test-google-adk-integration
       - test-roo-code-integration
       - build-control-plane
+      - test-figures
       - build-docs
       - test-rust-cli
       - lint-helm-chart
@@ -5718,6 +5699,7 @@ jobs:
       - test-agent-framework-integration
       - test-extension-supabase-tenant
       - test-extension-static-keys-tenant
+      - test-extension-bank-llm-routing
       - test-crewai-integration
       - test-langgraph-integration
       - test-superagent-integration
@@ -5736,7 +5718,6 @@ jobs:
       - verify-embed-control-center-bundle
       - test-hermes-compat
       - test-hindsight-all
-      - test-hindsight-agent-sdk
       - test-claude-agent-sdk-integration
       - test-doc-examples
       - test-upgrade

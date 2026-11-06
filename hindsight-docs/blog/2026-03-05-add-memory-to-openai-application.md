@@ -1,5 +1,6 @@
 ---
 title: "Give Your OpenAI App a Memory in 5 Minutes"
+description: "Build a chatbot on the OpenAI SDK that remembers its users across restarts, using three Hindsight calls and no vector database."
 authors: [benfrank241]
 date: 2026-03-05T12:00
 tags: [memory, openai, python, docker, rag, llm, vector, embedding, tutorial]
@@ -116,7 +117,7 @@ It includes:
 
 No external infrastructure.
 
-> **Prefer not to self-host?** [Hindsight Cloud](https://ui.hindsight.vectorize.io/signup) gives you the same API with no setup — just swap `base_url` for your Cloud endpoint.
+> **Prefer not to self-host?** [Hindsight Cloud](https://ui.hindsight.vectorize.io) gives you the same API with no setup — just swap `base_url` for your Cloud endpoint.
 
 ---
 
@@ -393,7 +394,7 @@ That's what you just built in 15 minutes.
 - **Use tags** for scoped memory (`tags` on retain, `tags_match` on recall)
 - **Add structured JSON output** to reflect with `response_schema`
 - **Inspect memories in the web UI** at `localhost:9999` via Docker
-- **Try [hosted Hindsight](https://ui.hindsight.vectorize.io/signup)** instead of self-hosting
+- **Try [hosted Hindsight](https://ui.hindsight.vectorize.io)** instead of self-hosting
 
 Persistent memory turns a chatbot into an agent.
 

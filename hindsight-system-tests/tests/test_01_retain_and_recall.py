@@ -6,10 +6,10 @@ background half of the retain, and a later question that never repeats the
 original wording gets those facts back.
 
 The assertions are deliberately total. With the LLM, the embedder and the
-reranker all stubbed, a recall is a pure function of the input — so the *whole*
-response is pinned, not just the presence of a keyword: the ranking, the four
-scores behind it, how a fact is rendered back into text, which envelope fields
-stay empty. A test that only checks "Berlin appears somewhere" passes just as
+reranker all stubbed, a recall is a pure function of the input and the clock — so
+the *whole* response is pinned, not just the presence of a keyword: the ranking,
+the four scores behind it, how a fact is rendered back into text, which envelope
+fields stay empty. A test that only checks "Berlin appears somewhere" passes just as
 happily when fusion inverts, the reranker stops contributing, or the temporal
 fields quietly stop being parsed.
 
@@ -59,14 +59,14 @@ async def test_a_retained_memory_comes_back_from_recall(client, llm, bank_id, se
     # a working pipeline must separate them; an inverted order here means fusion
     # or reranking regressed.
     assert [result.text for result in response.results] == [
-        "Alice moved to Berlin in 2021 | When: 2021 | Involving: Alice",
+        "Alice moved to Berlin in 2021 | When: 2021 | Where: Berlin | Involving: Alice",
         "Alice plays the cello professionally | Involving: Alice",
     ]
 
     berlin, cello = response.results
 
     # --- how a fact is rendered back ----------------------------------------
-    # `what` is not stored verbatim: the populated `when`/`who` fields are appended
+    # `what` is not stored verbatim: the populated `when`/`where`/`who` fields are appended
     # as labelled clauses, and the ones left at "N/A" are dropped. That rendering is
     # what a caller reads, so it is part of the contract.
     assert berlin.type == "world"
@@ -91,25 +91,27 @@ async def test_a_retained_memory_comes_back_from_recall(client, llm, bank_id, se
     assert berlin.id != cello.id
 
     # --- scores -------------------------------------------------------------
-    # Every retrieval strategy contributed. The embedder is a pure function of the
-    # text (see `lexical.py`), the reranker derives from the same model, and BM25 is
-    # deterministic, so those are pinned to the bit. `semantic` is NOT: pgvector
-    # computes `1 - (a <=> b)` as a float32 reduction whose rounding depends on its
-    # SIMD path and the runner CPU — two runs that agree in float32 to the last bit
-    # (0.4346591532230377) differed by 1.3e-8 in the float64 they report
-    # (BLO-47312). 1e-6 is still far below any real embedding or logic change.
-    assert berlin.scores.semantic == pytest.approx(0.43465916228227297, abs=1e-6)
-    assert berlin.scores.reranker == pytest.approx(0.37416573867739417, abs=1e-12)
+    # Every retrieval strategy contributed, and each component is reproducible: the
+    # embedder is a pure function of the text (see `lexical.py`), the reranker
+    # derives from the same model, and BM25 is deterministic. `semantic` is the one
+    # exception to bit-exactness: retain embeds the fact with "(happened in <Month>
+    # <Year>)" taken from the wall clock, and while the month token never changes
+    # the true cosine, it moves which vector slots pgvector sums in float32, so the
+    # last ~8 digits shift from month to month. Hence a float32-sized tolerance.
+    # It used to be pinned at abs=1e-12 to the September value, which failed every
+    # run from October 1 onward (#5043).
+    assert berlin.scores.semantic == pytest.approx(0.45907810086477396, abs=1e-7)
+    assert berlin.scores.reranker == pytest.approx(0.4291662538799943, abs=1e-12)
     assert berlin.scores.keyword == pytest.approx(0.30000001192092896, abs=1e-12)
 
-    assert cello.scores.semantic == pytest.approx(0.4146140043322447, abs=1e-6)
+    assert cello.scores.semantic == pytest.approx(0.4146140043322447, abs=1e-7)
     assert cello.scores.reranker == pytest.approx(0.3333333333333333, abs=1e-12)
     assert cello.scores.keyword == pytest.approx(0.30000001192092896, abs=1e-12)
 
     # `final` folds in recency, measured against wall-clock now, so it drifts in the
     # ninth decimal between runs. Loose enough to absorb that, tight enough that a
     # changed weighting fails.
-    assert berlin.scores.final == pytest.approx(0.41158231, abs=1e-6)
+    assert berlin.scores.final == pytest.approx(0.47208288, abs=1e-6)
     assert cello.scores.final == pytest.approx(0.36666666, abs=1e-6)
     assert berlin.scores.final > cello.scores.final
 

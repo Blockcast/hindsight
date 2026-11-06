@@ -1,7 +1,10 @@
-/* Inter and JetBrains Mono are loaded via next/font/google in
+/* Inter and JetBrains Mono are loaded via next/font/local in
    src/app/[locale]/layout.tsx. The CSS variables --font-sans and
    --font-mono are set on <html> and consumed below in :root. */
 @import "tailwindcss";
+/* Tailwind v4 does not auto-load tailwind.config.ts. Register typography here
+   so rendered Markdown gets the paragraph, heading and list styles of prose. */
+@plugin "@tailwindcss/typography";
 
 /* Bind the `dark:` variant to the `.dark` class this app actually toggles.
  *
@@ -93,7 +96,7 @@
   --sidebar-accent-foreground: #0D1117;
   --sidebar-border: rgba(0, 0, 0, 0.05);
   --sidebar-ring: #0074D9;
-  /* --font-sans and --font-mono are set on <html> by next/font/google in
+  /* --font-sans and --font-mono are set on <html> by next/font/local in
      [locale]/layout.tsx. :root inherits them; we intentionally do NOT
      redeclare them here so the next/font value is what utilities resolve to.
      A separate --font-fallback chain is provided for any future use. */
@@ -354,6 +357,42 @@ code, pre {
   font-family: var(--font-mono);
 }
 
+/* Mobile safety nets. These sit outside any @layer so they beat Tailwind
+   utilities, and they key off what an element already says it does, so new
+   components get the right behaviour without remembering to opt in. */
+
+/* The page itself never scrolls sideways: anything wider than the screen has
+   to scroll inside its own container (tables, tab rows) instead. */
+html, body {
+  overflow-x: clip;
+}
+
+/* Touch screens have no hover. Tailwind v4 only applies `hover:` and
+   `group-hover:` on devices that can hover, so a control written as
+   `opacity-0 group-hover:opacity-100` would never appear on a phone. Show
+   every such reveal-on-hover control there instead. */
+@media (hover: none) {
+  [class*="opacity-0"][class*="group-hover"] {
+    opacity: 1;
+  }
+}
+
+/* iOS Safari gives date/time fields a fixed minimum width from their native
+   picker, so `w-full` could not shrink them and they pushed forms off-screen. */
+input[type="date"],
+input[type="time"],
+input[type="datetime-local"] {
+  min-width: 0;
+}
+
+/* iOS zooms the page in on any focused field whose text is under 16px, and
+   leaves it zoomed. Fields here use 13-14px, so bump them on touch screens. */
+@media (pointer: coarse) {
+  input, textarea, select, [contenteditable="true"] {
+    font-size: max(16px, 1em);
+  }
+}
+
 /* Gradient utilities */
 .bg-primary-gradient {
   background: var(--primary-gradient);
@@ -393,75 +432,15 @@ input[type="datetime-local"]::-webkit-calendar-picker-indicator {
   filter: invert(1);
 }
 
-/* Markdown table styles - explicitly override Tailwind reset */
-.prose table {
-  width: 100%;
-  border-collapse: collapse;
-  margin-top: 1em;
-  margin-bottom: 1em;
-  font-size: 0.875em;
-  line-height: 1.5;
-  border: 2px solid rgba(0, 0, 0, 0.2) !important;
+/* Keep long answers readable while tables and code can use the card width.
+   The typography plugin owns table spacing, borders and dark-mode colors. */
+.reflect-answer {
+  /* Wrap long prose without shrinking tables' intrinsic column widths. */
+  overflow-wrap: break-word;
 }
 
-.prose thead {
-  border-bottom: 3px solid rgba(0, 0, 0, 0.3) !important;
-  background-color: rgba(0, 0, 0, 0.05);
-}
-
-.prose thead th {
-  padding: 0.5rem 0.75rem;
-  text-align: left;
-  font-weight: 600;
-  vertical-align: bottom;
-  border: 1px solid rgba(0, 0, 0, 0.2) !important;
-  border-bottom-width: 3px !important;
-}
-
-.prose tbody tr {
-  border-bottom: 1px solid rgba(0, 0, 0, 0.15) !important;
-}
-
-.prose tbody tr:last-child {
-  border-bottom: 1px solid rgba(0, 0, 0, 0.15) !important;
-}
-
-.prose tbody td {
-  padding: 0.5rem 0.75rem;
-  vertical-align: top;
-  border: 1px solid rgba(0, 0, 0, 0.15) !important;
-}
-
-.prose tbody tr:hover {
-  background-color: rgba(0, 0, 0, 0.04);
-}
-
-/* Dark mode table styles - use white borders with transparency */
-.dark .prose table {
-  color: hsl(var(--foreground));
-  border: 2px solid rgba(255, 255, 255, 0.2) !important;
-}
-
-.dark .prose thead {
-  border-bottom: 3px solid rgba(255, 255, 255, 0.3) !important;
-  background-color: rgba(255, 255, 255, 0.05);
-}
-
-.dark .prose thead th {
-  border: 1px solid rgba(255, 255, 255, 0.2) !important;
-  border-bottom-width: 3px !important;
-}
-
-.dark .prose tbody tr {
-  border-bottom: 1px solid rgba(255, 255, 255, 0.15) !important;
-}
-
-.dark .prose tbody td {
-  border: 1px solid rgba(255, 255, 255, 0.15) !important;
-}
-
-.dark .prose tbody tr:hover {
-  background-color: rgba(255, 255, 255, 0.05);
+.reflect-answer > :where(p, ul, ol, blockquote, h1, h2, h3, h4, h5, h6) {
+  max-width: 70ch;
 }
 
 /* Branded loading spinner — the Hindsight mark doing a looping "tumble": a
@@ -607,9 +586,24 @@ input[type="datetime-local"]::-webkit-calendar-picker-indicator {
   animation: soft-fade-in 200ms ease-out both;
 }
 
+/* The phone navigation drawer (components/sidebar.tsx) slides in from the left. */
+@keyframes drawer-in {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: none;
+  }
+}
+
+.animate-drawer-in {
+  animation: drawer-in 200ms ease-out both;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .animate-list-row-enter,
-  .animate-soft-fade-in {
+  .animate-soft-fade-in,
+  .animate-drawer-in {
     animation: none;
   }
 }

@@ -7,7 +7,7 @@
 
 use anyhow::Result;
 
-use crate::api::ApiClient;
+use crate::api::{ApiClient, KnowledgeTagFilter};
 use crate::output::{self, OutputFormat};
 use crate::ui;
 
@@ -35,10 +35,38 @@ fn parse_mode(value: &str) -> Result<types::Mode> {
     })
 }
 
+/// Build the knowledge-base tag filter from the `--tags` / `--tags-match` / `--tag-groups` flags.
+pub fn tag_filter(
+    tags: Vec<String>,
+    tags_match: Option<String>,
+    tag_groups: Option<String>,
+) -> Result<KnowledgeTagFilter> {
+    let tags_match = tags_match
+        .map(|value| {
+            Ok(match value.to_lowercase().as_str() {
+                "any" => types::TagsMatch::Any,
+                "all" => types::TagsMatch::All,
+                "any_strict" => types::TagsMatch::AnyStrict,
+                "all_strict" => types::TagsMatch::AllStrict,
+                "exact" => types::TagsMatch::Exact,
+                other => anyhow::bail!(
+                    "invalid --tags-match '{other}': expected one of any, all, any_strict, all_strict, exact"
+                ),
+            })
+        })
+        .transpose()?;
+    Ok(KnowledgeTagFilter {
+        tags,
+        tags_match,
+        tag_groups,
+    })
+}
+
 /// Show the folder/page tree for a bank
 pub fn tree(
     client: &ApiClient,
     bank_id: &str,
+    filter: &KnowledgeTagFilter,
     verbose: bool,
     output_format: OutputFormat,
 ) -> Result<()> {
@@ -48,7 +76,7 @@ pub fn tree(
         None
     };
 
-    let response = client.get_knowledge_base_tree(bank_id, verbose);
+    let response = client.get_knowledge_base_tree(bank_id, filter, verbose);
 
     if let Some(mut sp) = spinner {
         sp.finish();
@@ -149,6 +177,7 @@ pub fn create_page(
                 .unwrap_or(types::Mode::Delta),
             refresh_after_consolidation: true,
             refresh_cron: None,
+            full_refresh_cron: None,
             min_refresh_interval_seconds: None,
             exclude_mental_models: true,
             exclude_mental_model_ids: None,
@@ -160,6 +189,7 @@ pub fn create_page(
             recall_chunks_max_tokens: None,
             reflect_search_observations_max_tokens: None,
             reflect_search_observations_include_entities: None,
+            budget: None,
             response_schema: None,
             keep_trace: false,
         })
@@ -264,6 +294,7 @@ pub fn search(
     bank_id: &str,
     query: &str,
     limit: Option<u64>,
+    filter: &KnowledgeTagFilter,
     verbose: bool,
     output_format: OutputFormat,
 ) -> Result<()> {
@@ -286,7 +317,7 @@ pub fn search(
         None
     };
 
-    let response = client.search_knowledge_base(bank_id, &query, limit, verbose);
+    let response = client.search_knowledge_base(bank_id, &query, limit, filter, verbose);
 
     if let Some(mut sp) = spinner {
         sp.finish();
@@ -541,5 +572,27 @@ mod tests {
             err.contains("invalid --mode 'incremental'"),
             "unexpected error: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod tag_filter_tests {
+    use super::*;
+
+    #[test]
+    fn parses_every_mode_and_rejects_unknown() {
+        for (raw, want) in [
+            ("any", types::TagsMatch::Any),
+            ("ALL", types::TagsMatch::All),
+            ("any_strict", types::TagsMatch::AnyStrict),
+            ("all_strict", types::TagsMatch::AllStrict),
+            ("exact", types::TagsMatch::Exact),
+        ] {
+            let f = tag_filter(vec!["user:kate".into()], Some(raw.into()), None).unwrap();
+            assert_eq!(f.tags_match, Some(want));
+        }
+        assert!(tag_filter(vec![], Some("most".into()), None).is_err());
+        let f = tag_filter(vec![], None, Some("[]".into())).unwrap();
+        assert_eq!((f.tags_match, f.tag_groups.as_deref()), (None, Some("[]")));
     }
 }

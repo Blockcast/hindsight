@@ -20,7 +20,8 @@ import pytest
 
 from hindsight_api import RequestContext
 from hindsight_api.engine.memories import get_memories
-from hindsight_api.engine.memory_engine import MemoryEngine, fq_table
+from hindsight_api.engine.memory_engine import MemoryEngine
+from hindsight_api.engine.schema import fq_store_table
 from hindsight_api.engine.reflect.retractions import (
     MEMORY_BACKED_FACT_TYPES,
     based_on_fact_ids,
@@ -130,7 +131,7 @@ async def _insert_memory(memory: MemoryEngine, conn, bank_id: str, text: str) ->
     )
     # Consolidated baseline, not a backlog: a pending fact would defer the unsay.
     await store.mark_consolidated(
-        conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=unit_ids, when=datetime.now(timezone.utc)
+        conn=conn, fq_table=fq_store_table, bank_id=bank_id, unit_ids=unit_ids, when=datetime.now(timezone.utc)
     )
     return uuid.UUID(unit_ids[0])
 
@@ -160,7 +161,7 @@ async def _create_page(
     )
     # Stamp the grounding and the watermark a real refresh would have left behind.
     await conn.execute(
-        f"UPDATE {fq_table('mental_models')} SET content = $3, reflect_response = $4::jsonb, "
+        f"UPDATE {fq_store_table('mental_models')} SET content = $3, reflect_response = $4::jsonb, "
         f"last_memory_seen_at = now() WHERE bank_id = $1 AND id = $2",
         bank_id,
         model["id"],
@@ -173,7 +174,7 @@ async def _create_page(
 async def _staleness_row(conn, bank_id: str, mental_model_id: str):
     return await conn.fetchrow(
         f"SELECT id, tags, trigger, last_refreshed_at, last_memory_seen_at "
-        f"FROM {fq_table('mental_models')} WHERE bank_id = $1 AND id = $2",
+        f"FROM {fq_store_table('mental_models')} WHERE bank_id = $1 AND id = $2",
         bank_id,
         mental_model_id,
     )
@@ -217,7 +218,7 @@ async def test_live_memory_ids_reports_only_rows_that_exist(memory: MemoryEngine
     async with pool.acquire() as conn:
         live = await _insert_memory(memory, conn, bank_id, "Autocommit is disabled.")
         answered = await get_memories().live_memory_ids(
-            conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[str(live), str(uuid.uuid4())]
+            conn=conn, fq_table=fq_store_table, bank_id=bank_id, unit_ids=[str(live), str(uuid.uuid4())]
         )
     assert answered == {str(live)}
     await memory.delete_bank(bank_id, request_context=request_context)
@@ -231,7 +232,7 @@ async def test_live_memory_ids_treats_unparseable_ids_as_absent(memory: MemoryEn
     pool = await memory._get_pool()
     async with pool.acquire() as conn:
         answered = await get_memories().live_memory_ids(
-            conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=["coding-style", ""]
+            conn=conn, fq_table=fq_store_table, bank_id=bank_id, unit_ids=["coding-style", ""]
         )
     assert answered == set()
     await memory.delete_bank(bank_id, request_context=request_context)
@@ -248,7 +249,7 @@ async def test_live_memory_ids_does_not_cross_banks(memory: MemoryEngine, reques
     async with pool.acquire() as conn:
         elsewhere = await _insert_memory(memory, conn, other_bank, "Someone else's fact.")
         answered = await get_memories().live_memory_ids(
-            conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[str(elsewhere)]
+            conn=conn, fq_table=fq_store_table, bank_id=bank_id, unit_ids=[str(elsewhere)]
         )
     assert answered == set()
     await memory.delete_bank(bank_id, request_context=request_context)
@@ -365,7 +366,7 @@ async def test_sweep_schedules_a_refresh_for_a_page_whose_grounding_is_gone(
         mm_id = await _create_page(
             memory, conn, bank_id, request_context, based_on={"world": [_fact(str(live), "autocommit disabled")]}
         )
-        await conn.execute(f"DELETE FROM {fq_table('memory_units')} WHERE bank_id = $1", bank_id)
+        await conn.execute(f"DELETE FROM {fq_store_table('memory_units')} WHERE bank_id = $1", bank_id)
 
     submit = AsyncMock(return_value={"operation_id": "op-1"})
     with patch.object(memory, "submit_async_refresh_mental_model", new=submit):
@@ -389,12 +390,12 @@ async def test_sweep_leaves_manually_refreshed_pages_alone(memory: MemoryEngine,
             memory, conn, bank_id, request_context, based_on={"world": [_fact(str(live), "autocommit disabled")]}
         )
         await conn.execute(
-            f"UPDATE {fq_table('mental_models')} SET trigger = $3::jsonb WHERE bank_id = $1 AND id = $2",
+            f"UPDATE {fq_store_table('mental_models')} SET trigger = $3::jsonb WHERE bank_id = $1 AND id = $2",
             bank_id,
             mm_id,
             json.dumps({"mode": "delta", "refresh_after_consolidation": False}),
         )
-        await conn.execute(f"DELETE FROM {fq_table('memory_units')} WHERE bank_id = $1", bank_id)
+        await conn.execute(f"DELETE FROM {fq_store_table('memory_units')} WHERE bank_id = $1", bank_id)
 
     submit = AsyncMock(return_value={"operation_id": "op-1"})
     with patch.object(memory, "submit_async_refresh_mental_model", new=submit):
@@ -420,11 +421,13 @@ async def test_sweep_defers_to_consolidation_when_facts_are_pending(
         await _create_page(
             memory, conn, bank_id, request_context, based_on={"world": [_fact(str(live), "autocommit disabled")]}
         )
-        await conn.execute(f"DELETE FROM {fq_table('memory_units')} WHERE bank_id = $1 AND id = $2", bank_id, live)
+        await conn.execute(
+            f"DELETE FROM {fq_store_table('memory_units')} WHERE bank_id = $1 AND id = $2", bank_id, live
+        )
         # An unconsolidated fact left behind by the same edit.
         pending = await _insert_memory(memory, conn, bank_id, "Autocommit is enabled again.")
         await conn.execute(
-            f"UPDATE {fq_table('memory_units')} SET consolidated_at = NULL WHERE bank_id = $1 AND id = $2",
+            f"UPDATE {fq_store_table('memory_units')} SET consolidated_at = NULL WHERE bank_id = $1 AND id = $2",
             bank_id,
             pending,
         )
@@ -493,7 +496,7 @@ def _patch_op_calls(monkeypatch, memory: MemoryEngine, *, retraction_ops, delta_
         ops = _resolve_block_markers(retraction_ops if is_retraction else delta_ops, messages[1]["content"])
         return LLMCallResult(content=DeltaOperationList.model_validate({"operations": ops}), usage=TokenUsage())
 
-    monkeypatch.setattr(memory._reflect_llm_config, "call", fake_call)
+    monkeypatch.setattr(memory._mental_model_refresh_llm_config, "call", fake_call)
     return calls
 
 
@@ -547,6 +550,54 @@ async def test_delta_refresh_removes_content_resting_on_a_retracted_fact(
     stored = await memory.get_mental_model(bank_id, mm_id, detail="full", request_context=request_context)
     cited = based_on_fact_ids(stored["reflect_response"]["based_on"])
     assert gone_id not in cited
+
+    await memory.delete_bank(bank_id, request_context=request_context)
+
+
+@pytest.mark.asyncio
+async def test_unsay_call_uses_the_mental_model_refresh_temperature(
+    memory: MemoryEngine, request_context: RequestContext, monkeypatch, patch_reflect
+):
+    """The retraction pass sends ``llm_temperature_mental_model_refresh``, like the
+    delta pass, rather than the consolidation temperature."""
+    from hindsight_api.config import get_config
+
+    monkeypatch.setattr(get_config()._config, "llm_temperature_consolidation", 0.0)
+    monkeypatch.setattr(get_config()._config, "llm_temperature_mental_model_refresh", 0.65)
+
+    bank_id = f"test-retract-temperature-{uuid.uuid4().hex[:8]}"
+    await _ensure_bank(memory, bank_id, request_context)
+    gone_id = str(uuid.uuid4())
+
+    pool = await memory._get_pool()
+    async with pool.acquire() as conn:
+        live = await _insert_memory(memory, conn, bank_id, "Tests run on every push.")
+        mm_id = await _create_page(
+            memory,
+            conn,
+            bank_id,
+            request_context,
+            based_on={
+                "world": [
+                    _fact(gone_id, "Autocommit was disabled for hunk-level review.", "world"),
+                    _fact(str(live), "Tests run on every push.", "world"),
+                ]
+            },
+        )
+
+    patch_reflect(memory, text="No new information.")
+    calls = _patch_op_calls(
+        monkeypatch,
+        memory,
+        retraction_ops=[_remove_first_block_of("conventions")],
+        delta_ops=[],
+    )
+
+    await memory.refresh_mental_model(bank_id=bank_id, mental_model_id=mm_id, request_context=request_context)
+
+    retraction_call = next(call for call in calls if call["kind"] == "retraction")
+    assert retraction_call["scope"] == "mental_model_retraction_ops"
+    assert retraction_call["temperature"] == 0.65
 
     await memory.delete_bank(bank_id, request_context=request_context)
 
@@ -627,7 +678,7 @@ async def test_unsay_is_deferred_while_facts_are_pending_consolidation(
         )
         pending = await _insert_memory(memory, conn, bank_id, "Autocommit is enabled again.")
         await conn.execute(
-            f"UPDATE {fq_table('memory_units')} SET consolidated_at = NULL WHERE bank_id = $1 AND id = $2",
+            f"UPDATE {fq_store_table('memory_units')} SET consolidated_at = NULL WHERE bank_id = $1 AND id = $2",
             bank_id,
             pending,
         )
@@ -682,7 +733,7 @@ async def test_failed_unsay_keeps_the_citation_so_the_next_refresh_retries(
     async def exploding_call(*, messages, **kwargs):
         raise RuntimeError("provider is down")
 
-    monkeypatch.setattr(memory._reflect_llm_config, "call", exploding_call)
+    monkeypatch.setattr(memory._mental_model_refresh_llm_config, "call", exploding_call)
 
     refreshed = await memory.refresh_mental_model(
         bank_id=bank_id, mental_model_id=mm_id, request_context=request_context
@@ -716,7 +767,7 @@ async def test_full_mode_needs_no_unsay_pass(
             },
         )
         await conn.execute(
-            f"UPDATE {fq_table('mental_models')} SET trigger = $3::jsonb WHERE bank_id = $1 AND id = $2",
+            f"UPDATE {fq_store_table('mental_models')} SET trigger = $3::jsonb WHERE bank_id = $1 AND id = $2",
             bank_id,
             mm_id,
             json.dumps({"mode": "full", "refresh_after_consolidation": True}),

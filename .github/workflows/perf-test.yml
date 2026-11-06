@@ -91,7 +91,7 @@ jobs:
       uses: actions/cache@v5
       with:
         path: ~/.cache/huggingface
-        key: ${{ runner.os }}-huggingface-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
+        key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
         restore-keys: |
           ${{ runner.os }}-huggingface-
 
@@ -195,7 +195,7 @@ jobs:
       uses: actions/cache@v5
       with:
         path: ~/.cache/huggingface
-        key: ${{ runner.os }}-huggingface-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
+        key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
         restore-keys: |
           ${{ runner.os }}-huggingface-
 
@@ -289,7 +289,7 @@ jobs:
       uses: actions/cache@v5
       with:
         path: ~/.cache/huggingface
-        key: ${{ runner.os }}-huggingface-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
+        key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
         restore-keys: |
           ${{ runner.os }}-huggingface-
 
@@ -337,7 +337,8 @@ jobs:
 
   system-evals:
     # Knowledge-page convergence, reflect answers and retain language, graded by an
-    # independent judge. Blackbox: a real
+    # independent judge, plus ranked retrieval (nDCG@k / Recall@k) scored against
+    # BEIR's own labels rather than a judge. Blackbox: a real
     # hindsight-api process driven only through the published Python client, the
     # same shape as hindsight-system-tests — except the model is REAL, because a
     # quality eval against a stub would score the stub. That also means it needs
@@ -379,7 +380,7 @@ jobs:
       uses: actions/cache@v5
       with:
         path: ~/.cache/huggingface
-        key: ${{ runner.os }}-huggingface-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
+        key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
         restore-keys: |
           ${{ runner.os }}-huggingface-
 
@@ -406,7 +407,7 @@ jobs:
       with:
         name: system-evals-results-${{ github.sha }}
         path: hindsight-system-evals/system-evals-results.json
-        retention-days: 90
+        retention-days: 1
 
     - name: Publish system-evals to dashboard
       # Published even when an eval fails: for a quality metric the red run IS the

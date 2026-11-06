@@ -13,6 +13,7 @@ import CodeSnippet from '@site/src/components/CodeSnippet';
 {/* Import raw source files */}
 import documentsPy from '!!raw-loader!@site/examples/api/documents.py';
 import documentsMjs from '!!raw-loader!@site/examples/api/documents.mjs';
+import documentsSh from '!!raw-loader!@site/examples/api/documents.sh';
 import documentsGo from '!!raw-loader!@site/examples/api/documents.go';
 
 :::tip Prerequisites
@@ -52,15 +53,7 @@ Associate retained content with a document:
 <CodeSnippet code={documentsMjs} section="document-retain" language="javascript" />
 </TabItem>
 <TabItem value="cli" label="CLI">
-
-```bash
-# Retain content with document ID
-hindsight memory retain my-bank "Meeting notes content..." --doc-id notes-2024-03-15
-
-# Batch retain from files
-hindsight memory retain-files my-bank docs/
-```
-
+<CodeSnippet code={documentsSh} section="document-retain" language="bash" />
 </TabItem>
 <TabItem value="go" label="Go">
 <CodeSnippet code={documentsGo} section="document-retain" language="go" />
@@ -79,15 +72,7 @@ Re-retaining with the same document_id **replaces** the old content:
 <CodeSnippet code={documentsMjs} section="document-update" language="javascript" />
 </TabItem>
 <TabItem value="cli" label="CLI">
-
-```bash
-# Original
-hindsight memory retain my-bank "Project deadline: March 31" --doc-id project-plan
-
-# Update
-hindsight memory retain my-bank "Project deadline: April 15 (extended)" --doc-id project-plan
-```
-
+<CodeSnippet code={documentsSh} section="document-update" language="bash" />
 </TabItem>
 <TabItem value="go" label="Go">
 <CodeSnippet code={documentsGo} section="document-update" language="go" />
@@ -106,11 +91,7 @@ Retrieve a document's original text and metadata. This is useful for expanding d
 <CodeSnippet code={documentsMjs} section="document-get" language="javascript" />
 </TabItem>
 <TabItem value="cli" label="CLI">
-
-```bash
-hindsight document get my-bank meeting-2024-03-15
-```
-
+<CodeSnippet code={documentsSh} section="document-get" language="bash" />
 </TabItem>
 <TabItem value="go" label="Go">
 <CodeSnippet code={documentsGo} section="document-get" language="go" />
@@ -125,24 +106,16 @@ The `tags` array **replaces** the document's tags — it is not merged into them
 
 <Tabs>
 <TabItem value="python" label="Python">
-<CodeSnippet code={documentsPy} section="document-update" language="python" />
+<CodeSnippet code={documentsPy} section="document-update-tags" language="python" />
 </TabItem>
 <TabItem value="node" label="Node.js">
-<CodeSnippet code={documentsMjs} section="document-update" language="javascript" />
+<CodeSnippet code={documentsMjs} section="document-update-tags" language="javascript" />
 </TabItem>
 <TabItem value="cli" label="CLI">
-
-```bash
-# Replace tags with new values
-hindsight document update-tags my-bank meeting-2024-03-15 --tags team-a --tags team-b
-
-# Remove all tags
-hindsight document update-tags my-bank meeting-2024-03-15
-```
-
+<CodeSnippet code={documentsSh} section="document-update-tags" language="bash" />
 </TabItem>
 <TabItem value="go" label="Go">
-<CodeSnippet code={documentsGo} section="document-update" language="go" />
+<CodeSnippet code={documentsGo} section="document-update-tags" language="go" />
 </TabItem>
 </Tabs>
 
@@ -166,11 +139,7 @@ Remove a document and all its associated memories:
 <CodeSnippet code={documentsMjs} section="document-delete" language="javascript" />
 </TabItem>
 <TabItem value="cli" label="CLI">
-
-```bash
-hindsight document delete my-bank meeting-2024-03-15
-```
-
+<CodeSnippet code={documentsSh} section="document-delete" language="bash" />
 </TabItem>
 <TabItem value="go" label="Go">
 <CodeSnippet code={documentsGo} section="document-delete" language="go" />
@@ -197,18 +166,7 @@ Because filtering and ordering follow the same column, `total` counts only the d
 <CodeSnippet code={documentsMjs} section="document-list" language="javascript" />
 </TabItem>
 <TabItem value="cli" label="CLI">
-
-```bash
-# List all documents
-hindsight document list my-bank
-
-# Filter by ID substring
-hindsight document list my-bank --q report
-
-# Filter by tags
-hindsight document list my-bank --tags team-a --tags team-b
-```
-
+<CodeSnippet code={documentsSh} section="document-list" language="bash" />
 </TabItem>
 <TabItem value="go" label="Go">
 <CodeSnippet code={documentsGo} section="document-list" language="go" />
@@ -219,10 +177,14 @@ hindsight document list my-bank --tags team-a --tags team-b
 
 | Parameter | Description |
 |---|---|
-| `q` | Case-insensitive substring match on document ID. `report` matches `report-2024`, `annual-report`, etc. |
+| `q` | Case-insensitive substring match on document ID or document text. `report` matches `report-2024`, `annual-report`, or any document whose text contains `report`. Not indexed: meant for browsing and inspecting a bank, not for high-volume or latency-sensitive lookups (use recall for those). |
 | `tags` | Filter by document tags. Accepts multiple values. |
 | `tags_match` | How to match tags (default: `any_strict`). See below. |
 | `limit` / `offset` | Pagination. Default limit is 100. |
+
+When `q` is set, each returned row carries `matched_fields`: `["id"]`, `["original_text"]`, or both, so a caller can tell why a document matched.
+
+A `q` search counts at most 1,000 matches. Past that, `total` is a lower bound, `total_is_estimate` is `true`, and pages stop at the cap. Narrow the search, or add a tag or time filter, to reach the rest. Some storage backends match `q` approximately — `matched_fields` always says what matched.
 
 **`tags_match` modes:**
 
@@ -232,6 +194,67 @@ hindsight document list my-bank --tags team-a --tags team-b
 | `any` | Same as `any_strict` but also includes untagged documents. |
 | `all_strict` | Document must have **all** specified tags. Untagged docs excluded. |
 | `all` | Same as `all_strict` but also includes untagged documents. |
+
+## Document History
+
+Every change to a document is recorded with what it did: each retain, append and reprocess (facts added and removed), each fact edit, invalidation, restore and delete, each per-fact observation clear, each tag change, and each consolidation run (observations created, updated and removed, filed under every document their source facts came from).
+
+Observations are rebuilt rather than versioned, so when a change deletes one, this history is the only place its id is still recorded. Each event stores ids and counts only, never text, and each id list is capped at 100. The control plane shows this as the **History** tab of a document.
+
+The history is rebuilt from the bank's [operations](./operations), which carry these events, so two limits apply:
+
+- It reaches back only as far as operations are kept (`HINDSIGHT_API_OPERATION_RETENTION_DAYS`, unlimited by default).
+- A change that ran without an operation is not in it: a synchronous retain (`async: false`), or a fact edit, delete or tag change while auto-consolidation is off. A fact edit, delete or tag change is recorded on the consolidation operation it queues, next to the rebuild it causes. Clearing every observation in the bank is not listed.
+
+<Tabs>
+<TabItem value="python" label="Python">
+<CodeSnippet code={documentsPy} section="document-history" language="python" />
+</TabItem>
+<TabItem value="node" label="Node.js">
+<CodeSnippet code={documentsMjs} section="document-history" language="javascript" />
+</TabItem>
+<TabItem value="cli" label="CLI">
+<CodeSnippet code={documentsSh} section="document-history" language="bash" />
+</TabItem>
+<TabItem value="go" label="Go">
+<CodeSnippet code={documentsGo} section="document-history" language="go" />
+</TabItem>
+</Tabs>
+
+```json
+{
+  "document_id": "call-2026-10-01",
+  "total": 2,
+  "limit": 50,
+  "offset": 0,
+  "items": [
+    {
+      "document_id": "call-2026-10-01",
+      "kind": "consolidation",
+      "created_at": "2026-10-19T10:02:11Z",
+      "operation_id": "ce29121a-…",
+      "fact_id": null,
+      "facts_added": 0,
+      "facts_removed": 0,
+      "observations_created": { "count": 0, "ids": [] },
+      "observations_updated": { "count": 2, "ids": ["9545…", "c51c…"] },
+      "observations_removed": { "count": 0, "ids": [] }
+    },
+    {
+      "document_id": "call-2026-10-01",
+      "kind": "fact_edited",
+      "created_at": "2026-10-19T10:01:50Z",
+      "operation_id": "ce29121a-…",
+      "fact_id": "41ab…",
+      "facts_added": 0,
+      "facts_removed": 0,
+      "observations_created": { "count": 0, "ids": [] },
+      "observations_updated": { "count": 0, "ids": [] },
+      "observations_removed": { "count": 1, "ids": ["2098…"] }
+    }
+  ]
+}
+```
 
 ## Document Response Format
 

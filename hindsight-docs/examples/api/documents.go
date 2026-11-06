@@ -69,6 +69,40 @@ func main() {
 	fmt.Printf("Memory units: %d\n", doc.GetMemoryUnitCount())
 	// [/docs:document-get]
 
+	// [docs:document-history]
+	// What each retain, fact edit and consolidation did to this document, newest first
+	history, _, err := client.DocumentsAPI.GetDocumentHistory(ctx, "my-bank", "meeting-2024-03-15").Limit(50).Execute()
+	if err != nil {
+		log.Fatalf("Failed to get document history: %v", err)
+	}
+	for _, event := range history.GetItems() {
+		removed := event.GetObservationsRemoved()
+		fmt.Printf("%s: +%d facts, observations removed: %v\n", event.GetKind(), event.GetFactsAdded(), removed.GetIds())
+	}
+	// [/docs:document-history]
+
+	// [docs:document-update-tags]
+	// Replace the document's tags (the full set it should end up with)
+	updateResult, _, err := client.DocumentsAPI.UpdateDocument(ctx, "my-bank", "meeting-2024-03-15").
+		UpdateDocumentRequest(hindsight.UpdateDocumentRequest{Tags: []string{"team-a", "team-b"}}).
+		Execute()
+	if err != nil {
+		log.Fatalf("Failed to update document: %v", err)
+	}
+	fmt.Printf("Updated: %v\n", updateResult.GetSuccess())
+
+	// Remove all tags (make document visible everywhere). Pass an empty slice, not nil:
+	// a nil slice is left out of the request, and the server rejects an update with no tags.
+	client.DocumentsAPI.UpdateDocument(ctx, "my-bank", "meeting-2024-03-15").
+		UpdateDocumentRequest(hindsight.UpdateDocumentRequest{Tags: []string{}}).
+		Execute()
+	// [/docs:document-update-tags]
+
+	cleared, _, err := client.DocumentsAPI.GetDocument(ctx, "my-bank", "meeting-2024-03-15").Execute()
+	if err != nil || len(cleared.GetTags()) != 0 {
+		log.Fatalf("Expected no tags after clearing, got %v (err %v)", cleared.GetTags(), err)
+	}
+
 	// [docs:document-delete]
 	client.DocumentsAPI.DeleteDocument(ctx, "my-bank", "meeting-2024-03-15").Execute()
 	// [/docs:document-delete]

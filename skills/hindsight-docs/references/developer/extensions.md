@@ -85,6 +85,64 @@ HINDSIGHT_API_MCP_EXTENSION=mypackage.mcp:MyMCPExtension
 
 ---
 
+### LLMRequestExtension
+
+Decides, per LLM call, which LLM the call goes to and with which credentials. Use it to:
+
+- **Bill each customer on their own key.** Front your LLM spend with a gateway (LiteLLM proxy, Bifrost, OpenRouter, Portkey, ...) that gives each customer a virtual key, and send each bank's calls with its customer's key.
+- **Pick the model per bank or per operation.** A cheap model for one bank's retain and a strong one for its reflect, a different provider or cloud account per customer.
+
+It is asked once per LLM call with the tenant schema, the bank and the operation the call runs for — retain, reflect, consolidation, mental-model refresh — in the API process and in the worker alike. It answers with an `LLMRequestOverrides`, or `None` to use the server's own LLM. Raising refuses the call.
+
+```bash
+HINDSIGHT_API_LLM_REQUEST_EXTENSION=mypackage.llms:MyLLMs
+```
+
+An answer can carry:
+
+| Field | Effect |
+| --- | --- |
+| `llm` | Send the call to this LLM instead of the server's: provider, model, base URL, key and the other per-LLM settings (`LLMMemberConfig`, the shape of a multi-LLM chain member). Fields left unset inherit the server's global LLM defaults, except its credentials (default headers, Vertex service account, Codex home, LiteLLM router config); timeouts and retries inherit the operation's. |
+| `api_key` | The key for the LLM the call goes to (the server's, or `llm`'s — it fills an `llm` that has no key of its own). |
+| `headers` | Extra request headers, e.g. a gateway's customer id. |
+
+Things to know:
+
+- **The choice is server-side.** Nothing comes from the API caller. If your extension builds an answer from something a caller can write (bank config, metadata), validate it — otherwise that is where an endpoint or a key would come from user input.
+- **Credentials without `llm` cost no new client.** The key and headers go on a per-call copy of the existing SDK client that shares its connection pool. Supported on OpenAI-compatible endpoints (`openai`, `groq`, `deepseek`, `openrouter`, `fireworks`, `lmstudio`, any gateway set as `base_url`, ...), `anthropic` and `litellm` routed to a keyed backend (OpenAI, Anthropic, Azure, Gemini AI Studio, OpenRouter, a LiteLLM proxy, ...). A call to any other provider (`gemini`, `vertexai`, `ollama`, `bedrock`, `litellmrouter`, the OAuth/CLI providers) that the answer gives a key or headers to is **refused**, never sent on the configured credentials. To change the key of one of those, answer with a whole `llm` instead. A key is also refused when the server's default headers carry a credential (`Authorization`, `x-api-key`, `x-portkey-api-key`, ...) the answer does not override, since the SDK would send that one instead.
+- **Asked once per LLM in a chain.** With a multi-LLM chain or a provider per operation, each LLM is asked separately; check `target.provider` before handing out a key meant for one of them.
+- **Reflect prompt caching is off** while the extension is installed: Gemini's step-by-step reflect cache is created on the server's LLM, outside the calls the extension decides.
+- **An `llm` answer is built once and reused**, up to 64 distinct LLMs per process (least recently used are dropped). An extension that answers with one LLM per user on a large user base should use a gateway and `api_key` instead.
+- **No batch retain.** `HINDSIGHT_API_RETAIN_BATCH_ENABLED=true` with this extension fails at startup: batch jobs are submitted on the server's LLM.
+- **LLM calls only.** Embeddings and reranking keep their own configuration.
+- **Lifecycle:** `on_startup()` runs when the memory engine initializes, before any LLM call, and `on_shutdown()` when it closes.
+- **Startup check:** the connection check at boot uses the server's own LLM. If it has no usable key (for example, the gateway has none for the server), set `HINDSIGHT_API_SKIP_LLM_VERIFICATION=true`.
+
+Load the same extension in the API and in every worker: a worker without it runs consolidation and refreshes on the server's LLM.
+
+The [`bank-llm-routing`](https://github.com/vectorize-io/hindsight/tree/main/hindsight-extensions/bank-llm-routing) community extension routes on bank-id and operation patterns from configuration, and is a working example of the interface.
+
+---
+
+### ModelCallExtension
+
+Receives every model call the server makes — LLM, embedding, rerank and decision-model calls, successes and failures — once it finishes, as a `ModelCall`: the tenant schema, bank, operation and trace it ran for, scope, provider and model, input / cached / output / thoughts tokens, duration, and the request and response themselves (plus the tool calls, when the model asked for tools). Use it to keep a per-call record of model spend and content outside the `llm_requests` table: object storage, a warehouse, an observability product.
+
+```bash
+HINDSIGHT_API_MODEL_CALL_EXTENSION=mypackage.calls:MyRecorder
+```
+
+Things to know:
+
+- **`record()` runs on the call path, synchronously.** Only buffer there: no I/O, nothing that blocks. Send from a background task. An exception it raises never fails the call; it is swallowed and logged at DEBUG only, so catch and report your own errors.
+- **Lifecycle:** `on_startup()` runs when the memory engine initializes, before any model call; `on_shutdown()` when it closes, after the workers have stopped, so a buffer can be written out completely.
+- **It sees the same calls `llm_requests` tracing sees**, whether or not that table is written, and in the API and the worker alike. Load it in both.
+- **`input` and `output` are the call's content** (prompts and memories included). Treat what you store accordingly.
+- **Operation runs (optional):** override `record_operation(run)` to also receive an `OperationRun` when each retain, recall, reflect, consolidation or mental-model refresh ends, wherever it started (HTTP, MCP or a queued task). It carries the run's wall time, its success or error, the model calls it made (count, summed time and tokens), its calls into the memories store (count and summed time, measured at the store's interface), the engine's timed phases, and for a queued task its id and when it was queued. Every `ModelCall` made inside a run carries the run's id as `operation_id`, so the two join. A run opened inside another (a mental-model refresh's reflect pass) is its own run with `parent_id` set, and keeps only its own figures. Same rule as `record()`: buffer and return.
+- **`current_operation_id()`** (`hindsight_api.operation_runs`) returns the run in progress, for a memories store that wants to tag its own requests with it.
+
+---
+
 ## Writing Custom Extensions
 
 ### Extension Basics
@@ -109,6 +167,34 @@ All extensions support lifecycle hooks:
 Extensions have access to an `ExtensionContext` that provides:
 - `run_migration(schema)` - Run database migrations for a schema
 - `get_memory_engine()` - Get the MemoryEngine interface
+
+### Shipping your own database migrations
+
+An extension that keeps state of its own returns the directory holding its Alembic
+revision files, and they are applied in the same migration run as Hindsight's own —
+same ordering guarantees, same `alembic_version` table:
+
+```python
+class MyExtension(TenantExtension):
+    def alembic_version_locations(self) -> list[str]:
+        return [str(Path(__file__).parent / "alembic" / "versions")]
+```
+
+The directory holds revision files only — there is no `env.py`; Hindsight's own
+configures the schema and the connection. The tree is independent of Hindsight's: give
+its first revision `down_revision = None` and a `branch_labels` naming your extension,
+so an operator can address it (`alembic upgrade <label>@head`).
+
+Independent branches have no ordering between them. A revision that needs a Hindsight
+table to exist first must say so explicitly, which orders it without making Hindsight's
+revision its parent:
+
+```python
+depends_on = ("a1b2c3d4e5f6",)   # a Hindsight revision id
+```
+
+A directory that does not exist is skipped with a warning rather than failing the
+migration — a misconfigured extension must never leave a database unmigratable.
 
 ### Example: Custom TenantExtension with JWT
 
@@ -260,6 +346,148 @@ chunked transfer encoding). Use it for cheap size-aware quota or cost guards;
 the full `validate_*` hooks still run after parsing and should enforce precise
 per-operation limits.
 
+#### Rejecting an operation
+
+`ValidationResult.reject(reason, status_code=403)` refuses the operation before
+it does any work. The caller gets `status_code` with `reason` as the error
+detail, so pick the code that tells the client what to do: `403` for a policy
+refusal, `402` or `429` for a quota. The refusal is counted on
+`hindsight.operation.total` with `success="rejected"`, not `"false"`, so a
+client that keeps calling after it has been refused does not show up as a rise
+in the operation's failure rate (see [Monitoring](./monitoring.md)).
+
+Only a rejection counts that way. If the validator itself raises (for example,
+its quota service is down), the operation fails with a `500` and is counted as
+`success="false"`.
+
+#### Memory curation hooks
+
+Curating a memory (`PATCH /v1/default/banks/{bank_id}/memories/{memory_id}`:
+edit, invalidate, or revert) has its own pair of hooks, in addition to the
+`validate_bank_write` access check that runs first:
+
+- `validate_memory_update(ctx: MemoryUpdateContext)` runs before any work. The
+  context carries the requested `text` (when editing it), the requested `state`,
+  and `edits_fields`. Reject here to refuse the curation; the returned
+  `status_code` is passed through to the HTTP response.
+- `on_memory_update_complete(result: MemoryUpdateResult)` runs once the change
+  has committed. `result.action` is `edit`, `invalidate`, `revert`, or `reason`,
+  and `result.reembedded_tokens` is the size of the text the engine embedded
+  again (0 for a plain invalidation or a reason-only update). An edit or revert
+  re-embeds the memory and re-consolidates the bank, so this is the figure to
+  meter if curation should cost the same as ingesting that text.
+
+#### Transfer-archive import hooks
+
+Importing a transfer archive (a document import, or a whole-bank restore) brings
+pre-extracted facts into a bank without running fact extraction:
+
+- `validate_import(ctx: ImportContext)` runs at submission, before the archive
+  is stored or queued. `ctx.documents` lists the archive's documents
+  (`ImportArchiveDocument`: `document_id` and the original `content`), so a validator can size the import
+  for a quota or cost check. A rejection reaches the caller directly. The
+  default accepts.
+- Each imported document is then reported to `on_retain_complete` with
+  `result.source == RetainSource.IMPORT`, zero LLM token counts, and
+  `processed_content_tokens=0`. Use `source` to tell an import apart from a
+  re-retain whose chunks were all deduplicated, which also reports
+  `processed_content_tokens=0`; ordinary retains report `RetainSource.RETAIN`.
+
+Cloning a bank within the same instance is not an import: it is neither gated
+by `validate_import` nor reported to `on_retain_complete`.
+
+#### Confining a caller to a tag scope
+
+When several people share one bank and tags separate what each may see,
+`resolve_tag_scope` pins every operation of a caller to a tag filter. Return
+the tag groups the caller's reachable data must satisfy (they are AND-ed), or
+`None` for no restriction:
+
+```python
+from hindsight_api.engine.search.tags import TagGroupLeaf
+from hindsight_api.extensions import OperationValidatorExtension, TagScopeContext
+
+
+class TeamScopes(OperationValidatorExtension):
+    async def resolve_tag_scope(self, ctx: TagScopeContext):
+        user = ctx.request_context.api_key_id  # or whatever your tenant extension resolved
+        # Dan reads his own memories plus the shared team rules.
+        return [TagGroupLeaf(tags=[f"user:{user}", "kind:rule"], match="any_strict")]
+```
+
+The engine combines the scope with whatever filter the caller sends, so a
+caller can narrow its view but never widen it:
+
+- **Filtered reads** — recall, reflect (and every tool it runs), the memory,
+  document and mental-model lists, observation scopes, tag lists, the memory
+  graph, the timeseries, entities and the entity graph, and the knowledge-base
+  tree, search and export — only see rows inside the scope. Entity counts are
+  recounted over the visible memories.
+- **Reads and writes by id** — a memory, a document and its chunks, a mental
+  model or knowledge page — answer `404` when the item is outside the scope.
+  A retain that names an existing document outside the scope is refused (`403`),
+  since replacing or appending to it would touch someone else's text.
+- **Source text follows the document.** A memory can be visible through its own
+  tags (say, a `kind:rule` fact extracted from someone's private note) while the
+  note is not. Its chunk and document text are only returned when the
+  *document's* tags pass the filter. This applies to every tag-filtered recall
+  and reflect, with or without an extension.
+- **Mental models and knowledge pages** created or updated by a scoped caller
+  must carry tags inside the scope (`403` otherwise — the caller could not see
+  what it made), and record the scope in their trigger (`scope_tag_groups`),
+  which every refresh AND-s with the model's own filter, so they can never be
+  built from memories their creator could not read. Background refreshes run
+  unscoped and rely on that recorded scope. A recorded scope only ever narrows
+  the model and is not editable through the API: to drop it, recreate the model.
+
+Use a `_strict` match mode: the non-strict ones also admit untagged rows, and
+an untagged mental model is built from the whole bank.
+
+**Writing is a separate permission.** A caller can read a shared scope without
+being allowed to change it. `resolve_write_tag_scope` returns the tags a caller
+may write, as shell-style patterns (`user:dan`, `project:*`), or `None` for no
+restriction (the default):
+
+```python
+class TeamScopes(OperationValidatorExtension):
+    async def resolve_write_tag_scope(self, ctx: TagScopeContext):
+        user = ctx.request_context.api_key_id
+        # Everyone writes their own memories; only Kate writes the team rules.
+        return [f"user:{user}", "kind:rule"] if user == "kate" else [f"user:{user}"]
+```
+
+Every tag on anything the caller writes or changes must match one of the
+patterns, otherwise the write is refused with `403` (an item the caller cannot
+even read still answers `404`). An untagged item belongs to everyone, so a
+restricted writer cannot produce or change one. That covers:
+
+- **retain** (text and files): each item's tags and the batch's `document_tags`,
+  plus every tag the retain strategy's [entity labels](./api/memory-banks.md#entity-labels)
+  with `tag: true` could add (`key:value` for each allowed value, `key:*` for an
+  open vocabulary), and explicit `observation_scopes` (`"shared"` writes untagged
+  observations). They are checked before extraction, so a refused retain costs
+  no LLM call;
+- **memories and documents**: editing, invalidating or clearing the observations
+  of a memory; updating (including the new tags), reprocessing or deleting a
+  document;
+- **mental models and knowledge pages**: creating one (its tags), updating,
+  refreshing, clearing or deleting one, and renaming, moving or deleting a
+  knowledge node (every page under it, and under the folder it moves into);
+- **directives**: creating, updating or deleting one. An untagged directive
+  steers everyone's reflect, so a restricted writer cannot create one.
+
+Directives are read like reflect reads them: untagged directives apply to
+everyone, tagged ones only inside the caller's read scope.
+
+Whole-bank operations reach every memory regardless of tags, so a caller with a
+read or write scope cannot run them at all (`403`): export, clone and import,
+clearing the bank's memories or observations, deleting the bank, changing or
+resetting its config, mission or disposition, and running (or retrying failed)
+consolidation on request. The consolidation the engine queues after a scoped
+caller's own writes still runs. Operation status never returns the raw task payload to a
+scoped caller. Reads that are not tag-scoped (stats, webhooks) still go through
+`validate_bank_read` / `validate_bank_write`, which can only allow or deny them.
+
 #### Deferring an operation
 
 In addition to `accept` and `reject`, a `validate_*` hook can ask the
@@ -295,6 +523,14 @@ class QuotaAwareValidator(OperationValidatorExtension):
 `validate_recall` or `validate_reflect` in synchronous HTTP request
 paths — there is no queue to defer to and it will surface as a 500.
 
+Inside the worker, `ctx.request_context.operation_id` is the id of the
+operation being run (`None` on synchronous requests; for retains folded
+into one execution, the primary operation's id). A hook that decides the
+operation should not run at all, rather than fail, can cancel it with
+`self.context.get_memory_engine().cancel_operation(...)` and
+then raise `DeferOperation`: the row stays `cancelled` and no failure is
+recorded.
+
 ### Example: Custom MCPExtension
 
 ```python
@@ -312,6 +548,80 @@ class MyMCPExtension(MCPExtension):
             # ... custom logic
             return f"Results for: {query}"
 ```
+
+### Example: Custom LLMRequestExtension
+
+```python
+from hindsight_api.config import LLMMemberConfig
+from hindsight_api.extensions import (
+    LLMRequestExtension,
+    LLMRequestOverrides,
+    LLMRequestRefused,
+    LLMRequestTarget,
+)
+
+
+class PerCustomerLLMs(LLMRequestExtension):
+    def __init__(self, config: dict[str, str]) -> None:
+        super().__init__(config)
+        self.keys = load_keys(config["keys_file"])  # your own store: {(schema, bank_id): key}
+
+    async def resolve(self, target: LLMRequestTarget) -> LLMRequestOverrides | None:
+        key = self.keys.get((target.schema, target.bank_id))
+        if key is None:
+            # Refuse rather than return None: None sends the call on the server's own LLM.
+            raise LLMRequestRefused(f"no LLM key for bank {target.bank_id!r}")
+        if target.operation == "reflect":
+            # A stronger model for reflect, on the customer's own account.
+            return LLMRequestOverrides(llm=LLMMemberConfig(provider="anthropic", model="claude-sonnet-5-5", api_key=key))
+        return LLMRequestOverrides(api_key=key, headers={"x-customer": target.bank_id})
+```
+
+`resolve` runs on every LLM call, so cache anything slow. Bank ids are unique per tenant schema only — a multi-tenant deployment must key on `target.schema` too, or one tenant can name a bank after another tenant's and be billed to its key. `LLMRequestOverrides` keeps the LLM and key out of its `repr`; keep them out of your own logs as well.
+
+---
+
+### Example: Custom ModelCallExtension
+
+```python
+import asyncio
+
+from hindsight_api.extensions import ModelCall, ModelCallExtension
+
+
+class JsonlFileRecorder(ModelCallExtension):
+    """Appends every model call to a JSONL file, written once a second off the call path."""
+
+    def __init__(self, config: dict[str, str]) -> None:
+        super().__init__(config)
+        self.path = config.get("path", "model_calls.jsonl")
+        self.buffer: list[str] = []
+        self.task: asyncio.Task | None = None
+
+    def record(self, call: ModelCall) -> None:
+        self.buffer.append(call.model_dump_json())  # buffer only
+
+    async def on_startup(self) -> None:
+        self.task = asyncio.create_task(self._flush_forever())
+
+    async def on_shutdown(self) -> None:
+        if self.task:
+            self.task.cancel()
+        self._flush()
+
+    async def _flush_forever(self) -> None:
+        while True:
+            await asyncio.sleep(1)
+            self._flush()
+
+    def _flush(self) -> None:
+        lines, self.buffer = self.buffer, []
+        if lines:
+            with open(self.path, "a") as f:
+                f.write("\n".join(lines) + "\n")
+```
+
+Calls are recorded in the API and in every worker, from whichever event loop made them, so a production recorder should guard its buffer with a `threading.Lock` and write from a task of its own.
 
 ---
 
@@ -363,7 +673,7 @@ hindsight-api
 
 ## Contributing Extensions
 
-Custom extensions that solve common use cases are welcome contributions to the Hindsight project. If you've built an extension for:
+If you've built an extension that solves a common use case, for example:
 
 - Authentication providers (OAuth, SAML, API gateways)
 - Rate limiting or quota management
@@ -371,6 +681,6 @@ Custom extensions that solve common use cases are welcome contributions to the H
 - Metrics exporters (Datadog, New Relic, etc.)
 - Custom HTTP endpoints for specific platforms
 
-Add it to the [extensions registry](https://github.com/vectorize-io/hindsight/blob/main/hindsight-extensions/README.md) — either as a directory under `hindsight-extensions/`, or as a registry entry linking to your own repository. That README covers the layout, the development workflow, and Docker packaging.
+[open a feature request](https://github.com/vectorize-io/hindsight/issues/new?template=feature_request.yml) with a link to your repository, and we can list it in the [extensions registry](https://github.com/vectorize-io/hindsight/blob/main/hindsight-extensions/README.md). Hindsight does not accept pull requests from outside the team, so the team adds registry entries. That README covers the extension layout, the development workflow, and Docker packaging.
 
 Extensions live outside the server so that installing Hindsight does not pull in a vendor's client library, and so changing an extension does not require a Hindsight release. Only extensions that add no dependencies and are useful to any deployment (`ApiKeyTenantExtension`, `MemoryDefenseRegexExtension`) stay in `hindsight_api.extensions.builtin`.

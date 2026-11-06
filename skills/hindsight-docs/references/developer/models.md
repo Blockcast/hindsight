@@ -7,7 +7,7 @@ Hindsight uses several machine learning models for different tasks.
 
 - **LLM** — Fact extraction, reasoning, and generation. Provider-specific, fully configurable.
 - **Embedding** — Vector representations for semantic search. Default: `BAAI/bge-small-en-v1.5`.
-- **Cross-Encoder** — Reranking search results. Default: `cross-encoder/ms-marco-MiniLM-L-6-v2`.
+- **Cross-Encoder** — Reranking search results. Default: `hindsight-ai/hs-rerank-1`.
 
 Embedding and cross-encoder models are downloaded automatically from HuggingFace on first run.
 
@@ -39,6 +39,7 @@ Used for fact extraction, entity resolution, mental model consolidation, and ans
 - OpenRouter
 - Requesty
 - OpenAI Codex
+- ChatGPT
 - Claude Code
 - Cursor
 - GitHub Copilot
@@ -59,16 +60,12 @@ Hindsight works with any provider that exposes an OpenAI-compatible API. Set `HI
 
 The `openai` provider talks to the **Chat Completions API** (`/v1/chat/completions`). For the newer **Responses API** (`/v1/responses`), use `HINDSIGHT_API_LLM_PROVIDER=openai-responses` — see the tip below. Both accept a custom `HINDSIGHT_API_LLM_BASE_URL`, so an OpenAI-compatible endpoint that exposes `/v1/responses` works the same way as a Chat Completions one.
 
-See [Configuration](./configuration#llm-provider) for setup examples.
-> **💡 OpenAI Responses API (reasoning + tools together)**
+See [Configuration](./configuration.md#llm-provider) for setup examples.
+> **💡 OpenAI Responses API**
 >
-Set `HINDSIGHT_API_LLM_PROVIDER=openai-responses` to call OpenAI's **Responses API** (`/v1/responses`) instead of Chat Completions.
+Set `HINDSIGHT_API_LLM_PROVIDER=openai-responses` to call OpenAI's **Responses API** (`/v1/responses`) instead of Chat Completions. Both work for every operation; the Responses API keeps a reasoning model's chain-of-thought as a first-class item. It also honors a custom `HINDSIGHT_API_LLM_BASE_URL`, so any OpenAI-compatible endpoint exposing `/v1/responses` (gateways, Azure-style deployments) can be used just like the Chat Completions path.
 
-Why it exists: some reasoning models — e.g. `gpt-5.6-terra` — **reject `reasoning_effort` when function tools are present** on Chat Completions (HTTP 400 unless `reasoning_effort="none"`). Reflect is a tool-calling loop, so on the `openai` (Completions) provider that forces the whole operation — including the final synthesis — to run with reasoning disabled. The Responses API keeps the model's chain-of-thought as a first-class reasoning item, so **reasoning and tools coexist**: reflect's search loop runs with a real `HINDSIGHT_API_LLM_REASONING_EFFORT` (e.g. `high`).
-
-Recommended for reasoning models (gpt-5.x, o-series) that use tools. It also honors a custom `HINDSIGHT_API_LLM_BASE_URL`, so any OpenAI-compatible endpoint exposing `/v1/responses` (gateways, Azure-style deployments) can be used just like the Chat Completions path.
-
-See [Configuration](./configuration#llm-provider) for setup examples.
+See [Configuration](./configuration.md#llm-provider) for setup examples.
 > **ℹ️ Reasoning/thinking models and `max_tokens`**
 >
 On a thinking model (Gemini 2.5+/3.x, GPT-5/o-series, Grok reasoning, Claude extended thinking) the provider's output budget covers **reasoning tokens plus visible output** — the reasoning is billed against the same `max_output_tokens`/`max_completion_tokens` cap. A small cap can therefore be fully consumed by reasoning, leaving the visible answer truncated mid-word.
@@ -78,26 +75,26 @@ Hindsight keeps the reflect/mental-model `max_tokens` meaning **visible page len
 When a Gemini call does hit its cap, Hindsight logs a `truncated at max_output_tokens` warning instead of returning the half-written text as a silent success.
 > **💡 AWS Bedrock**
 >
-Set `HINDSIGHT_API_LLM_PROVIDER=bedrock` to use AWS Bedrock models directly. Model names use Bedrock model IDs (e.g., `us.amazon.nova-2-lite-v1:0`). No API key is required — authentication uses AWS credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION_NAME`) or IAM roles. For 50% cost savings on throughput, set `HINDSIGHT_API_LLM_BEDROCK_SERVICE_TIER=flex` (see [Configuration](./configuration#llm-provider)).
+Set `HINDSIGHT_API_LLM_PROVIDER=bedrock` to use AWS Bedrock models directly. Model names use Bedrock model IDs (e.g., `us.amazon.nova-2-lite-v1:0`). No API key is required — authentication uses AWS credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION_NAME`) or IAM roles. For 50% cost savings on throughput, set `HINDSIGHT_API_LLM_BEDROCK_SERVICE_TIER=flex` (see [Configuration](./configuration.md#llm-provider)).
 
-See [Configuration](./configuration#llm-provider) for setup examples.
+See [Configuration](./configuration.md#llm-provider) for setup examples.
 > **💡 Built-in llama.cpp (fully local, no API key)**
 >
 Set `HINDSIGHT_API_LLM_PROVIDER=llamacpp` to run a built-in llama.cpp server with no external dependencies. A Gemma 4 E2B GGUF model (~3.5 GB) is auto-downloaded on first run. Requires the `local-llm` extra: `pip install 'hindsight-api-slim[local-llm]'`.
 
 The published Docker image does not bundle `llama-cpp-python` (to keep the image small). For a runnable Docker setup that adds it on top, see [`docker/docker-compose/local-llm/`](https://github.com/vectorize-io/hindsight/tree/main/docker/docker-compose/local-llm).
 
-See [Configuration](./configuration#built-in-llamacpp) for all options.
+See [Configuration](./configuration.md#built-in-llamacpp) for all options.
 > **💡 LiteLLM Provider (Azure, Together AI, and more)**
 >
 Set `HINDSIGHT_API_LLM_PROVIDER=litellm` to use any model supported by [LiteLLM](https://docs.litellm.ai/docs/providers), including **Azure OpenAI**, **Together AI**, **Fireworks AI**, and many more. Model names use LiteLLM's provider prefix format (e.g., `azure/gpt-4o`).
 
-See [Configuration](./configuration#llm-provider) for setup examples.
+See [Configuration](./configuration.md#llm-provider) for setup examples.
 > **💡 LiteLLM Router (fallback chains, load-balancing, per-deployment limits)**
 >
 Set `HINDSIGHT_API_LLM_PROVIDER=litellmrouter` to run the default LLM through [LiteLLM's Router](https://docs.litellm.ai/docs/routing) — ordered fallback across deployments, load-balanced same-tier routing, weighted picks, per-deployment `rpm`/`tpm` limits, and cooldowns are all available via the [`Router` config](https://docs.litellm.ai/docs/routing#fallbacks). Hindsight passes the JSON config through verbatim.
 
-See [Configuration](./configuration#llm-router-litellm-router) for setup.
+See [Configuration](./configuration.md#llm-router-litellm-router) for setup.
 ### Provider Capabilities
 
 Beyond basic generation, some providers support optional features that lower cost or latency. Hindsight uses each feature automatically when the configured provider supports it.
@@ -124,6 +121,7 @@ Beyond basic generation, some providers support optional features that lower cos
 | OpenRouter (`openrouter`) | — | — |
 | Requesty (`requesty`) | — | — |
 | OpenAI Codex (`openai-codex`) | — | — |
+| ChatGPT (`chatgpt`) | — | — |
 | Claude Code (`claude-code`) | — | — |
 | Cursor (`cursor`) | — | — |
 | GitHub Copilot (`github-copilot`) | — | — |
@@ -134,7 +132,7 @@ Beyond basic generation, some providers support optional features that lower cos
 | LiteLLM (100+) (`litellm`) | — | — |
 
 - **Batch API** — submits bulk retain extraction through the provider's asynchronous batch endpoint, typically at ~50% lower cost. Used automatically when available; otherwise calls run synchronously.
-- **Explicit prompt caching** — reuses the large, fixed system prefix that retain (fact extraction), consolidation, and the reflect tool-loop send on every call, billing it at the provider's cached-input rate. On Gemini/Vertex this uses the `CachedContent` API. **On by default**; disable with `HINDSIGHT_API_LLM_PROMPT_CACHE_ENABLED=false`. Hindsight structures these prompts so the cached prefix is **bank-agnostic** — one cache is shared across all banks rather than one per bank/mission, and creation soft-fails to an uncached call, so it never breaks a request.
+- **Explicit prompt caching** — reuses the large, fixed system prefix that retain (fact extraction) and consolidation send on every call, billing it at the provider's cached-input rate. On Gemini/Vertex this uses the `CachedContent` API. **On by default**; disable with `HINDSIGHT_API_LLM_PROMPT_CACHE_ENABLED=false`. Hindsight structures these prompts so the cached prefix is **bank-agnostic** — one cache is shared across all banks rather than one per bank/mission, and creation soft-fails to an uncached call, so it never breaks a request.
 
 > **📝 Note**
 >
@@ -156,7 +154,7 @@ The following models have been tested and verified to work correctly with Hindsi
 | **OpenAI** | `gpt-5-mini` |
 | **OpenAI** | `gpt-5-nano` |
 | **OpenAI** | `gpt-4.1-mini` |
-| **OpenAI** | `gpt-4.1-nano` |
+| **OpenAI** | `gpt-6-luna` |
 | **OpenAI** | `gpt-4o-mini` |
 | **Anthropic** | `claude-sonnet-4-20250514` |
 | **Anthropic** | `claude-3-5-sonnet-20241022` |
@@ -192,7 +190,8 @@ Each provider has a recommended default model that's used when `HINDSIGHT_API_LL
 | `volcano` | `doubao-pro-32k` |
 | `openrouter` | `qwen/qwen3.5-9b` |
 | `requesty` | `openai/gpt-4o-mini` |
-| `openai-codex` | `gpt-5.4-mini` |
+| `openai-codex` | `gpt-5.6-luna` |
+| `chatgpt` | `gpt-6-luna` |
 | `claude-code` | `claude-sonnet-4-5-20250929` |
 | `cursor` | `auto` |
 | `github-copilot` | `gpt-5.6-terra` |
@@ -228,7 +227,7 @@ export HINDSIGHT_API_RETAIN_LLM_PROVIDER=anthropic
 
 ### Using Other Models
 
-Other LLM models not listed above may work with Hindsight, but they must support **at least 65,000 output tokens** to ensure reliable fact extraction. If you need support for a specific model that doesn't meet this requirement, please [open an issue](https://github.com/hindsight-ai/hindsight/issues) to request an exception.
+Other LLM models not listed above may work with Hindsight. What a model needs is to **follow a JSON schema** (structured output) and a large enough context window — **native tool calling is not used**: reflect's tool calls are made as replies to a response schema on every provider. It must also support **at least 65,000 output tokens** to ensure reliable fact extraction. If you need support for a specific model that doesn't meet this requirement, please [open an issue](https://github.com/hindsight-ai/hindsight/issues) to request an exception.
 
 > **💡 Models with Limited Output Tokens**
 >
@@ -259,11 +258,11 @@ export HINDSIGHT_API_LLM_PROVIDER=openai
 export HINDSIGHT_API_LLM_API_KEY=sk-xxxxxxxxxxxx
 export HINDSIGHT_API_LLM_MODEL=gpt-4o
 
-# OpenAI Responses API (/v1/responses) — reasoning + tools together
+# OpenAI Responses API (/v1/responses)
 export HINDSIGHT_API_LLM_PROVIDER=openai-responses
 export HINDSIGHT_API_LLM_API_KEY=sk-xxxxxxxxxxxx
 export HINDSIGHT_API_LLM_MODEL=gpt-5.6           # reasoning model; e.g. gpt-5.6-terra
-export HINDSIGHT_API_LLM_REASONING_EFFORT=high   # sent alongside tools, unlike Completions
+export HINDSIGHT_API_LLM_REASONING_EFFORT=high
 # Optional: point at any OpenAI-compatible endpoint exposing /v1/responses
 # export HINDSIGHT_API_LLM_BASE_URL=https://your-gateway.example.com/v1
 
@@ -296,6 +295,8 @@ export HINDSIGHT_API_LLM_MODEL=your-local-model
 export HINDSIGHT_API_LLM_PROVIDER=minimax
 export HINDSIGHT_API_LLM_API_KEY=your-minimax-api-key
 export HINDSIGHT_API_LLM_MODEL=MiniMax-M3  # or MiniMax-M2.7 for the previous generation
+# MiniMax-M3.1-* always thinks (Hindsight sends thinking=adaptive) and defaults to max effort;
+# lower it with: export HINDSIGHT_API_LLM_REASONING_EFFORT=low
 
 # DeepSeek (https://api.deepseek.com)
 export HINDSIGHT_API_LLM_PROVIDER=deepseek
@@ -353,7 +354,55 @@ export HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=your-gcp-project-id
 # export HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY=/path/to/key.json
 ```
 
-**Note:** The LLM is the primary bottleneck for retain operations. See [Performance](./performance) for optimization strategies.
+**Note:** The LLM is the primary bottleneck for retain operations. See [Performance](./performance.md) for optimization strategies.
+
+---
+
+### Cheap Memory Model with Failover
+
+Hindsight calls its own LLM, with its own credentials, only to process memory: extracting facts on retain, consolidating observations, refreshing mental models, and answering reflect. Your agent keeps calling whatever model it already uses — Hindsight never sees or changes that. So the memory model can be a cheap, high-throughput one, picked for volume rather than for the agent's reasoning.
+
+A typical production setup puts the cheap model first and stronger, pricier models behind it, used only when the cheap one fails. The building blocks are documented in [Multi-LLM Strategies](./configuration.md#multi-llm-strategies-failover--round-robin) and [Per-Operation LLM Configuration](./configuration.md#per-operation-llm-configuration):
+
+```bash
+# Member 0 (primary): cheap workhorse, serves almost every call
+export HINDSIGHT_API_LLM_PROVIDER=groq
+export HINDSIGHT_API_LLM_API_KEY=<groq-key>
+export HINDSIGHT_API_LLM_MODEL=<cheap-model>
+
+# Member 1: mid-tier fallback
+export HINDSIGHT_API_LLM_1_PROVIDER=openai
+export HINDSIGHT_API_LLM_1_API_KEY=<openai-key>
+export HINDSIGHT_API_LLM_1_MODEL=<mid-model>
+
+# Member 2: top-tier last resort, with its own retry budget
+export HINDSIGHT_API_LLM_2_PROVIDER=anthropic
+export HINDSIGHT_API_LLM_2_API_KEY=<anthropic-key>
+export HINDSIGHT_API_LLM_2_MODEL=<top-model>
+export HINDSIGHT_API_LLM_2_MAX_RETRIES=3
+
+export HINDSIGHT_API_LLM_MAX_RETRIES=0   # fail over at once instead of retrying the same member
+export HINDSIGHT_API_LLM_STRATEGY='{"mode": "failover"}'
+# Or spread load instead: '{"mode": "round-robin", "weights": [4, 1, 1]}'
+```
+
+To give one operation a stronger model, override only that operation's primary. Its chain still falls back to the global members above:
+
+```bash
+# Consolidation starts on the mid-tier model; retain and reflect stay on the cheap one
+export HINDSIGHT_API_CONSOLIDATION_LLM_PROVIDER=openai
+export HINDSIGHT_API_CONSOLIDATION_LLM_API_KEY=<openai-key>
+export HINDSIGHT_API_CONSOLIDATION_LLM_MODEL=<mid-model>
+```
+
+Give an operation a fully separate chain with its own indexed members and strategy (`HINDSIGHT_API_RETAIN_LLM_1_PROVIDER`, `HINDSIGHT_API_RETAIN_LLM_STRATEGY`, ...).
+
+Things to know:
+
+- **Number members from 1 with no gaps.** Hindsight stops reading at the first missing `HINDSIGHT_API_LLM_<n>_PROVIDER`: with `_1_` and `_3_` set, member 3 is ignored.
+- **An operation with no members or no strategy of its own uses the global ones.** Mental-model refresh uses the reflect chain first, then the global one.
+- **Batch retain does not fail over.** With `HINDSIGHT_API_RETAIN_BATCH_ENABLED=true`, the whole batch runs on the first member whose provider has a batch API. Put a reliable provider there.
+- **Startup sends a test call to each configured model.** A model that is down only logs a warning; the server still starts. Set `HINDSIGHT_API_SKIP_LLM_VERIFICATION=true` to skip these checks, for example when fallbacks are paid per call or slow to answer.
 
 ---
 
@@ -385,6 +434,86 @@ For automation, the Copilot SDK also accepts `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`,
 
 ---
 
+### ChatGPT Setup (Sign in with ChatGPT)
+
+The `chatgpt` provider runs Hindsight's LLM calls on your ChatGPT plan through
+OpenAI's documented [Sign in with ChatGPT flow for open-source apps](https://developers.openai.com/siwc/token-sharing-open-source).
+Hindsight registers itself as its own OAuth client on first sign-in, and every call goes to the public
+`https://api.openai.com/v1/responses` endpoint with your OAuth access token. It does not use an API key.
+
+How it differs from `openai-codex`: that provider reuses the Codex CLI's sign-in and calls ChatGPT's private
+`chatgpt.com/backend-api/codex` endpoint. `chatgpt` uses the supported route and keeps its own
+credentials, so it never shares or rotates the Codex CLI's tokens.
+
+**Prerequisites:**
+- A ChatGPT plan that allows plan usage in third-party apps
+- A browser on the machine where you run the login
+
+**Setup on a machine with a browser (for example a laptop):**
+
+1. **Sign in:**
+   ```bash
+   hindsight-admin chatgpt login
+   ```
+   This opens your browser and waits for the callback on `http://127.0.0.1:1455/auth/callback`
+   (`--port` changes the port; `--no-browser` prints the URL instead). Approve the request, including
+   use of your ChatGPT plan. The command validates the ID token and the granted scopes, then writes
+   `~/.hindsight/chatgpt/credentials.json` (mode `0600`) next to this host's `host_id`.
+   If you declined plan usage, run `login --enable-plan-usage` to be asked again.
+
+2. **Configure Hindsight:**
+   ```bash
+   export HINDSIGHT_API_LLM_PROVIDER=chatgpt
+   # export HINDSIGHT_API_LLM_MODEL=gpt-6-luna       # the default
+   # export HINDSIGHT_API_LLM_REASONING_EFFORT=medium  # sent as reasoning.effort
+   ```
+
+3. **Check the stored session** (prints account, client id, scopes and expiry, never token values):
+   ```bash
+   hindsight-admin chatgpt status
+   ```
+
+**Self-hosted server or VM (no browser):** the `127.0.0.1` callback reaches the machine running the
+browser, so sign in on your laptop and move the credential file to the server.
+
+1. On the laptop: run `login` as above.
+2. Copy the file over SSH and install it on the server with `login --from-file`, as the user that runs Hindsight (add
+   `--home <dir>` before `login` if the server sets `HINDSIGHT_API_LLM_CHATGPT_HOME`).
+   `--from-file` keeps the server's own `host_id` (creating one on first use) instead of the laptop's:
+   ```bash
+   scp ~/.hindsight/chatgpt/credentials.json server:/tmp/chatgpt.json
+   ssh server 'hindsight-admin chatgpt login --from-file /tmp/chatgpt.json && rm /tmp/chatgpt.json'
+   ```
+3. On the laptop, stop using that copy without revoking it:
+   ```bash
+   hindsight-admin chatgpt logout --local-only
+   ```
+   Refresh tokens rotate, so after the copy only the server may use and refresh this session. A plain
+   `logout` would revoke it and end the server's session too. `--local-only` clears the laptop's
+   tokens but keeps its client registration for a later `login`. `--from-file` refuses to replace a
+   different account's registration on the server unless you pass `--force`.
+
+The server then owns refreshes. Sign in again on the laptop later if you also want Hindsight there.
+
+**Important notes:**
+- Access tokens last one hour and are refreshed automatically (five minutes before expiry, and once on
+  an HTTP 401). Refresh tokens rotate; refreshes take a file lock and re-read the file first, so
+  several Hindsight processes can share one credential directory.
+- When the refresh token is no longer valid, calls fail with the `login` command to run.
+- On ChatGPT Plus, the five-hour usage limit is shared with every other app that uses your plan,
+  including Codex. When the limit is reached, Hindsight defers retain and consolidation work and
+  retries it 30 minutes later instead of failing it. Review usage and per-app limits at
+  [ChatGPT Settings → Usage](https://chatgpt.com/settings/usage).
+- The route is a preview: Hindsight sends `store: false` and `stream: true`, omits fields it rejects
+  (`temperature`, `max_output_tokens`, `user`, and others), and sends system prompts as developer
+  messages.
+- `logout` revokes the session and clears local tokens but keeps the client registration and host id
+  for the next `login`. `logout --local-only` clears the tokens without revoking.
+- `HINDSIGHT_API_LLM_CHATGPT_HOME` relocates the credential directory. Use one directory per
+  ChatGPT account. The directory must be writable, because each refresh writes the rotated token
+  back; in a container, mount a writable volume there. If a write fails, the process keeps the new
+  tokens in memory, but other processes and restarts will not see them.
+
 ### OpenAI Codex Setup (ChatGPT Plus/Pro)
 
 Use your ChatGPT Plus or Pro subscription for Hindsight without separate OpenAI Platform API costs.
@@ -414,7 +543,7 @@ Use your ChatGPT Plus or Pro subscription for Hindsight without separate OpenAI 
 4. **Configure Hindsight:**
    ```bash
    export HINDSIGHT_API_LLM_PROVIDER=openai-codex
-   # export HINDSIGHT_API_LLM_MODEL=gpt-5.6-luna  # defaults to gpt-5.4-mini
+   # export HINDSIGHT_API_LLM_MODEL=gpt-5.6-luna  # the default
    # No API key needed - reads from ~/.codex/auth.json automatically
    ```
 
@@ -486,7 +615,7 @@ resolves the same `auth.json`. To run more than one independently authorized
 ChatGPT account — for example, to fail over when the preferred account hits its
 usage limit — give each one its own credentials directory with
 `HINDSIGHT_API_LLM_CODEX_HOME` (primary) and `HINDSIGHT_API_LLM_<n>_CODEX_HOME`
-(indexed [multi-LLM chain](./configuration#multi-llm-strategies-failover--round-robin)
+(indexed [multi-LLM chain](./configuration.md#multi-llm-strategies-failover--round-robin)
 members). Each falls back to `CODEX_HOME`, then `~/.codex`, when unset.
 
 ```bash
@@ -655,6 +784,19 @@ an API key from the [Anthropic Console](https://console.anthropic.com/).
    # No API key needed - uses claude auth login credentials
    ```
 
+   **Server-held token (optional, for a personal machine without a browser login):** instead of
+   relying on the host's `claude auth login` session, you can generate a long-lived token once and
+   give it to Hindsight. This is still subscription access, so the Terms of Service notice above
+   applies in full: it does not make the provider suitable for servers, Docker deployments or shared
+   hosts. For those, use the `anthropic` provider with an API key.
+   ```bash
+   claude setup-token            # prints sk-ant-oat01-...
+   export HINDSIGHT_API_LLM_API_KEY=sk-ant-oat01-...
+   ```
+   Hindsight passes it to every spawned CLI as `CLAUDE_CODE_OAUTH_TOKEN`, so the auth session lives
+   in the server's config (and can be set per operation or per bank like any other LLM key).
+   With no key set, the CLI's own login is used.
+
 5. **Start Hindsight:**
    ```bash
    hindsight-api
@@ -718,12 +860,12 @@ which makes Cursor a *client* of Hindsight. Here Cursor is the model backend Hin
   against `auto` — slower than a chat-completions request and past the 30s
   `HINDSIGHT_API_REFLECT_LLM_TIMEOUT` default. Left at the default, reflect spends its
   first iteration on timeout retries before recovering.
-- **Structured output and tool calling are prompt-level emulations.** The CLI exposes no
-  `response_format`, JSON-schema, temperature or tool-definition flag — only
+- **Structured output is a prompt-level emulation.** The CLI exposes no
+  `response_format`, JSON-schema or temperature flag — only
   `--output-format text|json|stream-json`, which describes the envelope. Hindsight puts
-  the schema (or the tool list) in the prompt and parses the model's JSON back out,
-  retrying on a parse failure. That is less reliable than a native schema, so prefer a
-  strong named model over `auto` for reflect, the operation that leans hardest on tools.
+  the schema in the prompt and parses the model's JSON back out, retrying on a parse
+  failure. That is less reliable than a native schema, so prefer a strong named model
+  over `auto` for reflect, the operation that leans hardest on it.
 - **Free plans are limited to `auto`.** A named `--model` returns
   `Named models unavailable Free plans can only use Auto`. Paid plans can use any id from
   `cursor-agent --list-models`.
@@ -888,7 +1030,7 @@ export HINDSIGHT_API_LLM_BASE_URL=https://<resource>.openai.azure.com/openai/dep
   routing on GPT-5.6 and later), but the same `*.openai.azure.com` endpoint also
   serves non-OpenAI Foundry models (DeepSeek, Llama, Mistral) that reject it with
   `unrecognized_request_argument`. The host alone can't tell the two apart, so
-  [`HINDSIGHT_API_LLM_CACHE_AFFINITY`](./configuration#llm-provider) resolves
+  [`HINDSIGHT_API_LLM_CACHE_AFFINITY`](./configuration.md#llm-provider) resolves
   `auto` to `none` for Azure hosts. If your deployment serves an OpenAI model,
   set it explicitly to `openai_prompt_cache_key`.
 
@@ -966,6 +1108,7 @@ Converts text into dense vector representations for semantic similarity search.
 | `google` | Google embeddings (Gemini API or Vertex AI) | Production, multilingual, high quality |
 | `tei` | HuggingFace Text Embeddings Inference | Production, self-hosted |
 | `zeroentropy` | ZeroEntropy zembed-1 | Production, high quality retrieval |
+| `nvidia` | NVIDIA NIM retrieval embeddings (`input_type`-aware) | Users on NVIDIA NIM / build.nvidia.com |
 | `litellm` | LiteLLM proxy (unified gateway) | Multi-provider setups |
 | `litellm-sdk` | LiteLLM SDK (direct API, no proxy) | Multi-provider, simpler setup |
 
@@ -1055,6 +1198,11 @@ export HINDSIGHT_API_EMBEDDINGS_ZEROENTROPY_API_KEY=your-api-key
 export HINDSIGHT_API_EMBEDDINGS_ZEROENTROPY_MODEL=zembed-1
 export HINDSIGHT_API_EMBEDDINGS_ZEROENTROPY_DIMENSIONS=1280
 
+# NVIDIA NIM
+export HINDSIGHT_API_EMBEDDINGS_PROVIDER=nvidia
+export HINDSIGHT_API_EMBEDDINGS_NVIDIA_API_KEY=nvapi-your-key
+export HINDSIGHT_API_EMBEDDINGS_NVIDIA_MODEL=nvidia/llama-nemotron-embed-vl-1b-v2  # default, can omit
+
 # LiteLLM proxy
 export HINDSIGHT_API_EMBEDDINGS_PROVIDER=litellm
 export HINDSIGHT_API_LITELLM_API_BASE=http://localhost:4000
@@ -1087,7 +1235,7 @@ The two are separate because Bedrock's embedding request and response formats di
 
 Chat models don't need this: set `HINDSIGHT_API_LLM_MODEL=bedrock/converse/<arn>`, since the Converse API takes one format for every model.
 
-See [Configuration](./configuration#embeddings) for all options including Azure OpenAI and custom endpoints.
+See [Configuration](./configuration.md#embeddings) for all options including Azure OpenAI and custom endpoints.
 
 For a runnable Docker Compose setup that serves both embeddings and reranking from self-hosted TEI sidecars, see [`docker/docker-compose/tei/`](https://github.com/vectorize-io/hindsight/tree/main/docker/docker-compose/tei).
 
@@ -1097,7 +1245,7 @@ For a runnable Docker Compose setup that serves both embeddings and reranking fr
 
 Reranks initial search results to improve precision.
 
-**Default:** `cross-encoder/ms-marco-MiniLM-L-6-v2` (~85MB)
+**Default:** `hindsight-ai/hs-rerank-1` (multilingual, 114M parameters)
 
 ### Supported Providers
 
@@ -1108,10 +1256,13 @@ Reranks initial search results to improve precision.
 | `openrouter` | OpenRouter rerank API (Cohere-compatible gateway) | Multi-provider setups |
 | `zeroentropy` | ZeroEntropy rerank API (zerank-2) | Production, state-of-the-art accuracy |
 | `siliconflow` | SiliconFlow rerank API (Cohere-compatible `/rerank` endpoint) | Users in China or anyone on SiliconFlow's platform |
+| `nvidia` | NVIDIA NIM reranking API (native `/retrieval/{model}/reranking` endpoint) | Users on NVIDIA NIM / build.nvidia.com |
+| `typesafe` | **Deprecated** — set up the shared [decision model](configuration.md#decision-model) instead. TypeSafe typed-decision API (Jev) — ranks the whole pool in one question | Production, highest ranking quality; can also return only the relevant candidates |
 | `alibaba` | Alibaba Cloud DashScope rerank API (qwen3-rerank) | Users on Alibaba Cloud / DashScope |
 | `google` | Google Discovery Engine ranking API (REST + Google auth) | Production, GCP integration |
 | `tei` | HuggingFace Text Embeddings Inference | Production, self-hosted |
 | `flashrank` | FlashRank (lightweight, fast) | Resource-constrained environments |
+| `onnx` | Any cross-encoder exported to ONNX, in-process via ONNX Runtime | Custom models without PyTorch or a TEI server |
 | `litellm` | LiteLLM proxy (unified gateway) | Multi-provider setups |
 | `litellm-sdk` | LiteLLM SDK (direct API, no proxy) | Multi-provider, simpler setup |
 | `jina-mlx` | Jina rerank v3 via Apple Silicon MLX (local, no API key) | Apple Silicon (M1+) local inference |
@@ -1121,9 +1272,9 @@ Reranks initial search results to improve precision.
 
 | Model | Use Case |
 |-------|----------|
-| `cross-encoder/ms-marco-MiniLM-L-6-v2` | Default, fast |
-| `cross-encoder/ms-marco-MiniLM-L-12-v2` | Higher accuracy |
-| `cross-encoder/mmarco-mMiniLMv2-L12-H384-v1` | Multilingual |
+| `hindsight-ai/hs-rerank-1` | Default, multilingual (en, es, fr, de, pt, ja, ko, zh), trained for Hindsight |
+| `cross-encoder/ms-marco-MiniLM-L-6-v2` | English-only, smaller (the default before hs-rerank-1) |
+| `cross-encoder/mmarco-mMiniLMv2-L12-H384-v1` | Multilingual, 14 languages |
 
 ### Cohere Models
 
@@ -1147,6 +1298,34 @@ SiliconFlow hosts a range of open-weight rerankers behind a Cohere-compatible `/
 |-------|----------|
 | `BAAI/bge-reranker-v2-m3` | Multilingual, strong default |
 | `Qwen/Qwen3-Reranker-8B` | Larger, higher accuracy |
+
+### TypeSafe Models
+
+> **⚠️ Deprecated**
+>
+The `typesafe` reranker provider will be removed in a future release. Set up the shared
+[decision model](configuration.md#decision-model) instead
+(`HINDSIGHT_API_DECISION_MODEL_PROVIDER=typesafe` and `HINDSIGHT_API_DECISION_MODEL_API_KEY`):
+recall uses it in place of the reranker.
+TypeSafe is not a `/rerank` endpoint — it answers typed *questions* against a *state*.
+Hindsight makes the candidates the options of a Choice question, so the returned
+probability distribution is the ranking. When the candidate pool fits within the 250-option
+limit and context token budget, a single call ranks the entire pool. Larger pools or pools
+with long documents are partitioned into groups whose top candidates advance to a finals
+ranking round, with token truncation applied to fit context windows.
+
+| Model | Use Case |
+|-------|----------|
+| `jev-latest` | Default; tracks the current Jev release |
+
+Setting `HINDSIGHT_API_RERANKER_TYPESAFE_PRUNE_CANDIDATES=true` adds a second question
+that cuts the ranked list where relevance ends, so recall returns the relevant
+candidates and nothing else. It is off by default because it meaningfully shrinks what
+recall returns. See [Configuration](configuration.md#typesafe) for the full
+behaviour and its trade-offs.
+
+TypeSafe's scores are rank positions within one recall, not relevance scores, so recall
+publishes no `scores.reranker` under it and rejects `min_scores.reranker` with HTTP 400.
 
 ### Alibaba Cloud Models
 
@@ -1173,7 +1352,7 @@ LiteLLM supports multiple reranking providers via the `/rerank` endpoint:
 ```bash
 # Local provider (default)
 export HINDSIGHT_API_RERANKER_PROVIDER=local
-export HINDSIGHT_API_RERANKER_LOCAL_MODEL=cross-encoder/ms-marco-MiniLM-L-6-v2
+export HINDSIGHT_API_RERANKER_LOCAL_MODEL=hindsight-ai/hs-rerank-1
 
 # Cohere
 export HINDSIGHT_API_RERANKER_PROVIDER=cohere
@@ -1201,6 +1380,16 @@ export HINDSIGHT_API_RERANKER_PROVIDER=siliconflow
 export HINDSIGHT_API_RERANKER_SILICONFLOW_API_KEY=your-api-key
 export HINDSIGHT_API_RERANKER_SILICONFLOW_MODEL=BAAI/bge-reranker-v2-m3  # default, can omit
 
+# NVIDIA NIM (native reranking API, not Cohere-compatible)
+export HINDSIGHT_API_RERANKER_PROVIDER=nvidia
+export HINDSIGHT_API_RERANKER_NVIDIA_API_KEY=nvapi-your-key
+export HINDSIGHT_API_RERANKER_NVIDIA_MODEL=nvidia/llama-nemotron-rerank-vl-1b-v2  # default, can omit
+
+# TypeSafe (Jev) - the typesafe reranker provider is deprecated: set up the shared
+# decision model instead, which recall uses in place of the reranker
+export HINDSIGHT_API_DECISION_MODEL_PROVIDER=typesafe
+export HINDSIGHT_API_DECISION_MODEL_API_KEY=your-api-key
+
 # Alibaba Cloud DashScope (qwen3-rerank)
 export HINDSIGHT_API_RERANKER_PROVIDER=alibaba
 export HINDSIGHT_API_RERANKER_ALIBABA_API_KEY=your-dashscope-api-key
@@ -1222,4 +1411,4 @@ export HINDSIGHT_API_RERANKER_LITELLM_MODEL=cohere/rerank-english-v3.0
 export HINDSIGHT_API_RERANKER_PROVIDER=rrf
 ```
 
-See [Configuration](./configuration#reranker) for all options including Azure-hosted endpoints and batch settings.
+See [Configuration](./configuration.md#reranker) for all options including Azure-hosted endpoints and batch settings.

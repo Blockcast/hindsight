@@ -102,6 +102,7 @@ def _install_hermes_stubs(hermes_home: Path) -> None:
     module("hermes_cli")
     module("hermes_cli.config", cfg_get=_cfg_get, save_config=lambda *a, **k: None)
     module("hermes_cli.secret_prompt", masked_secret_prompt=lambda label="": "")
+    module("hermes_cli.urllib_security", open_credentialed_url=lambda *a, **k: None)
     module(
         "hermes_cli.memory_setup",
         _CANCELLED=-1,
@@ -113,13 +114,13 @@ def _install_hermes_stubs(hermes_home: Path) -> None:
     module("hermes_time", now=lambda: datetime.now(timezone.utc))
     module("tools")
     module("tools.registry", tool_error=lambda msg: f"ERROR: {msg}")
-    module("tools.lazy_deps", install_specs=lambda *a, **k: None)
     module("utils", read_json_or_empty=_read_json_or_empty, atomic_json_write=_atomic_json_write)
     # plugins.memory.config_schema stays Hermes-owned (the desktop panel needs core's type).
     module("plugins")
-    module("plugins.memory")
+    module("plugins.memory", _get_active_memory_provider=lambda: "hindsight")
     module(
         "plugins.memory.config_schema",
+        KIND_BOOL="bool",
         KIND_SECRET="secret",
         KIND_SELECT="select",
         KIND_TEXT="text",
@@ -156,13 +157,16 @@ _spec.loader.exec_module(plugin)
 
 
 class FakeResult:
-    def __init__(self, text: str):
+    def __init__(self, text: str, scores: dict[str, float | None] | None = None):
         self.text = text
+        # Like the SDK's ``RecallResult``: an object with one attribute per stage, or ``None``.
+        self.scores = types.SimpleNamespace(**scores) if scores is not None else None
 
 
 class FakeRecallResponse:
     def __init__(self, texts):
-        self.results = [FakeResult(t) for t in texts]
+        """*texts* items are a text, or a ``(text, scores)`` pair when scores matter."""
+        self.results = [FakeResult(*(t if isinstance(t, tuple) else (t,))) for t in texts]
 
 
 class FakeReflectResponse:

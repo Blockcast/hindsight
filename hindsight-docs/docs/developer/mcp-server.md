@@ -198,7 +198,7 @@ Search memories to provide personalized responses.
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `query` | string | Yes | Natural language search query |
-| `max_tokens` | integer | No | Maximum tokens to return (default: 4096) |
+| `max_tokens` | integer | No | Token budget for the facts' text (default: 4096). Per-result metadata (id, tags, scores, dates) is not counted, so the response is several times larger |
 | `budget` | string | No | Search thoroughness: `low`, `mid`, or `high` (default: `high`) |
 | `types` | list[string] | No | Filter by fact type: `world`, `experience`, `observation`. Defaults to all |
 | `tags` | list[string] | No | Filter memories by tags. Omit for no filter |
@@ -207,6 +207,12 @@ Search memories to provide personalized responses.
 | `query_timestamp` | string | No | ISO 8601 timestamp — recall as if asking at this point in time; anchors relative temporal expressions and recency scoring |
 | `min_scores` | object | No | Optional per-stage score floors, e.g. `{"reranker": 0.5}`. Keys: `semantic`/`keyword` (retrieval-level cutoffs), `reranker`/`final` (post-ranking). All inclusive and AND-ed; omit for no filtering. Reranker scores aren't calibrated across queries — calibrate before use |
 | `temporal_window` | object | No | An explicit `{"start": ISO, "end": ISO}` period to search over, used instead of reading dates out of the query text. Ranks memories dated inside the window higher; it does not drop the ones outside it, so it can't restrict results to a period |
+| `include_chunks` | boolean | No | Also return the source text chunks the facts came from. Use it when you need exact strings (paths, IDs, commands) that extraction may have reworded. Default: `false` |
+| `max_chunk_tokens` | integer | No | Max tokens of source chunks when `include_chunks` is set (default: 8192) |
+| `include_entities` | boolean | No | Also return observations about the entities in the results. Default: `false` |
+| `max_entity_tokens` | integer | No | Max tokens of entity observations when `include_entities` is set (default: 500) |
+| `include_source_facts` | boolean | No | For observation results, also return the facts they were built from. Default: `false` |
+| `max_source_facts_tokens` | integer | No | Max tokens of source facts when `include_source_facts` is set (default: 4096) |
 
 **Example:**
 ```json
@@ -374,6 +380,7 @@ you can also configure from an agent over MCP.
 | `mode` | string | `full` regenerates the content from scratch on each refresh; `delta` makes surgical edits, preserving unchanged sections byte-for-byte. Delta falls back to full when there is no existing content or the source query changed |
 | `refresh_after_consolidation` | boolean | Rebuild after each memory consolidation |
 | `refresh_cron` | string | UTC five-field cron, e.g. `0 3 * * *` for daily at 03:00 UTC. Only runs when the model is stale, so an unchanged scope costs no LLM call |
+| `full_refresh_cron` | string | UTC five-field cron for a scheduled **full** refresh of a delta model, e.g. `0 3 * * 0`. Independent of the two triggers above; skipped when no refresh ran since the last full one |
 | `min_refresh_interval_seconds` | integer | Floor between two *automatic* refreshes. Triggers arriving sooner fold into one queued refresh, so a burst of retains costs one rebuild. Explicit refreshes ignore it |
 | `fact_types` | list[string] | Which of `world`, `experience`, `observation` the refresh retrieves. Omit for all three |
 | `exclude_mental_models` | boolean | Exclude **all** mental models from the refresh, so a model never reflects on its siblings |
@@ -383,6 +390,7 @@ you can also configure from an agent over MCP.
 | `include_chunks` | boolean | Whether the refresh's internal recall returns raw chunk text |
 | `recall_max_tokens` | integer | Token budget for facts from the refresh's internal recall |
 | `recall_chunks_max_tokens` | integer | Token budget for raw chunks from the refresh's internal recall |
+| `budget` | string | How many agent steps a refresh may spend, as a multiple of the server's reflect iteration limit: `low` halves it, `mid` keeps it, `high` doubles it. Omit for `mid` |
 | `response_schema` | object | JSON Schema for structured output, stored alongside the markdown under `reflect_response.structured_output` |
 | `keep_trace` | boolean | Record how each refresh reached its result under `reflect_response.trace`. The only way to diagnose a cron- or consolidation-driven refresh after the fact |
 
@@ -536,6 +544,7 @@ List documents that have been ingested into the memory bank.
 |-----------|------|----------|-------------|
 | `q` | string | No | Search query to filter documents |
 | `limit` | integer | No | Maximum number of results (default: 100) |
+| `offset` | integer | No | Number of results to skip for pagination (default: 0) |
 
 ---
 
@@ -561,12 +570,15 @@ Delete a document and all memories linked to it.
 
 ### list_operations
 
-List async operations (retain processing, mental model refresh, etc.) with optional status filtering.
+List async operations (retain processing, mental model refresh, etc.) with optional status and type filtering.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `status` | string | No | Filter by status: `pending`, `running`, `completed`, `failed`, `cancelled` |
-| `limit` | integer | No | Maximum number of results (default: 100) |
+| `type` | string | No | Filter by type: `retain`, `consolidation`, `refresh_mental_model`, `file_convert_retain`, `webhook_delivery` |
+| `limit` | integer | No | Maximum number of results, 1–100 (default: 20) |
+| `offset` | integer | No | Number of results to skip for pagination (default: 0) |
+| `exclude_parents` | boolean | No | Exclude parent batch operations (default: false) |
 
 ---
 
@@ -598,6 +610,7 @@ List all unique tags used in a bank, optionally filtered by pattern.
 |-----------|------|----------|-------------|
 | `q` | string | No | Glob pattern to filter tags (e.g., `project:*`) |
 | `limit` | integer | No | Maximum number of results (default: 100) |
+| `offset` | integer | No | Number of results to skip for pagination (default: 0) |
 
 ---
 
@@ -640,6 +653,7 @@ The `config_updates` object accepts any bank-configurable field by its Python fi
 - `entity_labels` — controlled vocabulary for entity classification
 - `entities_allow_free_form` — allow labels outside `entity_labels`
 - `recall_include_chunks` — include raw chunks in recall results
+- `recall_prefer_observations` — default `prefer_observations` for recall calls that omit it
 - `recall_max_tokens` — max tokens for recall results
 - `mcp_enabled_tools` — tool allowlist for this bank
 

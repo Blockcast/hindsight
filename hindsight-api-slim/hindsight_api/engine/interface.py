@@ -11,9 +11,9 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from hindsight_api.engine.memory_engine import BankLlmHealthInfo, Budget
-    from hindsight_api.engine.response_models import RecallResult, ReflectResult
-    from hindsight_api.engine.search.tags import TagsMatch
+    from hindsight_api.engine.memory_engine import BankLlmHealthInfo
+    from hindsight_api.engine.response_models import Budget, RecallResult, ReflectResult
+    from hindsight_api.engine.search.tags import TagGroup, TagsMatch
     from hindsight_api.extensions import BankWriteOperation
     from hindsight_api.models import RequestContext
 
@@ -424,7 +424,7 @@ class MemoryEngineInterface(ABC):
 
         Args:
             bank_id: The memory bank ID.
-            search_query: Case-insensitive substring filter on document ID.
+            search_query: Case-insensitive substring filter on document ID or text (unindexed, for browsing).
             tags: Filter by tags.
             tags_match: How to match tags (any, all, any_strict, all_strict).
             time_field: Time axis to filter and order by — ``created_at`` or
@@ -510,6 +510,9 @@ class MemoryEngineInterface(ABC):
         self,
         bank_id: str,
         *,
+        tags: list[str] | None = None,
+        tags_match: "TagsMatch" = "any",
+        tag_groups: "list[TagGroup] | None" = None,
         limit: int = 100,
         offset: int = 0,
         request_context: "RequestContext",
@@ -519,6 +522,9 @@ class MemoryEngineInterface(ABC):
 
         Args:
             bank_id: The memory bank ID.
+            tags: Optional tag filter on the memories that mention each entity.
+            tags_match: How ``tags`` match.
+            tag_groups: Compound tag filter, AND-ed with ``tags``.
             limit: Maximum results.
             offset: Offset for pagination.
             request_context: Request context for authentication.
@@ -599,6 +605,9 @@ class MemoryEngineInterface(ABC):
         bank_id: str,
         entity_id: str,
         *,
+        tags: list[str] | None = None,
+        tags_match: "TagsMatch" = "any",
+        tag_groups: "list[TagGroup] | None" = None,
         request_context: "RequestContext",
     ) -> dict[str, Any] | None:
         """

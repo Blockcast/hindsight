@@ -10,6 +10,7 @@ import re
 import threading
 from abc import ABC, abstractmethod
 from datetime import UTC, datetime, timedelta
+from typing import cast
 
 from dateparser.conf import Settings, apply_settings
 from pydantic import BaseModel, Field
@@ -373,7 +374,10 @@ class DateparserQueryAnalyzer(QueryAnalyzer):
             # Settings populates its attributes dynamically, so this is a getattr
             # rather than a plain access: the name is not statically visible.
             default_languages = getattr(settings, "DEFAULT_LANGUAGES", None)
-            language = best_language(text, self._locales) or (default_languages[0] if default_languages else None)
+            # `_locales` starts as None and is filled during `load()`, which runs first.
+            language = best_language(text, cast("list", self._locales)) or (
+                default_languages[0] if default_languages else None
+            )
             if not language:
                 return None
             return self._exact_search.search_parse(language, text, settings=settings) or None
@@ -498,24 +502,29 @@ class TransformerQueryAnalyzer(QueryAnalyzer):
         if self._model is not None:
             return
 
-        try:
-            from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
-        except ImportError:
-            raise ImportError(
-                "transformers is required for TransformerQueryAnalyzer. Install it with: pip install transformers"
-            )
+        from .local_device import LOCAL_MODEL_BUILD_LOCK, align_local_model_weights, prefetch_local_model
 
-        from .local_device import align_local_model_weights
+        # Imports transformers; see LOCAL_MODEL_BUILD_LOCK.
+        with LOCAL_MODEL_BUILD_LOCK:
+            try:
+                from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+            except ImportError:
+                raise ImportError(
+                    "transformers is required for TransformerQueryAnalyzer. Install it with: pip install transformers"
+                )
 
         logger.info(f"Loading query analyzer model: {self.model_name}...")
-        self._tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-        self._model = AutoModelForSeq2SeqLM.from_pretrained(self.model_name)
-        self._model.to(self.device)
-        self._model.eval()
-        # Zero-copy safetensors weights can land on a sub-element byte offset, which
-        # corrupts the CPU matmul (see engine/local_device.py). `.to()` is a no-op for a
-        # CPU model, so it does not launder the alignment.
-        align_local_model_weights(self._model, label=f"QueryAnalyzer[{self.model_name}]")
+        # Starts alongside the other local models; see LOCAL_MODEL_BUILD_LOCK.
+        prefetch_local_model(self.model_name)
+        with LOCAL_MODEL_BUILD_LOCK:
+            self._tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+            self._model = AutoModelForSeq2SeqLM.from_pretrained(self.model_name)
+            self._model.to(self.device)
+            self._model.eval()
+            # Zero-copy safetensors weights can land on a sub-element byte offset, which
+            # corrupts the CPU matmul (see engine/local_device.py). `.to()` is a no-op for a
+            # CPU model, so it does not launder the alignment.
+            align_local_model_weights(self._model, label=f"QueryAnalyzer[{self.model_name}]")
         logger.info("Query analyzer model loaded")
 
     def _load_model(self):

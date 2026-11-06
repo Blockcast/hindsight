@@ -7,11 +7,12 @@
  * Hindsight API calls are intercepted via global fetch mocking.
  */
 
+import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createTestHarness } from "@paperclipai/plugin-sdk";
-import type { Agent } from "@paperclipai/plugin-sdk";
 import manifest from "../src/manifest.js";
-import plugin, { buildRecallQuery, DEFAULT_MAX_RECALL_QUERY_BYTES } from "../src/worker.js";
+import plugin from "../src/worker.js";
+import { DEFAULT_REQUEST_TIMEOUT_MS, HindsightClient } from "../src/client.js";
 
 // ---------------------------------------------------------------------------
 // Fetch mock helpers
@@ -41,41 +42,6 @@ const DEFAULT_CONFIG = {
   recallBudget: "mid",
   autoRetain: true,
 };
-
-function seedAgent(
-  harness: ReturnType<typeof buildHarness>,
-  agent: Partial<Agent> & { id: string }
-) {
-  const now = new Date("2026-01-01T00:00:00.000Z");
-  harness.seed({
-    agents: [
-      {
-        id: agent.id,
-        companyId: agent.companyId ?? "co-1",
-        name: agent.name ?? agent.id,
-        urlKey: agent.urlKey ?? agent.id,
-        role: agent.role ?? "general",
-        title: agent.title ?? null,
-        icon: agent.icon ?? null,
-        status: agent.status ?? "idle",
-        reportsTo: agent.reportsTo ?? null,
-        capabilities: agent.capabilities ?? null,
-        adapterType: agent.adapterType ?? "process",
-        adapterConfig: agent.adapterConfig ?? {},
-        runtimeConfig: agent.runtimeConfig ?? {},
-        budgetMonthlyCents: agent.budgetMonthlyCents ?? 0,
-        spentMonthlyCents: agent.spentMonthlyCents ?? 0,
-        pauseReason: agent.pauseReason ?? null,
-        pausedAt: agent.pausedAt ?? null,
-        permissions: agent.permissions ?? { canCreateAgents: false },
-        lastHeartbeatAt: agent.lastHeartbeatAt ?? null,
-        metadata: agent.metadata ?? null,
-        createdAt: agent.createdAt ?? now,
-        updatedAt: agent.updatedAt ?? now,
-      },
-    ],
-  });
-}
 
 function buildHarness(config: Record<string, unknown> = DEFAULT_CONFIG) {
   return createTestHarness({
@@ -262,6 +228,7 @@ describe("agent.run.started", () => {
     const recallCall = fetchMock.mock.calls.find(([url]: [string]) => url.includes("recall"));
     expect(recallCall).toBeDefined();
     expect(recallCall?.[0]).toContain("paperclip%3A%3Aco-1%3A%3Aag-1");
+    expect(recallCall?.[1]?.headers["User-Agent"]).toMatch(/^hindsight-paperclip\/\d+\.\d+\.\d+$/);
 
     const recallBody = JSON.parse(recallCall?.[1]?.body as string) as { query: string };
     expect(recallBody.query).toContain("Refactor auth module");
@@ -273,40 +240,6 @@ describe("agent.run.started", () => {
       stateKey: "recalled-memories",
     });
     expect(state).toContain("TypeScript");
-  });
-
-  it("bounds the run-start recall query before calling Hindsight", async () => {
-    const harness = buildHarness();
-    await setupPlugin(harness);
-    const issue = await seedIssue(harness, {
-      companyId: "co-1",
-      title: "Investigate preview deployment failures",
-      description: "Long issue body. ".repeat(500),
-    });
-
-    await harness.emit(
-      "agent.run.started",
-      { agentId: "ag-1", runId: "run-long", issueId: issue.id },
-      { companyId: "co-1" }
-    );
-
-    const recallCall = fetchMock.mock.calls.find(([url]: [string]) => url.includes("recall"));
-    expect(recallCall).toBeDefined();
-    const recallBody = JSON.parse(recallCall?.[1]?.body as string) as { query: string };
-    expect(Buffer.byteLength(recallBody.query, "utf8")).toBeLessThanOrEqual(
-      DEFAULT_MAX_RECALL_QUERY_BYTES
-    );
-    expect(recallBody.query).toContain("Investigate preview deployment failures");
-  });
-
-  it("builds a compact recall query from long issue text", () => {
-    const query = buildRecallQuery({
-      title: "Fix stuck reviewer runs",
-      description: "Detailed reproduction with logs and stack traces. ".repeat(500),
-    });
-
-    expect(Buffer.byteLength(query, "utf8")).toBeLessThanOrEqual(DEFAULT_MAX_RECALL_QUERY_BYTES);
-    expect(query).toContain("Fix stuck reviewer runs");
   });
 
   it("uses user-scoped bank ID when bankGranularity includes 'user'", async () => {
@@ -413,131 +346,6 @@ describe("agent.run.started", () => {
         { companyId: "co-1" }
       )
     ).resolves.not.toThrow();
-  });
-});
-
-// ---------------------------------------------------------------------------
-// agent.created — seed-bank lifecycle hook
-// ---------------------------------------------------------------------------
-
-describe("agent.created", () => {
-  afterEach(() => {
-    vi.unstubAllGlobals();
-  });
-
-  it("touches the canonical bank and queues one deterministic seed-bank job", async () => {
-    const fetchMock = mockFetch([
-      { url: /\/v1\/default\/banks\//, body: { success: true } },
-      { url: "https://seed.example/jobs", body: { queued: true } },
-    ]);
-    vi.stubGlobal("fetch", fetchMock);
-    const harness = buildHarness({
-      ...DEFAULT_CONFIG,
-      seedBankWebhookUrl: "https://seed.example/jobs",
-    });
-    seedAgent(harness, {
-      id: "parent-1",
-      companyId: "co-1",
-      capabilities: "Reviews production database migrations and checks rollback risk.",
-    });
-    seedAgent(harness, {
-      id: "ag-1",
-      companyId: "co-1",
-      capabilities: "Writes TypeScript services and React UI tests.",
-      reportsTo: "parent-1",
-      metadata: { desiredSkills: ["vercel-labs/browser", "github/pr-review"] },
-    });
-    await setupPlugin(harness);
-
-    await harness.emit("agent.created", { agentId: "ag-1" }, { companyId: "co-1" });
-
-    const bankCall = fetchMock.mock.calls.find(
-      ([url, init]: [string, RequestInit]) =>
-        url.includes("/v1/default/banks/") && init.method === "PUT"
-    );
-    expect(bankCall).toBeDefined();
-    expect(bankCall?.[0]).toContain("paperclip%3A%3Aco-1%3A%3Aag-1");
-
-    const queueCalls = fetchMock.mock.calls.filter(([url]: [string]) =>
-      url.includes("https://seed.example/jobs")
-    );
-    expect(queueCalls).toHaveLength(1);
-    const payload = JSON.parse(queueCalls[0]?.[1]?.body as string) as {
-      agentId: string;
-      companyId: string;
-      bankId: string;
-      mode: string;
-      queries: string[];
-    };
-    expect(payload).toEqual(
-      expect.objectContaining({
-        agentId: "ag-1",
-        companyId: "co-1",
-        bankId: "paperclip::co-1::ag-1",
-        mode: "seed",
-      })
-    );
-    expect(payload.queries).toEqual([
-      "Writes TypeScript services and React UI tests.",
-      "Skill: vercel-labs/browser",
-      "Skill: github/pr-review",
-      "Reporting parent capabilities: Reviews production database migrations and checks rollback risk.",
-    ]);
-  });
-
-  it("records retryable state and resolves when seed queue returns 503", async () => {
-    const fetchMock = mockFetch([
-      { url: /\/v1\/default\/banks\//, body: { success: true } },
-      { url: "https://seed.example/jobs", body: { error: "unavailable" }, status: 503 },
-    ]);
-    vi.stubGlobal("fetch", fetchMock);
-    const harness = buildHarness({
-      ...DEFAULT_CONFIG,
-      seedBankWebhookUrl: "https://seed.example/jobs",
-    });
-    seedAgent(harness, {
-      id: "ag-1",
-      companyId: "co-1",
-      capabilities: "Writes TypeScript services.",
-    });
-    await setupPlugin(harness);
-
-    await expect(
-      harness.emit("agent.created", { agentId: "ag-1" }, { companyId: "co-1" })
-    ).resolves.not.toThrow();
-
-    const failure = harness.getState({
-      scopeKind: "agent",
-      scopeId: "ag-1",
-      stateKey: "seed-bank-failure",
-    }) as { retryable?: boolean; status?: number; bankId?: string };
-    expect(failure).toEqual(
-      expect.objectContaining({
-        retryable: true,
-        status: 503,
-        bankId: "paperclip::co-1::ag-1",
-      })
-    );
-  });
-
-  it("skips the seed-bank hook when disabled", async () => {
-    const fetchMock = mockFetch([{ url: /\/v1\/default\/banks\//, body: { success: true } }]);
-    vi.stubGlobal("fetch", fetchMock);
-    const harness = buildHarness({
-      ...DEFAULT_CONFIG,
-      seedBankEnabled: false,
-      seedBankWebhookUrl: "https://seed.example/jobs",
-    });
-    seedAgent(harness, {
-      id: "ag-1",
-      companyId: "co-1",
-      capabilities: "Writes TypeScript services.",
-    });
-    await setupPlugin(harness);
-
-    await harness.emit("agent.created", { agentId: "ag-1" }, { companyId: "co-1" });
-
-    expect(fetchMock).not.toHaveBeenCalled();
   });
 });
 
@@ -668,7 +476,7 @@ describe("hindsight_recall tool", () => {
     vi.unstubAllGlobals();
   });
 
-  it("returns cached memories from run start without additional API call", async () => {
+  it("returns cached memories from run start without additional API call for the same query", async () => {
     const harness = buildHarness();
     await setupPlugin(harness);
     const issue = await seedIssue(harness, {
@@ -689,7 +497,7 @@ describe("hindsight_recall tool", () => {
     const callsBefore = (vi.mocked(fetch) as ReturnType<typeof vi.fn>).mock.calls.length;
     const result = await harness.executeTool(
       "hindsight_recall",
-      { query: "preferences" },
+      { query: "Update UI" },
       { agentId: "ag-1", runId: "run-1", companyId: "co-1", projectId: "proj-1" }
     );
 
@@ -697,6 +505,42 @@ describe("hindsight_recall tool", () => {
     const callsAfter = (vi.mocked(fetch) as ReturnType<typeof vi.fn>).mock.calls.length;
     // No new recall call — returned from cache
     expect(callsAfter).toBe(callsBefore);
+  });
+
+  it("performs a live recall when the query differs from the run-start query", async () => {
+    const harness = buildHarness();
+    await setupPlugin(harness);
+    const issue = await seedIssue(harness, {
+      companyId: "co-1",
+      title: "Update UI",
+    });
+
+    vi.stubGlobal(
+      "fetch",
+      mockFetch([{ url: /recall/, body: { results: [{ text: "User prefers dark mode" }] } }])
+    );
+    await harness.emit(
+      "agent.run.started",
+      { agentId: "ag-1", runId: "run-1", issueId: issue.id },
+      { companyId: "co-1" }
+    );
+
+    const liveFetch = mockFetch([
+      { url: /recall/, body: { results: [{ text: "Hosting decision is still open" }] } },
+    ]);
+    vi.stubGlobal("fetch", liveFetch);
+
+    const result = await harness.executeTool(
+      "hindsight_recall",
+      { query: "hosting decision" },
+      { agentId: "ag-1", runId: "run-1", companyId: "co-1", projectId: "proj-1" }
+    );
+
+    expect((result as { content: string }).content).toContain("Hosting decision");
+    expect((result as { content: string }).content).not.toContain("dark mode");
+    const recallCall = liveFetch.mock.calls.find(([url]: [string]) => url.includes("recall"));
+    const body = JSON.parse(recallCall?.[1]?.body as string) as { query: string };
+    expect(body.query).toBe("hosting decision");
   });
 
   it("falls back to live recall when no cached state", async () => {
@@ -714,6 +558,58 @@ describe("hindsight_recall tool", () => {
     );
 
     expect((result as { content: string }).content).toContain("Python specialist");
+  });
+
+  it("aborts the request after requestTimeoutMs", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        (_url: string, init?: RequestInit) =>
+          new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener("abort", () =>
+              reject(new DOMException("aborted", "AbortError"))
+            );
+          })
+      )
+    );
+    const harness = buildHarness({ ...DEFAULT_CONFIG, requestTimeoutMs: 50 });
+    await setupPlugin(harness);
+
+    const result = await harness.executeTool(
+      "hindsight_recall",
+      { query: "anything" },
+      { agentId: "ag-1", runId: "run-3", companyId: "co-1", projectId: "proj-1" }
+    );
+
+    expect((result as { content: string }).content).toContain("Memory recall failed");
+  });
+});
+
+describe("HindsightClient timeout", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  async function timeoutUsed(timeoutMs?: number): Promise<number | undefined> {
+    vi.stubGlobal("fetch", mockFetch([{ url: /recall/, body: { results: [] } }]));
+    const spy = vi.spyOn(globalThis, "setTimeout");
+    await new HindsightClient("http://localhost:8888", undefined, timeoutMs).recall("b", "q");
+    return spy.mock.calls[0]?.[1];
+  }
+
+  it("defaults to 15s", async () => {
+    expect(await timeoutUsed()).toBe(DEFAULT_REQUEST_TIMEOUT_MS);
+    expect(DEFAULT_REQUEST_TIMEOUT_MS).toBe(15_000);
+  });
+
+  it("uses a custom timeout", async () => {
+    expect(await timeoutUsed(45_000)).toBe(45_000);
+  });
+
+  it("ignores invalid timeouts", async () => {
+    expect(await timeoutUsed(0)).toBe(DEFAULT_REQUEST_TIMEOUT_MS);
+    expect(await timeoutUsed(Number.NaN)).toBe(DEFAULT_REQUEST_TIMEOUT_MS);
   });
 });
 
@@ -896,6 +792,111 @@ describe("enabledAgentIds", () => {
     expect(retainCalls.length).toBe(0);
   });
 
+  it("recall tool refuses when agent is not in enabledAgentIds allowlist", async () => {
+    const harness = buildHarness({
+      ...DEFAULT_CONFIG,
+      enabledAgentIds: ["ag-1"],
+    });
+    await setupPlugin(harness);
+
+    const result = await harness.executeTool(
+      "hindsight_recall",
+      { query: "anything" },
+      {
+        agentId: "ag-2",
+        runId: "run-tool-1",
+        companyId: "co-1",
+      }
+    );
+
+    expect(String(result.content)).toContain("not enabled for this agent");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("retain tool refuses when agent is not in enabledAgentIds allowlist", async () => {
+    const harness = buildHarness({
+      ...DEFAULT_CONFIG,
+      enabledAgentIds: ["ag-1"],
+    });
+    await setupPlugin(harness);
+
+    const result = await harness.executeTool(
+      "hindsight_retain",
+      { content: "a secret" },
+      {
+        agentId: "ag-2",
+        runId: "run-tool-2",
+        companyId: "co-1",
+      }
+    );
+
+    expect(String(result.content)).toContain("not enabled for this agent");
+    const retainCalls = fetchMock.mock.calls.filter(([url]: [string]) => /memories$/.test(url));
+    expect(retainCalls.length).toBe(0);
+  });
+
+  it("recall tool works when agent is in enabledAgentIds allowlist", async () => {
+    const harness = buildHarness({
+      ...DEFAULT_CONFIG,
+      enabledAgentIds: ["ag-1"],
+    });
+    await setupPlugin(harness);
+
+    await harness.executeTool(
+      "hindsight_recall",
+      { query: "anything" },
+      {
+        agentId: "ag-1",
+        runId: "run-tool-3",
+        companyId: "co-1",
+      }
+    );
+
+    const recallCall = fetchMock.mock.calls.find((c: unknown[]) =>
+      String(c[0]).includes("/memories/recall")
+    );
+    expect(recallCall).toBeDefined();
+  });
+
+  it("retain tool works when agent is in enabledAgentIds allowlist", async () => {
+    const harness = buildHarness({
+      ...DEFAULT_CONFIG,
+      enabledAgentIds: ["ag-1"],
+    });
+    await setupPlugin(harness);
+
+    await harness.executeTool(
+      "hindsight_retain",
+      { content: "a decision" },
+      {
+        agentId: "ag-1",
+        runId: "run-tool-4",
+        companyId: "co-1",
+      }
+    );
+
+    const retainCalls = fetchMock.mock.calls.filter(([url]: [string]) => /memories$/.test(url));
+    expect(retainCalls.length).toBe(1);
+  });
+
+  it("tools stay available to every agent when enabledAgentIds is unset", async () => {
+    const harness = buildHarness(DEFAULT_CONFIG);
+    await setupPlugin(harness);
+
+    const result = await harness.executeTool(
+      "hindsight_recall",
+      { query: "anything" },
+      {
+        agentId: "ag-whoever",
+        runId: "run-tool-5",
+        companyId: "co-1",
+      }
+    );
+
+    expect(String(result.content)).not.toContain("not enabled for this agent");
+    expect(fetchMock).toHaveBeenCalled();
+  });
+
   it("performs retain when agent is in enabledAgentIds allowlist", async () => {
     const harness = buildHarness({
       ...DEFAULT_CONFIG,
@@ -938,5 +939,89 @@ describe("enabledAgentIds", () => {
 
     const retainCalls = fetchMock.mock.calls.filter(([url]: [string]) => /memories$/.test(url));
     expect(retainCalls.length).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Hindsight Cloud API key — secret reference
+// ---------------------------------------------------------------------------
+
+describe("manifest version", () => {
+  it("matches package.json, so the host shows the version that is installed", () => {
+    const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+    expect(manifest.version).toBe(pkg.version);
+  });
+});
+
+describe("hindsightApiKeyRef", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("is declared as a secret-ref field that admits the picker's reference object", () => {
+    const field = (
+      manifest.instanceConfigSchema as {
+        properties: Record<string, { format?: string; oneOf?: Array<Record<string, unknown>> }>;
+      }
+    ).properties.hindsightApiKeyRef;
+
+    // Without `format` the host renders a plain text box, stores whatever is
+    // typed, and every resolve() fails closed on a bare string.
+    expect(field?.format).toBe("secret-ref");
+
+    // With `format` alone but `type: "string"`, the host's Ajv pass rejects what
+    // its own picker submits: "Configuration does not match the plugin's
+    // instanceConfigSchema". The schema must admit the reference object too.
+    const objectBranch = field?.oneOf?.find((branch) => branch.type === "object") as
+      | { required?: string[]; properties?: Record<string, unknown> }
+      | undefined;
+    expect(objectBranch).toBeDefined();
+    expect(objectBranch?.required).toEqual(["type", "secretId"]);
+    expect(field?.oneOf?.some((branch) => branch.type === "string")).toBe(true);
+  });
+
+  it("resolves the stored reference for the run's company and authenticates recall", async () => {
+    const fetchMock = mockFetch([{ url: /recall/, body: { results: [] } }]);
+    vi.stubGlobal("fetch", fetchMock);
+
+    const secretRef = { type: "secret_ref" as const, secretId: "sec-1" };
+    const harness = buildHarness({ ...DEFAULT_CONFIG, hindsightApiKeyRef: secretRef });
+    const resolve = vi.spyOn(harness.ctx.secrets, "resolve").mockResolvedValue("hs-cloud-key");
+    await setupPlugin(harness);
+    const issue = await seedIssue(harness, { companyId: "co-1", title: "Ship it" });
+
+    await harness.emit(
+      "agent.run.started",
+      { agentId: "ag-1", runId: "run-1", issueId: issue.id },
+      { companyId: "co-1" }
+    );
+
+    expect(resolve).toHaveBeenCalledWith(secretRef, {
+      companyId: "co-1",
+      configPath: "hindsightApiKeyRef",
+    });
+
+    const recallCall = fetchMock.mock.calls.find(([url]: [string]) => url.includes("recall"));
+    const headers = recallCall?.[1]?.headers as Record<string, string>;
+    expect(headers.Authorization).toBe("Bearer hs-cloud-key");
+  });
+
+  it("never touches the secrets client when no reference is configured", async () => {
+    const fetchMock = mockFetch([{ url: /recall/, body: { results: [] } }]);
+    vi.stubGlobal("fetch", fetchMock);
+
+    const harness = buildHarness();
+    const resolve = vi.spyOn(harness.ctx.secrets, "resolve");
+    await setupPlugin(harness);
+    const issue = await seedIssue(harness, { companyId: "co-1", title: "Self-hosted" });
+
+    await harness.emit(
+      "agent.run.started",
+      { agentId: "ag-1", runId: "run-1", issueId: issue.id },
+      { companyId: "co-1" }
+    );
+
+    expect(resolve).not.toHaveBeenCalled();
   });
 });

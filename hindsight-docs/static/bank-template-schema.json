@@ -159,6 +159,45 @@
           "description": "Toggle cross-encoder reranking during recall",
           "title": "Enable Reranking"
         },
+        "reflect_use_decision_model": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "When the server has a decision model, reflect lets it prune evidence and decide when to stop",
+          "title": "Reflect Use Decision Model"
+        },
+        "mental_model_refresh_use_decision_model": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The same, for knowledge-page refreshes",
+          "title": "Mental Model Refresh Use Decision Model"
+        },
+        "mental_model_delta_use_decision_model": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "When the server has a decision model, a delta knowledge-page refresh asks it which new memories could change the page instead of running reflect",
+          "title": "Mental Model Delta Use Decision Model"
+        },
         "disposition_skepticism": {
           "anyOf": [
             {
@@ -368,8 +407,52 @@
             }
           ],
           "default": null,
-          "description": "Per-scope overrides of max_observations_per_scope: [{\"scope\": [\"run_*\", \"shared\"], \"limit\": 1}]. Each scope is a list of fnmatch tag-globs; a consolidation scope matches under exact cover (every tag matched by a glob and every glob matched by a tag). The first matching rule wins; unmatched scopes fall back to max_observations_per_scope.",
+          "description": "DEPRECATED \u2014 use consolidation_strategies, which carries the mission too. Still honoured, but consulted only after consolidation_strategies. Per-scope overrides of max_observations_per_scope: [{\"scope\": [\"run_*\", \"shared\"], \"limit\": 1}]. Each scope is a list of fnmatch tag-globs; a consolidation scope matches under exact cover (every tag matched by a glob and every glob matched by a tag). The first matching rule wins; unmatched scopes fall back to max_observations_per_scope.",
           "title": "Observation Scope Limits"
+        },
+        "default_observation_scopes": {
+          "anyOf": [
+            {
+              "enum": [
+                "per_tag",
+                "combined",
+                "all_combinations",
+                "shared"
+              ],
+              "type": "string"
+            },
+            {
+              "items": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "observation_scopes applied at retain to items that send none ('combined' when unset). A list of tag lists may use globs, e.g. [['topic:*']] scopes each memory by its own topic tags.",
+          "title": "Default Observation Scopes"
+        },
+        "consolidation_strategies": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/ConsolidationStrategySpec"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Per-scope consolidation settings: [{\"scopes\": [{\"tags\": [\"company:*\"]}], \"observations_mission\": \"Record only generalized trends.\", \"max_observations_per_scope\": 20}]. Each strategy lists the rules it claims scopes with \u2014 a rule's tags are fnmatch globs that must all be on the scope, and its \"tags_match\" decides whether the scope may carry others (\"all\", the default) or not (\"exact\"). The rules are alternatives: any one matching claims the scope. A strategy may set any of observations_mission, max_observations_per_scope, consolidation_source_facts_max_tokens and consolidation_source_facts_max_tokens_per_observation; each is optional. Exactly one strategy applies to a scope: the first in the list that claims it. Whatever that strategy leaves unset \u2014 and every scope no strategy claims \u2014 uses the bank-wide value; a later strategy never fills the gaps. Supersedes observation_scope_limits. Lets one bank be federated across user/team/company tag scopes, each consolidating under its own brief.",
+          "title": "Consolidation Strategies"
         },
         "reflect_source_facts_max_tokens": {
           "anyOf": [
@@ -583,6 +666,19 @@
           "description": "Persist raw source text (documents.original_text / chunks.chunk_text). Set false to keep only derived facts.",
           "title": "Store Document Text"
         },
+        "default_timezone": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "IANA zone (e.g. 'Europe/Rome') a retain timestamp, or a time the LLM extracts, is read in when it carries no UTC offset.",
+          "title": "Default Timezone"
+        },
         "enable_auto_consolidation": {
           "anyOf": [
             {
@@ -595,6 +691,19 @@
           "default": null,
           "description": "Automatically consolidate observations after retain",
           "title": "Enable Auto Consolidation"
+        },
+        "consolidation_use_decision_model": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "When the server has a decision model, consolidation lets it settle restatements and chatter before the LLM call",
+          "title": "Consolidation Use Decision Model"
         },
         "consolidation_max_memories_per_round": {
           "anyOf": [
@@ -634,6 +743,45 @@
           "default": null,
           "description": "Include raw chunks in recall results",
           "title": "Recall Include Chunks"
+        },
+        "recall_prefer_observations": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Default for recall prefer_observations when the request omits it",
+          "title": "Recall Prefer Observations"
+        },
+        "recall_decision_model_prune": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Default for recall prune when the request omits it (decision-model reranker only)",
+          "title": "Recall Decision Model Prune"
+        },
+        "recall_decision_model_dedup": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Default for recall dedup when the request omits it (decision-model reranker only)",
+          "title": "Recall Decision Model Dedup"
         },
         "recall_max_tokens": {
           "anyOf": [
@@ -695,6 +843,8 @@
         "priority": {
           "default": 0,
           "description": "Higher priority directives are injected first",
+          "maximum": 2147483647,
+          "minimum": -2147483648,
           "title": "Priority",
           "type": "integer"
         },
@@ -768,6 +918,107 @@
         "source_query"
       ],
       "title": "BankTemplateMentalModel",
+      "type": "object"
+    },
+    "Budget": {
+      "description": "Budget levels for recall/reflect operations.",
+      "enum": [
+        "low",
+        "mid",
+        "high"
+      ],
+      "title": "Budget",
+      "type": "string"
+    },
+    "ConsolidationScopePattern": {
+      "description": "One rule of a consolidation strategy: tags, and how they must match.\n\n``tags`` may be empty \u2014 that is a rule still being filled in, which the editor\nsaves as typed and consolidation ignores. The type pins the *shape*, not\ncompleteness: a string where the tag list belongs is rejected at the door\ninstead of being stored and silently ignored for the life of the bank.\n\nUnknown keys are rejected too, but by :class:`StrictConsolidationStrategySpec`\non the write path rather than by ``extra=\"forbid\"`` here: that would put\n``additionalProperties: false`` in the schema, which openapi-generator cannot\nprocess (\"Codegen Property not yet supported in getPydanticType\").",
+      "properties": {
+        "tags": {
+          "description": "fnmatch tag patterns, e.g. company:*",
+          "items": {
+            "type": "string"
+          },
+          "title": "Tags",
+          "type": "array"
+        },
+        "tags_match": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "\"all\" (the default when omitted): the scope has every tag in the rule, other tags allowed. \"exact\": exactly these tags and no others.",
+          "title": "Tags Match"
+        }
+      },
+      "title": "ConsolidationScopePattern",
+      "type": "object"
+    },
+    "ConsolidationStrategySpec": {
+      "description": "One `consolidation_strategies` entry: the rules it claims scopes with, and\nthe observation settings those scopes use. Every setting is optional; unset\nones come from the bank-wide values.",
+      "properties": {
+        "scopes": {
+          "description": "Alternatives: the strategy claims a scope when any rule matches it",
+          "items": {
+            "$ref": "#/$defs/ConsolidationScopePattern"
+          },
+          "title": "Scopes",
+          "type": "array"
+        },
+        "observations_mission": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Observations Mission"
+        },
+        "max_observations_per_scope": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Observations Per Scope"
+        },
+        "consolidation_source_facts_max_tokens": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Consolidation Source Facts Max Tokens"
+        },
+        "consolidation_source_facts_max_tokens_per_observation": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Consolidation Source Facts Max Tokens Per Observation"
+        }
+      },
+      "title": "ConsolidationStrategySpec",
       "type": "object"
     },
     "LabelGroup": {
@@ -887,34 +1138,19 @@
       "type": "object"
     },
     "MentalModelTrigger": {
-      "description": "Trigger settings for a mental model.\n\nInherits the reflect options an operator can also default per bank\n(``reflect_default_options``): set here they apply to this model's refreshes\nonly, and win over the bank default.",
+      "description": "Trigger settings for a mental model.\n\nA refresh is not an ad-hoc reflect with different arguments: it synthesizes a\nwhole document, so it wants its own retrieval and iteration settings. This\ntrigger is therefore the only source for them \u2014 a bank's\n``reflect_default_options`` deliberately does not reach a refresh. The\nper-bank default for these fields is ``knowledge_page_default_trigger``,\nwhich is merged over this same shape when a page is created.",
       "properties": {
-        "reflect_search_observations_max_tokens": {
+        "budget": {
           "anyOf": [
             {
-              "minimum": 1,
-              "type": "integer"
+              "$ref": "#/$defs/Budget"
             },
             {
               "type": "null"
             }
           ],
           "default": null,
-          "description": "Token budget for reflect's search_observations tool when the model names none. Observation evidence is often the largest contributor to the reflect context; lowering it trades the lowest-ranked observations for a smaller LLM context. None means use the shipped default (5000).",
-          "title": "Reflect Search Observations Max Tokens"
-        },
-        "reflect_search_observations_include_entities": {
-          "anyOf": [
-            {
-              "type": "boolean"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "description": "Whether search_observations attaches resolved entity names to each observation. Entities can be more than half the serialized tool payload; turning them off keeps the same observations and ranking with a much smaller context. None means enabled.",
-          "title": "Reflect Search Observations Include Entities"
+          "description": "How many agent iterations a refresh may spend, as a multiple of reflect_max_iterations: 'low' halves it, 'mid' keeps it, 'high' doubles it. A refresh is the heaviest reflect there is \u2014 it writes a whole document, and with exclude_mental_models it must read raw facts first \u2014 so null means 'mid', not the 'low' an ad-hoc reflect defaults to."
         },
         "mode": {
           "default": "full",
@@ -945,6 +1181,19 @@
           "description": "Cron expression (UTC, standard 5-field syntax, e.g. '0 3 * * *' for daily at 03:00 UTC) for refreshing this mental model on a fixed schedule. Mutually exclusive with refresh_after_consolidation \u2014 a model refreshes either after consolidation or on a cron schedule, not both. A scheduled refresh only runs when the model is stale (new memories in its scope since the last refresh); if nothing changed, the tick is skipped to avoid a wasted LLM call. null = no schedule.",
           "title": "Refresh Cron"
         },
+        "full_refresh_cron": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Cron expression (UTC, standard 5-field syntax, e.g. '0 3 * * 0' for Sundays at 03:00 UTC) for a scheduled full refresh: on this schedule the model is refreshed in 'full' mode whatever its `mode` says, regenerating the content from scratch to clear the drift many delta edits accumulate. Independent of `refresh_cron` and `refresh_after_consolidation` \u2014 a delta model can refresh after consolidation and still get a weekly full refresh \u2014 and it does not change `mode`. A tick is skipped when no refresh has run since the last full one (there is nothing to correct). Like `refresh_cron`, it honours `min_refresh_interval_seconds` and pauses while the last refresh failed. null = no schedule.",
+          "title": "Full Refresh Cron"
+        },
         "min_refresh_interval_seconds": {
           "anyOf": [
             {
@@ -956,7 +1205,7 @@
             }
           ],
           "default": null,
-          "description": "Minimum seconds between two automatic refreshes of this mental model. A triggered refresh that arrives sooner is not dropped: it is queued and parked until the window expires, and every further trigger in the meantime folds into that one queued refresh, so a burst of retains costs one refresh instead of one per retain. Applies to both refresh_after_consolidation and refresh_cron. Explicit refreshes (API, MCP, control plane) ignore it and run immediately. 0 disables the floor for this model; null falls back to the bank/global mental_model_min_refresh_interval_seconds setting (itself 0 by default, i.e. no floor).",
+          "description": "Minimum seconds between two automatic refreshes of this mental model. A triggered refresh that arrives sooner is not dropped: it is queued and parked until the window expires, and every further trigger in the meantime folds into that one queued refresh, so a burst of retains costs one refresh instead of one per retain. Applies to every automatic trigger: refresh_after_consolidation, refresh_cron and full_refresh_cron. Explicit refreshes (API, MCP, control plane) ignore it and run immediately. 0 disables the floor for this model; null falls back to the bank/global mental_model_min_refresh_interval_seconds setting (itself 0 by default, i.e. no floor).",
           "title": "Min Refresh Interval Seconds"
         },
         "fact_types": {
@@ -1019,7 +1268,7 @@
             }
           ],
           "default": null,
-          "description": "Override how the model's tags filter memories during refresh. If not set, defaults to 'all_strict' when the model has tags (security isolation) or 'any' when the model has no tags. Under 'all_strict' a memory must carry EVERY one of the model's tags and untagged memories are excluded, which is why a model tagged with labels its memories do not carry refreshes to empty content. Set to 'all' to keep requiring the tags while including untagged memories, or to 'any' to include untagged memories alongside any single tag match.",
+          "description": "Override how the model's tags filter memories during refresh. If not set, defaults to 'all_strict' when the model has tags (security isolation) or 'any' when the model has no tags. Under 'all_strict' a memory must carry EVERY one of the model's tags and untagged memories are excluded, which is why a model tagged with labels its memories do not carry refreshes to empty content. Set to 'all' to keep requiring the tags while including untagged memories, or to 'any' to include untagged memories alongside any single tag match. Staleness ignores that widening: an untagged write never marks a tagged model stale, in any mode \u2014 only a write that matches the model's tags does.",
           "title": "Tags Match"
         },
         "tag_groups": {
@@ -1089,6 +1338,33 @@
           "default": null,
           "description": "Override the token budget for raw chunks returned by the internal recall during refresh. None means use the bank/global config default (recall_chunks_max_tokens).",
           "title": "Recall Chunks Max Tokens"
+        },
+        "reflect_search_observations_max_tokens": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Override the token budget for the refresh's search_observations calls. Observation evidence is often the largest contributor to the reflect context; lowering it trades the lowest-ranked observations for a smaller LLM context. null means the shipped 5000.",
+          "title": "Reflect Search Observations Max Tokens"
+        },
+        "reflect_search_observations_include_entities": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Override whether search_observations attaches resolved entity names to each observation. Entities can be more than half the serialized tool payload; turning them off keeps the same observations and ranking with a much smaller context. null means enabled.",
+          "title": "Reflect Search Observations Include Entities"
         },
         "response_schema": {
           "anyOf": [

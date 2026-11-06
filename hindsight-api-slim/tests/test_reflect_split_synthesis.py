@@ -15,6 +15,7 @@ flow with a mock LLM.
 
 from __future__ import annotations
 
+import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -91,17 +92,38 @@ class TestSplitContextHistory:
             assert all(e["output"]["query"] == "q" for e in chunk)
         assert _ids_in(chunks) == [f"mem-{i}" for i in range(40)]
 
-    def test_indivisible_oversized_entry_is_token_cut(self):
+    @pytest.mark.parametrize("text", ["y", '"quoted"\\path\n'])
+    def test_indivisible_oversized_entry_is_token_cut(self, text: str) -> None:
         """A single entry (or list-less output) bigger than the budget is the one
         case that cannot be split; it gets token-cut instead of dropped."""
-        giant = {"tool": "expand", "output": {"full_text": "y" * 40_000}}
+        giant = {"tool": "expand", "output": {"full_text": text * 40_000}}
         chunks = split_context_history([giant], _MAX_CONTEXT)
 
         assert len(chunks) == 1 and len(chunks[0]) == 1
         cut = chunks[0][0]
         assert cut["output"]["truncated"] is True
         assert cut["output"]["content"]
-        assert count_prompt_tokens(_render_history_block(cut)) <= _BUDGET_TOKENS + 32
+        assert json.dumps(giant["output"], indent=2, ensure_ascii=False).startswith(cut["output"]["content"])
+        assert count_prompt_tokens(_render_history_block(cut)) <= _BUDGET_TOKENS
+
+    def test_oversized_memory_cut_fits_with_escaped_content(self) -> None:
+        """A cut memory's JSON wrapper must fit without dropping its neighbours."""
+        small = [{"id": name, "text": "a short fact"} for name in ("before", "after")]
+        oversized = {"id": "large", "text": '"quoted"\\path\n' * 2_000}
+        memories = [small[0], oversized, small[1]]
+        history = [{"tool": "recall", "output": {"query": "q", "memories": memories}}]
+        original = json.dumps(history)
+
+        chunks = split_context_history(history, _MAX_CONTEXT)
+
+        assert _ids_in(chunks) == ["before", "after"]
+        cuts = [entry for chunk in chunks for entry in chunk if entry["output"].get("truncated")]
+        assert len(cuts) == 1
+        assert '"id": "large"' in cuts[0]["output"]["content"]
+        assert json.dumps(history) == original
+        for chunk in chunks:
+            rendered = "".join(_render_history_block(entry) for entry in chunk)
+            assert count_prompt_tokens(rendered) <= _BUDGET_TOKENS
 
     def test_budget_floor_prevents_per_entry_fanout(self):
         """A tiny configured budget must not shred the history into one chunk
@@ -112,6 +134,47 @@ class TestSplitContextHistory:
         assert len(chunks) <= 4
         assert _ids_in(chunks) == [f"mem-{i}" for i in range(30)]
         assert total_entries < 30, "history was shredded into per-entry chunks"
+
+    def test_big_sibling_is_packed_once_not_copied_into_every_piece(self):
+        """#4495: recall's raw ``chunks`` rides beside ``memories``. Copied into
+        every piece, it left no piece room for a second memory, so 30 memories
+        became 30 cut blocks, each re-carrying the chunks. It must instead be
+        packed on its own, every source chunk exactly once, with the memories
+        packing as if it were not there."""
+        entry = _entry("recall", "memories", 30, 300)
+        entry["output"]["chunks"] = {
+            f"c{i}": {"chunk_text": " ".join(f"source {i} word {j}" for j in range(250)), "chunk_index": i}
+            for i in range(10)
+        }
+        without_sibling = split_context_history([_entry("recall", "memories", 30, 300)], _MAX_CONTEXT)
+
+        chunks = split_context_history([entry], _MAX_CONTEXT)
+
+        blocks = [e["output"] for c in chunks for e in c]
+        assert _ids_in(chunks) == [f"mem-{i}" for i in range(30)]
+        source_ids = [cid for b in blocks for cid in b.get("chunks", {})]
+        assert source_ids == [f"c{i}" for i in range(10)], "each source chunk exactly once, in order"
+        assert not any("memories" in b and "chunks" in b for b in blocks)
+        assert all(b["query"] == "q" for b in blocks), "small siblings still ride along"
+        assert not any(b.get("truncated") for b in blocks)
+        memory_blocks = [b for b in blocks if "memories" in b]
+        assert len(memory_blocks) == sum(len(c) for c in without_sibling)
+        for chunk in chunks:
+            rendered = "".join(_render_history_block(e) for e in chunk)
+            assert count_prompt_tokens(rendered) <= _BUDGET_TOKENS
+
+    def test_big_indivisible_sibling_is_cut_once(self):
+        """A big sibling with no entries to split on (plain text) is token-cut
+        into one block of its own, not copied into every piece of the list."""
+        entry = _entry("recall", "memories", 30, 300)
+        entry["output"]["summary"] = " ".join(f"summary word {j}" for j in range(3000))
+
+        chunks = split_context_history([entry], _MAX_CONTEXT)
+
+        blocks = [e["output"] for c in chunks for e in c]
+        assert _ids_in(chunks) == [f"mem-{i}" for i in range(30)]
+        assert not any("summary" in b for b in blocks if "memories" in b)
+        assert sum(1 for b in blocks if b.get("truncated")) == 1
 
 
 class TestSplitSynthesisPrompts:
@@ -164,6 +227,7 @@ class TestSplitSynthesisAgentFlow:
     def _functions(recall_payload: dict):
         return {
             "search_mental_models_fn": AsyncMock(return_value={"mental_models": []}),
+            "read_mental_models_fn": AsyncMock(return_value={"mental_models": []}),
             "search_observations_fn": AsyncMock(return_value={"observations": []}),
             "recall_fn": AsyncMock(return_value=recall_payload),
             "expand_fn": AsyncMock(return_value={"memories": []}),
@@ -322,6 +386,8 @@ class TestSplitSynthesisAgentFlow:
             bank_id="b",
             query="q?",
             bank_profile={"name": "Test", "mission": "Testing"},
+            # Recall is the only forced step, so the empty second turn is a real stop.
+            include_observations=False,
             **self._functions(small),
         )
 
@@ -355,8 +421,11 @@ class TestSplitSynthesisAgentFlow:
             for c in llm.call.await_args_list
             if "extract evidence" in c.kwargs["messages"][0]["content"]
         ]
+        # The prompt carries per-reflect aliases (presentation.py) — mem-i is the
+        # (i+1)th fact shown — and a later search lists a memory it already showed
+        # by alias only, so "reaches a map prompt" means written out as an item.
         for i in range(n):
-            holders = [p for p in map_prompts if f'"mem-{i}"' in p]
+            holders = [p for p in map_prompts if f'"id":"f{i + 1}"' in p.replace(" ", "")]
             assert len(holders) == 1, f"mem-{i} appears in {len(holders)} map prompts"
 
 
@@ -396,6 +465,7 @@ class TestSplitSynthesisRealLLM:
 
         functions = {
             "search_mental_models_fn": AsyncMock(return_value={"mental_models": []}),
+            "read_mental_models_fn": AsyncMock(return_value={"mental_models": []}),
             "search_observations_fn": AsyncMock(return_value={"observations": []}),
             "recall_fn": AsyncMock(return_value={"memories": memories}),
             "expand_fn": AsyncMock(return_value={"memories": []}),

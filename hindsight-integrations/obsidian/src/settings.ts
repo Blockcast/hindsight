@@ -1,6 +1,6 @@
 import { type App, Notice, PluginSettingTab, Setting } from "obsidian";
 import type HindsightPlugin from "./main";
-import type { Budget } from "./types";
+import type { Budget, ObservationScopes, TimestampSource } from "./types";
 
 export interface HindsightSettings {
   apiUrl: string;
@@ -14,6 +14,10 @@ export interface HindsightSettings {
   /** DESIGN.md §0.5: OFF by default — keeps Hindsight from becoming a 2nd source of truth. */
   rememberConversations: boolean;
   prefixDocId: boolean;
+  /** Omitted to preserve the Hindsight server's default observation scope. */
+  observationScopes?: ObservationScopes;
+  /** Which time a note's facts are dated with (`created` keeps the old behaviour). */
+  timestampFrom: TimestampSource;
   /** Log reflect requests/responses to the console (open devtools to view). */
   debugLogging: boolean;
   /** Chat disclosure open/closed state — remembered across sessions (last value wins). */
@@ -33,6 +37,7 @@ export const DEFAULT_SETTINGS: HindsightSettings = {
   // On by default: all vaults share one bank, so document ids must be vault-prefixed
   // to avoid cross-vault collisions (e.g. two vaults both having Notes/todo.md).
   prefixDocId: true,
+  timestampFrom: "created",
   debugLogging: false,
   // Notes default to collapsed (the panel was previously always-open and noisy);
   // thereafter both disclosures remember the user's last open/closed choice.
@@ -126,6 +131,42 @@ export class HindsightSettingTab extends PluginSettingTab {
           this.plugin.settings.syncOnEdit = v;
           await this.plugin.saveSettings();
         })
+      );
+
+    new Setting(containerEl)
+      .setName("Observation consolidation")
+      .setDesc(
+        "How observations are grouped for newly ingested content. Source tags remain available for filtering and provenance. Changing this does not rescope existing memories."
+      )
+      .addDropdown((d) =>
+        d
+          .addOptions({
+            "": "Server default",
+            combined: "Combined tags",
+            shared: "Shared",
+            per_tag: "Per tag",
+            all_combinations: "All tag combinations",
+          })
+          .setValue(this.plugin.settings.observationScopes ?? "")
+          .onChange(async (v) => {
+            this.plugin.settings.observationScopes = v ? (v as ObservationScopes) : undefined;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Date facts by")
+      .setDesc(
+        "Creation time suits journals. Last-edit time suits notes you keep editing, so new text isn't dated to the day the note was created. Applies to notes synced from now on."
+      )
+      .addDropdown((d) =>
+        d
+          .addOptions({ created: "Creation time", updated: "Last-edit time" })
+          .setValue(this.plugin.settings.timestampFrom)
+          .onChange(async (v) => {
+            this.plugin.settings.timestampFrom = v as TimestampSource;
+            await this.plugin.saveSettings();
+          })
       );
 
     new Setting(containerEl)

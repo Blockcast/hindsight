@@ -32,6 +32,9 @@ import type {
   CloneBankData,
   CloneBankErrors,
   CloneBankResponses,
+  CreateBankAliasData,
+  CreateBankAliasErrors,
+  CreateBankAliasResponses,
   CreateDirectiveData,
   CreateDirectiveErrors,
   CreateDirectiveResponses,
@@ -50,6 +53,9 @@ import type {
   CreateWebhookData,
   CreateWebhookErrors,
   CreateWebhookResponses,
+  DeleteBankAliasData,
+  DeleteBankAliasErrors,
+  DeleteBankAliasResponses,
   DeleteBankData,
   DeleteBankErrors,
   DeleteBankResponses,
@@ -101,6 +107,9 @@ import type {
   GetAgentStatsData,
   GetAgentStatsErrors,
   GetAgentStatsResponses,
+  GetAuditLogData,
+  GetAuditLogErrors,
+  GetAuditLogResponses,
   GetBankAttachmentData,
   GetBankAttachmentErrors,
   GetBankAttachmentResponses,
@@ -120,6 +129,9 @@ import type {
   GetDirectiveResponses,
   GetDocumentData,
   GetDocumentErrors,
+  GetDocumentHistoryData,
+  GetDocumentHistoryErrors,
+  GetDocumentHistoryResponses,
   GetDocumentResponses,
   GetEntityData,
   GetEntityErrors,
@@ -174,6 +186,9 @@ import type {
   ListAuditLogsData,
   ListAuditLogsErrors,
   ListAuditLogsResponses,
+  ListBankAliasesData,
+  ListBankAliasesErrors,
+  ListBankAliasesResponses,
   ListBanksData,
   ListBanksErrors,
   ListBanksResponses,
@@ -218,6 +233,9 @@ import type {
   LlmRequestStatsResponses,
   MetricsEndpointMetricsGetData,
   MetricsEndpointMetricsGetResponses,
+  PreviewConsolidationStrategiesData,
+  PreviewConsolidationStrategiesErrors,
+  PreviewConsolidationStrategiesResponses,
   PreviewPromptData,
   PreviewPromptErrors,
   PreviewPromptResponses,
@@ -251,6 +269,9 @@ import type {
   SearchKnowledgeBaseData,
   SearchKnowledgeBaseErrors,
   SearchKnowledgeBaseResponses,
+  SetBankAliasPrimaryData,
+  SetBankAliasPrimaryErrors,
+  SetBankAliasPrimaryResponses,
   TestBankLlmData,
   TestBankLlmErrors,
   TestBankLlmResponses,
@@ -385,7 +406,7 @@ export const getGraph = <ThrowOnError extends boolean = false>(
 /**
  * List memory units
  *
- * List memory units with pagination and optional full-text search. Supports filtering by type, source document, linked entity ID, and a time window. Results are sorted by most recent first (mentioned_at DESC, then created_at DESC) unless a time window selects another axis.
+ * List memory units with pagination and an optional substring filter (`q`). Supports filtering by type, source document, linked entity ID, and a time window. Results are sorted by most recent first (mentioned_at DESC, then created_at DESC) unless a time window selects another axis.
  */
 export const listMemories = <ThrowOnError extends boolean = false>(
   options: Options<ListMemoriesData, ThrowOnError>
@@ -732,7 +753,7 @@ export const getMentalModelHistory = <ThrowOnError extends boolean = false>(
 /**
  * Refresh mental model
  *
- * Submit an async task to re-run the source query through reflect and update the content.
+ * Submit an async task to re-run the source query through reflect and update the content. With no body the refresh runs in the model's own `trigger.mode`. Send `{"mode": "full"}` for a full refresh: the content is regenerated from scratch this once (to clear the drift delta edits accumulate) while the stored trigger keeps its mode. Unlike clearing the model first, a full refresh that fails leaves the previous content in place.
  */
 export const refreshMentalModel = <ThrowOnError extends boolean = false>(
   options: Options<RefreshMentalModelData, ThrowOnError>
@@ -741,7 +762,14 @@ export const refreshMentalModel = <ThrowOnError extends boolean = false>(
     RefreshMentalModelResponses,
     RefreshMentalModelErrors,
     ThrowOnError
-  >({ url: "/v1/default/banks/{bank_id}/mental-models/{mental_model_id}/refresh", ...options });
+  >({
+    url: "/v1/default/banks/{bank_id}/mental-models/{mental_model_id}/refresh",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
 
 /**
  * Dry-run mental model refresh (preview, no persistence)
@@ -1010,6 +1038,22 @@ export const listDocumentChunks = <ThrowOnError extends boolean = false>(
   >({ url: "/v1/default/banks/{bank_id}/documents/{document_id}/chunks", ...options });
 
 /**
+ * Get document change history
+ *
+ * What each change to a document did, newest first: every retain, append and reprocess (facts added and removed), every fact edit, invalidation, restore, delete, retag and per-fact observation clear (observations removed), and every consolidation run (observations created, updated and removed). Observations are rebuilt, not versioned, so this is the only record of the ones a change removed. Ids and counts only, with each id list capped at 100.
+ *
+ * Rebuilt from the bank's async operations, which carry these events: it reaches back only as far as operations are kept (HINDSIGHT_API_OPERATION_RETENTION_DAYS, unlimited by default), and a change that ran without an operation is not in it — a synchronous retain (async=false), or a fact edit, delete or retag while auto-consolidation is off. A fact edit, delete or retag is recorded on the consolidation operation it queues. Clearing every observation in the bank is not listed. total, limit and offset count operations, not events.
+ */
+export const getDocumentHistory = <ThrowOnError extends boolean = false>(
+  options: Options<GetDocumentHistoryData, ThrowOnError>
+) =>
+  (options.client ?? client).get<
+    GetDocumentHistoryResponses,
+    GetDocumentHistoryErrors,
+    ThrowOnError
+  >({ url: "/v1/default/banks/{bank_id}/documents/{document_id}/history", ...options });
+
+/**
  * Reprocess document
  *
  * Re-run the retain pipeline on an existing document without changing its content. This deletes the existing memory units and re-extracts facts using the current engine configuration. Useful when the LLM model, chunking strategy, or extraction settings have changed.
@@ -1063,7 +1107,11 @@ export const getDocument = <ThrowOnError extends boolean = false>(
  *
  * **Tags** (`tags`): The array REPLACES the document's tags, it is not merged into them — send the complete set you want the document to end up with, and any tag you leave out is dropped. An empty array (`[]`) therefore clears every tag; only omitting the field entirely is rejected (422).
  *
- * The new tags are propagated to all associated memory units. Observations derived from those units are invalidated and queued for re-consolidation under the new tags. Co-source memories from other documents that shared those observations are also reset. Tags are compared as a set, so re-sending the tags a document already has (in any order) changes nothing and queues no re-consolidation.
+ * The new tags are propagated to all associated memory units.
+ *
+ * **Observation scopes** (`observation_scopes`): Replaces how the document's memories are scoped during consolidation, with the same values retain accepts. Use it to move a bank whose documents were retained under per-session tags to `shared` without re-extracting anything. It is also what a later reprocess of the document retains with.
+ *
+ * A memory is re-consolidated only when the change moves the observation scopes it resolves to: its observations are deleted and it is queued again, along with co-source memories from other documents that shared those observations. A change that resolves to the same scopes (a tag change under `shared`, `combined` over one tag vs `[[that tag]]`, re-sending the current values) keeps every observation and queues nothing.
  *
  * At least one field must be provided.
  */
@@ -1148,7 +1196,7 @@ export const getOperationStatus = <ThrowOnError extends boolean = false>(
 /**
  * Retry a failed async operation
  *
- * Re-queue a failed async operation so the worker picks it up again
+ * Re-queue a failed or cancelled async operation so the worker picks it up again. On a deferred operation (pending with a future next_retry_at), runs it now.
  */
 export const retryOperation = <ThrowOnError extends boolean = false>(
   options: Options<RetryOperationData, ThrowOnError>
@@ -1225,6 +1273,74 @@ export const addBankBackground = <ThrowOnError extends boolean = false>(
     ThrowOnError
   >({
     url: "/v1/default/banks/{bank_id}/background",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * List the bank's aliases
+ *
+ * Extra bank ids that reach this bank. Every endpoint accepts an alias wherever it accepts a bank id, so callers can be moved onto a new id in phases while the old one keeps working.
+ */
+export const listBankAliases = <ThrowOnError extends boolean = false>(
+  options: Options<ListBankAliasesData, ThrowOnError>
+) =>
+  (options.client ?? client).get<ListBankAliasesResponses, ListBankAliasesErrors, ThrowOnError>({
+    url: "/v1/default/banks/{bank_id}/aliases",
+    ...options,
+  });
+
+/**
+ * Add an alias to the bank
+ *
+ * Give the bank another id to answer to. Nothing is copied or moved: the bank keeps its own id and all of its data, and the alias is only a second way to reach it — which is what makes it a zero-downtime alternative to renaming.
+ *
+ * Returns 409 if the name is already a bank or another alias.
+ */
+export const createBankAlias = <ThrowOnError extends boolean = false>(
+  options: Options<CreateBankAliasData, ThrowOnError>
+) =>
+  (options.client ?? client).post<CreateBankAliasResponses, CreateBankAliasErrors, ThrowOnError>({
+    url: "/v1/default/banks/{bank_id}/aliases",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Remove an alias from the bank
+ *
+ * Stop an id reaching this bank. The bank and its memories are untouched; only the extra name goes away, and callers still using it get the same 404 (or new empty bank) they would have got before it existed.
+ */
+export const deleteBankAlias = <ThrowOnError extends boolean = false>(
+  options: Options<DeleteBankAliasData, ThrowOnError>
+) =>
+  (options.client ?? client).delete<DeleteBankAliasResponses, DeleteBankAliasErrors, ThrowOnError>({
+    url: "/v1/default/banks/{bank_id}/aliases/{alias}",
+    ...options,
+  });
+
+/**
+ * Show this alias in place of the bank id
+ *
+ * Present the bank under one of its aliases. Purely cosmetic: the bank keeps its own `bank_id`, which every other part of the system — authorisation, metering, exports, audit logs — continues to use.
+ *
+ * Promoting an alias demotes whichever one was shown before, so a bank is presented under at most one alias. Send `primary: false` to go back to showing its own id.
+ */
+export const setBankAliasPrimary = <ThrowOnError extends boolean = false>(
+  options: Options<SetBankAliasPrimaryData, ThrowOnError>
+) =>
+  (options.client ?? client).patch<
+    SetBankAliasPrimaryResponses,
+    SetBankAliasPrimaryErrors,
+    ThrowOnError
+  >({
+    url: "/v1/default/banks/{bank_id}/aliases/{alias}",
     ...options,
     headers: {
       "Content-Type": "application/json",
@@ -1495,6 +1611,27 @@ export const listObservationScopes = <ThrowOnError extends boolean = false>(
     ListObservationScopesErrors,
     ThrowOnError
   >({ url: "/v1/default/banks/{bank_id}/observations/scopes", ...options });
+
+/**
+ * Preview consolidation strategies
+ *
+ * Report which of the bank's existing observation scopes each consolidation strategy would apply to, for a draft `consolidation_strategies` value (nothing is saved). Uses the same matching and first-strategy-wins rule as consolidation. Scans up to 10,000 distinct scopes; `complete` is false beyond that and the counts are lower bounds. Scopes with no observations yet do not exist and are not counted.
+ */
+export const previewConsolidationStrategies = <ThrowOnError extends boolean = false>(
+  options: Options<PreviewConsolidationStrategiesData, ThrowOnError>
+) =>
+  (options.client ?? client).post<
+    PreviewConsolidationStrategiesResponses,
+    PreviewConsolidationStrategiesErrors,
+    ThrowOnError
+  >({
+    url: "/v1/default/banks/{bank_id}/consolidation-strategies/preview",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
 
 /**
  * Recover failed consolidation
@@ -1791,9 +1928,22 @@ export const auditLogStats = <ThrowOnError extends boolean = false>(
   });
 
 /**
+ * Get audit log entry
+ *
+ * Get one audit log entry with its full request and response bodies.
+ */
+export const getAuditLog = <ThrowOnError extends boolean = false>(
+  options: Options<GetAuditLogData, ThrowOnError>
+) =>
+  (options.client ?? client).get<GetAuditLogResponses, GetAuditLogErrors, ThrowOnError>({
+    url: "/v1/default/banks/{bank_id}/audit-logs/{log_id}",
+    ...options,
+  });
+
+/**
  * List LLM request traces
  *
- * List traced LLM requests for a bank, ordered by most recent first. Requires LLM request tracing to be enabled (HINDSIGHT_API_LLM_TRACE_ENABLED).
+ * List traced LLM requests for a bank, ordered by most recent first. Requires LLM request tracing to be enabled (HINDSIGHT_API_LLM_TRACE_ENABLED). Requests older than HINDSIGHT_API_LLM_TRACE_RETENTION_DAYS are deleted; `retention_days` in the response says how many days are kept (null = forever).
  */
 export const listLlmRequests = <ThrowOnError extends boolean = false>(
   options: Options<ListLlmRequestsData, ThrowOnError>
@@ -1806,7 +1956,7 @@ export const listLlmRequests = <ThrowOnError extends boolean = false>(
 /**
  * LLM request statistics
  *
- * Get LLM request counts grouped by time bucket and status for charting.
+ * Get LLM request counts grouped by time bucket and status for charting. Only requests within HINDSIGHT_API_LLM_TRACE_RETENTION_DAYS are kept, so a period longer than `retention_days` (in the response; null = kept forever) only covers the last `retention_days`.
  */
 export const llmRequestStats = <ThrowOnError extends boolean = false>(
   options: Options<LlmRequestStatsData, ThrowOnError>

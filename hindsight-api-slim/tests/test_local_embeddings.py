@@ -1,3 +1,7 @@
+import asyncio
+import contextvars
+import threading
+import time
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -39,3 +43,68 @@ def test_sentence_transformer_exposes_input_type_entry_points():
 
     assert hasattr(sentence_transformers.SentenceTransformer, "encode_query")
     assert hasattr(sentence_transformers.SentenceTransformer, "encode_document")
+
+
+@pytest.mark.parametrize(
+    "methods",
+    [
+        # 5.4+: both exist, the old one emits a FutureWarning, so it must not be called.
+        ["get_embedding_dimension", "get_sentence_embedding_dimension"],
+        # 5.0-5.3 (still allowed by local-ml): only the old name exists.
+        ["get_sentence_embedding_dimension"],
+    ],
+)
+async def test_local_embeddings_read_the_dimension_on_every_supported_version(methods: list[str]):
+    model = MagicMock(spec=[*methods, "encode"])
+    if "get_embedding_dimension" in methods:
+        model.get_embedding_dimension.return_value = 8
+        model.get_sentence_embedding_dimension.side_effect = AssertionError("deprecated method called")
+    else:
+        model.get_sentence_embedding_dimension.return_value = 8
+    model.encode.side_effect = lambda texts, **_: np.zeros((len(texts), 8), dtype=np.float32)
+    embeddings = LocalSTEmbeddings(model_name="test-model", force_cpu=True)
+
+    with (
+        patch("sentence_transformers.SentenceTransformer", return_value=model),
+        patch("hindsight_api.engine.embeddings.align_local_model_weights"),
+        patch("hindsight_api.engine.embeddings.resolve_model_device_type", return_value="cpu"),
+    ):
+        await embeddings.initialize()
+
+    assert embeddings.dimension == 8
+
+
+async def test_local_embeddings_run_on_a_fixed_pool_and_keep_the_callers_context(monkeypatch):
+    """#6110: every thread that runs torch keeps its own native pools for life, so
+    forward passes must stay on the model's own fixed pool, however many callers come
+    in at once — not spread over the default executor's threads."""
+    monkeypatch.setattr(LocalSTEmbeddings, "_executor", None)
+    bank: contextvars.ContextVar[str] = contextvars.ContextVar("bank")
+    threads: set[str] = set()
+    seen_banks: set[str] = set()
+
+    def encode_query(texts, **_):
+        threads.add(threading.current_thread().name)
+        seen_banks.add(bank.get())
+        time.sleep(0.01)  # hold the thread so callers pile up
+        return np.zeros((len(texts), 1), dtype=np.float32)
+
+    model = MagicMock()
+    model.encode_query.side_effect = encode_query
+    embeddings = LocalSTEmbeddings(max_concurrent=2)
+    embeddings._model = model
+
+    async def caller(i: int) -> None:
+        bank.set(f"bank-{i}")
+        await embeddings.encode_query([f"q{i}"])
+
+    try:
+        with patch("hindsight_api.engine.embeddings.release_local_inference_memory"):
+            await asyncio.gather(*(caller(i) for i in range(20)))
+    finally:
+        if LocalSTEmbeddings._executor is not None:
+            LocalSTEmbeddings._executor.shutdown(wait=True)
+
+    assert len(threads) <= 2
+    assert all(name.startswith("local-embeddings") for name in threads)
+    assert seen_banks == {f"bank-{i}" for i in range(20)}

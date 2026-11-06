@@ -47,17 +47,22 @@ async def _insert_unit(
     return unit_id
 
 
+@pytest.mark.memory_backend_incompatible
 @pytest.mark.asyncio
 async def test_score_counts_distinct_shared_sources(memory, request_context):
     """Score == number of distinct source facts shared with the seed neighbourhood."""
     from hindsight_api.engine.db.ops import UpdatedWindow
-    from hindsight_api.engine.task_backend import fq_table
+    from hindsight_api.engine.schema import fq_store_table_explicit
 
     bank_id = f"test_obs_score_{uuid.uuid4().hex[:8]}"
     try:
         pool = await memory._get_pool()
         backend = await memory._get_backend()
-        mu, ue, ml = fq_table("memory_units"), fq_table("unit_entities"), fq_table("memory_links")
+        mu, ue, ml = (
+            fq_store_table_explicit("memory_units"),
+            fq_store_table_explicit("unit_entities"),
+            fq_store_table_explicit("memory_links"),
+        )
 
         async with pool.acquire() as conn:
             await _ensure_bank(conn, bank_id)
@@ -66,7 +71,7 @@ async def test_score_counts_distinct_shared_sources(memory, request_context):
             facts = [await _insert_unit(conn, mu, bank_id, f"fact {i}", "world") for i in range(4)]
             entity_id = uuid.uuid4()
             await conn.execute(
-                f"INSERT INTO {fq_table('entities')} (id, bank_id, canonical_name) VALUES ($1, $2, $3)",
+                f"INSERT INTO {fq_store_table_explicit('entities')} (id, bank_id, canonical_name) VALUES ($1, $2, $3)",
                 entity_id,
                 bank_id,
                 "Acme",
@@ -112,6 +117,7 @@ async def test_score_counts_distinct_shared_sources(memory, request_context):
         await memory.delete_bank(bank_id=bank_id, request_context=request_context)
 
 
+@pytest.mark.memory_backend_incompatible
 @pytest.mark.asyncio
 async def test_wide_source_arrays_do_not_change_results(memory, request_context):
     """A long source array is a cost problem, not a correctness one (#3085).
@@ -120,20 +126,24 @@ async def test_wide_source_arrays_do_not_change_results(memory, request_context)
     whether their arrays hold 1 id or 200 — the extra ids are simply unrelated.
     """
     from hindsight_api.engine.db.ops import UpdatedWindow
-    from hindsight_api.engine.task_backend import fq_table
+    from hindsight_api.engine.schema import fq_store_table_explicit
 
     bank_id = f"test_obs_wide_{uuid.uuid4().hex[:8]}"
     try:
         pool = await memory._get_pool()
         backend = await memory._get_backend()
-        mu, ue, ml = fq_table("memory_units"), fq_table("unit_entities"), fq_table("memory_links")
+        mu, ue, ml = (
+            fq_store_table_explicit("memory_units"),
+            fq_store_table_explicit("unit_entities"),
+            fq_store_table_explicit("memory_links"),
+        )
 
         async with pool.acquire() as conn:
             await _ensure_bank(conn, bank_id)
             shared = [await _insert_unit(conn, mu, bank_id, f"shared fact {i}", "world") for i in range(2)]
             entity_id = uuid.uuid4()
             await conn.execute(
-                f"INSERT INTO {fq_table('entities')} (id, bank_id, canonical_name) VALUES ($1, $2, $3)",
+                f"INSERT INTO {fq_store_table_explicit('entities')} (id, bank_id, canonical_name) VALUES ($1, $2, $3)",
                 entity_id,
                 bank_id,
                 "Acme",
@@ -165,6 +175,7 @@ async def test_wide_source_arrays_do_not_change_results(memory, request_context)
         await memory.delete_bank(bank_id=bank_id, request_context=request_context)
 
 
+@pytest.mark.memory_backend_incompatible
 @pytest.mark.asyncio
 async def test_per_entity_cap_bounds_hub_traversal(memory, request_context):
     """A hub entity contributes at most ``per_entity_limit`` source facts (#3510).
@@ -177,20 +188,24 @@ async def test_per_entity_cap_bounds_hub_traversal(memory, request_context):
     lowest ids of an over-cap entity must fall outside the cap and score nothing.
     """
     from hindsight_api.engine.db.ops import UpdatedWindow
-    from hindsight_api.engine.task_backend import fq_table
+    from hindsight_api.engine.schema import fq_store_table_explicit
 
     bank_id = f"test_obs_cap_{uuid.uuid4().hex[:8]}"
     per_entity_limit = 3
     try:
         pool = await memory._get_pool()
         backend = await memory._get_backend()
-        mu, ue, ml = fq_table("memory_units"), fq_table("unit_entities"), fq_table("memory_links")
+        mu, ue, ml = (
+            fq_store_table_explicit("memory_units"),
+            fq_store_table_explicit("unit_entities"),
+            fq_store_table_explicit("memory_links"),
+        )
 
         async with pool.acquire() as conn:
             await _ensure_bank(conn, bank_id)
             entity_id = uuid.uuid4()
             await conn.execute(
-                f"INSERT INTO {fq_table('entities')} (id, bank_id, canonical_name) VALUES ($1, $2, $3)",
+                f"INSERT INTO {fq_store_table_explicit('entities')} (id, bank_id, canonical_name) VALUES ($1, $2, $3)",
                 entity_id,
                 bank_id,
                 "Hub",

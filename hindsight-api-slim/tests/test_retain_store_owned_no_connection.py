@@ -17,7 +17,10 @@ store — a double that is easier to satisfy than the contract tests the double,
 
 from types import SimpleNamespace
 
+import pytest
+
 import hindsight_api.engine.retain.orchestrator as orch
+from hindsight_api.engine.memories.base import MemoriesExtension
 from hindsight_api.engine.retain.types import ConcurrentAppendConflict
 
 
@@ -134,6 +137,94 @@ async def test_a_store_owned_batch_write_holds_no_connection(monkeypatch):
     assert doc_tracking_done == [True]
 
 
+async def test_a_store_owned_retain_tells_the_store_which_names_to_take_literally(monkeypatch):
+    """`resolve_entities=False` reaches a store that resolves names itself (#5050).
+
+    The store got only plain names, so it fuzzy-resolved the caller's "Alice Smyth" onto an
+    existing "Alice Smith". The opted-out names now travel as their own list; the extractor's
+    names stay resolvable, and a retain that opts nothing out sends no extra argument at all.
+    """
+    monkeypatch.setattr(orch.fact_storage, "insert_facts_batch", lambda *a, **k: _async(["u1"]))
+
+    async def run(resolve):
+        retained = {}
+
+        class _StoreOwned:
+            async def retain(self, bank_id, unit_ids, facts, **kw):
+                retained.update(kw)
+                return {"seq": 1, "unit_ids": list(unit_ids), "new_entities": 0}
+
+        fact = _fact()
+        fact.entities = [SimpleNamespace(name="Paris")]
+        await orch._streaming_store_owned_retain(
+            provider=_StoreOwned(),
+            pool=SimpleNamespace(ops=None),
+            bank_id="b",
+            batch_contents=[SimpleNamespace(entities=[{"text": "Alice Smyth"}], resolve_entities=resolve)],
+            batch_extracted=[SimpleNamespace(chunk_index=None)],
+            batch_processed=[fact],
+            batch_chunk_meta=[],
+            effective_doc_id="d1",
+            config=SimpleNamespace(entity_similarity_threshold=0.0),
+            log_buffer=[],
+            is_first_batch=True,
+            append_base_hash=None,
+            doc_tracking_done=[False],
+            doc_replace_done=[False],
+            p2_start=0.0,
+        )
+        return retained
+
+    opted_out = await run(resolve=False)
+    assert opted_out["unit_entity_names"] == {"u1": ["Paris", "Alice Smyth"]}
+    assert opted_out["unit_exact_entity_names"] == {"u1": ["Alice Smyth"]}
+
+    assert "unit_exact_entity_names" not in await run(resolve=True)
+
+
+async def test_a_retain_session_part_carries_the_names_to_take_literally(monkeypatch):
+    """The session path hands the store the same opted-out names, on the part (#5050)."""
+    import hindsight_api.engine.memories.base as base
+
+    monkeypatch.setattr(orch.fact_storage, "insert_facts_batch", lambda *a, **k: _async(["u1"]))
+    monkeypatch.setattr(base, "build_fact_records", lambda *a, **k: [])
+    parts = []
+
+    class _Session:
+        async def add(self, part):
+            parts.append(part)
+
+    fact = _fact()
+    fact.entities = [SimpleNamespace(name="Paris")]
+    await orch._streaming_session_retain(
+        session=_Session(),
+        bank_id="b",
+        batch_contents=[SimpleNamespace(entities=[{"text": "Alice Smyth"}], resolve_entities=False)],
+        batch_extracted=[SimpleNamespace(chunk_index=None)],
+        batch_processed=[fact],
+        batch_chunk_meta=[],
+        chunk_index_offset=0,
+        effective_doc_id="d1",
+        combined_content="hello",
+        content_hash=None,
+        merged_tags=None,
+        retain_params=None,
+        is_first_batch=True,
+        doc_tracking_done=[False],
+        doc_replace_done=[False],
+        entity_resolver=None,
+        log_buffer=[],
+    )
+
+    (part,) = parts
+    assert part.entity_names == {"u1": ["Paris", "Alice Smyth"]}
+    assert part.exact_entity_names == {"u1": ["Alice Smyth"]}
+
+
+async def _async(value):
+    return value
+
+
 # --------------------------------------------------------------------------------------------
 # Delta re-retain path
 # --------------------------------------------------------------------------------------------
@@ -160,6 +251,9 @@ async def test_a_store_owned_delta_holds_no_connection_and_scopes_its_replace(mo
             saw_open.append(tracker.open)
             return SimpleNamespace(memories=[], next_page_token="")
 
+        # The interface's store-owned answer: the ids come from `scan_memories` above.
+        memory_ids_for_chunks = MemoriesExtension.memory_ids_for_chunks
+
         async def retain(self, bank_id, unit_ids, facts, **kw):
             saw_open.append(tracker.open)
             retained.update(kw)
@@ -183,7 +277,8 @@ async def test_a_store_owned_delta_holds_no_connection_and_scopes_its_replace(mo
         log_buffer=[],
         entity_resolver=SimpleNamespace(flush_pending_stats=_noop_async),
         contents_dicts=[{"content": "hello"}],
-        delta_contents=[SimpleNamespace(entities=None, resolve_entities=True)],
+        # A caller name opted out of resolution, which the delta must pass on as literal (#5050).
+        delta_contents=[SimpleNamespace(entities=[{"text": "Alice Smyth"}], resolve_entities=False)],
         document_tags=[],
         full_document_body=None,
         extracted_facts=[SimpleNamespace(chunk_index=0)],
@@ -194,7 +289,7 @@ async def test_a_store_owned_delta_holds_no_connection_and_scopes_its_replace(mo
         existing_by_index={1: SimpleNamespace(chunk_id="b_d1_1")},
         changed_indices=[1],
         removed_indices=[],
-        doc_watermark_at_load=5,
+        doc_hash_at_load="planned-hash",
     )
 
     assert ok is True
@@ -204,19 +299,23 @@ async def test_a_store_owned_delta_holds_no_connection_and_scopes_its_replace(mo
     # And the replace was SCOPED — the changed chunk named, not the whole document blown away.
     assert retained["replace_document_id"] == "d1"
     assert retained["replace_chunk_ids"] == ["b_d1_1"]
+    assert retained["unit_exact_entity_names"] == {"u1": ["Alice Smyth"]}
 
 
 async def test_a_store_owned_delta_falls_back_when_the_document_moved(monkeypatch):
-    """The watermark compare-and-set is the fence, and losing it means falling back.
+    """The content-hash compare-and-set is the fence, and losing it means falling back.
 
     `_store_document_bodies` runs FIRST precisely so this is detected before anything is written:
-    it compare-and-sets on the document's watermark, and the fact write would move the WAL head
-    that CAS reads. Fencing after the write would fence the batch against itself.
+    it compare-and-sets on the hash the delta was planned against, so a document that moved is
+    caught before the fact write lands on top of a stale plan.
     """
     calls = []
 
+    fenced_on = []
+
     async def _store_bodies(**kw):
         calls.append("store_bodies")
+        fenced_on.append(kw["expect_content_hash"])
         raise ConcurrentAppendConflict("moved")
 
     async def _insert(*a, **k):
@@ -251,7 +350,7 @@ async def test_a_store_owned_delta_falls_back_when_the_document_moved(monkeypatc
         existing_by_index={1: SimpleNamespace(chunk_id="b_d1_1")},
         changed_indices=[1],
         removed_indices=[],
-        doc_watermark_at_load=5,
+        doc_hash_at_load="planned-hash",
     )
 
     assert ok is False
@@ -259,3 +358,117 @@ async def test_a_store_owned_delta_falls_back_when_the_document_moved(monkeypatc
     # Nothing was written: the fence tripped before the fact write, which is the point of it
     # running first.
     assert calls == ["store_bodies"], calls
+    assert fenced_on == ["planned-hash"], "the fence is conditional on the hash the delta planned against"
+
+
+@pytest.mark.parametrize(
+    ("existing", "changed", "removed", "relabelled"),
+    [
+        # Chunk 0 survived the edit: its facts were not re-written, so they must be relabelled.
+        ({0: "b_d1_0", 1: "b_d1_1"}, [1], [], True),
+        # Every old chunk changed or went: each fact was just written with the current labels.
+        ({0: "b_d1_0", 1: "b_d1_1"}, [0], [1], False),
+    ],
+)
+async def test_a_store_owned_delta_relabels_the_unchanged_chunks(monkeypatch, existing, changed, removed, relabelled):
+    """The facts on UNCHANGED chunks carry the previous retain's tags and metadata until relabelled.
+
+    The SQL delta always relabelled them; the store-owned delta did not, so one document ended a
+    partial re-retain with facts disagreeing on their tags by whether their chunk happened to change.
+    """
+    tracker = _ConnTracker()
+    relabels = []
+
+    class _StoreOwned:
+        async def scan_memories(self, **kw):
+            return SimpleNamespace(memories=[], next_page_token="")
+
+        memory_ids_for_chunks = MemoriesExtension.memory_ids_for_chunks
+
+        async def retain(self, bank_id, unit_ids, facts, **kw):
+            return {"seq": 7, "unit_ids": list(unit_ids), "new_entities": 0}
+
+    async def _relabel(conn, bank_id, document_id, tags, metadata, **kw):
+        relabels.append((document_id, tags, metadata))
+        return 0
+
+    monkeypatch.setattr(orch, "_store_document_bodies", lambda **kw: _async(None))
+    monkeypatch.setattr(orch.fact_storage, "insert_facts_batch", lambda *a, **k: _async(["u1"]))
+    monkeypatch.setattr(orch.fact_storage, "update_memory_units_metadata_and_tags", _relabel)
+    monkeypatch.setattr(orch, "acquire_with_retry", lambda *_a, **_k: tracker.acquire())
+
+    ok, _unit_ids = await orch._delta_store_owned_write(
+        provider=_StoreOwned(),
+        pool=SimpleNamespace(ops=None),
+        bank_id="b",
+        effective_doc_id="d1",
+        config=SimpleNamespace(entity_similarity_threshold=0.0, entity_labels=None),
+        log_buffer=[],
+        entity_resolver=SimpleNamespace(flush_pending_stats=_noop_async),
+        contents_dicts=[{"content": "hello", "metadata": {"source": "crm"}}],
+        delta_contents=[SimpleNamespace(entities=None, resolve_entities=True)],
+        document_tags=["v2"],
+        full_document_body=None,
+        extracted_facts=[SimpleNamespace(chunk_index=changed[0])],
+        processed_facts=[_fact()],
+        new_chunk_metadata=[SimpleNamespace(chunk_index=changed[0])],
+        delta_chunk_map={},
+        new_chunks_with_contents={changed[0]: "hello"},
+        existing_by_index={i: SimpleNamespace(chunk_id=c) for i, c in existing.items()},
+        changed_indices=changed,
+        removed_indices=removed,
+        doc_hash_at_load="planned-hash",
+    )
+
+    assert ok is True
+    assert relabels == ([("d1", ["v2"], {"source": "crm"})] if relabelled else [])
+
+
+async def test_a_store_owned_delta_tags_facts_with_the_document_chunk_id(monkeypatch):
+    """A changed chunk sits at delta position 0 but document position 1; its facts carry chunk 1's id.
+
+    Keyed by the delta position, the lookup missed for any changed chunk but the first and the facts
+    were written with no chunk id, so the next re-send could not replace them and they piled up (#5919).
+    """
+    from hindsight_api.engine.chunk_ids import build_chunk_id
+
+    class _StoreOwned:
+        async def scan_memories(self, **kw):
+            return SimpleNamespace(memories=[], next_page_token="")
+
+        memory_ids_for_chunks = MemoriesExtension.memory_ids_for_chunks
+
+        async def retain(self, bank_id, unit_ids, facts, **kw):
+            return {"seq": 7, "unit_ids": list(unit_ids), "new_entities": 0}
+
+    monkeypatch.setattr(orch, "_store_document_bodies", lambda **kw: _async(None))
+    monkeypatch.setattr(orch.fact_storage, "insert_facts_batch", lambda *a, **k: _async(["u1"]))
+    monkeypatch.setattr(orch.fact_storage, "update_memory_units_metadata_and_tags", lambda *a, **k: _async(0))
+    monkeypatch.setattr(orch, "acquire_with_retry", lambda *_a, **_k: _ConnTracker().acquire())
+
+    fact = _fact()
+    ok, _unit_ids = await orch._delta_store_owned_write(
+        provider=_StoreOwned(),
+        pool=SimpleNamespace(ops=None),
+        bank_id="b",
+        effective_doc_id="d1",
+        config=SimpleNamespace(entity_similarity_threshold=0.0, entity_labels=None),
+        log_buffer=[],
+        entity_resolver=SimpleNamespace(flush_pending_stats=_noop_async),
+        contents_dicts=[{"content": "kept\nchanged"}],
+        delta_contents=[SimpleNamespace(entities=None, resolve_entities=True)],
+        document_tags=[],
+        full_document_body=None,
+        extracted_facts=[SimpleNamespace(chunk_index=0)],
+        processed_facts=[fact],
+        new_chunk_metadata=[SimpleNamespace(chunk_index=0)],
+        delta_chunk_map={0: 1},
+        new_chunks_with_contents={1: "changed"},
+        existing_by_index={0: SimpleNamespace(chunk_id="b_d1_0"), 1: SimpleNamespace(chunk_id="b_d1_1")},
+        changed_indices=[1],
+        removed_indices=[],
+        doc_hash_at_load="planned-hash",
+    )
+
+    assert ok is True
+    assert fact.chunk_id == build_chunk_id("b", "d1", 1)

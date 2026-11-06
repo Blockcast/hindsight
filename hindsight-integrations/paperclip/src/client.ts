@@ -4,6 +4,19 @@
  * Uses native fetch (Node 20+). No external dependencies.
  */
 
+import { createRequire } from "node:module";
+
+function loadPackageVersion(): string {
+  try {
+    const pkg = createRequire(import.meta.url)("../package.json") as { version?: string };
+    return pkg.version ?? "0.0.0";
+  } catch {
+    return "0.0.0";
+  }
+}
+
+const USER_AGENT = `hindsight-paperclip/${loadPackageVersion()}`;
+
 export interface Memory {
   text: string;
   type?: string;
@@ -13,26 +26,36 @@ export interface RecallResponse {
   results: Memory[];
 }
 
+export const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
+
 export class HindsightClient {
   private readonly baseUrl: string;
   private readonly token: string | undefined;
+  private readonly timeoutMs: number;
 
-  constructor(baseUrl: string, token?: string) {
+  constructor(baseUrl: string, token?: string, timeoutMs?: number) {
     const url = baseUrl.trim();
     if (!url) throw new Error("hindsightApiUrl is required");
     this.baseUrl = url.replace(/\/$/, "");
     this.token = token;
+    this.timeoutMs =
+      typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0
+        ? timeoutMs
+        : DEFAULT_REQUEST_TIMEOUT_MS;
   }
 
   private headers(): Record<string, string> {
-    const h: Record<string, string> = { "Content-Type": "application/json" };
+    const h: Record<string, string> = {
+      "Content-Type": "application/json",
+      "User-Agent": USER_AGENT,
+    };
     if (this.token) h["Authorization"] = `Bearer ${this.token}`;
     return h;
   }
 
   private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 15_000);
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
 
     try {
       const resp = await fetch(`${this.baseUrl}${path}`, {
@@ -47,9 +70,7 @@ export class HindsightClient {
         throw new Error(`HTTP ${resp.status} from ${path}: ${text}`);
       }
 
-      const text = await resp.text();
-      if (!text.trim()) return undefined as T;
-      return JSON.parse(text) as T;
+      return (await resp.json()) as T;
     } finally {
       clearTimeout(timer);
     }
@@ -78,11 +99,6 @@ export class HindsightClient {
     if (documentId) item["document_id"] = documentId;
     if (metadata) item["metadata"] = metadata;
     await this.request("POST", path, { items: [item], async: true });
-  }
-
-  async touchBank(bankId: string): Promise<void> {
-    const path = `/v1/default/banks/${encodeURIComponent(bankId)}`;
-    await this.request("PUT", path, {});
   }
 
   async health(): Promise<boolean> {

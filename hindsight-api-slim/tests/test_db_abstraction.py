@@ -12,8 +12,8 @@ import asyncpg
 import pytest
 
 from hindsight_api.engine.db import DatabaseBackend, DatabaseConnection, create_database_backend
-from hindsight_api.engine.db.ops import UpdatedWindow
 from hindsight_api.engine.db import postgresql as pg_backend
+from hindsight_api.engine.db.ops import UpdatedWindow
 from hindsight_api.engine.db.postgresql import PostgreSQLBackend, apply_session_settings
 from hindsight_api.engine.db.result import DictResultRow as ResultRow
 from hindsight_api.engine.sql import SQLDialect, create_sql_dialect
@@ -225,6 +225,8 @@ class TestPostgreSQLDialect:
         assert "to_tsquery" in arm
         assert "'bm25' AS source" in arm
         assert "LIMIT $3" in arm
+        # Ties at the LIMIT cut break on id, so repeated recalls keep the same rows (#6056)
+        assert "ORDER BY ts_rank_cd(search_vector, to_tsquery('english', $4)) DESC, id LIMIT $3" in arm
         # Default language is english when bm25_language is not specified
         assert "to_tsquery('english', $4)" in arm
 
@@ -567,6 +569,37 @@ class TestOracleQueryRewriter:
         query2, _, _ = _rewrite_pg_to_oracle("WHERE a = $1 AND b = $2")
         assert ":2" in query2
 
+    def test_left_becomes_dbms_lob_substr(self):
+        # LEFT() does not exist in Oracle (ORA-00904); knowledge-page snippets use it.
+        from hindsight_api.engine.db.oracle import _rewrite_pg_to_oracle
+
+        query, _, _ = _rewrite_pg_to_oracle("SELECT LEFT(mm.content, 280) AS snippet FROM t LEFT JOIN u ON 1=1")
+        assert "DBMS_LOB.SUBSTR(mm.content, 280, 1) AS snippet" in query
+        assert "LEFT JOIN u" in query
+        query, _, _ = _rewrite_pg_to_oracle("SELECT left(name, $2) FROM t")
+        assert "DBMS_LOB.SUBSTR(name, :2, 1)" in query
+
+    def test_array_position_keeps_list_order(self):
+        # Oracle has no array_position(); the list param must expand into a CASE ordinal.
+        import json
+        import uuid
+
+        from hindsight_api.engine.db.oracle import OracleConnection, _rewrite_pg_to_oracle
+
+        query, _, _ = _rewrite_pg_to_oracle(
+            "SELECT id FROM memory_units WHERE id = ANY($1::uuid[]) ORDER BY array_position($1::uuid[], id)"
+        )
+        assert "array_position(" not in query.lower()
+        assert "/*ARRAY_POSITION:1:id*/" in query
+
+        ids = [str(uuid.uuid4()), str(uuid.uuid4())]
+        expanded, params = OracleConnection._expand_any_lists(query, {"1": json.dumps(ids)})
+        assert "ORDER BY CASE id WHEN :ap" in expanded
+        assert "THEN 1" in expanded and "THEN 2" in expanded
+        assert "1" not in params  # every reference to the list was expanded
+        ap_values = [v for k, v in params.items() if k.startswith("ap")]
+        assert ap_values == [uuid.UUID(i).bytes for i in ids]  # RAW(16) binds, list order kept
+
     def test_cast_removal(self):
         from hindsight_api.engine.db.oracle import _rewrite_pg_to_oracle
 
@@ -582,12 +615,108 @@ class TestOracleQueryRewriter:
         assert "::uuid" not in query
         assert "::varchar[]" not in query
 
+    def test_jsonb_merge_returns_clob(self):
+        # Without RETURNING CLOB, JSON_MERGEPATCH returns VARCHAR2(4000) with
+        # NULL ON ERROR, so large merged documents silently become NULL.
+        from hindsight_api.engine.db.oracle import _rewrite_pg_to_oracle
+
+        query, _, _ = _rewrite_pg_to_oracle("UPDATE banks SET config = config || $1::jsonb WHERE bank_id = $2")
+        assert "JSON_MERGEPATCH(config, :1 RETURNING CLOB)" in query
+
+        query, _, _ = _rewrite_pg_to_oracle(
+            "UPDATE banks SET config = COALESCE(config, '{}'::jsonb) || $1::jsonb WHERE bank_id = $2"
+        )
+        assert "JSON_MERGEPATCH(COALESCE(config, TO_CLOB('{}')), :1 RETURNING CLOB)" in query
+
+    def test_jsonb_merge_returning_clob_is_not_a_returning_clause(self):
+        # The function-level RETURNING CLOB must not be mistaken for a PG RETURNING clause.
+        from hindsight_api.engine.db.oracle import _rewrite_pg_to_oracle
+
+        query, _, returning_cols = _rewrite_pg_to_oracle(
+            "UPDATE banks SET config = COALESCE(config, '{}'::jsonb) || $1::jsonb, updated_at = now() WHERE bank_id = $2"
+        )
+        assert returning_cols is None
+        assert " INTO " not in query
+        assert query.rstrip().endswith("WHERE bank_id = :2")
+
+        query, _, returning_cols = _rewrite_pg_to_oracle(
+            "UPDATE async_operations SET result_metadata = result_metadata || $1::jsonb WHERE operation_id = $2 RETURNING status"
+        )
+        assert returning_cols == ["status"]
+        assert query.rstrip().endswith("RETURNING status INTO :ret_0")
+
+    def test_set_local_is_a_noop(self):
+        # PG-only session GUCs must not reach Oracle (ORA-00922).
+        from unittest.mock import MagicMock
+
+        from hindsight_api.engine.db.oracle import OracleConnection
+
+        raw = MagicMock()
+        conn = OracleConnection(raw)
+        for q in ("SET LOCAL enable_seqscan = off", "  set local lock_timeout = '5s'"):
+            assert asyncio.run(conn.execute(q)) == "SET"
+        raw.cursor.assert_not_called()
+
+    def test_not_jsonb_contains_is_parent_literal(self):
+        # list_operations(exclude_parents=True) filter: a jsonb literal, not a bind param.
+        from hindsight_api.engine.db.oracle import _rewrite_pg_to_oracle
+
+        query, _, _ = _rewrite_pg_to_oracle(
+            "SELECT id FROM async_operations WHERE NOT (result_metadata::jsonb @> '{\"is_parent\": true}'::jsonb)"
+        )
+        assert "@>" not in query
+        assert "result_metadata IS NOT NULL" in query
+        assert "JSON_VALUE(result_metadata, '$.is_parent') = 'true'" in query
+
+    def test_result_metadata_contains_bind_compares_parent_operation_id(self):
+        # Parent/sibling lookup: the generic JSON_EXISTS(col, '$' PASSING :N) rewrite matches no row.
+        from hindsight_api.engine.db.oracle import _rewrite_pg_to_oracle
+
+        query, _, _ = _rewrite_pg_to_oracle(
+            "SELECT 1 FROM async_operations child WHERE result_metadata::jsonb @> $1::jsonb "
+            "AND child.result_metadata::jsonb @> $2::jsonb"
+        )
+        assert "JSON_EXISTS" not in query
+        assert "JSON_VALUE(result_metadata, '$.parent_operation_id') = JSON_VALUE(:1, '$.parent_operation_id')" in query
+        assert (
+            "JSON_VALUE(child.result_metadata, '$.parent_operation_id') = JSON_VALUE(:2, '$.parent_operation_id')"
+            in query
+        )
+
+    def test_connect_params_host_port_service(self):
+        from hindsight_api.engine.db.oracle import _oracle_connect_params
+
+        params = _oracle_connect_params("oracle://u:p@db:1522/SVC")
+        assert params == {"user": "u", "password": "p", "dsn": "db:1522/SVC"}
+
+    def test_connect_params_decode_credentials(self):
+        from hindsight_api.engine.db.oracle import _oracle_connect_params
+
+        params = _oracle_connect_params("oracle+oracledb://ADMIN:Pa%23ss%40w0rd@db/SVC")
+        assert params["user"] == "ADMIN"
+        assert params["password"] == "Pa#ss@w0rd"
+
+    def test_connect_params_full_descriptor(self):
+        from urllib.parse import quote
+
+        from hindsight_api.engine.db.oracle import _oracle_connect_params
+
+        desc = "(description=(address=(protocol=tcps)(port=1522)(host=adb.example.com))(connect_data=(service_name=x_low)))"
+        params = _oracle_connect_params(f"oracle://u:p@/?dsn={quote(desc)}")
+        assert params["dsn"] == desc
+
     def test_now_to_systimestamp(self):
         from hindsight_api.engine.db.oracle import _rewrite_pg_to_oracle
 
         query, _, _ = _rewrite_pg_to_oracle("updated_at > NOW()")
         assert "SYSTIMESTAMP" in query
         assert "NOW()" not in query
+
+    def test_now_at_utc_to_sys_extract_utc(self):
+        from hindsight_api.engine.db.oracle import _rewrite_pg_to_oracle
+
+        query, _, _ = _rewrite_pg_to_oracle("SELECT now() AT TIME ZONE 'UTC'")
+        assert query == "SELECT SYS_EXTRACT_UTC(SYSTIMESTAMP)"
 
     def test_gen_random_uuid(self):
         from hindsight_api.engine.db.oracle import _rewrite_pg_to_oracle
@@ -1272,7 +1401,7 @@ class TestOracleSetSessionSchema:
         like oracledb: this test fails (TypeError) against the buggy code and
         passes once the erroneous await is removed.
         """
-        from hindsight_api.engine import memory_engine
+        from hindsight_api import schema_context
         from hindsight_api.engine.db.oracle import OracleBackend
 
         executed: list[str] = []
@@ -1294,11 +1423,11 @@ class TestOracleSetSessionSchema:
                 return _FakeAsyncCursor()
 
         backend = OracleBackend()
-        token = memory_engine._current_schema.set("TENANT_X")
+        token = schema_context._current_schema.set("TENANT_X")
         try:
             await backend._set_session_schema(_FakeConn())
         finally:
-            memory_engine._current_schema.reset(token)
+            schema_context._current_schema.reset(token)
 
         assert closed["count"] == 1
         assert any('ALTER SESSION SET CURRENT_SCHEMA = "TENANT_X"' in s for s in executed)
@@ -1313,7 +1442,7 @@ class TestOracleSetSessionSchema:
         reset applies ``ALTER SESSION SET CURRENT_SCHEMA`` to the cached SESSION_USER,
         and the synchronous ``cursor.close()`` is not awaited.
         """
-        from hindsight_api.engine import memory_engine
+        from hindsight_api import schema_context
         from hindsight_api.engine.db.oracle import OracleBackend
 
         executed: list[str] = []
@@ -1334,11 +1463,110 @@ class TestOracleSetSessionSchema:
                 return _FakeAsyncCursor()
 
         backend = OracleBackend()
-        token = memory_engine._current_schema.set("public")
+        token = schema_context._current_schema.set("public")
         try:
             await backend._set_session_schema(_FakeConn())
         finally:
-            memory_engine._current_schema.reset(token)
+            schema_context._current_schema.reset(token)
 
         assert closed["count"] == 1
         assert any('ALTER SESSION SET CURRENT_SCHEMA = "APP_USER"' in s for s in executed)
+
+
+# ---------------------------------------------------------------------------
+# Oracle session setup and CLOB binding (#4630, #4632)
+# ---------------------------------------------------------------------------
+
+
+class TestOracleSessionAndClobBinding:
+    """No live Oracle required."""
+
+    @pytest.mark.asyncio
+    async def test_new_session_disables_parallel_dml(self):
+        from hindsight_api.engine.db.oracle import _disable_parallel_dml
+
+        executed: list[str] = []
+        closed: list[bool] = []
+
+        class _FakeAsyncCursor:
+            async def execute(self, sql: str) -> None:
+                executed.append(sql)
+
+            def close(self) -> None:  # synchronous, like oracledb.AsyncCursor.close
+                closed.append(True)
+
+        class _FakeConn:
+            def cursor(self) -> _FakeAsyncCursor:
+                return _FakeAsyncCursor()
+
+        await _disable_parallel_dml(_FakeConn(), None)
+        assert executed == ["ALTER SESSION DISABLE PARALLEL DML"]
+        assert closed == [True]
+
+    def test_clob_bind_covers_json_and_values_past_4000_bytes(self):
+        from hindsight_api.engine.db.oracle import _needs_clob_bind
+
+        assert _needs_clob_bind("[]")
+        assert _needs_clob_bind('{"a": 1}')
+        assert _needs_clob_bind("x" * 4001)
+        # 1500 characters, but 4500 bytes in UTF-8.
+        assert _needs_clob_bind("é" * 1500 + "x" * 1500)
+        assert not _needs_clob_bind("x" * 4000)
+        assert not _needs_clob_bind("é" * 2000)  # exactly 4000 bytes
+        assert not _needs_clob_bind("")
+        assert not _needs_clob_bind(None)
+        assert not _needs_clob_bind(42)
+
+    def test_blob_bind_covers_bytes_past_raw_limit(self):
+        from hindsight_api.engine.db.oracle import _needs_blob_bind
+
+        assert _needs_blob_bind(b"x" * 2001)
+        assert _needs_blob_bind(bytearray(1_000_000))
+        assert not _needs_blob_bind(b"x" * 2000)
+        assert not _needs_blob_bind(bytes(16))  # a UUID bound as RAW(16)
+        assert not _needs_blob_bind("x" * 5000)
+        assert not _needs_blob_bind(None)
+
+    def test_clob_lob_covers_text_past_32k_bytes(self):
+        from hindsight_api.engine.db.oracle import _needs_clob_lob
+
+        assert _needs_clob_lob("x" * 32768)
+        assert _needs_clob_lob("é" * 16384)  # 32 768 bytes in UTF-8
+        assert not _needs_clob_lob("x" * 32767)
+        assert not _needs_clob_lob("é" * 8000)
+        assert not _needs_clob_lob(b"x" * 40000)
+        assert not _needs_clob_lob(None)
+
+    @pytest.mark.asyncio
+    async def test_large_bytes_and_text_bind_as_temporary_lobs(self):
+        # A file past 2000 bytes binds as RAW, and text past 32 767 bytes as LONG even with
+        # a CLOB input size (documents.original_text in MERGE ... USING (SELECT :N ... FROM DUAL));
+        # both fail with ORA-01461 unless bound as a real LOB.
+        import oracledb
+
+        from hindsight_api.engine.db.oracle import OracleConnection
+
+        class FakeLob:
+            def __init__(self, lob_type):
+                self.lob_type = lob_type
+                self.data = None
+
+            async def write(self, data):
+                self.data = data
+
+        class FakeConn:
+            async def createlob(self, lob_type):
+                return FakeLob(lob_type)
+
+        conn = OracleConnection.__new__(OracleConnection)
+        conn._conn = FakeConn()
+        payload = bytes(range(256)) * 20  # 5120 bytes
+        text = "laudo pericial " * 4000  # 60 000 bytes
+        params = {"1": "doc-id", "2": payload, "3": bytes(16), "4": text, "5": "x" * 5000}
+
+        await conn._bind_large_values_as_lobs(params)
+
+        assert params["2"].lob_type == oracledb.DB_TYPE_BLOB and params["2"].data == payload
+        assert params["4"].lob_type == oracledb.DB_TYPE_CLOB and params["4"].data == text
+        assert params["1"] == "doc-id" and params["3"] == bytes(16)  # a UUID stays RAW(16)
+        assert params["5"] == "x" * 5000  # 4 000-32 767 bytes stay a string with a CLOB input size

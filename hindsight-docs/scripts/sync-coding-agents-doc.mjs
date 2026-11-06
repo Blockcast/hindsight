@@ -15,6 +15,9 @@
  *     so images render on npm and GitHub, but on the docs site those same URLs pin every image to
  *     PRODUCTION — so a new asset shows as broken locally and in previews until it is deployed,
  *     which is exactly when you are trying to look at it.
+ *   - A `<!-- figure: <name> -->` line becomes a React component, imported at the top (see
+ *     FIGURES). The README keeps an invisible comment there, since a React component renders on
+ *     neither GitHub nor npm.
  *   - The `skill:begin` / `skill:end` markers are dropped. They tell the integration's
  *     scripts/build-skill.mjs which regions the companion skill copies; MDX has no HTML comments,
  *     so leaving them in would fail the docs build outright.
@@ -42,6 +45,25 @@ description: "One Hindsight memory plugin for coding agents — per-repo memory 
     node hindsight-docs/scripts/sync-coding-agents-doc.mjs */}
 `;
 
+/**
+ * `<!-- figure: NAME -->` in the README -> this component on the doc page, with its imports.
+ * The marker is an HTML comment so it stays invisible on GitHub and npm, which render the README
+ * but cannot render React.
+ */
+const FIGURES = {
+  'coding-agents': {
+    jsx: '<Figure doc={codingAgents} />',
+    imports: [
+      "import Figure from '@site/src/components/Figure';",
+      "import codingAgents from '@site/figures/coding-agents.json';",
+    ],
+  },
+  'coding-agents-benchmark': {
+    jsx: "<CodingAgentsChart title=\"AMB · sdebench\" />",
+    imports: ["import CodingAgentsChart from '@site/src/components/CodingAgentsChart';"],
+  },
+};
+
 /** Sections that only make sense inside the repo (contributor-facing), dropped from the doc page. */
 const DROP_SECTIONS = ['Layout', 'Ingestion internals (no CLI)', 'Companion skill (generated)'];
 
@@ -55,8 +77,14 @@ function build() {
     if (heading) {
       const [, hashes, text] = heading;
       if (hashes.length === 1) continue; // the H1 becomes frontmatter `title`
-      dropping = hashes.length === 2 && DROP_SECTIONS.includes(text.trim());
-      if (dropping) continue;
+      // Only an H2 opens or closes a dropped section. Recomputing on every heading would let an
+      // H3 *inside* a dropped section switch dropping back off and leak the rest of it.
+      if (hashes.length === 2) {
+        dropping = DROP_SECTIONS.includes(text.trim());
+        if (dropping) continue;
+      } else if (dropping) {
+        continue;
+      }
     }
     if (!dropping) out.push(line);
   }
@@ -65,6 +93,16 @@ function build() {
     // Region markers for the companion-skill generator — invalid syntax in MDX, and meaningless
     // to a reader of the docs site either way.
     .replace(/^<!--\s*skill:(?:begin|end)[^>]*-->\n?/gm, '')
+    .replace(/^<!--\s*figure: ([a-z0-9-]+)\s*-->$/gm, (line, name) => {
+      // Loud, rather than leaving the comment in place: MDX has no HTML comments, so a typo'd
+      // marker would otherwise surface as an unrelated parse error in the docs build.
+      if (!FIGURES[name]) {
+        throw new Error(
+          `[coding-agents] unknown figure "${name}" in the README — add it to FIGURES or fix the marker.`,
+        );
+      }
+      return FIGURES[name].jsx;
+    })
     // Repo-relative links 404 on the docs site; keep the label, drop the link.
     .replace(/\[([^\]]+)\]\((?!https?:|\/)[^)]+\)/g, '$1')
     // Our own absolute URLs -> site-relative. Assets so the page uses THIS build's static
@@ -75,7 +113,11 @@ function build() {
     .replace(/https:\/\/hindsight\.vectorize\.io\/([^\s"')]+)/g, '/$1')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
-  return `${FRONTMATTER}\n${body}\n`;
+  const imports = Object.values(FIGURES)
+    .filter((f) => body.includes(f.jsx))
+    .flatMap((f) => f.imports)
+    .join('\n');
+  return `${FRONTMATTER}\n${imports ? `${imports}\n\n` : ''}${body}\n`;
 }
 
 const generated = build();

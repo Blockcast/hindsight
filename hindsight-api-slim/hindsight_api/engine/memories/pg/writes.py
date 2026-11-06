@@ -16,10 +16,11 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any
 
 from ....config import get_config
+from ...document_history import note_observations_removed
 from ..base import StoredMemory
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -182,7 +183,9 @@ async def observations_for_sources(
     ops,
     fq_table: Callable[[str], str],
     bank_id: str,
-    unit_ids: list[str | uuid.UUID],
+    # `Sequence`, not `list`: a list is invariant, so neither `list[str]` nor `list[UUID]` --
+    # what the two callers hold -- is a `list[str | UUID]`. Nothing here mutates it.
+    unit_ids: Sequence[str | uuid.UUID],
 ) -> list[StoredMemory]:
     """Observations consolidated from any of ``unit_ids``.
 
@@ -273,6 +276,8 @@ async def delete_stale_observations(
     affected_obs = await observations_for_sources(
         conn=conn, ops=ops, fq_table=fq_table, bank_id=bank_id, unit_ids=fact_uuids
     )
+    # The rows go for good below; the change history keeps their ids (#5638).
+    note_observations_removed({obs.unit_id: list(obs.source_memory_ids) for obs in affected_obs}, fact_uuids)
     if not affected_obs:
         return 0
 
@@ -292,8 +297,15 @@ async def delete_stale_observations(
     # writes next and deadlock (#4251). The engine's delete, edit and invalidate paths, which
     # write their facts first, therefore also sweep before that write, so their locks are
     # taken in this order too.
+    # The facts only need a writer lock here: their keys are unchanged until the
+    # caller's later delete. FOR UPDATE also blocks the relinker's FOR KEY SHARE
+    # parent locks while it holds graph_maintenance_queue rows that our caller
+    # next enqueues, forming a cross-table deadlock. NO KEY UPDATE still excludes
+    # concurrent sweeps and consolidation's FOR SHARE, but lets those FK guards
+    # finish; actual DELETEs acquire the stronger lock when they remove a row.
     await conn.fetch(
-        f"SELECT id FROM {fq_table('memory_units')} WHERE bank_id = $1 AND id = ANY($2::uuid[]) ORDER BY id FOR UPDATE",
+        f"SELECT id FROM {fq_table('memory_units')} WHERE bank_id = $1 AND id = ANY($2::uuid[]) "
+        "ORDER BY id FOR NO KEY UPDATE",
         bank_id,
         sorted({*fact_uuids, *obs_ids, *remaining_source_ids}),
     )
@@ -420,7 +432,7 @@ async def invalidate_memory(*, conn, fq_table, bank_id: str, unit_id: str, reaso
     # Causal edges are retain-time extraction output the FK cascade would destroy for good —
     # unlike temporal/semantic links they can't be recomputed, so snapshot their descriptors onto
     # the archive row and revert rematerializes them (#2864).
-    from ...retain.link_utils import snapshot_causal_links
+    from .links import snapshot_causal_links
 
     causal_links = await snapshot_causal_links(conn, bank_id, str(unit_id))
     inserted = await conn.fetchval(
@@ -510,7 +522,7 @@ async def restore_memory(*, conn, fq_table, bank_id: str, unit_id: str) -> Store
     # Rematerialize the causal edges parked at invalidation (#2864). Edges whose peer is still
     # archived or permanently deleted are skipped — the peer keeps its own copy and recreates the
     # edge when it reverts, so the restore is order-independent and idempotent.
-    from ...retain.link_utils import rematerialize_causal_links
+    from .links import rematerialize_causal_links
 
     causal_json = await conn.fetchval(
         f"SELECT causal_links FROM {arch} WHERE id = $1 AND bank_id = $2", str(unit_id), bank_id
@@ -556,10 +568,9 @@ async def apply_edit(
     entity_ids: list[str] | None,
     embedding=None,
 ) -> None:
-    # `entity_ids` and `mentioned_at` are unused here: the entity postings are
-    # re-linked into `unit_entities` by the caller, and an edit does not move the
-    # mention time. Both are on the signature for a store that carries entities on
-    # the memory and rebuilds it wholesale.
+    # `entity_ids` is unused here: the entity postings are re-linked into
+    # `unit_entities` by the caller. It is on the signature for a store that carries
+    # entities on the memory and rebuilds it wholesale.
     from ...causal_links import CAUSAL_LINK_TYPES
     from ...db.ops_postgresql import pg_search_vector_expr
 
@@ -572,12 +583,27 @@ async def apply_edit(
     # Reference the bind parameters, not the columns: PostgreSQL evaluates the
     # UPDATE's RHS before the sibling SET assignments land, so a column reference
     # would see the pre-edit values.
-    sv_expr = pg_search_vector_expr(get_config(), text_col="$3", context_col="$4")
+    # PostgreSQL only: on Oracle search_vector is a CLOB kept by Oracle's own text index, and the
+    # ``::regconfig`` cast would reach it as an unbound ``:REGCONFIG`` placeholder (DPY-4010) — the
+    # same guard as ``observation_search_vector_expr`` in pg/consolidation.py (#3021).
+    from ...schema import _is_oracle
+
+    sv_expr = None if _is_oracle() else pg_search_vector_expr(get_config(), text_col="$3", context_col="$4")
     sv_clause = f", search_vector = {sv_expr}" if sv_expr else ""
     # The re-embedded vector rides the edit's own UPDATE. It describes the text being written by
     # this statement, so writing it here is what keeps the two from ever disagreeing — and it
     # spares a store whose write is not a row update a second write of this row.
-    params: list = [str(unit_id), bank_id, text, context, fact_type, occurred_start, occurred_end, event_date]
+    params: list = [
+        str(unit_id),
+        bank_id,
+        text,
+        context,
+        fact_type,
+        occurred_start,
+        occurred_end,
+        event_date,
+        mentioned_at,
+    ]
     embedding_clause = ""
     if embedding is not None:
         params.append(embedding)
@@ -586,7 +612,7 @@ async def apply_edit(
         f"""
         UPDATE {mu}
         SET text = $3, context = $4, fact_type = $5, occurred_start = $6, occurred_end = $7,
-            event_date = $8, consolidated_at = NULL, consolidation_failed_at = NULL,
+            event_date = $8, mentioned_at = $9, consolidated_at = NULL, consolidation_failed_at = NULL,
             edited_at = now(), updated_at = now(){sv_clause}{embedding_clause}
         WHERE id = $1 AND bank_id = $2
         """,

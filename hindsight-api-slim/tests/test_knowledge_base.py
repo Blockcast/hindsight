@@ -17,14 +17,11 @@ import pytest
 import pytest_asyncio
 
 import hindsight_api.engine.memory_engine as memory_engine_module
+from hindsight_api.engine import page_markdown
 from hindsight_api.engine.db import DatabaseConnection
-from hindsight_api.engine.memory_engine import (
-    MENTAL_MODEL_PENDING_CONTENT,
-    MemoryEngine,
-    _may_need_refresh,
-    fq_table,
-)
+from hindsight_api.engine.memory_engine import KnowledgeTagFilter, MemoryEngine, _may_need_refresh
 from hindsight_api.engine.retain import embedding_utils
+from hindsight_api.engine.schema import fq_table
 from hindsight_api.extensions import (
     BankReadContext,
     BankReadOperation,
@@ -439,6 +436,22 @@ class TestTree:
         assert single_calls == 0, "no per-page fallback for plain flat-tag scopes"
 
 
+class TestKnowledgeTreeOrder:
+    """The tree is sorted in Python because knowledge_pages.name is a CLOB on Oracle."""
+
+    def test_sorts_by_sort_order_then_name_with_nulls_last(self):
+        from hindsight_api.engine.memory_engine import _knowledge_tree_sort_key
+
+        rows = [
+            {"sort_order": None, "name": "a"},
+            {"sort_order": 2, "name": "b"},
+            {"sort_order": 1, "name": "z"},
+            {"sort_order": 1, "name": "m"},
+        ]
+        ordered = [(r["sort_order"], r["name"]) for r in sorted(rows, key=_knowledge_tree_sort_key)]
+        assert ordered == [(1, "m"), (1, "z"), (2, "b"), (None, "a")]
+
+
 class TestWatermarkRule:
     """The pure rule behind every "may need refresh" badge."""
 
@@ -457,6 +470,15 @@ class TestWatermarkRule:
     def test_a_write_after_the_refresh_may_need_one(self):
         refreshed = datetime.now(timezone.utc)
         assert _may_need_refresh(refreshed, refreshed + timedelta(microseconds=1)) is True
+
+    def test_naive_timestamps_compare_as_utc(self):
+        # Oracle TIMESTAMP columns come back naive; the watermark may be aware.
+        refreshed = datetime.now(timezone.utc)
+        naive = refreshed.replace(tzinfo=None)
+        assert _may_need_refresh(naive, refreshed) is False
+        assert _may_need_refresh(naive, refreshed + timedelta(seconds=1)) is True
+        assert _may_need_refresh(refreshed, naive - timedelta(seconds=1)) is False
+        assert _may_need_refresh(naive, naive + timedelta(seconds=1)) is True
 
 
 class TestSearch:
@@ -477,6 +499,7 @@ class TestSearch:
         names = [r["name"] for r in body["results"]]
         assert names, "expected at least one hit"
         assert names[0] == "Billing"
+        assert body["results"][0]["source_query"] == "What is the billing policy?"
         assert body["total"] == len(body["results"])
         # Scores are strictly descending.
         scores = [r["score"] for r in body["results"]]
@@ -535,6 +558,44 @@ class TestSearch:
 
         assert results, "the BM25 arm must still generate candidates for a question"
         assert results[0]["id"] == ids.billing
+
+    @pytest.mark.memory_backend_incompatible
+    async def test_a_page_with_no_body_says_so_in_its_snippet(
+        self, memory: MemoryEngine, kb_bank, request_context, monkeypatch
+    ):
+        """An empty body must reach a searcher as words, not as a blank snippet.
+
+        A titled hit with nothing under it reads as "matched, snippet came back
+        empty" — which is how an agent decides the topic is uncovered and creates a
+        second page for one that already exists. The marker is built on the way out,
+        so the stored body stays empty and the search index never carries it.
+        """
+
+        async def no_embedding(embeddings, texts, *, input_type=None):
+            return [None]
+
+        monkeypatch.setattr(embedding_utils, "generate_embeddings_batch", no_embedding)
+
+        bank_id, _ = kb_bank
+        pending = await memory.create_knowledge_page(
+            bank_id=bank_id,
+            name="Refund window",
+            source_query="How long is the refund window?",
+            content="",
+            request_context=request_context,
+        )
+
+        results = await memory.search_knowledge_pages(bank_id, "refund window", request_context=request_context)
+
+        hit = next(r for r in results if r["id"] == pending["id"])
+        assert hit["snippet"] == page_markdown.EMPTY_PAGE_NOTICE
+
+        stored = await memory.get_mental_model(
+            bank_id, pending["mental_model_id"], detail="full", request_context=request_context
+        )
+        assert not (stored["content"] or "").strip(), (
+            "the marker is a read-time label; storing it would put it back in the index"
+        )
 
     @pytest.mark.memory_backend_incompatible
     async def test_query_without_word_characters_returns_nothing(
@@ -757,6 +818,30 @@ class TestGetPage:
         assert page["markdown"].startswith("---\n")
         assert 'type: "runbook"' in page["markdown"]
 
+    async def test_a_page_with_no_body_yet_says_so_in_its_markdown(self, api_client, kb_bank, memory, request_context):
+        """``markdown`` carries the notice; ``body`` stays empty.
+
+        Two readers, two needs: an agent is handed the rendered document and must be
+        told the page is unwritten rather than shown bare frontmatter, while the
+        control plane branches on ``body`` to show its own localized empty state —
+        putting the notice there would replace that string with this one.
+        """
+        bank_id, _ = kb_bank
+        page = await memory.create_knowledge_page(
+            bank_id=bank_id,
+            name="Unwritten",
+            source_query="What is not written yet?",
+            content="",
+            request_context=request_context,
+        )
+
+        resp = await api_client.get(f"/v1/default/banks/{_enc(bank_id)}/knowledge-base/pages/{page['id']}")
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert page_markdown.EMPTY_PAGE_NOTICE in body["markdown"]
+        assert not (body["body"] or "").strip()
+
     async def test_missing_page_404(self, api_client, kb_bank):
         bank_id, ids = kb_bank
         resp = await api_client.get(f"/v1/default/banks/{_enc(bank_id)}/knowledge-base/pages/nope")
@@ -945,6 +1030,9 @@ class TestMoveRenameDelete:
         assert hit.status_code == 200, hit.text
         assert any(r["id"] == ids.orders for r in hit.json()["results"])
 
+    # Reads the mental_models.embedding column, which a store-owned bank leaves empty: its page
+    # vectors live in the store's index.
+    @pytest.mark.memory_backend_incompatible
     async def test_rename_page_reembeds_backing_model(
         self, api_client, kb_bank, memory: MemoryEngine, request_context, monkeypatch
     ):
@@ -1328,8 +1416,8 @@ class TestMoveRenameDelete:
 class TestListReportsTheContentItDelivers:
     """A list that carries content is a bulk read of that content.
 
-    A knowledge page is a mental_models row and is not excluded from
-    list_mental_models, so a list that returns content hands back every
+    A knowledge page is a mental_models row and list_mental_models includes
+    it by default, so a list that returns content hands back every
     page in the bank. Reporting the single-page read while leaving that
     unreported would watch the narrow door and leave the wide one open — a
     caller could enumerate a bank's synthesized knowledge by asking for it in
@@ -1398,13 +1486,13 @@ class TestListReportsTheContentItDelivers:
         assert validator.model_reads == []
 
     async def test_a_model_still_generating_is_not_reported(self, memory, kb_bank, request_context, monkeypatch):
-        # The placeholder is not synthesized knowledge; nothing was delivered.
+        # An unwritten page is not synthesized knowledge; nothing was delivered.
         bank_id, ids = kb_bank
         pending = await memory.create_mental_model(
             bank_id=bank_id,
             name="Pending",
             source_query="Not answered yet.",
-            content=MENTAL_MODEL_PENDING_CONTENT,
+            content="",
             request_context=request_context,
         )
         validator = _kb_validator()
@@ -1414,6 +1502,81 @@ class TestListReportsTheContentItDelivers:
 
         assert any(m["id"] == pending["id"] for m in page.items), "the pending model should still be listed"
         assert pending["id"] not in validator.model_reads
+
+    async def test_a_legacy_placeholder_is_not_reported_either(self, memory, kb_bank, request_context, monkeypatch):
+        """This path prices what it reports, so a body nobody wrote must not be billed.
+
+        An upgraded bank still holds pages carrying "Generating content..." from
+        before pages were created empty. They are unwritten by every other measure,
+        and metering them charges for content that was never synthesized.
+        """
+        bank_id, _ = kb_bank
+        legacy = await memory.create_mental_model(
+            bank_id=bank_id,
+            name="Legacy Pending",
+            source_query="Not answered yet.",
+            content="Generating content...",
+            request_context=request_context,
+        )
+        validator = _kb_validator()
+        monkeypatch.setattr(memory, "_operation_validator", validator)
+
+        page = await memory.list_mental_models(bank_id=bank_id, detail="content", request_context=request_context)
+
+        assert any(m["id"] == legacy["id"] for m in page.items), "the page is still listed"
+        assert legacy["id"] not in validator.model_reads
+
+
+class TestListStandaloneMentalModels:
+    """The Mental Models tab lists standalone models only (#5665).
+
+    A knowledge page keeps its content in a mental_models row; with
+    exclude_knowledge_pages those rows stay out of the list and its total.
+    """
+
+    async def test_page_backing_models_are_left_out(self, api_client, memory, kb_bank, request_context):
+        bank_id, ids = kb_bank
+        standalone = await memory.create_mental_model(
+            bank_id=bank_id,
+            name="Coding preferences",
+            source_query="How does the user like code written?",
+            content="Functional style.",
+            request_context=request_context,
+        )
+
+        everything = await api_client.get(f"/v1/default/banks/{_enc(bank_id)}/mental-models")
+        flags = {m["id"]: m["is_knowledge_page"] for m in everything.json()["items"]}
+        assert flags[ids.orders_mm] is True
+        assert flags[standalone["id"]] is False
+
+        resp = await api_client.get(
+            f"/v1/default/banks/{_enc(bank_id)}/mental-models", params={"exclude_knowledge_pages": "true"}
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert [m["id"] for m in body["items"]] == [standalone["id"]]
+        assert body["total"] == 1
+
+    async def test_get_says_whether_a_model_backs_a_page(self, api_client, kb_bank):
+        bank_id, ids = kb_bank
+        resp = await api_client.get(f"/v1/default/banks/{_enc(bank_id)}/mental-models/{ids.orders_mm}")
+        assert resp.status_code == 200
+        assert resp.json()["is_knowledge_page"] is True
+
+    async def test_template_export_leaves_pages_out(self, api_client, memory, kb_bank, request_context):
+        # A template carries no pages; their models would come back as standalone ones.
+        bank_id, _ = kb_bank
+        standalone = await memory.create_mental_model(
+            bank_id=bank_id,
+            name="Coding preferences",
+            source_query="How does the user like code written?",
+            content="Functional style.",
+            request_context=request_context,
+        )
+
+        resp = await api_client.get(f"/v1/default/banks/{_enc(bank_id)}/export")
+        assert resp.status_code == 200
+        assert [m["id"] for m in resp.json()["mental_models"]] == [standalone["id"]]
 
 
 class TestExportReportsOnceNotPerPage:
@@ -1478,6 +1641,35 @@ class TestPageReadIsAModelRead:
         assert len(validator.model_get_tokens) == 1
         assert validator.model_get_tokens[0] == len(body.get("body") or "") // 4
         assert validator.model_get_tokens[0] > 0
+
+    async def test_reading_an_unwritten_page_still_reports_completion_at_zero(
+        self, api_client, kb_bank, memory, request_context, monkeypatch
+    ):
+        """Zero tokens, not a missing hook — for an empty body and for the legacy one.
+
+        A gated read that reports no completion is the shape the post-hook exists to
+        prevent: the deployment authorized a read it then has no record of. So an
+        unwritten page still reports, it just reports nothing delivered — whether its
+        body is the empty string pages are created with now, or the placeholder an
+        upgraded bank's pages were created with before.
+        """
+        bank_id, _ = kb_bank
+        for name, content in (("Unwritten", ""), ("Legacy Unwritten", "Generating content...")):
+            page = await memory.create_knowledge_page(
+                bank_id=bank_id,
+                name=name,
+                source_query=f"what is {name}?",
+                content=content,
+                request_context=request_context,
+            )
+            validator = _kb_validator()
+            monkeypatch.setattr(memory, "_operation_validator", validator)
+
+            resp = await api_client.get(f"/v1/default/banks/{_enc(bank_id)}/knowledge-base/pages/{page['id']}")
+
+            assert resp.status_code == 200, resp.text
+            assert validator.model_gets, f"{name}: the read was gated"
+            assert validator.model_get_tokens == [0], f"{name}: gated but not reported"
 
     async def test_a_refused_model_get_returns_no_page_content(self, api_client, kb_bank, memory, monkeypatch):
         # The gate has to run before the body is handed back, or it is
@@ -1631,6 +1823,61 @@ class TestAuthorizationWriteDenied:
         # Rejected before touching the backing mental model — a single write hook.
         assert _write_ops(validator) == [BankWriteOperation.UPDATE_KNOWLEDGE_PAGE]
 
+    @pytest.mark.parametrize(
+        "body",
+        [
+            # The empty body too: that check moved from the handler into the
+            # engine, and nothing pinned it there before.
+            {},
+            {"source_query": None},
+            {"tags": None},
+            {"max_tokens": None},
+            {"trigger": None},
+            {"name": None, "source_query": None},
+        ],
+    )
+    async def test_explicit_null_patch_is_rejected_before_any_read(
+        self, api_client, kb_bank, memory, monkeypatch, body
+    ):
+        """A null page field means "not supplied", so the patch changes nothing.
+
+        It used to slip past the "nothing to update" check, run no write
+        validator at all, and still hand back the node's metadata — a read of
+        another tenant's tree for anyone the validator would have denied.
+        """
+        bank_id, ids = kb_bank
+        validator = _kb_validator(reject_write=BankWriteOperation.UPDATE_KNOWLEDGE_PAGE)
+        monkeypatch.setattr(memory, "_operation_validator", validator)
+        resp = await api_client.patch(
+            f"/v1/default/banks/{_enc(bank_id)}/knowledge-base/nodes/{ids.orders}",
+            json=body,
+        )
+        assert resp.status_code == 400, resp.text
+        assert "Orders" not in resp.text
+        assert _write_ops(validator) == []
+
+    @pytest.mark.parametrize("body", [{"tags": []}, {"max_tokens": 0}, {"name": ""}])
+    async def test_empty_but_supplied_values_still_authorize(self, api_client, kb_bank, memory, monkeypatch, body):
+        """The near misses of the guard above: supplied-but-empty is a real change.
+
+        `tags: []` in particular is the documented fix for a page whose tags match
+        no memory, so the guard has to test "is not None", never truthiness — a
+        falsy value must still reach the validator rather than be dismissed as a
+        no-op.
+        """
+        bank_id, ids = kb_bank
+        operation = (
+            BankWriteOperation.RENAME_KNOWLEDGE_NODE if "name" in body else BankWriteOperation.UPDATE_KNOWLEDGE_PAGE
+        )
+        validator = _kb_validator(reject_write=operation)
+        monkeypatch.setattr(memory, "_operation_validator", validator)
+        resp = await api_client.patch(
+            f"/v1/default/banks/{_enc(bank_id)}/knowledge-base/nodes/{ids.orders}",
+            json=body,
+        )
+        assert resp.status_code == 403, resp.text
+        assert _write_ops(validator) == [operation]
+
     async def test_delete_denied(self, api_client, kb_bank, memory, monkeypatch):
         bank_id, ids = kb_bank
         validator = _kb_validator(reject_write=BankWriteOperation.DELETE_KNOWLEDGE_NODE)
@@ -1749,3 +1996,98 @@ class TestAuthorizationDisabled:
         export = await memory.export_knowledge_base(bank_id=bank_id, request_context=request_context)
         assert any(n["id"] == folder["id"] for n in export.nodes)
         await memory.delete_bank(bank_id, request_context=request_context)
+
+
+class TestTagFilter:
+    """Tree and search take recall's tag filter: tags + tags_match, and tag_groups."""
+
+    @pytest.mark.parametrize("match", ["any", "any_strict", "all_strict", "exact"])
+    def test_clause_survives_the_oracle_rewrite(self, match):
+        """The clause names the column bare, because Oracle's ``&&``/``@>`` rewrite only
+        matches a bare column — a qualified ``mm.tags`` came out as ``mm.EXISTS(...)``."""
+        from hindsight_api.engine.db.oracle import _rewrite_pg_to_oracle
+
+        clause = KnowledgeTagFilter(tags=["user:kate"], tags_match=match).clause(3)
+        rewritten = _rewrite_pg_to_oracle(f"SELECT 1 FROM t WHERE x = $1 {clause.sql}").query
+        assert "&&" not in rewritten and "@>" not in rewritten, rewritten
+        assert "mm." not in rewritten, rewritten
+
+    @staticmethod
+    def _names(roots: list[dict]) -> set[str]:
+        out: set[str] = set()
+        for node in roots:
+            out.add(node["name"])
+            out |= TestTagFilter._names(node.get("children") or [])
+        return out
+
+    async def _tree(self, api_client, bank_id: str, **params) -> set[str]:
+        resp = await api_client.get(f"/v1/default/banks/{_enc(bank_id)}/knowledge-base/tree", params=params)
+        assert resp.status_code == 200, resp.text
+        return self._names(resp.json()["roots"])
+
+    async def test_tree_keeps_matching_pages_and_their_folders(self, api_client, kb_bank):
+        bank_id, _ = kb_bank
+        # Strict: only tagged pages; the empty "Sub" folder goes with the untagged page.
+        assert await self._tree(api_client, bank_id, tags="type:policy", tags_match="any_strict") == {
+            "Policies",
+            "Billing",
+        }
+        # 'any' keeps untagged pages too, as recall does.
+        assert await self._tree(api_client, bank_id, tags="type:policy", tags_match="any") == {
+            "Policies",
+            "Billing",
+            "Loose",
+        }
+        assert await self._tree(api_client, bank_id, tags=["revenue", "sales"], tags_match="all_strict") == {
+            "Runbooks",
+            "Orders",
+        }
+        # No filter: the whole tree, empty folders included.
+        assert "Sub" in await self._tree(api_client, bank_id)
+
+    async def test_tree_tag_groups(self, api_client, kb_bank):
+        bank_id, _ = kb_bank
+        groups = '[{"and":[{"tags":["revenue"],"match":"any_strict"},{"not":{"tags":["sales"],"match":"any_strict"}}]}]'
+        assert await self._tree(api_client, bank_id, tag_groups=groups) == {"Policies", "Billing"}
+
+        bad = await api_client.get(
+            f"/v1/default/banks/{_enc(bank_id)}/knowledge-base/tree", params={"tag_groups": "[{"}
+        )
+        assert bad.status_code == 400
+        # Blank is no filter — the same as on the entity routes, which share the parser.
+        assert "Sub" in await self._tree(api_client, bank_id, tag_groups="")
+
+    async def test_search_only_returns_matching_pages(self, api_client, kb_bank):
+        bank_id, ids = kb_bank
+        resp = await api_client.get(
+            f"/v1/default/banks/{_enc(bank_id)}/knowledge-base/search",
+            params={"q": "billing net-30 orders", "tags": "type:runbook", "tags_match": "any_strict"},
+        )
+        assert resp.status_code == 200, resp.text
+        assert {r["id"] for r in resp.json()["results"]} == {ids.orders}
+
+        resp = await api_client.get(
+            f"/v1/default/banks/{_enc(bank_id)}/knowledge-base/search",
+            params={"q": "billing net-30 orders", "tag_groups": '[{"tags":["type:policy"],"match":"exact"}]'},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["results"] == []
+
+    async def test_validator_can_narrow_tree_and_search(self, api_client, memory: MemoryEngine, kb_bank, monkeypatch):
+        """An extension trims the reads by answering with a tag filter."""
+        bank_id, ids = kb_bank
+        seen: list[BankReadContext] = []
+
+        class _Narrowing(_RecordingValidator):
+            async def validate_bank_read(self, ctx: BankReadContext) -> ValidationResult:
+                seen.append(ctx)
+                return ValidationResult.accept_with(tags=["type:policy"], tags_match="all_strict")
+
+        monkeypatch.setattr(memory, "_operation_validator", _Narrowing())
+        assert await self._tree(api_client, bank_id, tags="sales") == {"Policies", "Billing"}
+        assert seen[-1].tags == ["sales"]
+
+        resp = await api_client.get(
+            f"/v1/default/banks/{_enc(bank_id)}/knowledge-base/search", params={"q": "orders billing net-30"}
+        )
+        assert {r["id"] for r in resp.json()["results"]} == {ids.billing}

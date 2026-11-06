@@ -35,7 +35,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Iterable
-from typing import IO
+from typing import IO, cast
 
 from prometheus_client import REGISTRY, CollectorRegistry, generate_latest
 from prometheus_client.metrics_core import Metric
@@ -108,7 +108,9 @@ def merge_expositions(parts: Iterable[tuple[str, str]]) -> bytes:
                     sample.name, {**sample.labels, LABEL: slot}, sample.value, sample.timestamp, sample.exemplar
                 )
     registry = CollectorRegistry(auto_describe=False)
-    registry.register(_Families(families.values()))
+    # `_Families` implements `collect()`, which is all a registry calls; it does not inherit
+    # prometheus_client's `Collector` base.
+    registry.register(cast("Collector", _Families(families.values())))
     return generate_latest(registry)
 
 
@@ -160,7 +162,7 @@ class WorkerMetrics:
     def render(self, *, stale_after_s: float = STALE_AFTER_S) -> bytes:
         """Every live worker's series, each labelled with its slot. This worker's are read live."""
         parts: list[tuple[str, str]] = [(str(self.slot), generate_latest(self._registry).decode())]
-        now = time.time()
+        now = time.time()  # noqa: TID251
         for path in sorted(glob.glob(os.path.join(self.directory, "worker-*.prom"))):
             slot = os.path.basename(path)[len("worker-") : -len(".prom")]
             if slot == str(self.slot):

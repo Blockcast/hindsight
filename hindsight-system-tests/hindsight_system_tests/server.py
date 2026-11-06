@@ -37,6 +37,10 @@ PG0_PORT = 15499
 
 SERVER_STARTUP_TIMEOUT = 180.0
 
+#: How often the server's worker looks for queued work. Stories that assert on what
+#: the worker has *not* claimed wait a multiple of this.
+WORKER_POLL_INTERVAL_MS = 500
+
 
 def free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -128,6 +132,13 @@ def stub_environment(stub_url: str) -> dict[str, str]:
         "HINDSIGHT_API_RERANKER_SILICONFLOW_API_KEY": "stub-key",
         "HINDSIGHT_API_RERANKER_SILICONFLOW_BASE_URL": stub_url,
         "HINDSIGHT_API_RERANKER_SILICONFLOW_MODEL": "stub-reranker",
+        # Consolidation's decision model (triage), for consolidation only: set up globally it
+        # would also rank recall. Triage is on by default wherever one is set up; it is off
+        # here so no other story's consolidation changes, and test_22 turns it on per bank.
+        "HINDSIGHT_API_CONSOLIDATION_DECISION_MODEL_PROVIDER": "typesafe",
+        "HINDSIGHT_API_CONSOLIDATION_DECISION_MODEL_API_KEY": "stub-key",
+        "HINDSIGHT_API_CONSOLIDATION_DECISION_MODEL_BASE_URL": stub_url,
+        "HINDSIGHT_API_CONSOLIDATION_USE_DECISION_MODEL": "false",
         # In production a retry earns its keep even on a 400: a model that
         # returned malformed JSON often gets it right the second time. Against a
         # deterministic stub it cannot — the same request gets the same answer —
@@ -143,6 +154,11 @@ def stub_environment(stub_url: str) -> dict[str, str]:
         # deterministic stub the retry cannot change the answer, and the wait
         # turns a fast loud-miss into a 90-second timeout.
         "HINDSIGHT_API_WORKER_MAX_RETRIES": "0",
+        # Pinned, not inherited: story 33 waits a few poll intervals and then
+        # asserts that queued work is still pending *because it cannot be claimed*.
+        # A longer default would let that check pass without the worker ever
+        # having looked.
+        "HINDSIGHT_API_WORKER_POLL_INTERVAL_MS": str(WORKER_POLL_INTERVAL_MS),
         # Bank stats are cached for 60s by default. A test that changes the bank
         # and then asserts on a counter would be reading a value from before its
         # own action — racy at best, a minute of waiting at worst.
@@ -163,23 +179,53 @@ def stub_environment(stub_url: str) -> dict[str, str]:
     }
 
 
-def start_hindsight_server(*, stub_url: str, log_path: Path) -> HindsightServer:
+def start_hindsight_server(
+    *, stub_url: str, log_path: Path, extra_env: dict[str, str] | None = None
+) -> HindsightServer:
     port = free_port()
+    env = _server_env(stub_url, extra_env)
+    env.update({"HINDSIGHT_API_HOST": "127.0.0.1", "HINDSIGHT_API_PORT": str(port)})
+    return _start(["hindsight-api"], env=env, url=f"http://127.0.0.1:{port}", log_path=log_path)
 
+
+def start_hindsight_worker(
+    *, stub_url: str, log_path: Path, extra_env: dict[str, str] | None = None
+) -> HindsightServer:
+    """A standalone ``hindsight-worker`` process, as a split deployment runs one.
+
+    It claims queued work from every schema its tenant extension lists — with the
+    default extension, ``HINDSIGHT_API_DATABASE_SCHEMA`` — so a story pairing it
+    with an HTTP-only server gives both its own schema, or this worker would claim
+    every other server's work too.
+    """
+    port = free_port()
+    env = _server_env(stub_url, extra_env)
+    command = ["hindsight-worker", "--http-host", "127.0.0.1", "--http-port", str(port)]
+    return _start(command, env=env, url=f"http://127.0.0.1:{port}", log_path=log_path)
+
+
+def _server_env(stub_url: str, extra_env: dict[str, str] | None) -> dict[str, str]:
     env = os.environ.copy()
     # The repo .env is for the developer's own server; a system test must depend
     # only on what it sets here, or it passes on one machine and fails on another.
     for key in list(env):
-        if key.startswith("HINDSIGHT_API_"):
+        # ANTHROPIC_* too: with no Hindsight key the Anthropic SDK reads its own
+        # variables, and a developer's ANTHROPIC_API_KEY would outrank the federation
+        # credentials a story sets.
+        if key.startswith(("HINDSIGHT_API_", "ANTHROPIC_")):
             del env[key]
 
     env.update(stub_environment(stub_url))
 
+    # A second server for a story that needs different server-level config — the
+    # reranker provider, say, which is not per-bank. It shares the stub and the
+    # database; banks are isolated by id, so two servers on one database do not
+    # collide.
+    env.update(extra_env or {})
+
     env.update(
         {
             "HINDSIGHT_API_DATABASE_URL": f"pg0://{PG0_INSTANCE}:{PG0_PORT}",
-            "HINDSIGHT_API_HOST": "127.0.0.1",
-            "HINDSIGHT_API_PORT": str(port),
             "HINDSIGHT_API_LOG_LEVEL": "info",
             # Everything the server does by default stays on, background work
             # included. A retain enqueues observation extraction and can trigger
@@ -191,7 +237,10 @@ def start_hindsight_server(*, stub_url: str, log_path: Path) -> HindsightServer:
             # catch are mostly in that half.
         }
     )
+    return env
 
+
+def _start(command: list[str], *, env: dict[str, str], url: str, log_path: Path) -> HindsightServer:
     # `hindsight-api` calls load_dotenv(find_dotenv(usecwd=True), override=True) at
     # startup, and a discovered .env deliberately wins over the ambient environment
     # (see issue #2961). Started from anywhere inside the repo it would therefore
@@ -204,14 +253,13 @@ def start_hindsight_server(*, stub_url: str, log_path: Path) -> HindsightServer:
 
     log_file = log_path.open("w")
     process = subprocess.Popen(
-        ["uv", "run", "--project", str(API_DIR), "hindsight-api"],
+        ["uv", "run", "--project", str(API_DIR), *command],
         cwd=run_dir,
         env=env,
         stdout=log_file,
         stderr=subprocess.STDOUT,
     )
 
-    url = f"http://127.0.0.1:{port}"
     server = HindsightServer(url=url, log_path=log_path, _process=process)
     _wait_until_healthy(server)
     return server
@@ -221,7 +269,7 @@ def _wait_until_healthy(server: HindsightServer) -> None:
     deadline = time.monotonic() + SERVER_STARTUP_TIMEOUT
     while time.monotonic() < deadline:
         if server._process.poll() is not None:
-            raise RuntimeError(f"hindsight-api exited during startup:\n{server.logs()}")
+            raise RuntimeError(f"{server._process.args} exited during startup:\n{server.logs()}")
         with contextlib.suppress(httpx.HTTPError):
             response = httpx.get(f"{server.url}/health", timeout=5)
             if response.status_code == 200:
@@ -229,4 +277,4 @@ def _wait_until_healthy(server: HindsightServer) -> None:
         time.sleep(0.5)
 
     server.stop()
-    raise RuntimeError(f"hindsight-api was not healthy within {SERVER_STARTUP_TIMEOUT}s:\n{server.logs()}")
+    raise RuntimeError(f"{server._process.args} was not healthy within {SERVER_STARTUP_TIMEOUT}s:\n{server.logs()}")

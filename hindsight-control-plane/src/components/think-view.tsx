@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { useTranslations } from "next-intl";
 import { client } from "@/lib/api";
 import { useBank } from "@/lib/bank-context";
@@ -29,6 +29,7 @@ import {
   Check,
   Play,
 } from "lucide-react";
+import { AttachmentStrip } from "@/components/ui/inline-attachment-text";
 import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
 import JsonView from "react18-json-view";
@@ -42,6 +43,15 @@ import remarkGfm from "remark-gfm";
 type TagsMatch = "any" | "all" | "any_strict" | "all_strict" | "exact";
 type ViewMode = "answer" | "trace" | "json";
 type BasedOnTab = "directives" | "mental_models" | "observations" | "world" | "experience";
+
+// Stable component identity preserves the table's scroll position when controls change.
+function ReflectMarkdownTable({ children }: { children?: ReactNode }) {
+  return (
+    <div className="overflow-x-auto">
+      <table>{children}</table>
+    </div>
+  );
+}
 
 export function ThinkView() {
   const t = useTranslations("thinkView");
@@ -439,8 +449,13 @@ export function ThinkView() {
                   <CardTitle>{t("answerTitle")}</CardTitle>
                 </CardHeader>
                 <CardContent>
-                  <div className="prose prose-sm max-w-none dark:prose-invert">
-                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{result.text}</ReactMarkdown>
+                  <div className="reflect-answer prose prose-base max-w-none dark:prose-invert prose-headings:font-semibold prose-h1:text-2xl prose-h2:text-xl prose-h3:text-lg">
+                    <ReactMarkdown
+                      remarkPlugins={[remarkGfm]}
+                      components={{ table: ReflectMarkdownTable }}
+                    >
+                      {result.text}
+                    </ReactMarkdown>
                   </div>
                 </CardContent>
               </Card>
@@ -905,6 +920,20 @@ export function ThinkView() {
                                             {item.context}
                                           </div>
                                         )}
+                                        {item.attachments?.length > 0 && currentBank && (
+                                          // Each attachment links to its own bytes; stop the click
+                                          // so it does not also open the memory dialog.
+                                          <div
+                                            className="mt-2"
+                                            onClick={(e) => e.stopPropagation()}
+                                            role="presentation"
+                                          >
+                                            <AttachmentStrip
+                                              bankId={currentBank}
+                                              attachments={item.attachments}
+                                            />
+                                          </div>
+                                        )}
                                       </>
                                     )}
                                   </div>
@@ -971,7 +1000,7 @@ export function ThinkView() {
 
       {/* Observation Detail Panel */}
       {selectedObservation && (
-        <div className="fixed right-0 top-0 h-screen w-[420px] bg-card border-l shadow-2xl z-50 overflow-y-auto">
+        <div className="fixed right-0 top-0 h-dvh w-full sm:w-[420px] bg-card border-l shadow-2xl z-50 overflow-y-auto">
           <div className="p-6">
             <div className="flex items-center justify-between mb-6">
               <div className="flex items-center gap-2">

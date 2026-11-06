@@ -1,5 +1,8 @@
 """Tests for metrics instrumentation."""
 
+import itertools
+import time
+
 import pytest
 from unittest.mock import MagicMock, patch
 
@@ -7,11 +10,11 @@ from hindsight_api.metrics import (
     MetricsCollector,
     MetricsCollectorBase,
     NoOpMetricsCollector,
+    OperationOutcome,
     get_metrics_collector,
     get_token_bucket,
     create_metrics_collector,
     initialize_metrics,
-    normalize_http_endpoint,
 )
 
 
@@ -104,6 +107,26 @@ class TestMetricsCollector:
         assert attributes["source"] == "api"
         assert attributes["success"] == "true"
 
+    @pytest.fixture
+    def wall_clock_steps_back(self, monkeypatch):
+        """Each time.time() reading is a second earlier than the last, as across an NTP step back."""
+        readings = itertools.count(1_790_897_894.0, -1.0)
+        monkeypatch.setattr(time, "time", lambda: next(readings))
+
+    def test_operation_duration_stays_non_negative_when_the_wall_clock_steps_back(
+        self, collector, wall_clock_steps_back
+    ):
+        with collector.record_operation("recall", bank_id="test_bank", source="api"):
+            pass
+
+        assert collector.operation_duration.record.call_args[0][0] >= 0
+
+    def test_http_duration_stays_non_negative_when_the_wall_clock_steps_back(self, collector, wall_clock_steps_back):
+        with collector.record_http_request("POST", "/v1/default/banks/b/memories/recall", lambda: 200):
+            pass
+
+        assert collector.http_request_duration.record.call_args[0][0] >= 0
+
     def test_record_operation_records_failure_on_exception(self, collector):
         """Test that record_operation records failure when exception occurs."""
         with pytest.raises(RuntimeError):
@@ -115,14 +138,14 @@ class TestMetricsCollector:
         attributes = call_args[0][1]
         assert attributes["success"] == "false"
 
-    def test_record_operation_cancellation_excluded_from_metric(self, collector):
+    def test_record_operation_cancellation_recorded_as_cancelled(self, collector):
         """A client-disconnect cancellation is neither a success nor a failure.
 
         Recall/reflect run the engine call inside record_operation; when the
         client disconnects the engine raises OperationCancelledError (issue
-        #2122). That abandoned request must not be recorded on
-        hindsight.operation.total at all -- inflating neither the failure nor
-        the success rate -- even though the exception still propagates.
+        #2122). That abandoned request is counted with success="cancelled", so
+        it shows up in hindsight.operation.total (and its time-until-cancel in
+        the duration histogram) without inflating the failure rate (#6126).
         """
         from hindsight_api.cancellation import OperationCancelledError
 
@@ -130,13 +153,13 @@ class TestMetricsCollector:
             with collector.record_operation("recall", bank_id="test_bank", source="api"):
                 raise OperationCancelledError("client disconnected")
 
-        collector.operation_total.add.assert_not_called()
-        collector.operation_duration.record.assert_not_called()
+        assert collector.operation_total.add.call_args[0][1]["success"] == "cancelled"
+        assert collector.operation_duration.record.call_args[0][1]["success"] == "cancelled"
 
-    def test_record_operation_http_499_from_cancellation_excluded(self, collector):
+    def test_record_operation_http_499_from_cancellation_recorded_as_cancelled(self, collector):
         """run_cancellable_on_disconnect re-raises the cancellation as
         ``HTTPException(499) from exc``; the cause chain marks it as a
-        cancellation, so it is excluded from the metric too."""
+        cancellation, so it is recorded as cancelled too."""
         from fastapi import HTTPException
 
         from hindsight_api.cancellation import OperationCancelledError
@@ -148,8 +171,7 @@ class TestMetricsCollector:
                 except OperationCancelledError as cancel:
                     raise HTTPException(status_code=499, detail="client disconnected") from cancel
 
-        collector.operation_total.add.assert_not_called()
-        collector.operation_duration.record.assert_not_called()
+        assert collector.operation_total.add.call_args[0][1]["success"] == "cancelled"
 
     def test_record_operation_unrelated_499_still_recorded_as_failure(self, collector):
         """A 499 that is NOT caused by a cancellation (no OperationCancelledError
@@ -162,6 +184,48 @@ class TestMetricsCollector:
 
         attributes = collector.operation_duration.record.call_args[0][1]
         assert attributes["success"] == "false"
+
+    def test_record_operation_validator_rejection_recorded_as_rejected(self, collector):
+        """An operation a validator refused did not fail: it is counted with
+        success="rejected", outside the failure rate, like a cancellation."""
+        from hindsight_api.extensions.operation_validator import OperationValidationError
+
+        with pytest.raises(OperationValidationError):
+            with collector.record_operation("retain", bank_id="test_bank", source="api"):
+                raise OperationValidationError("quota exceeded", status_code=402)
+
+        assert collector.operation_total.add.call_args[0][1]["success"] == "rejected"
+        assert collector.operation_duration.record.call_args[0][1]["success"] == "rejected"
+
+    def test_record_operation_http_error_from_rejection_recorded_as_rejected(self, collector):
+        """A rejection re-raised as an HTTPException ``from`` it is still a rejection."""
+        from fastapi import HTTPException
+
+        from hindsight_api.extensions.operation_validator import OperationValidationError
+
+        with pytest.raises(HTTPException):
+            with collector.record_operation("recall", bank_id="test_bank", source="api"):
+                try:
+                    raise OperationValidationError("quota exceeded", status_code=402)
+                except OperationValidationError as rejection:
+                    raise HTTPException(status_code=402, detail=rejection.reason) from rejection
+
+        assert collector.operation_total.add.call_args[0][1]["success"] == "rejected"
+
+    def test_record_operation_unrelated_402_still_recorded_as_failure(self, collector):
+        """A 402 that no validator raised is a real failure and is still recorded as one."""
+        from fastapi import HTTPException
+
+        with pytest.raises(HTTPException):
+            with collector.record_operation("retain", bank_id="test_bank", source="api"):
+                raise HTTPException(status_code=402, detail="upstream provider out of quota")
+
+        assert collector.operation_total.add.call_args[0][1]["success"] == "false"
+
+    def test_record_operation_result_records_rejected(self, collector):
+        collector.record_operation_result("retain", "test_bank", outcome=OperationOutcome.REJECTED, duration=0.1)
+
+        assert collector.operation_total.add.call_args[0][1]["success"] == "rejected"
 
     def test_record_operation_with_budget(self, collector):
         """Test that budget is included in attributes when provided."""
@@ -221,7 +285,9 @@ class TestMetricsCollector:
 
     def test_record_operation_result_records_with_explicit_success(self, collector):
         """Direct recording path used by the worker (source=worker, explicit success)."""
-        collector.record_operation_result("retain", bank_id="test_bank", success=False, duration=1.5, source="worker")
+        collector.record_operation_result(
+            "retain", bank_id="test_bank", outcome=OperationOutcome.FAILURE, duration=1.5, source="worker"
+        )
 
         duration, attributes = collector.operation_duration.record.call_args[0]
         assert duration == 1.5
@@ -263,6 +329,58 @@ class TestMetricsCollector:
 
         attributes = collector.operation_duration.record.call_args[0][1]
         assert attributes["bank_id"] == "test_bank"
+
+    def test_tenant_label_excluded_by_default(self):
+        """The per-tenant (schema) label is high-cardinality and off by default.
+
+        metrics_include_tenant=False must strip ``tenant`` from every always-on instrument.
+        Regression for OTel metric blow-up on deployments with many tenant schemas: one series
+        set per tenant, multiplied through every histogram bucket.
+        """
+        from hindsight_api.config import DEFAULT_METRICS_INCLUDE_TENANT
+
+        assert DEFAULT_METRICS_INCLUDE_TENANT is False
+        mock_config = MagicMock()
+        mock_config.metrics_include_bank_id = False
+        mock_config.metrics_include_tenant = False
+        mock_config.recall_diagnostic_phases = True
+        mock_config.recall_phase_sample_every = 1
+        with (
+            patch("hindsight_api.metrics.get_meter", return_value=MagicMock()),
+            patch("hindsight_api.config.get_config", return_value=mock_config),
+            patch("hindsight_api.metrics._get_tenant", return_value="tenant_abc"),
+        ):
+            collector = MetricsCollector()
+
+        collector.record_operation_result("recall", "test_bank", outcome=OperationOutcome.SUCCESS, duration=0.1)
+        collector.record_recall_phase("engine_auth", 0.01)
+        collector.record_retain_phase("write", 0.01)
+
+        op_attrs = collector.operation_duration.record.call_args[0][1]
+        recall_attrs = collector.recall_phase_duration.record.call_args[0][1]
+        retain_attrs = collector.retain_phase_duration.record.call_args[0][1]
+        assert "tenant" not in op_attrs
+        assert "tenant" not in recall_attrs
+        assert "tenant" not in retain_attrs
+
+    def test_tenant_label_included_when_enabled(self):
+        """metrics_include_tenant=True restores the ``tenant`` label for small deployments."""
+        mock_config = MagicMock()
+        mock_config.metrics_include_bank_id = False
+        mock_config.metrics_include_tenant = True
+        mock_config.recall_diagnostic_phases = True
+        mock_config.recall_phase_sample_every = 1
+        with (
+            patch("hindsight_api.metrics.get_meter", return_value=MagicMock()),
+            patch("hindsight_api.config.get_config", return_value=mock_config),
+            patch("hindsight_api.metrics._get_tenant", return_value="tenant_abc"),
+        ):
+            collector = MetricsCollector()
+            # _get_tenant is read at record time, so the phase must be recorded inside the patch.
+            collector.record_recall_phase("engine_auth", 0.01)
+
+        recall_attrs = collector.recall_phase_duration.record.call_args[0][1]
+        assert recall_attrs["tenant"] == "tenant_abc"
 
     @pytest.mark.parametrize("enabled", [True, False])
     def test_recall_diagnostic_phases_follow_config(self, enabled):
@@ -387,24 +505,6 @@ class TestGetTokenBucket:
         assert get_token_bucket(50000) == "50k+"
         assert get_token_bucket(100000) == "50k+"
         assert get_token_bucket(1000000) == "50k+"
-
-
-class TestNormalizeHttpEndpoint:
-    """Tests for normalize_http_endpoint (low-cardinality HTTP metric labels)."""
-
-    def test_templates_high_cardinality_segments(self):
-        """Bank ids (incl. non-numeric), UUIDs, and numeric ids collapse to placeholders."""
-        cases = [
-            ("/v1/default/banks/user-1680/memories/recall", "/v1/default/banks/{bank_id}/memories/recall"),
-            ("/v1/default/banks/tenant-acme/memories", "/v1/default/banks/{bank_id}/memories"),
-            ("/v1/default/banks/user-1680", "/v1/default/banks/{bank_id}"),
-            ("/v1/default/banks/3f8c1e2a-1111-2222-3333-444455556666/config", "/v1/default/banks/{bank_id}/config"),
-            ("/v1/default/banks/42/config", "/v1/default/banks/{bank_id}/config"),
-            ("/v1/default/banks", "/v1/default/banks"),
-            ("/health", "/health"),
-        ]
-        for raw, expected in cases:
-            assert normalize_http_endpoint(raw) == expected, raw
 
 
 class TestLLMMetrics:

@@ -68,6 +68,8 @@ describe("full bank config surface mapping", () => {
   test("maps the consolidation, retain and security groups onto the updates map", async () => {
     await client.updateBankConfig("bank", {
       enableAutoConsolidation: false,
+      consolidationUseDecisionModel: false,
+      mentalModelDeltaUseDecisionModel: false,
       consolidationLlmBatchSize: 4,
       consolidationLlmParallelism: 2,
       consolidationMaxMemoriesPerRound: 50,
@@ -78,10 +80,15 @@ describe("full bank config surface mapping", () => {
       reflectSourceFactsMaxTokens: 1024,
       maxObservationsPerScope: 25,
       observationScopeLimits: [{ scope: "team", limit: 10 }],
+      consolidationStrategies: [
+        { scopes: [{ tags: ["company:*"] }], observations_mission: "Trends only." },
+      ],
+      defaultObservationScopes: [["topic:*", "user:*"]],
       retainDefaultStrategy: "fast",
       retainStrategies: { fast: { retain_extraction_mode: "concise" } },
       retainChunkBatchSize: 64,
       storeDocumentText: false,
+      defaultTimezone: "Asia/Shanghai",
       mcpEnabledTools: ["recall", "reflect"],
       llmGeminiSafetySettings: [{ category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" }],
       memoryDefense: { redact_secrets: true },
@@ -91,6 +98,8 @@ describe("full bank config surface mapping", () => {
     const body = mockedUpdateConfig.mock.calls[0][0].body as any;
     expect(body.updates).toEqual({
       enable_auto_consolidation: false,
+      consolidation_use_decision_model: false,
+      mental_model_delta_use_decision_model: false,
       consolidation_llm_batch_size: 4,
       consolidation_llm_parallelism: 2,
       consolidation_max_memories_per_round: 50,
@@ -101,10 +110,15 @@ describe("full bank config surface mapping", () => {
       reflect_source_facts_max_tokens: 1024,
       max_observations_per_scope: 25,
       observation_scope_limits: [{ scope: "team", limit: 10 }],
+      consolidation_strategies: [
+        { scopes: [{ tags: ["company:*"] }], observations_mission: "Trends only." },
+      ],
+      default_observation_scopes: [["topic:*", "user:*"]],
       retain_default_strategy: "fast",
       retain_strategies: { fast: { retain_extraction_mode: "concise" } },
       retain_chunk_batch_size: 64,
       store_document_text: false,
+      default_timezone: "Asia/Shanghai",
       mcp_enabled_tools: ["recall", "reflect"],
       llm_gemini_safety_settings: [
         { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },

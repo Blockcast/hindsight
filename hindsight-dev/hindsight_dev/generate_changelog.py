@@ -86,6 +86,7 @@ TABLE_VOLUME: dict[str, VolumeTier] = {
     "document_attachments": MEDIUM_VOLUME,
     # Configuration-sized: a handful of rows per bank or tenant.
     "banks": LOW_VOLUME,
+    "bank_aliases": LOW_VOLUME,
     "webhooks": LOW_VOLUME,
     "bank_stats_cache": LOW_VOLUME,
 }
@@ -132,25 +133,18 @@ INTEGRATIONS: dict[str, IntegrationMeta] = {
     "langgraph": IntegrationMeta("hindsight-langgraph", "LangGraph"),
     "nemoclaw": IntegrationMeta("@vectorize-io/hindsight-nemoclaw", "NemoClaw"),
     "strands": IntegrationMeta("hindsight-strands", "Strands"),
-    "claude-code": IntegrationMeta("hindsight-memory", "Claude Code"),
     # Git-distributed plugin bundle (Agent Plugins standard), not a registry
     # package — its changelog links to the source tree (see _package_url).
     "agent-plugin": IntegrationMeta("hindsight-agent-plugin", "Agent Plugins"),
-    "zcode": IntegrationMeta("hindsight-zcode", "ZCode"),
     "claude-agent-sdk": IntegrationMeta("hindsight-claude-agent-sdk", "Claude Agent SDK"),
     "llamaindex": IntegrationMeta("hindsight-llamaindex", "LlamaIndex"),
-    "codex": IntegrationMeta("hindsight-codex", "Codex"),
     # npm-published under the @vectorize-io scope, unlike the PyPI integrations above.
     "coding-agents": IntegrationMeta("@vectorize-io/hindsight-coding-agents", "Coding Agents"),
     "github-copilot": IntegrationMeta("hindsight-copilot", "GitHub Copilot"),
-    "cline": IntegrationMeta("hindsight-cline", "Cline"),
-    "cursor-cli": IntegrationMeta("hindsight-cursor-cli", "Cursor CLI"),
-    "copilot-cli": IntegrationMeta("hindsight-copilot-cli", "GitHub Copilot CLI"),
     "cursor": IntegrationMeta("hindsight-cursor", "Cursor"),
     "autogen": IntegrationMeta("hindsight-autogen", "AutoGen"),
     "aider": IntegrationMeta("hindsight-aider", "Aider"),
     "paperclip": IntegrationMeta("@vectorize-io/hindsight-paperclip", "Paperclip"),
-    "opencode": IntegrationMeta("@vectorize-io/opencode-hindsight", "OpenCode"),
     "eve": IntegrationMeta("@vectorize-io/hindsight-eve", "Eve"),
     "cloudflare-oauth-proxy": IntegrationMeta("hindsight-cloudflare-oauth-proxy"),
     "openai-agents": IntegrationMeta("hindsight-openai-agents"),
@@ -161,11 +155,21 @@ INTEGRATIONS: dict[str, IntegrationMeta] = {
     "dify": IntegrationMeta("hindsight-dify", "Dify"),
     "vapi": IntegrationMeta("hindsight-vapi", "Vapi"),
     "gemini-spark": IntegrationMeta("hindsight-gemini-spark", "Gemini Spark"),
+    "meta-muse": IntegrationMeta("hindsight-meta-muse", "Meta Muse"),
+    # Marketplace-distributed: Grok Bot and Cursor install the plugin from the Cursor
+    # Marketplace at an approved commit of this repo, so `package_name` is the plugin id
+    # rather than a registry package, and _package_url points at the source tree.
+    "grok-bot": IntegrationMeta("hindsight", "Grok Bot"),
     "flowise": IntegrationMeta("@vectorize-io/flowise-nodes-hindsight", "Flowise"),
     "google-adk": IntegrationMeta("hindsight-google-adk", "Google ADK"),
     "superagent": IntegrationMeta("hindsight-superagent", "Superagent"),
     "obsidian": IntegrationMeta("@vectorize-io/hindsight-obsidian", "Obsidian"),
     "haystack": IntegrationMeta("hindsight-haystack", "Haystack"),
+    "agno": IntegrationMeta("hindsight-agno", "Agno"),
+    # Git-distributed: Hermes installs the plugin from this repo at a catalog-pinned commit, so
+    # `package_name` is the Hermes plugin id rather than a registry package, and _package_url
+    # points at the source tree (see the carve-out there).
+    "hermes": IntegrationMeta("hindsight", "Hermes Agent"),
     "roo-code": IntegrationMeta("hindsight-roo-code", "Roo Code"),
     "omo": IntegrationMeta("hindsight-omo", "OMO"),
     "composio": IntegrationMeta("hindsight-composio", "Composio"),
@@ -854,6 +858,14 @@ def build_changelog_markdown(
     # Build markdown
     lines = [f"## [{version}]({tag_url})", ""]
 
+    # Integrations that install from git are pinned by commit, not by version: the Hermes catalog
+    # pins a sha, and `hermes plugins install --ref` takes a full 40-character sha and rejects tag
+    # names outright. The release's own sha cannot be printed here — this file is written *before*
+    # the release commit that contains it exists — so link the commits page at the tag, where the
+    # top entry is that commit and GitHub offers its full hash.
+    if integration:
+        lines += [f"[Commits in this release →](https://github.com/{GITHUB_REPO}/commits/{tag})", ""]
+
     has_entries = False
     for cat_key in ["breaking", "feature", "improvement", "bugfix", "other"]:
         cat_name, cat_entries = categories[cat_key]
@@ -1124,7 +1136,7 @@ def _get_package_name(integration: str) -> str:
 def _package_url(integration: str, package_name: str) -> str:
     # Git-distributed plugin bundles have no npm/pypi package — link to the
     # source tree instead of a registry page.
-    if integration in ("claude-code", "agent-plugin"):
+    if integration in ("agent-plugin", "hermes", "grok-bot"):
         return f"https://github.com/vectorize-io/hindsight/tree/main/hindsight-integrations/{integration}"
     if package_name.startswith("@"):
         return f"https://www.npmjs.com/package/{package_name}"

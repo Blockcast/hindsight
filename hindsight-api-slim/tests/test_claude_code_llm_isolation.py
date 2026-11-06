@@ -7,16 +7,17 @@ user-installed plugins (e.g. hindsight-memory). Their Stop hooks then retain
 the subprocess's own transcript back into the same bank, causing a recursive
 feedback loop documented in issue #1751.
 
-The fix redirects the subprocess to an isolated config dir via env. This test
-mocks the SDK to capture the ClaudeAgentOptions passed at call time and asserts
-the isolation env is present on both code paths (`call` and `call_with_tools`).
+The fix redirects the subprocess to an isolated config dir via env. That alone
+still let the CLI load ./.claude/settings.json from an inherited $HOME cwd as
+project settings (issue #5542), so the subprocess also runs in the isolated dir
+with no setting sources. This test mocks the SDK to capture the
+ClaudeAgentOptions passed at call time and asserts all of it.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any
-from unittest.mock import patch
 
 import pytest
 
@@ -30,13 +31,15 @@ class _FakeOptions:
     allowed_tools: list[str] = field(default_factory=list)
     tools: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
-    mcp_servers: dict[str, Any] = field(default_factory=dict)
     model: str | None = None
+    cwd: str | None = None
+    setting_sources: list[str] | None = None
 
 
 class _FakeAssistantMessage:
     def __init__(self, content: list[Any]) -> None:
         self.content = content
+        self.usage = None
 
 
 class _FakeTextBlock:
@@ -44,16 +47,25 @@ class _FakeTextBlock:
         self.text = text
 
 
-def _instantiate_provider():
+def _instantiate_provider(api_key: str = ""):
     from hindsight_api.engine.providers.claude_code_llm import ClaudeCodeLLM
 
     return ClaudeCodeLLM(
         provider="claude-code",
-        api_key="",
+        api_key=api_key,
         base_url="",
         model="claude-haiku-4-5",
         reasoning_effort="low",
     )
+
+
+def _assert_isolation(options: _FakeOptions) -> None:
+    _assert_isolation_env(options.env)
+    # Issue #5542: the CLI loads ./.claude/settings.json from its cwd as project
+    # settings. Inheriting a $HOME cwd would load ~/.claude/settings.json (the
+    # host's hooks) despite CLAUDE_CONFIG_DIR, so pin cwd and load no settings.
+    assert options.cwd == options.env["CLAUDE_CONFIG_DIR"], "subprocess must run in the isolated dir"
+    assert options.setting_sources == [], "subprocess must load no user/project/local settings"
 
 
 def _assert_isolation_env(env: dict[str, str]) -> None:
@@ -92,69 +104,10 @@ async def test_call_passes_isolation_env_to_sdk_options(monkeypatch):
 
     assert result == "ok"
     assert "options" in captured, "fake query was not called"
-    _assert_isolation_env(captured["options"].env)
-
-
-@pytest.mark.asyncio
-async def test_call_with_tools_passes_isolation_env_to_sdk_options(monkeypatch):
-    """call_with_tools() must apply the same isolation env."""
-    import claude_agent_sdk
-
-    captured: dict[str, _FakeOptions] = {}
-
-    class _FakeClient:
-        def __init__(self, options: _FakeOptions) -> None:
-            captured["options"] = options
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return False
-
-        async def query(self, prompt: str) -> None:
-            return None
-
-        async def receive_response(self):
-            yield _FakeAssistantMessage(content=[_FakeTextBlock(text="ok")])
-
-    @dataclass
-    class _FakeSdkMcpTool:
-        name: str
-        description: str
-        input_schema: dict[str, Any]
-        handler: Any
-
-    def fake_create_sdk_mcp_server(name: str, version: str, tools=None):
-        return {"name": name, "version": version, "tools": tools}
-
-    monkeypatch.setattr(claude_agent_sdk, "ClaudeAgentOptions", _FakeOptions)
-    monkeypatch.setattr(claude_agent_sdk, "AssistantMessage", _FakeAssistantMessage)
-    monkeypatch.setattr(claude_agent_sdk, "TextBlock", _FakeTextBlock)
-    monkeypatch.setattr(claude_agent_sdk, "ToolUseBlock", type("ToolUseBlock", (), {}))
-    monkeypatch.setattr(claude_agent_sdk, "ClaudeSDKClient", _FakeClient)
-    monkeypatch.setattr(claude_agent_sdk, "SdkMcpTool", _FakeSdkMcpTool)
-    monkeypatch.setattr(claude_agent_sdk, "create_sdk_mcp_server", fake_create_sdk_mcp_server)
-
-    provider = _instantiate_provider()
-    result = await provider.call_with_tools(
-        messages=[{"role": "user", "content": "hi"}],
-        tools=[
-            {
-                "function": {
-                    "name": "noop",
-                    "description": "no-op",
-                    "parameters": {"type": "object", "properties": {}},
-                }
-            }
-        ],
-        max_retries=0,
-        scope="test",
-    )
-
-    assert result.content == "ok"
-    assert "options" in captured, "fake client was not constructed"
-    _assert_isolation_env(captured["options"].env)
+    _assert_isolation(captured["options"])
+    # The configured model is pinned (issue #2881): without it the spawned CLI runs its own
+    # default model while metrics and logs still print the configured one.
+    assert captured["options"].model == "claude-haiku-4-5"
 
 
 def test_isolation_dir_is_reused_across_calls():
@@ -177,3 +130,27 @@ def test_isolation_dir_is_not_home():
     assert env["CLAUDE_CONFIG_DIR"] != os.path.expanduser("~"), (
         "Isolated dir must not be $HOME, or it would still load installed_plugins.json"
     )
+
+
+def test_setup_token_is_passed_to_cli_as_oauth_token():
+    """A configured `claude setup-token` token reaches the CLI; no key leaves CLI login in charge."""
+    from hindsight_api.engine.providers.claude_code_llm import _get_isolated_claude_env
+
+    with_token = _instantiate_provider(api_key=" sk-ant-oat01-x ")
+    assert with_token._env["CLAUDE_CONFIG_DIR"] == _get_isolated_claude_env()["CLAUDE_CONFIG_DIR"]
+    assert with_token._env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-x"
+    # The CLI prefers a stored login over the token; the un-suffixed keychain
+    # redirect would hand it the host login and silently ignore the token.
+    assert "CLAUDE_SECURESTORAGE_CONFIG_DIR" not in with_token._env
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in _get_isolated_claude_env(), "token must not leak into the shared env"
+    # The shared isolation env is a process-lifetime singleton: the token path must
+    # copy it, not mutate it, or the no-key path would inherit the token.
+    assert "CLAUDE_SECURESTORAGE_CONFIG_DIR" in _get_isolated_claude_env()
+
+    without = _instantiate_provider(api_key="")
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in without._env
+
+    # A rejected token must not send the operator to `claude auth login`, which the token bypasses.
+    assert "claude setup-token" in with_token._auth_hint
+    assert "claude auth login" not in with_token._auth_hint
+    assert "claude auth login" in without._auth_hint

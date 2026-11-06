@@ -28,13 +28,18 @@ class RequestContext:
     internal: bool = False  # True for background/internal operations (skips extension auth)
     mcp_authenticated: bool = False  # True when MCP transport auth already validated (skips tenant re-auth)
     user_initiated: bool = False  # True for async operations that originated from a user request
-    allowed_bank_ids: list[str] | None = None  # None = unrestricted (all banks)
     # Number of times this task has been retried. Populated by the worker
     # from async_operations.retry_count before dispatching to a task handler;
     # 0 for sync/HTTP requests and for the first worker attempt. Useful for
     # validators that want exponential backoff on repeated failures (e.g.
     # "defer for 2^retry_count minutes") without querying the DB themselves.
     retry_count: int = 0
+    # Id of the async operation this task is executing. Populated by the worker
+    # alongside retry_count; None for sync/HTTP requests. Lets a validator act
+    # on the operation it is deciding about (e.g. cancel it rather than fail it)
+    # without having to infer the row from the bank and its status. When retains
+    # are folded into one execution this is the primary operation's id.
+    operation_id: str | None = None
     # Cooperative cancellation signal for long-running operations. The HTTP
     # layer sets this to a token that fires when the client disconnects; the
     # engine checks it at stage boundaries and aborts abandoned work so it stops
@@ -49,6 +54,15 @@ class RequestContext:
     # the Authorization header — e.g. a per-caller assertion sent alongside a
     # shared bearer token by an authenticating proxy.
     extra_headers: dict[str, str] = field(default_factory=dict)
+    # Tenant schema this context already authenticated into, memoised so one
+    # request authenticates once. A request can reach the engine through more
+    # than one entry point — the bank-alias resolution on the route class runs
+    # before the endpoint's own engine call, and `precheck_for` before that — and
+    # re-running the tenant extension for each would bill a deployment two or
+    # three identity lookups per request for a single caller. Scoped to this
+    # object, which the transports build per request; `internal` and
+    # `mcp_authenticated` contexts skip authentication entirely and never set it.
+    authenticated_schema: str | None = None
 
     def raise_if_cancelled(self) -> None:
         """Abort the current operation if its cancellation token has fired.

@@ -11,6 +11,7 @@ export async function POST(request: NextRequest) {
       types,
       fact_type,
       prefer_observations,
+      rerank,
       max_tokens,
       trace,
       budget,
@@ -30,6 +31,7 @@ export async function POST(request: NextRequest) {
         query,
         types: types || fact_type,
         prefer_observations,
+        rerank,
         max_tokens,
         trace,
         budget: budget || "mid",
@@ -48,16 +50,9 @@ export async function POST(request: NextRequest) {
       throw new Error(`API returned no data: ${JSON.stringify(response.error || "Unknown error")}`);
     }
 
-    // Return a clean JSON object by spreading the response
-    // This ensures any non-serializable properties are excluded
-    const jsonResponse = {
-      results: response.data.results,
-      trace: response.data.trace,
-      entities: response.data.entities,
-      chunks: response.data.chunks,
-    };
-
-    return NextResponse.json(jsonResponse, { status: 200 });
+    // Pass the whole body through: a hand-picked projection silently dropped
+    // fields the caller asked for (source_facts, source_facts_truncated).
+    return NextResponse.json(response.data, { status: 200 });
   } catch (error) {
     console.error("Error recalling:", error);
     return NextResponse.json(

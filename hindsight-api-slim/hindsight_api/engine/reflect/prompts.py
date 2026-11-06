@@ -8,6 +8,7 @@ The reflect agent uses hierarchical retrieval:
 """
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -132,8 +133,8 @@ _TOOLS_LANGUAGE_RULE = (
 )
 
 
-def build_agent_user_prompt(query: str, llm_output_language: str | None = None) -> str:
-    """The reasoning loop's opening user message: the question, closed by the directive.
+def build_agent_user_prompt(query: str, llm_output_language: str | None = None, mission: str | None = None) -> str:
+    """The reasoning loop's opening user message: the question, the mission, closed by the directive.
 
     The ``done()`` answer is written by the tool-calling model, whose system prompt is
     :func:`build_system_prompt_for_tools`. For the same reason :func:`build_final_prompt`
@@ -143,8 +144,19 @@ def build_agent_user_prompt(query: str, llm_output_language: str | None = None) 
     this is "last" for the question the model is answering, not for the whole
     conversation — the system prompt dropping its contradicting rule is what makes the
     directive uncontested (#3776).
+
+    The bank's mission is restated here for the same reason. As the role line at the top of the
+    system prompt it lost to the retrieval ladder below it: with a mission telling reflect to read a
+    decision's own commit or conversation before reporting it, agent turns still answered from a
+    fresh page that had misread the decision (coding-agent reflect benchmark, boltons-budget-history, 0/2), and the answer
+    reported a "simplification" commit as replacing a decision the mission said it does not.
     """
-    return query + output_language_directive(llm_output_language)
+    mission_section = (
+        f"\n\n## Bank mission (it governs what you search and how you answer)\n{mission.strip()}"
+        if mission and mission.strip()
+        else ""
+    )
+    return query + mission_section + output_language_directive(llm_output_language)
 
 
 def bank_name_line(bank_profile: dict[str, Any]) -> str:
@@ -197,6 +209,7 @@ def build_system_prompt_for_tools(
     budget: str | None = None,
     answer_as_document: bool = False,
     llm_output_language: str | None = None,
+    answer_ready: bool = False,
 ) -> str:
     """
     Build the system prompt for tool-calling reflect agent.
@@ -218,7 +231,8 @@ def build_system_prompt_for_tools(
         has_mental_models: Whether the bank has any mental models (skip if not)
         include_observations: Whether search_observations is in the tool list.
         budget: Search depth budget - "low", "mid", or "high". Controls exploration thoroughness.
-        answer_as_document: Whether done() takes a structured document instead of markdown.
+        answer_as_document: Whether done() takes the answer as a markdown document, split into
+            sections by its headings (see tools_schema's markdown document tool).
         llm_output_language: Configured output language; drops the default language rule
             (the directive itself goes on the user message, see build_agent_user_prompt).
     """
@@ -274,7 +288,9 @@ def build_system_prompt_for_tools(
             "- `mentioned_at` — when the user retained the fact (always set).",
             "- `occurred_start` / `occurred_end` — when the underlying event happened (optional, set for dated events).",
             "",
-            "When facts about the SAME facet conflict — counts, statuses, ownership, location, presence, etc. — the fact with the LATEST `mentioned_at` is authoritative. Later statements SUPERSEDE earlier ones. Do NOT average, sum, or favor an explicitly-dated fact over a more recent one.",
+            "When facts about the SAME facet conflict — counts, statuses, ownership, location, presence, etc. — the fact with the LATEST `mentioned_at` is authoritative. Later statements SUPERSEDE earlier ones. Do NOT average, sum, or favor an explicitly-dated fact over a more recent one. The one exception is a DECISION, below.",
+            "",
+            "A DECISION is different from a state. When the record holds a decision with its rationale (what was decided and why) and a later record changes the same thing WITHOUT stating a reason that overturns that decision (a refactor, a 'simplification', a cleanup, a performance change), the later record does NOT supersede the decision: report the decision as the standing one, and report the later change as a departure from it. Only a later record that itself decides, with its own rationale, replaces an earlier decision. Example: 'Invoices are due net-30; finance chose it for cash flow' (March) and 'cleanup: simplify billing config, terms = net-45' (May) → the rule is net-30; the May cleanup is a change that departed from it, NOT the rule.",
             "",
             "Example: three count facts come back from recall:",
             "  - 'Team has 2 engineers' (mentioned_at=T1)",
@@ -324,7 +340,12 @@ def build_system_prompt_for_tools(
                 [
                     "- User-curated summaries about specific topics",
                     "- HIGHEST quality - manually created and maintained",
-                    "- If a relevant mental model exists and is FRESH, it may fully answer the question",
+                    "- Search returns the best matches in full (`content`) and a SNIPPET of the others (`snippet`, only the page opening); call "
+                    "read_mental_models on any id whose snippet looks like it answers the question, and read it "
+                    "before answering from it",
+                    "- A FRESH mental model may fully answer the question — but only if it actually STATES the "
+                    "answer. One that shares the question's topic without stating the answer (e.g. it describes a "
+                    "process, or names the thing without its status) has not answered it: go to the next level",
                     "- Check `is_stale` field - if stale, also verify with lower levels",
                 ],
             )
@@ -345,7 +366,10 @@ def build_system_prompt_for_tools(
         recall_body.extend(
             [
                 "- Use when: no mental models/observations exist, they're stale, or you need specific details",
-                "- MANDATORY: If search_mental_models and search_observations both return 0 results, you MUST call recall() before giving up",
+                "- MANDATORY: If search_mental_models and search_observations return 0 results, OR return results that "
+                "do not STATE the answer, you MUST call recall() before giving up. Never report that the bank holds "
+                "nothing about something until recall() has run with the question's key terms (an issue key, name or "
+                "identifier) verbatim",
                 "- This is the source of truth that other levels are built from",
                 "",
                 "**Tool result ordering:** `recall()` and `search_observations()` return their `memories` / `observations` arrays sorted by SEMANTIC RELEVANCE to the query, NOT by time. The POSITION of an entry tells you nothing about when it was retained. For any temporal reasoning — recency, supersession, applying events on top of a state — IGNORE the position and read the per-entry `mentioned_at` field (and `occurred_start` / `occurred_end` for events).",
@@ -356,7 +380,9 @@ def build_system_prompt_for_tools(
         recall_body.extend(
             [
                 "- Use when: no mental model exists, it's stale, or you need specific details",
-                "- MANDATORY: If search_mental_models returns 0 results, you MUST call recall() before giving up",
+                "- MANDATORY: If search_mental_models returns 0 results, OR returns a model that does not STATE the "
+                "answer, you MUST call recall() before giving up. Never report that the bank holds nothing about "
+                "something until recall() has run with the question's key terms verbatim",
                 "- This is the source of truth that mental models are built from",
             ]
         )
@@ -364,7 +390,9 @@ def build_system_prompt_for_tools(
         recall_body.extend(
             [
                 "- Use when: no observations exist, they're stale, or you need specific details",
-                "- MANDATORY: If search_observations returns 0 results or count=0, you MUST call recall() before giving up",
+                "- MANDATORY: If search_observations returns 0 results or count=0, OR returns observations that do "
+                "not STATE the answer, you MUST call recall() before giving up. Never report that the bank holds "
+                "nothing about something until recall() has run with the question's key terms verbatim",
                 "- This is the source of truth that observations are built from",
                 "",
                 "**Tool result ordering:** `recall()` and `search_observations()` return their `memories` / `observations` arrays sorted by SEMANTIC RELEVANCE to the query, NOT by time. The POSITION of an entry tells you nothing about when it was retained. For any temporal reasoning — recency, supersession, applying events on top of a state — IGNORE the position and read the per-entry `mentioned_at` field (and `occurred_start` / `occurred_end` for events).",
@@ -399,6 +427,32 @@ def build_system_prompt_for_tools(
         parts.extend(body)
         parts.append("")
 
+    # Stating the ladder here, rather than only forcing it turn by turn: the agent
+    # still pins the first turns with ``tool_choice`` (see ``forced_sequence`` in
+    # agent.py), but a model that has read the plan keeps following it once the
+    # forcing stops, instead of answering from whatever the last forced turn left.
+    if len(levels) > 1:
+        names = [header.split(" (")[0].split(" - ")[0].title() for header, _ in levels]
+        parts.extend(
+            [
+                "## Search Plan",
+                f"Work down the levels in order ({' → '.join(names)}) before you answer:",
+                "- Search a level before deciding it has nothing; a level you did not search is not evidence of absence.",
+                # Named from the levels actually offered: on a bank with no mental
+                # models the top level is observations, and pointing at a layer the
+                # model has no tool for is how #1724 happened.
+                f"- Stop descending as soon as what you have answers the question — fresh {names[0]} often do.",
+                "- Go deeper when the level above is stale, thin, or silent on what was asked.",
+                (
+                    "- Call `answer_ready` once you have the evidence; you are then asked for the answer. "
+                    "Do not write the answer before that."
+                    if answer_ready
+                    else "- Call `done` with the answer once you have the evidence. Do not write the answer as plain text."
+                ),
+                "",
+            ]
+        )
+
     parts.extend(
         [
             "## Query Strategy",
@@ -415,18 +469,32 @@ def build_system_prompt_for_tools(
         ]
     )
 
-    # Add budget guidance
+    # Add budget guidance. The budget bounds how LONG the answer is and how many
+    # searches get spent on it — never whether the lower retrieval layers are
+    # consulted at all. The earlier low/mid wording ("if mental models or
+    # observations provide a reasonable answer, stop there") did the latter:
+    # combined with the fresh-mental-model short-circuit in agent.py, which stops
+    # forcing the lower layers once a page search returns fresh non-empty pages,
+    # it let a reflect answer "the bank holds nothing about X" off the page layer
+    # while recall() on the same bank returned the facts (#4567). Freshness and
+    # topical overlap are not coverage, so both levels now say to go deeper when
+    # what came back does not answer the question. The absence rule itself is NOT
+    # repeated here: it lives once in the RAW FACTS level above and once on the
+    # ``done`` tool, because every line here is paid for on every reflect (#4716).
     if budget:
         budget_lower = budget.lower()
         if budget_lower == "low":
             parts.extend(
                 [
                     "## RESEARCH DEPTH: SHALLOW (Quick Response)",
-                    "- Prioritize speed over completeness",
-                    "- If mental models or observations provide a reasonable answer, stop there",
-                    "- Only dig deeper if the initial results are clearly insufficient",
-                    "- Prefer a quick overview rather than exhaustive details",
-                    "- Answer promptly with available information",
+                    "- Keep the ANSWER short: a quick overview, not exhaustive detail. Depth is what you cut, "
+                    "not coverage",
+                    "- Spend few searches, but make them count: vary the query instead of repeating one that "
+                    "already ran",
+                    "- A mental model or observation that ANSWERS the question is enough to stop; one that is "
+                    "merely on the same topic is not",
+                    "- If what you found does not cover the question, go on to the next level rather than "
+                    "answering from it",
                     "",
                 ]
             )
@@ -437,6 +505,8 @@ def build_system_prompt_for_tools(
                     "- Balance thoroughness with efficiency",
                     "- Check multiple sources when the question warrants it",
                     "- Verify stale data if it's central to the answer",
+                    "- A result that is merely on the same topic does not answer the question: when it does not "
+                    "cover it, go on to the next level",
                     "- Don't over-explore, but ensure reasonable coverage",
                     "",
                 ]
@@ -462,63 +532,53 @@ def build_system_prompt_for_tools(
         steps.append("First, try search_mental_models() - check if a curated summary exists")
     if include_observations:
         if has_mental_models:
-            steps.append("If no mental model or it's stale, try search_observations() for consolidated knowledge")
+            steps.append(
+                "If there is no mental model, it's stale, OR it does not state the answer, "
+                "try search_observations() for consolidated knowledge"
+            )
         else:
             steps.append("First, try search_observations() - check for consolidated knowledge")
     # Recall step phrasing varies with whichever upstream tool(s) precede it.
     if include_observations:
         steps.append(
-            "If observations are stale OR you need specific details, use recall() for raw facts"
+            "If the levels above are stale, do not state the answer, OR you need specific details, "
+            "use recall() for raw facts. Reporting that nothing is known requires recall() first"
             if has_mental_models
-            else "If search_observations returns 0 results OR observations are stale, you MUST call recall() for raw facts"
+            else "If search_observations returns 0 results, is stale, OR does not state the answer, you MUST call "
+            "recall() for raw facts"
         )
     elif has_mental_models:
-        steps.append("If no mental model or it's stale, use recall() for raw facts")
+        steps.append(
+            "If there is no mental model, it's stale, OR it does not state the answer, use recall() for raw facts. "
+            "Reporting that nothing is known requires recall() first"
+        )
     else:
         steps.append("Call recall() to gather raw facts")
     steps.append("Use expand() if you need more context on specific memories")
-    steps.append("When ready, call done() with your answer and supporting IDs")
+    steps.append(
+        "When ready, call answer_ready(); you are then asked for the answer through done()"
+        if answer_ready
+        else "When ready, call done() with your answer and supporting IDs"
+    )
     parts.extend(f"{idx}. {step}" for idx, step in enumerate(steps, 1))
 
-    common_output_rules = [
-        "- NEVER include memory IDs, UUIDs, or 'Memory references' in the answer text",
-        "- Put IDs ONLY in the memory_ids/mental_model_ids/observation_ids arrays, not in the answer",
-        "- CRITICAL: This is a NON-CONVERSATIONAL system. NEVER ask follow-up questions, offer further assistance, or suggest next steps. Your answer must be complete and self-contained. The user cannot reply.",
-    ]
+    non_conversational_rule = "- CRITICAL: This is a NON-CONVERSATIONAL system. NEVER ask follow-up questions, offer further assistance, or suggest next steps. Your answer must be complete and self-contained. The user cannot reply."
     if answer_as_document:
-        # The document is stored as structure and the markdown is rendered from
-        # it, so asking for "a markdown answer" here would be asking for the one
-        # thing the caller does not want (see tools_schema's document tool).
+        # The document again, written as markdown: its headings are its sections. The
+        # section-array instructions below must not appear here -- told to "state the
+        # structure, do NOT write markdown" and then asked for markdown, the model gets
+        # two contracts for one answer.
         parts.extend(
             [
                 "",
-                "## Output Format: Structured Document",
-                "Call done() with a 'document' field. Do NOT write a markdown document — "
-                "state its structure and the markdown is generated from it.",
-                # Name the wrapper and show it. Every field of a *section* was spelled out
-                # here — heading, level, blocks — and the array holding them never was, so
-                # the prose described a section while the tool schema described a document
-                # containing sections. Models resolved that disagreement in favour of the
-                # prose and emitted the bare section, which parsed to zero sections, an
-                # empty render, and a failed refresh. A shape stated in one place and shown
-                # in another is a shape that gets filled correctly.
-                "- 'document' holds a 'sections' array — one entry per section, in order. "
-                'Shape: {"sections": [{"heading": "Overview", "level": 2, "blocks": '
-                '["First paragraph.", "- a list item\\n- another"]}]}',
-                "- Even a one-section document uses the 'sections' array; never emit a bare section",
-                "- Each section carries its heading text (no '#') and a level; the heading is NOT a block",
-                "- 'blocks' holds the section's content, ONE block per paragraph, list, table or code fence",
-                "- Never put two paragraphs in one block, and never put a heading inside a block",
-                "- Inside a block, write list items and table rows on their own lines as usual",
-                # Stating the structure is a more clerical task than writing prose, and a
-                # model doing clerical work gets terse: measured against the markdown
-                # answer it replaced, the first version of this produced noticeably
-                # shorter documents that judges liked less. Say plainly that the
-                # structure is the shape, not a budget.
-                "- The structure is how the answer is laid out, NOT a reason to say less: give each "
-                "block the same specifics, numbers, names and examples you would write in prose",
-                "- Prefer a section with several blocks over one block that summarises them away",
-                *common_output_rules,
+                "## Output Format: Markdown Document",
+                "Call done() with a 'markdown' field holding the whole document: a '## ' heading per "
+                "section, then its paragraphs, lists, tables or code fences.",
+                "- Give every section the specifics, numbers, names, dates and examples the results "
+                "hold: the structure is how the answer is laid out, NOT a reason to say less",
+                "- Prefer several paragraphs and lists over one paragraph that summarises them away",
+                f"- {NO_IDS_IN_TEXT_RULE}",
+                non_conversational_rule,
             ]
         )
     else:
@@ -530,7 +590,9 @@ def build_system_prompt_for_tools(
                 "- USE markdown formatting for structure (headers, lists, bold, italic, code blocks, tables, etc.)",
                 "- CRITICAL: Add blank lines before and after block elements (tables, code blocks, lists)",
                 "- Format for clarity and readability with proper spacing and hierarchy",
-                *common_output_rules,
+                "- NEVER include memory IDs, UUIDs, or 'Memory references' in the answer text",
+                "- Put IDs ONLY in the memory_ids/mental_model_ids/observation_ids arrays, not in the answer",
+                non_conversational_rule,
             ]
         )
 
@@ -564,6 +626,12 @@ def build_system_prompt_for_tools(
 #: Result-list keys a tool output can carry; an over-budget block is split on
 #: these entry boundaries so no retrieved evidence is dropped.
 _SPLITTABLE_RESULT_KEYS = ("observations", "memories", "results")
+
+#: A sibling of the split list bigger than this fraction of the per-chunk budget
+#: is packed into blocks of its own instead of riding along in every piece of the
+#: list. Half, not the whole budget: a sibling just under budget still leaves no
+#: room for a second item, so the list would fan out one item per chunk (#4495).
+_MAX_SHARED_SIBLING_FRACTION = 0.5
 
 #: Above this many synthesis chunks the retrieval volume is pathological
 #: (each chunk is ~0.8 * max_context_tokens); we still process everything,
@@ -601,6 +669,21 @@ _GROUNDING_BOUNDARY = (
     "inference is unaffected."
 )
 
+#: Keeps memory ids out of text a reader sees, in every path that writes it.
+#: Plain mode said this only in the ``answer`` field and its output rules, so
+#: document mode (which has no ``answer``) and forced synthesis said nothing,
+#: and the handles the model cites inline (``o3``) are resolved to real UUIDs
+#: (#4876), which filled mental-model pages with ids (#5833). The exception
+#: keeps reports that ask for ids, the #4876 use case, working. It names no
+#: field to put ids in: forced synthesis has none, and done's id arrays say so
+#: in their own descriptions.
+NO_IDS_IN_TEXT_RULE = (
+    "NEVER cite memory IDs, UUIDs or result handles (f3, o12) in the text a reader sees - the "
+    "supporting ids are tracked separately. Only include IDs in the text when the question "
+    "explicitly asks for them."
+)
+
+
 _FINAL_INSTRUCTIONS = (
     "Provide a thoughtful answer by synthesizing and reasoning from the retrieved data above. "
     "You can make reasonable inferences from the memories, but don't completely fabricate information. "
@@ -616,8 +699,10 @@ def _render_history_block(entry: dict) -> str:
     """Render one context-history entry as a fenced JSON block."""
     tool = entry["tool"]
     output = entry["output"]
+    # Compact, like the tool messages the loop sends: indentation was 7% of the
+    # synthesis prompt and tells the model nothing.
     try:
-        output_str = json.dumps(output, indent=2, default=str, ensure_ascii=False)
+        output_str = json.dumps(output, default=str, ensure_ascii=False)
     except (TypeError, ValueError):
         output_str = str(output)
     return f"\n### From {tool}:\n```json\n{output_str}\n```"
@@ -637,14 +722,18 @@ def _cut_entry_to_budget(entry: dict, token_budget: int) -> dict:
         output_str = json.dumps(output, indent=2, default=str, ensure_ascii=False)
     except (TypeError, ValueError):
         output_str = str(output)
-    tokens = count_prompt_tokens(output_str)
+    cut = {**entry, "output": {"truncated": True, "content": output_str}}
+    # Count the final block, not the raw text: wrapping JSON as a string escapes
+    # quotes and newlines again, and the wrapper and tool heading also take space.
+    tokens = count_prompt_tokens(_render_history_block(cut))
     while output_str and tokens > token_budget:
         # Proportional shrink with a safety margin; the loop guards against the
         # estimate landing high, and always makes progress.
         keep = min(len(output_str) - 1, max(1, int(len(output_str) * token_budget / tokens * 0.95)))
         output_str = output_str[:keep]
-        tokens = count_prompt_tokens(output_str)
-    return {**entry, "output": {"truncated": True, "content": output_str}}
+        cut["output"]["content"] = output_str
+        tokens = count_prompt_tokens(_render_history_block(cut))
+    return cut
 
 
 def split_context_history(context_history: list[dict], max_context_tokens: int) -> list[list[dict]]:
@@ -656,10 +745,12 @@ def split_context_history(context_history: list[dict], max_context_tokens: int) 
     (``observations``/``memories``/``results``) into synthetic partial blocks,
     so evidence is split across chunks rather than dropped — the failure mode
     of the old ``break`` was answering from nothing while citing everything
-    (#3122). Only an *indivisible* over-budget entry gets token-cut.
+    (#3122). A big sibling of that list (recall's raw ``chunks``) is packed
+    into blocks of its own rather than copied into every piece (#4495). Only
+    an *indivisible* over-budget entry gets token-cut.
 
     Returns at least one chunk when history is non-empty; every original
-    result entry appears in exactly one chunk.
+    result entry, and every entry of a big sibling, appears in exactly one chunk.
     """
     budget = max(_MIN_SPLIT_CHUNK_TOKENS, int(max_context_tokens * _FINAL_PROMPT_CONTEXT_FRACTION))
     chunks: list[list[dict]] = []
@@ -679,6 +770,26 @@ def split_context_history(context_history: list[dict], max_context_tokens: int) 
             _close_current()
         current.append(entry)
         current_tokens += tokens
+
+    def _pack_items(entry: dict, shared: dict, key: str, items: list, join: Callable[[list], Any]) -> None:
+        """Pack ``items`` under ``output[key]`` (next to ``shared``) into in-budget blocks."""
+        piece: list = []
+        for item in items:
+            candidate = {**entry, "output": {**shared, key: join(piece + [item])}}
+            if piece and count_prompt_tokens(_render_history_block(candidate)) > budget:
+                partial = {**entry, "output": {**shared, key: join(piece)}}
+                _append_block(partial, count_prompt_tokens(_render_history_block(partial)))
+                piece = []
+                candidate = {**entry, "output": {**shared, key: join([item])}}
+            single_tokens = count_prompt_tokens(_render_history_block(candidate))
+            if not piece and single_tokens > budget:
+                cut = _cut_entry_to_budget(candidate, budget)
+                _append_block(cut, count_prompt_tokens(_render_history_block(cut)))
+            else:
+                piece.append(item)
+        if piece:
+            partial = {**entry, "output": {**shared, key: join(piece)}}
+            _append_block(partial, count_prompt_tokens(_render_history_block(partial)))
 
     for entry in context_history:
         tokens = count_prompt_tokens(_render_history_block(entry))
@@ -701,24 +812,29 @@ def split_context_history(context_history: list[dict], max_context_tokens: int) 
             _append_block(cut, count_prompt_tokens(_render_history_block(cut)))
             continue
 
-        items = output[split_key]
-        piece: list = []
-        for item in items:
-            candidate = {**entry, "output": {**output, split_key: piece + [item]}}
-            if piece and count_prompt_tokens(_render_history_block(candidate)) > budget:
-                partial = {**entry, "output": {**output, split_key: piece}}
-                _append_block(partial, count_prompt_tokens(_render_history_block(partial)))
-                piece = []
-                candidate = {**entry, "output": {**output, split_key: [item]}}
-            single_tokens = count_prompt_tokens(_render_history_block(candidate))
-            if not piece and single_tokens > budget:
-                cut = _cut_entry_to_budget({**entry, "output": {**output, split_key: [item]}}, budget)
-                _append_block(cut, count_prompt_tokens(_render_history_block(cut)))
+        # Every piece of the list carries the entry's other keys, so a big one
+        # (tool_recall's raw "chunks" beside its "memories") left no piece room
+        # for a second item: N items became N cut blocks, each re-carrying the
+        # same sibling (#4495). A big sibling is packed on its own instead —
+        # once, and split by its own entries, so none of it is dropped.
+        allowance = int(budget * _MAX_SHARED_SIBLING_FRACTION)
+        big = [
+            k
+            for k, v in output.items()
+            if k != split_key
+            and count_prompt_tokens(_render_history_block({"tool": entry["tool"], "output": {k: v}})) > allowance
+        ]
+        shared = {k: v for k, v in output.items() if k != split_key and k not in big}
+        _pack_items(entry, shared, split_key, output[split_key], list)
+        for k in big:
+            value = output[k]
+            if isinstance(value, dict):
+                _pack_items(entry, shared, k, list(value.items()), dict)
+            elif isinstance(value, list):
+                _pack_items(entry, shared, k, value, list)
             else:
-                piece.append(item)
-        if piece:
-            partial = {**entry, "output": {**output, split_key: piece}}
-            _append_block(partial, count_prompt_tokens(_render_history_block(partial)))
+                cut = _cut_entry_to_budget({**entry, "output": {**shared, k: value}}, budget)
+                _append_block(cut, count_prompt_tokens(_render_history_block(cut)))
 
     _close_current()
     return chunks
@@ -830,6 +946,74 @@ def build_final_prompt(
         parts.append(length_directive)
 
     return "\n".join(parts) + output_language_directive(llm_output_language)
+
+
+#: The two shapes a generated page took that later delta refreshes could not edit
+#: cleanly: an untitled section per list item (the delta then addresses those
+#: blocks under the heading they visually sit under), and a list split one item
+#: per block (a delta "rewriting the list" rewrites only its first item, so a
+#: removed member stays listed). Replayed benchmark pages had each about a third
+#: of the time; the done tool's field descriptions alone did not move that.
+#: Written for the markdown page, which ``split_markdown`` cuts into sections at
+#: its headings and into blocks at its blank lines: the rules were first written
+#: for the section-array page, whose "blocks" a markdown page does not have.
+_DOCUMENT_SHAPE_INSTRUCTIONS = (
+    "\n## Document shape\n"
+    "- Only an opening summary may come before the first heading. Everything after it sits under a "
+    "real '## ' heading.\n"
+    "- Items of one kind (bugs, releases, customers, components) go under ONE heading together — "
+    "never a heading per item, and never items left after the summary without a heading.\n"
+    "- Write a list with no blank lines between its items ('- a\\n- b\\n- c'): a blank line splits it "
+    "into separate lists."
+)
+
+
+def build_done_request_prompt(
+    query: str,
+    max_tokens: int | None = None,
+    llm_output_language: str | None = None,
+    *,
+    as_document: bool = False,
+) -> str:
+    """The closing user turn that asks for the answer as a ``done`` call.
+
+    Sent inside the tool-loop conversation, so it carries only what the answer
+    needs beyond the evidence already there: stop retrieving, the question, the
+    instructions and the length target — and, when the answer is a page,
+    the shape rules that keep it editable.
+    """
+    parts = [
+        "## Answer now",
+        "Stop retrieving. Call the `done` tool with your final answer, built from the tool results above.",
+        "This is the ANSWER, not a summary of it: carry over every relevant fact, date and number from the "
+        "tool results, at the same depth you would write for a reader who cannot see them.",
+        f"\n## Question\n{query}",
+        "\n## Instructions\n" + _FINAL_INSTRUCTIONS,
+    ]
+    if as_document:
+        parts.append(_DOCUMENT_SHAPE_INSTRUCTIONS)
+    length_directive = _length_directive(max_tokens)
+    if length_directive is not None:
+        parts.append(length_directive)
+    return "\n".join(parts) + output_language_directive(llm_output_language)
+
+
+# Decision-orchestrated reflect: a request too long to search with as written (a plugin's prompt wraps the
+# developer's goal in rendering rules) is first turned into one short search query.
+#
+# The query keeps what KIND of information is asked for, not only the subject: distilled to
+# "merge_records implementation logic", a request for decisions and their rationale pulled in
+# the later commit that broke the decision, which the answer then reported as superseding it
+# (sde-bench dedupe-history). Agent mode's own queries never asked for "implementation".
+ROUND_SEARCH_QUERY_SYSTEM_PROMPT = (
+    "You write search queries for a memory bank. Given a request, reply with ONE short search "
+    "query (at most 12 words) naming the subject (component, function, feature), the problem or "
+    "symptom the request reports in its own words, and the kind of information the request wants "
+    "about it: a decision and why it was made, a value or limit, a policy or rule, an event. Never add words like 'implementation', 'code' or 'logic' unless the "
+    "request asks how the code works. Leave out instructions about formatting the answer. "
+    "Reply with the query only, no quotes. "
+    "A '## Context' section, when present, says what the request refers to: use it to name the subject."
+)
 
 
 #: System prompt for the intermediate (map) calls of split synthesis. They do
@@ -945,6 +1129,8 @@ CRITICAL: Output ONLY the final synthesized answer. Do NOT include:
 - Descriptions of your approach
 Just provide the direct answer with proper markdown formatting.
 
+{no_ids_rule}
+
 CRITICAL: This is a NON-CONVERSATIONAL system. NEVER ask follow-up questions, offer to search again, suggest alternatives, or end with anything like "Would you like me to..." or "Let me know if...". The user cannot reply. Your answer must be complete and self-contained."""
 
 
@@ -996,7 +1182,11 @@ def build_final_system_prompt(
     role_section = escape_for_prompt(mission.strip()) if mission else _DEFAULT_FINAL_ROLE
 
     parts = [build_directives_section(directives) if directives else ""]
-    parts.append(_FINAL_SYSTEM_PROMPT_BASE.format(role_section=role_section, grounding_boundary=_GROUNDING_BOUNDARY))
+    parts.append(
+        _FINAL_SYSTEM_PROMPT_BASE.format(
+            role_section=role_section, grounding_boundary=_GROUNDING_BOUNDARY, no_ids_rule=NO_IDS_IN_TEXT_RULE
+        )
+    )
     parts.append(default_language_section(_FINAL_LANGUAGE_RULE, llm_output_language))
     parts.append(build_directives_reminder(directives) if directives else "")
     # Volatile "now" reference last, so the static/per-bank instructions above
@@ -1020,35 +1210,28 @@ You will be given:
    (1..6) and an ordered list of ``blocks``. Each block has a stable ``id`` and
    a ``text`` field holding one markdown fragment — a paragraph, a list, a
    table, or a fenced code block.
-3. NEW INFORMATION SYNTHESIS (markdown) — UNTRUSTED. Prose written by another
-   model that saw ONLY the supporting facts below. It is a reading aid, not
-   evidence, and it is frequently wrong about what exists: it says things like
-   "no X was found" or "a total of N" when X is merely absent from this batch
-   and N counts only this batch. NEVER edit the document on the strength of a
-   sentence in the synthesis — only the SUPPORTING FACTS justify an operation.
-   A synthesis showing how the new facts
-   relate to the document's topic. Use it to understand context and relevance,
-   but do NOT copy its formatting or wording wholesale.
-   It was written from the SUPPORTING FACTS BELOW AND NOTHING ELSE. It could not
-   see the current document or any earlier fact, so every count, total, list or
-   summary in it describes ONLY the new facts — never the topic as a whole.
-   "A total of 4 customers..." in the synthesis means four in this batch, not
-   four altogether. Such a figure NEVER contradicts a different figure in the
-   document: the document counted what it could see, the synthesis counted what
-   it could see, and the answer is usually the two combined. Likewise the
-   synthesis saying nothing about something is not evidence against it.
-4. SUPPORTING FACTS — observations and facts created since the last refresh.
-   These are genuinely new — they were NOT available when the current document
-   was written.
+3. SUPPORTING FACTS — observations and facts recorded since the last refresh.
+   Recorded since, not necessarily new to the document: a fact is often
+   recorded again, in other words, after the document already states it.
 
 Your task: output a JSON object ``{"operations": [...]}``. Applied to CURRENT
 DOCUMENT, the operations must produce a document that best answers the TOPIC
 by integrating the new facts.
 
 RULES
-- These facts are NEW since the last refresh. The existing document already
-  captures all prior information from earlier refreshes. Your job is to
-  integrate the new facts into the existing document.
+- **A fact the document already states needs no operation.** Before you add
+  anything, find it in CURRENT DOCUMENT; only what is not there yet is new.
+  Re-adding a stated fact duplicates it, and adding every fact of a long batch
+  one by one is the way a reply grows until it is cut off and nothing lands.
+  Judge each fact by WHAT it says, never by how it is worded: compare the
+  item it names (a person, release, customer, incident) against the items
+  the document lists.
+  ❌ document "- Lisbon office: opened March 2024" + fact "Note: the Lisbon
+     office opened in March 2024" → an ``append_block`` adding Lisbon again
+  ✅ the same pair → no operation; Lisbon is already listed
+  ✅ the same document + fact "Note: the Porto office opened in May 2025" →
+     add Porto: the document does not list it, however the fact is worded
+  A batch that only restates the document is ``{"operations": []}``.
 - **Preserve existing content**: The current document was built from prior facts
   that you cannot see. Do NOT remove or replace existing sections just because
   the new facts do not reference them. Only remove content when the new facts
@@ -1067,6 +1250,35 @@ RULES
   never invent one, never use a heading in place of an id, and never guess an
   id for a block you cannot see. An operation naming an id that does not exist
   is dropped, and its content never reaches the document.
+- **Never re-type a table to add rows to it, and never sort one.** New rows go
+  in their own ``insert_block`` right after the table block (or ``append_block``
+  when the table ends its section), holding ONLY the new rows — no header, no
+  separator. They join the table below its last row. Send each new row ONCE,
+  in one operation: never an ``insert_block`` and an ``append_block`` that
+  both carry the same rows. Rows stay in the order they
+  arrived: a new row whose date or id falls between existing rows still goes at
+  the end. Re-typing a table to slot rows in, merge them or re-sort it drops
+  rows you meant to keep.
+- **An item that leaves a list comes out of it.** When a fact says a member,
+  customer, owner or item no longer belongs to what a list or table names
+  (moved to another plan, left, retired, replaced), remove it from that list,
+  and note the change outside it — a dated sentence after the list, or in a
+  history section. Never re-add the item to the same list with a parenthetical:
+  a list item reads as a current member whatever its note says.
+  ❌ "Pro plan customers:" list keeps "- Acme Freight (moved to Basic on 3 May 2025)"
+  ✅ the list drops Acme Freight; after it: "Acme Freight moved to the Basic plan on 3 May 2025."
+  A list is sometimes stored one item per block — consecutive blocks that each
+  hold a single "- item". Then the item that leaves is its own block: send
+  ``remove_block`` for THAT block. Re-emitting another item's block without it
+  removes nothing.
+- **A state that ended is no longer current.** When a fact ends something the
+  document presents as current — a person left or changed role, a service was
+  retired or moved, a plan or owner changed — rewrite the claim that presents it
+  as current (``replace_block``). A sentence added beside it leaves the old claim
+  reading as true. For a member of a list, the rule above applies instead: take
+  the member out of the list (``remove_block`` when it is a block of its own).
+  ❌ keeps "Ana Ruiz is the on-call lead." and adds "Ana Ruiz left on 3 May 2025."
+  ✅ "Ana Ruiz was the on-call lead until she left on 3 May 2025."
 - **Add** new content with ``append_block``, ``insert_block``, or ``add_section``
   when facts introduce information not yet covered. Prefer extending an
   existing section over creating a new one.
@@ -1077,17 +1289,26 @@ RULES
   SUPPORTING FACTS is NOT thereby wrong, superseded or removed. The facts are one
   batch, not the whole memory — the document was built from facts you cannot see.
   "The batch does not mention X" and "X did not happen" are different statements,
-  and only the second would justify an edit. This applies to the SYNTHESIS too: if
-  it reports that something is absent, unrecorded or not found, that is a
-  statement about the batch, never about the topic.
+  and only the second would justify an edit.
+- **A fact about one thing never refutes a claim about another**: facts about
+  OTHER people, items, versions or events — even the ones just before and after
+  it in a sequence or on the calendar — say nothing about the one the document
+  names. Keep that claim exactly as written; never cast doubt on it ("may be
+  misrecorded", "however, records show…"). Add the new facts beside it.
 - **Refutation threshold for removal or overwrite**: you may only remove or
   overwrite existing text when a SUPPORTING FACT explicitly refutes or corrects
   that exact detail, OR is a later-DATED statement about the same facet (a
   status, count, owner or location that has since changed). "Later" is about
   the dates the texts give, never about arrival: facts reach you out of date
   order, and a fact dated before the state the document records is backfilled
-  history — it belongs in the history, not in place of the current state, even
-  when the synthesis calls it current. Failing both tests, keep the
+  history — it belongs in the history, not in place of the current state.
+  Compare the dates before touching a current state:
+  ❌ document "Dana has led the billing rota since June 2025" + fact "Lee took
+     over the billing rota in January 2025" → "Lee currently leads the billing
+     rota" (January 2025 is EARLIER than June 2025)
+  ✅ the same pair → Dana stays the current lead; Lee's January 2025 handover
+     is added to the history, in date order
+  Failing both tests, keep the
   existing text: use ``append_block`` / ``insert_block``, or re-emit the block
   with the new detail merged into a cohesive statement that still carries the old
   one. Combining two disjoint sets is a merge, never a replacement.
@@ -1113,6 +1334,15 @@ ALLOWED OPERATIONS (each line shows the JSON shape)
 - ``{"op": "remove_section", "section_id": "..."}``
 - ``{"op": "replace_section_blocks", "section_id": "...", "blocks": ["...", "..."]}``
 - ``{"op": "rename_section", "section_id": "...", "new_heading": "..."}``
+- Each operation carries EXACTLY the keys shown on its line — no others. Do not
+  copy a key from another operation's shape, do not add a key of your own, and
+  do not emit a key with ``null`` to stand in for one the operation does not
+  take. ``append_block`` in particular has no ``block_id``: the id is minted
+  when the block lands, and it takes ``text``, never ``blocks``.
+  ❌ ``{"op": "append_block", "section_id": "members", "block_id": null, "text": "- Carol"}``
+  ✅ ``{"op": "append_block", "section_id": "members", "text": "- Carol"}``
+  ❌ ``{"op": "replace_section_blocks", "section_id": "members", "blocks": ["- Carol"], "blocks_note": "merged"}``
+  ✅ ``{"op": "replace_section_blocks", "section_id": "members", "blocks": ["- Carol"]}``
 
 BLOCK TEXT RULES
 - Every ``text`` (and every entry of ``blocks``) is ONE markdown fragment:
@@ -1123,10 +1353,18 @@ BLOCK TEXT RULES
   a list is ``"- one\\n- two"``, a table is
   ``"| col | col |\\n| --- | --- |\\n| a | b |"``. A table whose rows are not
   separated by ``\\n`` is not a table.
-- To add a row to an existing table, or an item to an existing list, use
-  ``replace_block`` on that block and re-emit it *with* the addition. A lone
-  table row or bullet appended as its own block is a separate fragment, and a
-  table row on its own is not a table.
+- **Adding rows to a table never re-emits the table.** Send ONLY the new rows
+  (no header, no separator) with ``insert_block`` right after the table block,
+  or ``append_block`` when the table is the section's last block: they join
+  that table, below its last row. Leave the existing rows alone even when the
+  new ones would sort between them — a row out of date order is fine; a
+  re-typed table loses rows. Use ``replace_block`` on a table only to change
+  rows that are already in it.
+  ❌ ``insert_block`` with the 5 new rows AND a ``replace_block`` re-typing the
+     whole table with them merged in
+  ✅ one ``insert_block`` after the table block with just the 5 new rows
+- To add an item to an existing list, use ``replace_block`` on that block and
+  re-emit it *with* the addition.
 - ``insert_block`` places the new block directly after ``after_block_id``; use
   ``"after_block_id": null`` to place it first in the section.
 
@@ -1139,6 +1377,11 @@ JSON STRING RULES (critical)
   ``operations``, whose value is an array of operation objects (empty array
   when nothing changes).
 - Do not append extra ``]`` or ``}`` after the closing ``}`` of the root object.
+- EVERY operation goes inside the one ``operations`` array — the second and
+  later ones too. Close the array only after the LAST operation; the root
+  object has no key but ``operations``.
+  ❌ ``{"operations": [{"op": "replace_block", ...}], "op": "append_block", "section_id": "x", "text": "..."}``
+  ✅ ``{"operations": [{"op": "replace_block", ...}, {"op": "append_block", "section_id": "x", "text": "..."}]}``
 
 Examples
 - No changes needed → ``{"operations": []}``
@@ -1170,7 +1413,7 @@ class FittedDeltaPrompt:
 
     The sections are named for their *slots*, not their contents, because both
     callers reuse this fitter with different material in them: the refresh prompt
-    puts the synthesis in ``candidate`` and the new facts in ``facts``, while the
+    leaves ``candidate`` empty and puts the new facts in ``facts``, while the
     retraction prompt puts the still-supported facts in ``candidate`` and the
     retracted ones in ``facts``.
 
@@ -1204,20 +1447,31 @@ def _fit_structured_delta_prompt_parts(
         f"## Topic\n{source_query}\n\n"
         f"## CURRENT DOCUMENT (apply ops to this; copy section and block ids from it verbatim)\n"
         f"```json\n\n```\n\n"
-        f"## NEW INFORMATION SYNTHESIS (context for how new facts relate to the topic)\n"
-        f"```markdown\n\n```\n\n"
-        f"## SUPPORTING FACTS (new since last refresh — integrate these)\n"
+        f"## CANDIDATE SLOT (the retraction prompt's still-supported facts)\n\n"
+        f"## SUPPORTING FACTS (recorded since last refresh — integrate what the document does not already say)\n"
         f"{budget_hint}\n\n"
         f"{task_footer}"
     )
-    facts_header = "## SUPPORTING FACTS (new since last refresh — integrate these)\n"
+    facts_header = (
+        "## SUPPORTING FACTS (recorded since last refresh — integrate what the document does not already say)\n"
+    )
     facts_prefix_tokens = count_prompt_tokens(facts_header)
     reserved_facts = min(4096, max(512, max_input_tokens // 8))
-    doc_budget = max(1024, (max_input_tokens - count_prompt_tokens(fixed) - reserved_facts) * 55 // 100)
+    # The refresh prompt leaves the candidate slot empty (its synthesis is not
+    # sent, #5272), so the document gets the candidate's share as well.
+    doc_share = 55 if candidate_markdown else 85
+    doc_budget = max(1024, (max_input_tokens - count_prompt_tokens(fixed) - reserved_facts) * doc_share // 100)
     cand_budget = max(512, (max_input_tokens - count_prompt_tokens(fixed) - reserved_facts) * 30 // 100)
-    facts_budget = max(256, reserved_facts - facts_prefix_tokens)
     doc_json = _truncate_prompt_text(current_document_json, doc_budget)
     candidate = _truncate_prompt_text(candidate_markdown, cand_budget)
+    # The facts get the reserve, plus whatever the document and candidate leave of
+    # theirs. A flat reserve cut a gated batch of new memories at ~3k tokens behind a
+    # page that used a tenth of its share: the cut facts were never shown, and the
+    # next refresh starts after them, so they never reached the page at all.
+    unused = (
+        max_input_tokens - count_prompt_tokens(fixed) - count_prompt_tokens(doc_json) - count_prompt_tokens(candidate)
+    )
+    facts_budget = max(256, max(reserved_facts, unused) - facts_prefix_tokens)
     facts_body = _truncate_prompt_text(facts_block, facts_budget)
     truncated = doc_json != current_document_json or candidate != candidate_markdown or facts_body != facts_block
     return FittedDeltaPrompt(doc_json, candidate, facts_body, truncated)
@@ -1267,7 +1521,6 @@ def build_mental_model_refresh_context(name: str, *, delta: bool) -> str:
 def build_structured_delta_prompt(
     *,
     current_document_json: str,
-    candidate_markdown: str,
     supporting_facts: list[dict[str, Any]],
     source_query: str,
     max_output_tokens: int | None = None,
@@ -1278,8 +1531,16 @@ def build_structured_delta_prompt(
     """Build the user prompt for a structured-delta mental model refresh.
 
     The LLM's job is to emit operations against ``current_document_json``;
-    the surrounding ``candidate_markdown`` and ``supporting_facts`` are
-    references for *what new information exists*, not templates to mimic.
+    ``supporting_facts`` say *what new information exists*.
+
+    The refresh's own synthesis is deliberately NOT shown. It is written from the
+    new batch alone, so it reports "no release was deployed" or "a total of 4"
+    about the batch, and the ops call kept reading those as statements about the
+    topic: it overwrote a production release recorded one wave earlier. #4304
+    labelled it UNTRUSTED and added absence-is-not-contradiction rules (5/5 then),
+    but gemini-3.1-flash-lite and qwen3.8-flash both overwrote the release again
+    (0/2). Without the synthesis the same eval went 5/5, with the count case
+    unchanged — the facts carry everything an operation may rest on (#5272).
 
     ``max_output_tokens`` is surfaced in the prompt so the model can keep its
     op list within the provider's response cap. The actual cap is enforced by
@@ -1332,11 +1593,27 @@ def build_structured_delta_prompt(
                 "where the new facts update something the document already covers."
             )
 
+    # The re-read line (#5228): a refresh rewrote the block a new fact was about and
+    # left the opening summary still saying "Alice owns it, no owner change recorded".
+    # On gemini-2.5-flash-lite the system eval (test_refresh_pages_consistency) kept a stale line in 10/16
+    # pages without this line and 3/16 with it. A system-prompt rule to "update
+    # every block about the changed item" did not move it (8/16) and made
+    # gemini-3.1-flash-lite rewrite the unrefuted release in
+    # test_delta_keeps_unrefuted_claims_llm (pass 4/4 -> 0/4); this line alone keeps it
+    # at 6/6. It sits before the date-order rule, which must stay last.
     task_footer = (
         "## Task\n"
         "Output a JSON object matching the operations schema. Integrate the new "
         "supporting facts into CURRENT DOCUMENT. Add, update, or remove content "
         "as needed. Preserve unchanged sections and blocks by not mentioning them.\n"
+        "Then re-read CURRENT DOCUMENT from its FIRST block to its last — the untitled "
+        "opening summary (section id 'preamble'), every 'Sources' / 'Dated changes' / "
+        "'Information gaps' block, and every table. The opening summary restates the "
+        "page's key values, so it is almost always affected when a value changes. For "
+        "each block that still presents an old value as current (or as the only value), "
+        "or says a change has not happened / no change was recorded / an old source is "
+        "the only one, emit a replace_block that corrects just that part and keeps the "
+        "rest. Dated history stays.\n"
         "Facts arrive out of date order. Before changing what the document says is "
         "current (an owner, version, status or count), put the dated events from the "
         "document and the new facts on one timeline: the latest-dated event is the "
@@ -1347,7 +1624,7 @@ def build_structured_delta_prompt(
     fitted = _fit_structured_delta_prompt_parts(
         source_query=source_query,
         current_document_json=current_document_json,
-        candidate_markdown=candidate_markdown,
+        candidate_markdown="",
         facts_block=facts_block,
         budget_hint=budget_hint,
         task_footer=task_footer,
@@ -1356,7 +1633,7 @@ def build_structured_delta_prompt(
     truncation_note = ""
     if fitted.truncated:
         truncation_note = (
-            "\n\n*Note: Document, synthesis, or facts were truncated to fit the model "
+            "\n\n*Note: Document or facts were truncated to fit the model "
             "context window. Prefer minimal, high-leverage operations.*"
         )
 
@@ -1364,9 +1641,7 @@ def build_structured_delta_prompt(
         f"## Topic\n{source_query}\n\n"
         f"## CURRENT DOCUMENT (apply ops to this; copy section and block ids from it verbatim)\n"
         f"```json\n{fitted.document_json}\n```\n\n"
-        f"## NEW INFORMATION SYNTHESIS (context for how new facts relate to the topic)\n"
-        f"```markdown\n{fitted.candidate}\n```\n\n"
-        f"## SUPPORTING FACTS (new since last refresh — integrate these)\n{fitted.facts}"
+        f"## SUPPORTING FACTS (recorded since last refresh — integrate what the document does not already say)\n{fitted.facts}"
         f"{document_hint}{budget_hint}{truncation_note}\n\n"
         f"{task_footer}"
     )
@@ -1418,6 +1693,12 @@ ALLOWED OPERATIONS (each line shows the JSON shape)
 - ``{"op": "remove_section", "section_id": "..."}``
 - ``{"op": "replace_block", "section_id": "...", "block_id": "...", "text": "..."}``
 - ``{"op": "replace_section_blocks", "section_id": "...", "blocks": ["...", "..."]}``
+
+Each operation carries EXACTLY the keys shown on its line — no others. Do not add
+a key of your own, and do not emit a key with ``null`` to stand in for one the
+operation does not take.
+❌ ``{"op": "remove_block", "section_id": "s", "block_id": "b1", "reason": "retracted"}``
+✅ ``{"op": "remove_block", "section_id": "s", "block_id": "b1"}``
 
 Blocks are addressed by ``block_id`` — the ``id`` printed beside each block in
 CURRENT DOCUMENT. Copy it exactly; never invent one, and never use a position.

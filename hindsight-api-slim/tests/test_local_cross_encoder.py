@@ -7,6 +7,11 @@ These tests use mocked models — they do not load real SentenceTransformers or
 FlashRank weights, so they run fast in CI without network access.
 """
 
+import asyncio
+import inspect
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -15,18 +20,22 @@ from hindsight_api.config import DEFAULT_RERANKER_FLASHRANK_BATCH_SIZE
 from hindsight_api.engine import cross_encoder as ce_module
 from hindsight_api.engine.cross_encoder import (
     FlashRankCrossEncoder,
+    JinaMLXCrossEncoder,
     LocalSTCrossEncoder,
+    OnnxCrossEncoder,
+    RerankTimeoutError,
 )
 
 
 class TestLocalSTCrossEncoder:
     """Unit tests for the SentenceTransformers-backed local reranker."""
 
-    def _make_encoder(self, *, bucket_batching: bool = False, batch_size: int = 32):
+    def _make_encoder(self, *, bucket_batching: bool = False, batch_size: int = 32, timeout: float = 300.0):
         encoder = LocalSTCrossEncoder(
             model_name="test-model",
             bucket_batching=bucket_batching,
             batch_size=batch_size,
+            timeout=timeout,
         )
         # Bypass initialize() — we don't want to download or load real weights.
         encoder._model = MagicMock()
@@ -34,11 +43,6 @@ class TestLocalSTCrossEncoder:
 
     def test_provider_name(self):
         assert LocalSTCrossEncoder().provider_name == "local"
-
-    def test_torch_threads_are_configurable_and_positive(self):
-        assert LocalSTCrossEncoder(torch_threads=2).torch_threads == 2
-        with pytest.raises(ValueError, match="torch_threads must be >= 1"):
-            LocalSTCrossEncoder(torch_threads=0)
 
     async def test_predict_returns_scores_in_input_order(self):
         encoder = self._make_encoder()
@@ -102,6 +106,64 @@ class TestLocalSTCrossEncoder:
         # In original order: [long=3.0, short=1.0, medium=2.0]
         assert scores == [3.0, 1.0, 2.0]
 
+    async def test_predict_scores_in_batches_of_batch_size(self):
+        """The wall-clock budget is only checkable between batches, so a large
+        candidate set must arrive as several predict() calls, not one."""
+        encoder = self._make_encoder(batch_size=2)
+        encoder._model.predict.side_effect = lambda batch, **kw: [0.5] * len(batch)
+
+        scores = await encoder.predict([("q", f"doc-{i}") for i in range(5)])
+
+        assert scores == [0.5] * 5
+        assert encoder._model.predict.call_count == 3  # 2 + 2 + 1
+
+    async def test_predict_raises_budget_exceeded_with_partial_scores(self):
+        """On expiry the scored pairs survive and the rest come back as None."""
+        encoder = self._make_encoder(batch_size=2, timeout=0.05)
+
+        def slow_predict(batch, **kwargs):
+            time.sleep(0.06)  # every batch overruns the whole budget
+            return [0.9] * len(batch)
+
+        encoder._model.predict.side_effect = slow_predict
+
+        with pytest.raises(RerankTimeoutError) as excinfo:
+            await encoder.predict([("q", f"doc-{i}") for i in range(6)])
+
+        exc = excinfo.value
+        # First batch always runs (the deadline is checked before each batch), the
+        # second finds the budget gone.
+        assert exc.scores == [0.9, 0.9, None, None, None, None]
+        assert exc.timeout == 0.05
+        assert "test-model" in str(exc)
+
+    async def test_predict_timeout_zero_disables_the_budget(self):
+        encoder = self._make_encoder(batch_size=1, timeout=0.0)
+
+        def slow_predict(batch, **kwargs):
+            time.sleep(0.02)
+            return [0.4] * len(batch)
+
+        encoder._model.predict.side_effect = slow_predict
+
+        assert await encoder.predict([("q", "a"), ("q", "b"), ("q", "c")]) == [0.4, 0.4, 0.4]
+
+    async def test_initialize_loads_the_model_returning_raw_logits(self):
+        """Recall applies the sigmoid; sentence-transformers would apply one too for a
+        single-label model (hs-rerank-1), squashing every score into 0.5..0.73."""
+        torch = pytest.importorskip("torch")
+        model = MagicMock()
+        model.model = torch.nn.Linear(4, 4)
+        model.predict.return_value = [1.0]
+
+        with (
+            patch("hindsight_api.engine.cross_encoder.prefetch_local_model"),
+            patch("sentence_transformers.CrossEncoder", return_value=model) as build,
+        ):
+            await LocalSTCrossEncoder(model_name="org/m", force_cpu=True).initialize()
+
+        assert isinstance(build.call_args.kwargs["activation_fn"], torch.nn.Identity)
+
     async def test_predict_not_initialized_raises(self):
         encoder = LocalSTCrossEncoder()
         with pytest.raises(RuntimeError, match="not initialized"):
@@ -130,6 +192,88 @@ class TestLocalSTCrossEncoder:
 
         assert cleanup_calls == ["cleanup"]
 
+    @pytest.mark.parametrize("bucket_batching", [False, True])
+    async def test_cancel_skips_batches_not_yet_started(self, monkeypatch, bucket_batching):
+        """Cancelling the caller lets the in-flight batch finish but starts no more,
+        so the next request does not queue behind abandoned work (#5722)."""
+        executor = ThreadPoolExecutor(max_workers=1)
+        monkeypatch.setattr(LocalSTCrossEncoder, "_executor", executor)
+        encoder = self._make_encoder(batch_size=1, bucket_batching=bucket_batching)
+        started, release = threading.Event(), threading.Event()
+        calls: list[str] = []
+
+        def gated_predict(batch, **kwargs):
+            calls.append(batch[0][1])
+            if len(calls) == 1:
+                started.set()
+                assert release.wait(5)
+            return [0.5] * len(batch)
+
+        encoder._model.predict.side_effect = gated_predict
+        try:
+            abandoned = asyncio.create_task(encoder.predict([("q", "a0"), ("q", "a1"), ("q", "a2")]))
+            assert await asyncio.to_thread(started.wait, 5)
+            # Queued behind the in-flight batch, then cancelled before it ever runs.
+            queued = asyncio.create_task(encoder.predict([("q", "queued")]))
+            await asyncio.sleep(0)
+            for task in (abandoned, queued):
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            successor = asyncio.create_task(encoder.predict([("q", "successor")]))
+            release.set()
+
+            assert await asyncio.wait_for(successor, 5) == [0.5]
+            assert calls[1:] == ["successor"]
+        finally:
+            release.set()
+            executor.shutdown(wait=True)
+
+
+# In-process rerankers whose `_predict_sync` loops over batches without honouring a
+# cancel flag, each with the reason that is acceptable.
+_CANCEL_EXEMPT = {
+    # One MLX call per query group, not a batch loop; recall sends a single query.
+    "JinaMLXCrossEncoder",
+}
+
+
+def _all_subclasses(cls: type) -> list[type]:
+    return [sub for direct in cls.__subclasses__() for sub in (direct, *_all_subclasses(direct))]
+
+
+def test_every_batching_reranker_takes_a_cancel_flag():
+    """Family guard for #5722: a new in-process reranker must stop on cancel too."""
+    batching = {
+        cls.__name__
+        for cls in _all_subclasses(ce_module.CrossEncoderModel)
+        if "_predict_sync" in vars(cls) and cls.__name__ not in _CANCEL_EXEMPT
+    }
+    assert batching == {"LocalSTCrossEncoder", "FlashRankCrossEncoder", "OnnxCrossEncoder"}
+    for name in batching:
+        params = inspect.signature(getattr(ce_module, name)._predict_sync).parameters
+        assert "cancelled" in params, name
+
+
+def test_set_cancel_flag_starts_no_batch_in_any_provider():
+    cancelled = threading.Event()
+    cancelled.set()
+
+    local = LocalSTCrossEncoder()
+    local._model = MagicMock()
+    flashrank = FlashRankCrossEncoder()
+    flashrank._ranker = MagicMock()
+    onnx = OnnxCrossEncoder(model_id="test/model")
+    onnx._session, onnx._tokenizer = MagicMock(), MagicMock()
+
+    with patch.dict("sys.modules", {"flashrank": MagicMock()}):
+        for encoder in (local, flashrank, onnx):
+            with pytest.raises(asyncio.CancelledError):
+                encoder._predict_sync([("q", "doc")], cancelled)
+    local._model.predict.assert_not_called()
+    flashrank._ranker.rerank.assert_not_called()
+    onnx._session.run.assert_not_called()
+
 
 class TestFlashRankCrossEncoder:
     """Unit tests for the FlashRank ONNX reranker."""
@@ -143,6 +287,29 @@ class TestFlashRankCrossEncoder:
 
     def test_provider_name(self):
         assert FlashRankCrossEncoder().provider_name == "flashrank"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("arena", [False, True])
+    async def test_initialize_rebuilds_session_with_bounded_threads(self, tmp_path, monkeypatch, arena):
+        """FlashRank builds its own unbounded ONNX session; it is always replaced (#5725)."""
+        (tmp_path / "model.onnx").write_bytes(b"")
+        options = MagicMock()
+        fake_ort = MagicMock()
+        fake_ort.SessionOptions.return_value = options
+        ranker = MagicMock(model_dir=str(tmp_path))
+        fake_flashrank = MagicMock()
+        fake_flashrank.Ranker.return_value = ranker
+        monkeypatch.setenv("OMP_NUM_THREADS", "2")
+        monkeypatch.setattr(FlashRankCrossEncoder, "_executor", None)
+        encoder = FlashRankCrossEncoder(cpu_mem_arena=arena)
+        with patch.dict("sys.modules", {"flashrank": fake_flashrank, "onnxruntime": fake_ort}):
+            await encoder.initialize()
+        fake_ort.InferenceSession.assert_called_once_with(str(tmp_path / "model.onnx"), sess_options=options)
+        assert ranker.session is fake_ort.InferenceSession.return_value
+        assert options.enable_cpu_mem_arena is arena
+        assert (options.intra_op_num_threads, options.inter_op_num_threads) == (2, 1)
+        options.add_session_config_entry.assert_called_once_with("session.intra_op.allow_spinning", "0")
+        FlashRankCrossEncoder._executor.shutdown()
 
     def test_predict_sync_empty_pairs(self):
         encoder = self._make_encoder()
@@ -314,3 +481,56 @@ class TestFlashRankCrossEncoder:
 
     def test_default_batch_size_matches_config(self):
         assert FlashRankCrossEncoder().batch_size == DEFAULT_RERANKER_FLASHRANK_BATCH_SIZE
+
+
+class TestInProcessRerankerTimeoutCoverage:
+    """Family guard: which in-process rerankers carry a wall-clock budget.
+
+    Only these backends score in this process, so only these can wedge a worker on
+    compute (#4696) — a remote one is already bounded by its HTTP timeout. A new
+    in-process backend must therefore either take a `timeout`, or be given a reason
+    here; this test fails until someone decides, because the sibling that forgot is
+    by definition the one nobody wrote a test for.
+    """
+
+    # provider id (as create_cross_encoder dispatches on) -> backend class
+    BACKENDS = {
+        "local": LocalSTCrossEncoder,
+        "flashrank": FlashRankCrossEncoder,
+        "onnx": OnnxCrossEncoder,
+        "jina-mlx": JinaMLXCrossEncoder,
+    }
+
+    # Deliberately unbounded, and why. Not a permanent exemption — if a report lands
+    # on one of these, it gets the same treatment `local` got.
+    NO_TIMEOUT = {
+        "flashrank": (
+            "Already splits into bounded batches for the OOM fix (#3355), and its "
+            "ONNX MiniLM-class models score in milliseconds per pair."
+        ),
+        "jina-mlx": (
+            "rerank() scores a whole query group in one opaque MLX call, so there is "
+            "no point between batches at which a deadline could be observed."
+        ),
+    }
+
+    def test_family_matches_the_in_process_providers(self):
+        """The enumeration above must stay in step with the providers the module
+        itself calls in-process, or this guard silently stops covering one."""
+        declared = {
+            provider
+            for provider, reason in ce_module._RERANKER_PROVIDERS_WITHOUT_RETRY.items()
+            if reason == "in-process model"
+        }
+        assert declared == set(self.BACKENDS)
+
+    @pytest.mark.parametrize("provider", sorted(BACKENDS))
+    def test_backend_takes_a_timeout_or_says_why_not(self, provider: str):
+        params = inspect.signature(self.BACKENDS[provider].__init__).parameters
+        if provider in self.NO_TIMEOUT:
+            assert "timeout" not in params, (
+                f"{provider} now takes a timeout — drop its NO_TIMEOUT entry and test the budget"
+            )
+            assert self.NO_TIMEOUT[provider].strip()
+        else:
+            assert "timeout" in params, f"in-process backend {provider} has no wall-clock budget"

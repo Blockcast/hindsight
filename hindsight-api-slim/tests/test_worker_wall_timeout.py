@@ -102,6 +102,12 @@ class TestWallTimeoutResolution:
             clear_config_cache()
             assert _wall_timeout_for("consolidation") is None
 
+    def test_mental_model_refresh_follows_the_reflect_wall_timeout(self):
+        """#4581: a wedged refresh held its slot forever. It now shares reflect's budget."""
+        with patch.dict("os.environ", {"HINDSIGHT_API_REFLECT_WALL_TIMEOUT": "240"}):
+            clear_config_cache()
+            assert _wall_timeout_for("refresh_mental_model") == 240.0
+
     def test_unknown_task_types_are_unbounded(self):
         assert _wall_timeout_for("graph_maintenance") is None
         assert _wall_timeout_for("reflect") is None
@@ -371,10 +377,11 @@ class TestWallTimeoutNotification:
 
         poller._mark_failed.assert_awaited_once()
         notified.assert_awaited_once()
-        task_dict, schema, message = notified.await_args.args
+        task_dict, schema, message, stage = notified.await_args.args
         assert task_dict["type"] == "consolidation"
         assert schema == "tenant_x"
         assert "wall-clock limit" in message
+        assert stage in message
 
     @pytest.mark.asyncio
     async def test_notification_is_not_fired_for_ordinary_failures(self):

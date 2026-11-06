@@ -11,18 +11,26 @@ import { withBasePath } from "@/lib/base-path";
 import { client } from "@/lib/api";
 import type { RetainContentBlock as ContentBlock } from "@/lib/api";
 import {
+  ContentComposer,
+  hasComposedContent,
+  toRetainContent,
+  type ComposeMode,
+  type ComposerBlock,
+} from "@/components/content-composer";
+
+import { LanguageSwitcher, useSwitchLocale } from "@/components/language-switcher";
+import { SidebarMenuButton } from "@/components/sidebar";
+import { locales, localeNames, type Locale } from "@/i18n/config";
+import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-
-/** One element of a document composed as an ordered block list. */
-type DocBlock =
-  | { kind: "text"; text: string }
-  | { kind: "attachment"; name: string; mediaType: string; data: string; size: number };
-
-import { LanguageSwitcher } from "@/components/language-switcher";
 import { Button } from "@/components/ui/button";
 import {
   Command,
@@ -56,8 +64,8 @@ import {
   ChevronRight,
   LogOut,
   Copy,
-  Paperclip,
-  ChevronUp,
+  Globe,
+  MoreHorizontal,
 } from "lucide-react";
 import { Spinner } from "@/components/ui/spinner";
 import { toast } from "sonner";
@@ -127,6 +135,7 @@ function BankSelectorInner() {
   } = useBank();
   const { theme, toggleTheme } = useTheme();
   const { features } = useFeatures();
+  const { locale, switchLocale } = useSwitchLocale();
   const [open, setOpen] = React.useState(false);
   // One-shot spin of the header logo, fired by sidebar navigation (see the
   // "hindsight:logo-spin" listener below). Reset on animationEnd so it can replay.
@@ -143,18 +152,8 @@ function BankSelectorInner() {
   const [docDialogOpen, setDocDialogOpen] = React.useState(false);
   const [docTab, setDocTab] = React.useState<"text" | "upload">("text");
   const [docContent, setDocContent] = React.useState("");
-  // Attachments to interleave into the document's content. Kept in order, and
-  // appended after the prose: the API takes an ordered block list, and a form
-  // with one textarea has no way to express "this picture goes *here*". Anyone
-  // needing exact placement sends blocks through the API directly.
-  // How the document's content is being composed. "text" is the plain textarea
-  // every document has always used; "blocks" is the ordered list that lets an
-  // attachment sit *between* two runs of prose, which is the whole point of
-  // inline attachments and cannot be expressed with one textarea. Kept as a
-  // switch so the common case — typing some text — is not cluttered by an
-  // editor most documents never need.
-  const [docComposeMode, setDocComposeMode] = React.useState<"text" | "blocks">("text");
-  const [docBlocks, setDocBlocks] = React.useState<DocBlock[]>([]);
+  const [docComposeMode, setDocComposeMode] = React.useState<ComposeMode>("text");
+  const [docBlocks, setDocBlocks] = React.useState<ComposerBlock[]>([]);
   const [docContext, setDocContext] = React.useState("");
   const [docEventDate, setDocEventDate] = React.useState("");
   const [docDocumentId, setDocDocumentId] = React.useState("");
@@ -488,11 +487,7 @@ function BankSelectorInner() {
   };
 
   const handleCreateDocument = async () => {
-    const hasBlockContent = docBlocks.some((b) =>
-      b.kind === "text" ? b.text.trim().length > 0 : true
-    );
-    const hasContent = docComposeMode === "blocks" ? hasBlockContent : docContent.trim().length > 0;
-    if (!currentBank || !hasContent) return;
+    if (!currentBank || !hasComposedContent(docComposeMode, docContent, docBlocks)) return;
 
     setIsCreatingDoc(true);
 
@@ -512,29 +507,7 @@ function BankSelectorInner() {
         metadata?: Record<string, string>;
         entities?: Array<{ text: string }>;
         strategy?: string;
-      } = { content: docContent };
-      if (docComposeMode === "blocks") {
-        // Sent in the order they were arranged, so an attachment reaches the
-        // extractor between the sentences that frame it. An image block for
-        // images and a file block for everything else — the distinction the API
-        // keeps because the providers keep it.
-        item.content = docBlocks
-          .filter((b) => (b.kind === "text" ? b.text.trim().length > 0 : true))
-          .map((b) =>
-            b.kind === "text"
-              ? { type: "text" as const, text: b.text }
-              : b.mediaType.startsWith("image/")
-                ? {
-                    type: "image" as const,
-                    source: { type: "base64" as const, media_type: b.mediaType, data: b.data },
-                  }
-                : {
-                    type: "file" as const,
-                    filename: b.name,
-                    source: { type: "base64" as const, media_type: b.mediaType, data: b.data },
-                  }
-          );
-      }
+      } = { content: toRetainContent(docComposeMode, docContent, docBlocks) };
       if (docContext) item.context = docContext;
       if (docEventDate) item.timestamp = toIsoTimestamp(docEventDate);
       if (docDocumentId) item.document_id = docDocumentId;
@@ -597,9 +570,17 @@ function BankSelectorInner() {
     }
   };
 
+  const logout = async () => {
+    try {
+      await fetch(withBasePath("/api/auth/logout"), { method: "POST" });
+    } finally {
+      window.location.href = withBasePath("/login");
+    }
+  };
+
   return (
-    <div className="bg-card text-card-foreground px-5 py-3 border-b-4 border-primary-gradient">
-      <div className="flex items-center gap-4 text-sm">
+    <div className="bg-card text-card-foreground px-3 sm:px-5 py-3 border-b-4 border-primary-gradient">
+      <div className="flex items-center gap-2 sm:gap-4 text-sm">
         {/* Logo, split so only the mark spins on navigation while the wordmark
             stays put. The mark is the standalone favicon.png (so it can rotate
             freely); the wordmark is the right slice of the full lockup (logo.png)
@@ -608,7 +589,7 @@ function BankSelectorInner() {
         {/* The logo is the way back to the banks overview, as it is in most apps. */}
         <button
           type="button"
-          className="flex items-center h-10 select-none cursor-pointer"
+          className="flex shrink-0 items-center h-10 select-none cursor-pointer"
           aria-label={tNavBank("allBanks")}
           title={tNavBank("allBanks")}
           onClick={() => router.push("/dashboard")}
@@ -619,8 +600,9 @@ function BankSelectorInner() {
             className={cn("h-10 w-auto", logoSpinning && "animate-logo-wiggle")}
             onAnimationEnd={() => setLogoSpinning(false)}
           />
+          {/* The wordmark gives way on phones so the bank picker keeps its room. */}
           <div
-            className="h-10 w-[99px]"
+            className="hidden sm:block h-10 w-[99px]"
             style={{
               backgroundImage: `url(${withBasePath("/logo.png")})`,
               backgroundSize: "auto 100%",
@@ -631,7 +613,9 @@ function BankSelectorInner() {
         </button>
 
         {/* Separator */}
-        <div className="h-8 w-px bg-border" />
+        <div className="hidden sm:block h-8 w-px bg-border" />
+
+        {currentBank && <SidebarMenuButton />}
 
         {/* Memory Bank Selector */}
         <Popover
@@ -651,7 +635,7 @@ function BankSelectorInner() {
               variant="outline"
               role="combobox"
               aria-expanded={open}
-              className="w-[250px] justify-between font-bold border-2 border-primary hover:bg-accent"
+              className="min-w-0 flex-1 sm:flex-none sm:w-[250px] justify-between font-bold border-2 border-primary hover:bg-accent"
             >
               <span className="truncate">
                 {currentBankName || currentBank || tNavBank("select")}
@@ -659,7 +643,7 @@ function BankSelectorInner() {
               <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
             </Button>
           </PopoverTrigger>
-          <PopoverContent className="w-[420px] p-0" align="start">
+          <PopoverContent className="w-[min(420px,calc(100vw-1rem))] p-0" align="start">
             {/* shouldFilter={false}: matching is done by the server so search reaches
                 banks that haven't been paged in yet. */}
             <Command shouldFilter={false}>
@@ -746,10 +730,36 @@ function BankSelectorInner() {
                               "truncate flex-1",
                               isSelected ? "font-semibold" : "font-medium"
                             )}
-                            title={bank.name || bank.bank_id}
+                            title={bank.display_alias || bank.name || bank.bank_id}
                           >
-                            {bank.name || bank.bank_id}
+                            {/* display_alias outranks name: `name` is a deprecated
+                                free-text label, while a promoted alias is a real id
+                                the operator chose to present the bank under. */}
+                            {bank.display_alias || bank.name || bank.bank_id}
                           </span>
+                          {/* The real id stays visible whenever it is not what is
+                              shown — the display is a convenience, never a disguise. */}
+                          {bank.display_alias && (
+                            <span
+                              className="shrink-0 truncate max-w-[35%] font-mono text-[11px] text-muted-foreground/60"
+                              title={bank.bank_id}
+                            >
+                              {bank.bank_id}
+                            </span>
+                          )}
+                          {/* Only set when the search matched an alias rather than this
+                              bank's own id or name, which is exactly when the row would
+                              otherwise look like it does not match what was typed. */}
+                          {bank.matched_aliases.length > 0 && (
+                            <span
+                              className="shrink-0 truncate max-w-[40%] font-mono text-[11px] text-muted-foreground/70"
+                              title={tNavBank("viaAlias", {
+                                aliases: bank.matched_aliases.join(", "),
+                              })}
+                            >
+                              {tNavBank("viaAlias", { aliases: bank.matched_aliases.join(", ") })}
+                            </span>
+                          )}
                           <button
                             type="button"
                             aria-label={tNavBank("copyName")}
@@ -815,74 +825,132 @@ function BankSelectorInner() {
         </Popover>
 
         {/* Separator */}
-        <div className="h-8 w-px bg-border" />
+        <div className="hidden sm:block h-8 w-px bg-border" />
 
-        {/* Add Document Button */}
+        {/* Add Document Button — icon only on phones. */}
         {currentBank && (
           <Button
             variant="outline"
             size="sm"
-            className="h-9 gap-1.5"
+            className="h-9 shrink-0 gap-1.5 px-2.5 sm:px-3"
             onClick={() => setDocDialogOpen(true)}
             title={tAddDocument("addDocumentToCurrentBank")}
+            aria-label={tAddDocument("addDocumentButton")}
             data-add-document
           >
             <Plus className="h-4 w-4" />
-            <span>{tAddDocument("addDocumentButton")}</span>
+            <span className="hidden sm:inline">{tAddDocument("addDocumentButton")}</span>
           </Button>
         )}
 
         {/* Spacer */}
-        <div className="flex-1" />
+        <div className="hidden sm:block flex-1" />
 
-        {/* GitHub Link */}
-        <a
-          href="https://github.com/vectorize-io/hindsight"
-          target="_blank"
-          rel="noopener noreferrer"
-          className="flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-accent transition-colors text-muted-foreground hover:text-foreground"
-          title={tNav("viewOnGitHub")}
-        >
-          <Github className="h-5 w-5" />
-          <span className="text-sm font-medium">GitHub</span>
-        </a>
-
-        {/* Separator */}
-        <div className="h-8 w-px bg-border" />
-
-        {/* Dark Mode Toggle */}
-        <Button
-          variant="ghost"
-          size="icon"
-          onClick={toggleTheme}
-          className="h-9 w-9"
-          title={theme === "light" ? tNav("darkMode") : tNav("lightMode")}
-        >
-          {theme === "light" ? <Moon className="h-5 w-5" /> : <Sun className="h-5 w-5" />}
-        </Button>
-
-        <LanguageSwitcher />
-
-        {features?.access_key_auth && (
-          <>
-            <div className="h-8 w-px bg-border" />
+        {/* Phones: GitHub, theme, language and logout fold into one menu. */}
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
             <Button
               variant="ghost"
               size="icon"
-              className="h-9 w-9"
-              title="Logout"
-              onClick={async () => {
-                try {
-                  await fetch(withBasePath("/api/auth/logout"), { method: "POST" });
-                } finally {
-                  window.location.href = withBasePath("/login");
-                }
-              }}
+              className="md:hidden h-9 w-9 shrink-0 ml-auto"
+              aria-label={tNav("more")}
+              title={tNav("more")}
             >
-              <LogOut className="h-5 w-5" />
+              <MoreHorizontal className="h-5 w-5" />
             </Button>
-          </>
-        )}
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" className="w-52">
+            <DropdownMenuItem asChild>
+              <a
+                href="https://github.com/vectorize-io/hindsight"
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                <Github className="h-4 w-4 mr-2" />
+                GitHub
+              </a>
+            </DropdownMenuItem>
+            <DropdownMenuItem onClick={toggleTheme}>
+              {theme === "light" ? (
+                <Moon className="h-4 w-4 mr-2" />
+              ) : (
+                <Sun className="h-4 w-4 mr-2" />
+              )}
+              {theme === "light" ? tNav("darkMode") : tNav("lightMode")}
+            </DropdownMenuItem>
+            <DropdownMenuSub>
+              <DropdownMenuSubTrigger>
+                <Globe className="h-4 w-4 mr-2" />
+                {localeNames[locale as Locale] ?? locale}
+              </DropdownMenuSubTrigger>
+              <DropdownMenuSubContent>
+                {locales.map((l) => (
+                  <DropdownMenuItem
+                    key={l}
+                    onClick={() => switchLocale(l)}
+                    className={l === locale ? "bg-accent" : ""}
+                  >
+                    {localeNames[l]}
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuSubContent>
+            </DropdownMenuSub>
+            {features?.access_key_auth && (
+              <>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem onClick={logout}>
+                  <LogOut className="h-4 w-4 mr-2" />
+                  Logout
+                </DropdownMenuItem>
+              </>
+            )}
+          </DropdownMenuContent>
+        </DropdownMenu>
+
+        <div className="hidden md:contents">
+          {/* GitHub Link */}
+          <a
+            href="https://github.com/vectorize-io/hindsight"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-accent transition-colors text-muted-foreground hover:text-foreground"
+            title={tNav("viewOnGitHub")}
+          >
+            <Github className="h-5 w-5" />
+            <span className="text-sm font-medium">GitHub</span>
+          </a>
+
+          {/* Separator */}
+          <div className="h-8 w-px bg-border" />
+
+          {/* Dark Mode Toggle */}
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={toggleTheme}
+            className="h-9 w-9"
+            title={theme === "light" ? tNav("darkMode") : tNav("lightMode")}
+          >
+            {theme === "light" ? <Moon className="h-5 w-5" /> : <Sun className="h-5 w-5" />}
+          </Button>
+
+          <LanguageSwitcher />
+
+          {features?.access_key_auth && (
+            <>
+              <div className="h-8 w-px bg-border" />
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-9 w-9"
+                title="Logout"
+                onClick={logout}
+              >
+                <LogOut className="h-5 w-5" />
+              </Button>
+            </>
+          )}
+        </div>
 
         <Dialog open={createDialogOpen} onOpenChange={setCreateDialogOpen}>
           <DialogContent className="sm:max-w-[550px]">
@@ -1003,204 +1071,20 @@ function BankSelectorInner() {
                 </TabsList>
 
                 <TabsContent value="text" className="mt-3">
-                  <div className="flex items-center justify-between mb-1">
-                    <label className="font-bold text-sm text-foreground">
-                      {tAddDocument("contentLabel")}
-                    </label>
-                    {/* The switch, rather than always showing the block editor:
-                        most documents are just text, and an ordered block list
-                        would be clutter in front of every one of them. */}
-                    <div className="flex items-center rounded border border-border overflow-hidden text-xs">
-                      <button
-                        type="button"
-                        onClick={() => setDocComposeMode("text")}
-                        className={`px-2 py-1 ${
-                          docComposeMode === "text"
-                            ? "bg-muted text-foreground font-semibold"
-                            : "text-muted-foreground hover:bg-muted/50"
-                        }`}
-                      >
-                        {tAddDocument("composeText")}
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          // Carry the typed text across so switching never
-                          // silently loses what is already written.
-                          setDocBlocks((current) =>
-                            current.length > 0 ? current : [{ kind: "text", text: docContent }]
-                          );
-                          setDocComposeMode("blocks");
-                        }}
-                        className={`px-2 py-1 border-l border-border ${
-                          docComposeMode === "blocks"
-                            ? "bg-muted text-foreground font-semibold"
-                            : "text-muted-foreground hover:bg-muted/50"
-                        }`}
-                      >
-                        {tAddDocument("composeBlocks")}
-                      </button>
-                    </div>
-                  </div>
-
-                  {docComposeMode === "text" ? (
-                    <Textarea
-                      value={docContent}
-                      onChange={(e) => setDocContent(e.target.value)}
-                      placeholder={tAddDocument("contentPlaceholder")}
-                      className="min-h-[150px] resize-y"
-                      autoFocus
-                    />
-                  ) : (
-                    <div className="space-y-2">
-                      <p className="text-xs text-muted-foreground">
-                        {tAddDocument("composeBlocksHint")}
-                      </p>
-                      {docBlocks.map((block, index) => (
-                        <div
-                          key={index}
-                          className="group relative rounded border border-border bg-muted/20 p-2"
-                        >
-                          {/* Controls overlay the block rather than sitting in a
-                              column beside it: at this width a fixed gutter of
-                              arrows and a close button squeezed the content into
-                              a sliver. Revealed on hover and on keyboard focus,
-                              so they stay reachable without a pointer. */}
-                          <div className="absolute top-1 right-1 flex items-center gap-0.5 rounded bg-background/80 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
-                            <button
-                              type="button"
-                              aria-label={tAddDocument("blockMoveUp")}
-                              disabled={index === 0}
-                              onClick={() =>
-                                setDocBlocks((current) => {
-                                  const next = [...current];
-                                  [next[index - 1], next[index]] = [next[index], next[index - 1]];
-                                  return next;
-                                })
-                              }
-                              className="p-1 rounded text-muted-foreground hover:text-foreground hover:bg-muted disabled:opacity-25"
-                            >
-                              <ChevronUp className="h-3.5 w-3.5" />
-                            </button>
-                            <button
-                              type="button"
-                              aria-label={tAddDocument("blockMoveDown")}
-                              disabled={index === docBlocks.length - 1}
-                              onClick={() =>
-                                setDocBlocks((current) => {
-                                  const next = [...current];
-                                  [next[index], next[index + 1]] = [next[index + 1], next[index]];
-                                  return next;
-                                })
-                              }
-                              className="p-1 rounded text-muted-foreground hover:text-foreground hover:bg-muted disabled:opacity-25"
-                            >
-                              <ChevronDown className="h-3.5 w-3.5" />
-                            </button>
-                            <button
-                              type="button"
-                              aria-label={tAddDocument("blockRemove")}
-                              onClick={() =>
-                                setDocBlocks((current) => current.filter((_, i) => i !== index))
-                              }
-                              className="p-1 rounded text-muted-foreground hover:text-foreground hover:bg-muted"
-                            >
-                              <X className="h-3.5 w-3.5" />
-                            </button>
-                          </div>
-
-                          {block.kind === "text" ? (
-                            <Textarea
-                              value={block.text}
-                              onChange={(e) =>
-                                setDocBlocks((current) =>
-                                  current.map((b, i) =>
-                                    i === index && b.kind === "text"
-                                      ? { ...b, text: e.target.value }
-                                      : b
-                                  )
-                                )
-                              }
-                              placeholder={tAddDocument("contentPlaceholder")}
-                              // Room for the overlay so the first line never runs
-                              // underneath it.
-                              className="min-h-[80px] resize-y border-0 bg-transparent p-0 pr-20 shadow-none focus-visible:ring-0"
-                            />
-                          ) : (
-                            <div className="flex items-center gap-2 pr-20 text-sm">
-                              <Paperclip className="h-4 w-4 shrink-0 text-muted-foreground" />
-                              <span className="truncate">{block.name}</span>
-                              <span className="shrink-0 text-xs text-muted-foreground">
-                                {(block.size / 1024).toFixed(0)} KB
-                              </span>
-                            </div>
-                          )}
-                        </div>
-                      ))}
-
-                      <input
-                        id="doc-attachment-input"
-                        type="file"
-                        multiple
-                        className="hidden"
-                        onChange={async (e) => {
-                          const files = Array.from(e.target.files ?? []);
-                          const encoded = await Promise.all(
-                            files.map(
-                              (file) =>
-                                new Promise<DocBlock>((resolve, reject) => {
-                                  const reader = new FileReader();
-                                  reader.onerror = () => reject(reader.error);
-                                  reader.onload = () =>
-                                    resolve({
-                                      kind: "attachment",
-                                      name: file.name,
-                                      // Some browsers report "" for unusual
-                                      // extensions; the API accepts any
-                                      // well-formed type, so fall back to a
-                                      // generic one rather than refusing it.
-                                      mediaType: file.type || "application/octet-stream",
-                                      size: file.size,
-                                      // readAsDataURL gives "data:<type>;base64,<payload>";
-                                      // the API wants the payload alone.
-                                      data: String(reader.result).split(",", 2)[1] ?? "",
-                                    });
-                                  reader.readAsDataURL(file);
-                                })
-                            )
-                          );
-                          setDocBlocks((current) => [...current, ...encoded]);
-                          // Let the same file be picked again after removal.
-                          e.target.value = "";
-                        }}
-                      />
-                      <DropdownMenu>
-                        <DropdownMenuTrigger asChild>
-                          <Button type="button" variant="outline" size="sm">
-                            <Plus className="mr-1.5 h-3.5 w-3.5" />
-                            {tAddDocument("blockAdd")}
-                            <ChevronDown className="ml-1.5 h-3.5 w-3.5" />
-                          </Button>
-                        </DropdownMenuTrigger>
-                        <DropdownMenuContent align="start">
-                          <DropdownMenuItem
-                            onSelect={() =>
-                              setDocBlocks((current) => [...current, { kind: "text", text: "" }])
-                            }
-                          >
-                            {tAddDocument("blockAddText")}
-                          </DropdownMenuItem>
-                          <DropdownMenuItem
-                            onSelect={() =>
-                              document.getElementById("doc-attachment-input")?.click()
-                            }
-                          >
-                            {tAddDocument("blockAddAttachment")}
-                          </DropdownMenuItem>
-                        </DropdownMenuContent>
-                      </DropdownMenu>
-                    </div>
-                  )}
+                  <ContentComposer
+                    label={
+                      <label className="font-bold text-sm text-foreground">
+                        {tAddDocument("contentLabel")}
+                      </label>
+                    }
+                    mode={docComposeMode}
+                    onModeChange={setDocComposeMode}
+                    text={docContent}
+                    onTextChange={setDocContent}
+                    blocks={docBlocks}
+                    onBlocksChange={setDocBlocks}
+                    autoFocus
+                  />
                 </TabsContent>
 
                 <TabsContent value="upload" className="mt-3">
@@ -1749,12 +1633,7 @@ function BankSelectorInner() {
                 <Button
                   onClick={handleCreateDocument}
                   disabled={
-                    isCreatingDoc ||
-                    (docComposeMode === "blocks"
-                      ? !docBlocks.some((b) =>
-                          b.kind === "text" ? b.text.trim().length > 0 : true
-                        )
-                      : !docContent.trim())
+                    isCreatingDoc || !hasComposedContent(docComposeMode, docContent, docBlocks)
                   }
                 >
                   {isCreatingDoc
@@ -1783,8 +1662,8 @@ export function BankSelector() {
   return (
     <Suspense
       fallback={
-        <div className="bg-card text-card-foreground px-5 py-3 border-b-4 border-primary-gradient">
-          <div className="flex items-center gap-4 text-sm">
+        <div className="bg-card text-card-foreground px-3 sm:px-5 py-3 border-b-4 border-primary-gradient">
+          <div className="flex items-center gap-2 sm:gap-4 text-sm">
             <Image
               src={withBasePath("/logo.png")}
               alt="Hindsight"
@@ -1793,29 +1672,31 @@ export function BankSelector() {
               className="h-10 w-auto"
               unoptimized
             />
-            <div className="h-8 w-px bg-border" />
+            <div className="hidden sm:block h-8 w-px bg-border" />
             <Button
               variant="outline"
-              className="w-[250px] justify-between font-bold border-2 border-primary"
+              className="min-w-0 flex-1 sm:flex-none sm:w-[250px] justify-between font-bold border-2 border-primary"
               disabled
             >
               Loading...
               <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
             </Button>
-            <div className="flex-1" />
-            <a
-              href="https://github.com/vectorize-io/hindsight"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-accent transition-colors text-muted-foreground"
-            >
-              <Github className="h-5 w-5" />
-              <span className="text-sm font-medium">GitHub</span>
-            </a>
-            <div className="h-8 w-px bg-border" />
-            <Button variant="ghost" size="icon" className="h-9 w-9" disabled>
-              <Moon className="h-5 w-5" />
-            </Button>
+            <div className="hidden md:contents">
+              <div className="flex-1" />
+              <a
+                href="https://github.com/vectorize-io/hindsight"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-accent transition-colors text-muted-foreground"
+              >
+                <Github className="h-5 w-5" />
+                <span className="text-sm font-medium">GitHub</span>
+              </a>
+              <div className="h-8 w-px bg-border" />
+              <Button variant="ghost" size="icon" className="h-9 w-9" disabled>
+                <Moon className="h-5 w-5" />
+              </Button>
+            </div>
           </div>
         </div>
       }

@@ -4,20 +4,26 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from hindsight_api.extensions.base import Extension
 
 if TYPE_CHECKING:
-    from hindsight_api.engine.memory_engine import Budget
+    from hindsight_api.engine.response_models import Budget, ReflectResult
     from hindsight_api.engine.response_models import RecallResult as RecallResultModel
-    from hindsight_api.engine.response_models import ReflectResult
     from hindsight_api.engine.search.tags import TagGroup, TagsMatch
     from hindsight_api.models import RequestContext
 
 
 class OperationValidationError(Exception):
-    """Raised when an operation fails validation."""
+    """The operation was refused before it did any work.
+
+    Raised for a ``ValidationResult.reject`` from an OperationValidatorExtension, and by
+    the engine's own tag-scope checks.
+
+    The HTTP layer answers ``status_code`` with ``reason``, and the operation is counted
+    with ``success="rejected"`` rather than as a failure (see metrics.OperationOutcome).
+    """
 
     def __init__(self, reason: str, status_code: int = 403):
         self.reason = reason
@@ -232,6 +238,18 @@ class ConsolidateContext:
 # =============================================================================
 
 
+class RetainSource(StrEnum):
+    """How the content reported to ``on_retain_complete`` entered the bank."""
+
+    #: Extracted from submitted content by the retain pipeline.
+    RETAIN = "retain"
+    #: Restored from a transfer archive (document import or whole-bank restore). The
+    #: facts arrive pre-extracted, so no extraction LLM runs and the token counts are
+    #: zero -- but the documents are new to the bank, unlike a deduplicated re-retain,
+    #: which also reports ``processed_content_tokens=0``.
+    IMPORT = "import"
+
+
 @dataclass
 class RetainResult:
     """Result context for post-retain hook.
@@ -289,6 +307,11 @@ class RetainResult:
     # the rest. Summing across a fold therefore yields exactly the tokens the
     # execution spent, the same total an unfolded run would have reported.
     folded_with: list[str] | None = None
+    # How the content entered the bank. ``IMPORT`` results carry zero token counts
+    # (nothing was extracted) and the imported document's text in ``contents``, so an
+    # extension that meters imports can tell them apart from a re-retain that the
+    # chunk dedup made free.
+    source: RetainSource = RetainSource.RETAIN
 
 
 @dataclass
@@ -368,6 +391,7 @@ class BankReadOperation(StrEnum):
     GET_CHUNK = "get_chunk"
     GET_DIRECTIVE = "get_directive"
     GET_DOCUMENT = "get_document"
+    GET_DOCUMENT_HISTORY = "get_document_history"
     GET_ENTITY = "get_entity"
     GET_ENTITY_GRAPH = "get_entity_graph"
     GET_ENTITY_STATE = "get_entity_state"
@@ -379,6 +403,7 @@ class BankReadOperation(StrEnum):
     GET_MENTAL_MODEL_HISTORY = "get_mental_model_history"
     GET_OBSERVATION_HISTORY = "get_observation_history"
     GET_OPERATION_STATUS = "get_operation_status"
+    LIST_BANK_ALIASES = "list_bank_aliases"
     LIST_DIRECTIVES = "list_directives"
     LIST_DOCUMENT_CHUNKS = "list_document_chunks"
     LIST_DOCUMENTS = "list_documents"
@@ -401,18 +426,21 @@ class BankWriteOperation(StrEnum):
     CLEAR_MENTAL_MODEL = "clear_mental_model"
     CLEAR_OBSERVATIONS = "clear_observations"
     CLEAR_OBSERVATIONS_FOR_MEMORY = "clear_observations_for_memory"
+    CREATE_BANK_ALIAS = "create_bank_alias"
     CREATE_DIRECTIVE = "create_directive"
     CREATE_KNOWLEDGE_FOLDER = "create_knowledge_folder"
     CREATE_KNOWLEDGE_PAGE = "create_knowledge_page"
     CREATE_MENTAL_MODEL = "create_mental_model"
     CREATE_WEBHOOK = "create_webhook"
     DELETE_BANK = "delete_bank"
+    DELETE_BANK_ALIAS = "delete_bank_alias"
     DELETE_DIRECTIVE = "delete_directive"
     DELETE_DOCUMENT = "delete_document"
     DELETE_KNOWLEDGE_NODE = "delete_knowledge_node"
     DELETE_MENTAL_MODEL = "delete_mental_model"
     DELETE_OPERATION = "delete_operation"
     DELETE_WEBHOOK = "delete_webhook"
+    IMPORT_DOCUMENTS = "import_documents"
     MERGE_BANK_MISSION = "merge_bank_mission"
     MOVE_KNOWLEDGE_NODE = "move_knowledge_node"
     RENAME_KNOWLEDGE_NODE = "rename_knowledge_node"
@@ -443,6 +471,20 @@ class BankReadContext:
     bank_id: str
     operation: BankReadOperation
     request_context: "RequestContext"
+    # The caller's tag filter, set only on the reads that take one (knowledge-base tree
+    # and search). A validator narrows what they return by answering with
+    # ``ValidationResult.accept_with(tags=..., tags_match=..., tag_groups=...)``.
+    tags: list[str] | None = None
+    tags_match: "TagsMatch" = "any"
+    tag_groups: "list[TagGroup] | None" = None
+
+
+@dataclass
+class TagScopeContext:
+    """Context for resolving the tag scope a caller is confined to in one bank."""
+
+    bank_id: str
+    request_context: "RequestContext"
 
 
 @dataclass
@@ -463,6 +505,31 @@ class CreateBankContext:
 
 
 @dataclass
+class ImportArchiveDocument:
+    """One document of a transfer archive, as the import gate sees it."""
+
+    document_id: str
+    #: The document's original text ("" when the archive carries none).
+    content: str
+
+
+@dataclass
+class ImportContext:
+    """Context for validating a transfer-archive import before it is accepted.
+
+    Covers both document imports into ``bank_id`` and whole-bank restores (where
+    ``bank_id`` is the bank being restored). Runs at submission, before the archive
+    is stored or queued, so a rejection reaches the caller directly.
+    """
+
+    bank_id: str
+    request_context: "RequestContext"
+    #: Every document in the archive. Documents a ``skip`` import later passes over
+    #: are still listed: which ones exist is only known when the import runs.
+    documents: list[ImportArchiveDocument]
+
+
+@dataclass
 class BankListContext:
     """Context for filtering the bank list (post-query)."""
 
@@ -475,6 +542,17 @@ class BankListResult:
     """Result of filtering the bank list."""
 
     banks: list[dict]
+
+
+@dataclass
+class BankListScope:
+    """Which banks a request's bank list may show, declared before the list is read.
+
+    ``bank_ids=None`` means every bank. A list means only those banks; an entry may be a bank's
+    own id or one of its aliases, and an entry that names no bank is ignored.
+    """
+
+    bank_ids: list[str] | None = None
 
 
 # =============================================================================
@@ -526,6 +604,60 @@ class MentalModelRefreshResult:
     mental_models_used: int  # mental models referenced in based_on
     success: bool = True
     error: str | None = None
+
+
+# =============================================================================
+# Memory Curation Contexts
+# =============================================================================
+
+
+MemoryCurationAction = Literal["edit", "invalidate", "revert", "reason"]
+
+
+@dataclass
+class MemoryUpdateContext:
+    """Context for curating a single memory unit (pre-operation).
+
+    Curation edits a raw world/experience fact and/or moves it between the live
+    and invalidated states. Carries the requested change so a validator can gate
+    or quota it before any work runs; ``validate_bank_write`` still fires first
+    with ``BankWriteOperation.UPDATE_MEMORY_UNIT`` for plain access checks.
+    """
+
+    bank_id: str
+    memory_id: str
+    request_context: "RequestContext"
+    #: New text when the request edits it, else None.
+    text: str | None = None
+    #: Requested state ("valid" / "invalidated"), or None when unchanged.
+    state: str | None = None
+    #: True when the request edits any field (text, context, dates, fact type,
+    #: entities). An edit re-embeds the memory and re-consolidates.
+    edits_fields: bool = False
+
+
+@dataclass
+class MemoryUpdateResult:
+    """Result context for the post-curation hook.
+
+    Fired once the curation has committed. ``reembedded_tokens`` is the size of
+    the text the engine embedded again (an edit's new text, or a reverted
+    memory's restored text) and is 0 when nothing was re-embedded, e.g. a plain
+    invalidation or a reason-only update.
+    """
+
+    bank_id: str
+    memory_id: str
+    request_context: "RequestContext"
+    #: "edit", "invalidate", "revert", or "reason" (reason-only update of an
+    #: already invalidated memory). An edit that also changes state reports the
+    #: state change.
+    action: MemoryCurationAction
+    #: Text that was re-embedded, or None when nothing was.
+    reembedded_text: str | None = None
+    reembedded_tokens: int = 0
+    #: Whether the curation queued a consolidation pass for the bank.
+    consolidation_submitted: bool = False
 
 
 # =============================================================================
@@ -834,6 +966,81 @@ class OperationValidatorExtension(Extension, ABC):
         pass
 
     # =========================================================================
+    # Tag scope - which tagged data a caller may reach (optional - override to implement)
+    # =========================================================================
+
+    async def resolve_tag_scope(self, ctx: TagScopeContext) -> "list[TagGroup] | None":
+        """
+        Confine a caller to the memories whose tags satisfy these groups.
+
+        Override to isolate callers that share a bank by tag — e.g. a caller who may
+        read only ``user:dan`` and the shared ``kind:rule`` scope returns
+        ``[TagGroupLeaf(tags=["user:dan", "kind:rule"], match="any_strict")]``.
+
+        The engine AND-s the returned groups into every tag-scoped operation, on
+        top of whatever filter the caller asked for, so a caller can narrow its
+        scope but never widen it:
+
+        - filtered reads (recall, reflect and its tools, memory / document /
+          mental-model lists, observation scopes, tag lists, graph, timeseries,
+          entities, the knowledge-base tree, search and export) only see rows
+          inside the scope; directives keep applying when untagged;
+        - reads and writes of one item by id (a memory, a document and its
+          chunks, a mental model or knowledge node, a directive) answer 404 when
+          the item's tags fall outside it;
+        - a mental model created or updated by the caller records the scope in its
+          trigger (``scope_tag_groups``), which every refresh AND-s in, so it can
+          never be built from memories the caller could not read itself;
+        - whole-bank operations (export, clone, import, bank-wide clears, deleting
+          the bank, changing its config, mission or disposition, running or retrying
+          consolidation on request) are refused (403): they cannot be narrowed.
+
+        A ``_strict`` match is almost always what you want: the non-strict modes
+        also admit untagged rows, and an untagged mental model is built from the
+        whole bank.
+
+        Called once per operation; background work running with
+        ``request_context.internal`` is never scoped.
+
+        Args:
+            ctx: Context containing:
+                - bank_id: Bank identifier
+                - request_context: Request context with auth info
+
+        Returns:
+            Tag groups every reachable row must satisfy (AND-ed), or None for no
+            restriction.
+        """
+        return None
+
+    async def resolve_write_tag_scope(self, ctx: TagScopeContext) -> "list[str] | None":
+        """
+        The tags a caller may write in a bank, as shell-style patterns (``user:dan``, ``project:*``).
+
+        Reading and writing are separate permissions: a caller can read the shared
+        ``kind:rule`` scope without being allowed to change it. Return the tags the caller
+        may write; the engine then refuses (403) any write that would produce or touch a
+        tag outside them:
+
+        - a retain (text or files) whose item or document tags fall outside them, whose
+          explicit ``observation_scopes`` do, or whose retain strategy has an entity label
+          with ``tag: true`` that could tag a fact outside them (checked before
+          extraction, so a refused retain costs no LLM call);
+        - editing, invalidating or clearing the observations of a memory, and updating,
+          reprocessing or deleting a document, whose tags fall outside them;
+        - creating, updating, refreshing, clearing or deleting a mental model or
+          knowledge page whose tags fall outside them (including the tags it is
+          given), and moving a knowledge node into a folder that holds such pages;
+        - creating, updating or deleting a directive whose tags fall outside them.
+
+        An untagged item counts as outside any scope: it belongs to everyone. As with
+        the read scope, whole-bank operations are refused to a write-scoped caller.
+
+        Return None (the default) to leave writes unrestricted.
+        """
+        return None
+
+    # =========================================================================
     # Mental Model - Pre-operation validation hook (optional - override to implement)
     # =========================================================================
 
@@ -912,6 +1119,49 @@ class OperationValidatorExtension(Extension, ABC):
         pass
 
     # =========================================================================
+    # Memory Curation - Pre/post-operation hooks (optional - override to implement)
+    # =========================================================================
+
+    async def validate_memory_update(self, ctx: MemoryUpdateContext) -> ValidationResult:
+        """
+        Validate a memory curation (edit / invalidate / revert) before execution.
+
+        Override to gate or quota curation, e.g. to reject edits when the tenant
+        cannot pay for the re-embedding and re-consolidation they trigger.
+
+        Args:
+            ctx: Context containing:
+                - bank_id: Bank identifier
+                - memory_id: Memory unit identifier
+                - text: New text when editing it (else None)
+                - state: Requested state change (else None)
+                - edits_fields: Whether any field is being edited
+                - request_context: Request context with auth info
+
+        Returns:
+            ValidationResult indicating whether the operation is allowed.
+        """
+        return ValidationResult.accept()
+
+    async def on_memory_update_complete(self, result: MemoryUpdateResult) -> None:
+        """
+        Called after a memory curation has committed.
+
+        Override to implement post-operation logic such as usage tracking or audit
+        logging. Errors raised here are logged and do not fail the curation.
+
+        Args:
+            result: Result context containing:
+                - bank_id: Bank identifier
+                - memory_id: Memory unit identifier
+                - action: "edit", "invalidate", "revert" or "reason"
+                - reembedded_text: Text that was re-embedded (else None)
+                - reembedded_tokens: Token count of reembedded_text (0 if none)
+                - consolidation_submitted: Whether consolidation was queued
+        """
+        pass
+
+    # =========================================================================
     # Bank Management - Validation hooks (optional - override to implement)
     # =========================================================================
 
@@ -974,9 +1224,50 @@ class OperationValidatorExtension(Extension, ABC):
         """
         return ValidationResult.accept()
 
+    async def validate_import(self, ctx: ImportContext) -> ValidationResult:
+        """
+        Validate a transfer-archive import (document import or bank restore) at submission.
+
+        Override to enforce quotas or credits on imports. Imported documents are then
+        reported to ``on_retain_complete`` with ``source=RetainSource.IMPORT``.
+
+        Args:
+            ctx: Context containing:
+                - bank_id: Bank the archive is imported into
+                - request_context: Request context with auth info
+                - documents: The archive's documents (document_id, content)
+
+        Returns:
+            ValidationResult indicating whether the import may proceed.
+        """
+        return ValidationResult.accept()
+
+    async def bank_list_scope(self, request_context: "RequestContext") -> BankListScope | None:
+        """
+        Declare which banks this request's bank list may show, so the engine reads only those.
+
+        filter_bank_list takes the whole list, so running it means ranking every bank in the
+        tenant before a page can be cut. A validator that can say up front which banks a caller
+        may see returns a BankListScope instead: every bank (read one page directly), or an
+        explicit set of ids or aliases (read only those banks). filter_bank_list is then not
+        called for the request.
+
+        The default returns None — nothing declared — and the engine ranks every bank and runs
+        filter_bank_list, as a validator written before this hook expects.
+
+        Args:
+            request_context: Request context with auth info (already authenticated)
+
+        Returns:
+            A BankListScope, or None to run filter_bank_list over the full list.
+        """
+        return None
+
     async def filter_bank_list(self, ctx: BankListContext) -> BankListResult:
         """
         Filter the bank list after querying.
+
+        Runs only when bank_list_scope returns None for the request.
 
         Unlike validate_* methods, this is a post-query filter that narrows results
         rather than a gate that blocks the operation.

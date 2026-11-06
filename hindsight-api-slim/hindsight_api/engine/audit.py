@@ -6,12 +6,12 @@ Provides fire-and-forget audit logging of all mutating and core operations
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
+import time
 import uuid
-from collections.abc import Awaitable, Callable
-from contextlib import asynccontextmanager
+from collections.abc import Awaitable, Callable, Iterator
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -21,13 +21,38 @@ from pydantic import BaseModel, Field
 
 from ..engine.db_utils import acquire_with_retry
 from ..models import RequestContext
+from .background_writes import PendingWrites
 from .schema import fq_table_explicit
 
 logger = logging.getLogger(__name__)
 
+# How long close() waits for in-flight audit writes before giving up on them.
+_DRAIN_TIMEOUT_SECONDS = 5.0
 
-class AuditLogEntry(BaseModel):
-    """A single audit log entry."""
+# Actions that remove or replace a bank's data. Each call logs one INFO line whatever the
+# audit setting, so "who deleted my bank" has an answer with audit off (#5960).
+DESTRUCTIVE_ACTIONS: frozenset[str] = frozenset(
+    {
+        "delete_bank",
+        "clear_memories",
+        "delete_document",
+        "delete_mental_model",
+        "clear_mental_model",
+        "delete_knowledge_node",
+        "delete_directive",
+        "delete_bank_alias",
+        "delete_webhook",
+        "clear_observations",
+        "clear_memory_observations",
+        "import_bank_template",
+        "import_documents",
+        "import_bank_transfer",
+    }
+)
+
+
+class AuditLogSummary(BaseModel):
+    """An audit log entry without its request/response bodies, as the list returns it."""
 
     id: str
     action: str
@@ -39,9 +64,14 @@ class AuditLogEntry(BaseModel):
         default=None,
         description="Server-computed duration in milliseconds (started_at → ended_at). Null if not yet completed.",
     )
+    metadata: dict[str, Any]
+
+
+class AuditLogEntry(AuditLogSummary):
+    """A single audit log entry with its full request/response bodies."""
+
     request: dict[str, Any] | None
     response: dict[str, Any] | None
-    metadata: dict[str, Any]
 
 
 class AuditLogListResponse(BaseModel):
@@ -51,7 +81,9 @@ class AuditLogListResponse(BaseModel):
     total: int
     limit: int
     offset: int
-    items: list[AuditLogEntry]
+    items: list[AuditLogSummary] = Field(
+        description="Entries without request/response bodies; fetch one entry by id for its bodies."
+    )
 
 
 class AuditLogStatsBucket(BaseModel):
@@ -143,6 +175,7 @@ class AuditLogger:
         # (env -> tenant -> bank). None means "no per-bank resolution wired",
         # in which case the global value alone decides.
         self._bank_enabled_resolver = bank_enabled_resolver
+        self._writes = PendingWrites("audit log write")
 
     def action_allowed(self, action: str) -> bool:
         """Global action-allowlist check. Cheap, synchronous, bank-independent.
@@ -180,6 +213,43 @@ class AuditLogger:
             logger.warning(f"Audit config resolution failed for bank={bank_id}: {e}; using global default")
             return self._enabled
 
+    @contextmanager
+    def destructive_op(
+        self,
+        action: str,
+        transport: str,
+        bank_id: str | None,
+        context: RequestContext | None = None,
+        tenant_id: str | None = None,
+        api_key_id: str | None = None,
+    ) -> Iterator[None]:
+        """Log one line when a destructive action ends. Not gated by the audit setting.
+
+        Tenant, key and schema are read at the end: the tenant extension fills them in
+        during the call.
+        """
+        if action not in DESTRUCTIVE_ACTIONS:
+            yield
+            return
+        start = time.monotonic()
+        status = "error"
+        try:
+            yield
+            status = "ok"
+        finally:
+            logger.info(
+                "destructive_op action=%s bank=%s transport=%s tenant=%s schema=%s api_key_id=%s "
+                "status=%s duration_ms=%d",
+                action,
+                bank_id,
+                transport,
+                tenant_id or (context.tenant_id if context else None),
+                self._schema_getter(),
+                api_key_id or (context.api_key_id if context else None),
+                status,
+                (time.monotonic() - start) * 1000,
+            )
+
     def log_fire_and_forget(self, entry: AuditEntry) -> None:
         """Schedule an audit write as a background task.
 
@@ -188,11 +258,15 @@ class AuditLogger:
         """
         if not self.action_allowed(entry.action):
             return
-        try:
-            asyncio.create_task(self._safe_log(entry))
-        except RuntimeError:
-            # No running event loop (e.g. during shutdown)
-            logger.debug("Cannot schedule audit log write: no running event loop")
+        self._writes.schedule(self._safe_log(entry))
+
+    async def drain(self) -> None:
+        """Wait for audit writes already scheduled; call before the database pool is closed.
+
+        Bounded, so a stuck database cannot hang shutdown. Writes still running
+        at the deadline are abandoned and counted in a warning.
+        """
+        await self._writes.drain_all(_DRAIN_TIMEOUT_SECONDS)
 
     async def _safe_log(self, entry: AuditEntry) -> None:
         """Write audit entry to DB. Errors are logged, never raised."""

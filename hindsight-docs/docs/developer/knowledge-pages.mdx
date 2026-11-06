@@ -2,11 +2,16 @@
 sidebar_position: 7
 ---
 
+import Figure from '@site/src/components/Figure';
+import knowledgePagesFigure from '@site/figures/knowledge-pages.json';
+
 # Knowledge Pages
 
 **Knowledge pages** are living documents a bank writes about itself. Each page answers one question — "What are the components here?", "What's our error-handling convention?" — and rewrites itself as the bank learns more. They're organized in folders, browsable, searchable, and can be projected onto disk as ordinary markdown files.
 
 The shape is a wiki. The engine underneath is memory.
+
+<Figure doc={knowledgePagesFigure} />
 
 ---
 
@@ -76,4 +81,4 @@ This is also why pages heal themselves rather than rot: they aren't the storage,
 - **Control plane** — the Knowledge Base view renders the tree, page contents, and which pages have fallen behind.
 - **HTTP API** — see [Knowledge Pages API](./api/knowledge-pages) for the full endpoint surface.
 - **CLI** — `hindsight fs` mirrors a bank to a local folder of markdown files.
-- **Agent tools** — the agent SDK exposes `agent_knowledge_*` tools so an agent can list, read, create, and update its own pages during a session.
+- **Agent tools** — the Claude Code plugin exposes `agent_knowledge_*` MCP tools so an agent can list, read, create, and update its own pages during a session.

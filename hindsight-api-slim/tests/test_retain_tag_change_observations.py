@@ -17,16 +17,23 @@ as an upsert.
 These tests drive the public retain API on the three shapes an upsert can take:
 tags-only (identical body), tags plus a partial edit (unchanged chunks survive and get
 relabelled), and a change to ``observation_scopes`` rather than to the tags themselves.
+
+The converse is covered too (#5593): when the tags are not the scope (``shared``, an
+explicit scope list), a tag change must invalidate nothing — and an all-pairs test pins
+exactly which (scope mode, tags) transitions count as a move.
 """
 
+import json
 import uuid
 
 import pytest
 
 from hindsight_api import RequestContext
 from hindsight_api.config import _get_raw_config
+from hindsight_api.engine.consolidation.consolidator import write_scopes_changed
 from hindsight_api.engine.memories import FactRecord, get_memories
-from hindsight_api.engine.memory_engine import MemoryEngine, fq_table
+from hindsight_api.engine.memory_engine import MemoryEngine, _renamed_scopes
+from hindsight_api.engine.schema import fq_table
 
 # Two chunk-sized blocks (chunk size is 3000 chars). Keeping BLOCK_A byte-identical
 # across a re-ingest is what keeps the second retain on the delta path: chunking is
@@ -257,3 +264,197 @@ async def test_observation_scopes_change_re_retain_invalidates_observations(
 
     finally:
         await memory.delete_bank(bank_id, request_context=request_context)
+
+
+@pytest.mark.asyncio
+async def test_retag_renames_explicit_observation_scopes(memory: MemoryEngine, request_context: RequestContext):
+    """A tags PATCH renames the tags an explicit observation_scopes spec froze (#4609).
+
+    A fact retained with an explicit spec naming ``project:old`` carries
+    that spec verbatim on its memory units; the tags PATCH that renames
+    ``project:old`` -> ``project:new`` rewrites ``tags`` but used to leave the spec
+    pointing at the old tag, so the next consolidation rebuilt the observation under
+    ``project:old`` — stranded, because recall by the new tag can no longer reach it.
+    """
+    bank_id = f"test_retag_scopes_rename_{uuid.uuid4().hex[:8]}"
+    document_id = "mobile-room-key"
+    old_tag, new_tag, other_tag = "project:old", "project:new", "project:stays"
+
+    try:
+        await _retain(
+            memory,
+            bank_id,
+            document_id,
+            _DOCUMENT_V1,
+            [old_tag, other_tag],
+            request_context,
+            observation_scopes=[[old_tag], [other_tag], [old_tag, other_tag]],
+        )
+        await memory.run_consolidation(bank_id=bank_id, request_context=request_context)
+
+        facts_v1 = await _facts(memory, bank_id)
+        assert facts_v1, "Setup: retention should have produced facts"
+        scoped = [f for f in facts_v1 if isinstance(f.observation_scopes, list)]
+        assert scoped and any(old_tag in s for f in scoped for s in f.observation_scopes), (
+            "Setup: the facts should carry the explicit scope spec with the old tag"
+        )
+        observations_v1 = {o.unit_id for o in await _observations(memory, bank_id)}
+        assert observations_v1, "Setup: consolidation should have produced observations"
+
+        # The retag itself — the issue's exact scenario: the document carries
+        # [old, other], the PATCH sends [new, other] — one removed, one added, an
+        # unambiguous rename. No re-retain in between: a re-retain would move the
+        # document's tags itself and turn this PATCH into a no-op.
+        await memory.update_document(
+            document_id=document_id,
+            bank_id=bank_id,
+            tags=[new_tag, other_tag],
+            request_context=request_context,
+        )
+
+        facts_v2 = await _facts(memory, bank_id)
+        assert facts_v2, "Setup: the facts should have survived the retag"
+        assert all(old_tag not in (f.tags or []) for f in facts_v2), (
+            "Setup: the facts should have been relabelled to the new tag"
+        )
+        stale_specs = [
+            (f.unit_id, f.observation_scopes)
+            for f in facts_v2
+            if f.observation_scopes and old_tag in json.dumps(f.observation_scopes)
+        ]
+        assert stale_specs == [], (
+            f"Retag left {len(stale_specs)} fact(s) whose explicit observation_scopes still "
+            f"name {old_tag}; re-consolidation would rebuild their observations under the "
+            f"renamed-away tag: {stale_specs[:3]}"
+        )
+        remapped = [f for f in facts_v2 if f.observation_scopes and any(new_tag in s for s in f.observation_scopes)]
+        assert remapped, "The explicit spec should name the new tag after the rename"
+
+        # Whatever observations re-consolidation rebuilt must be reachable by the NEW tag
+        # and none may carry the old one.
+        observations_v2 = await _observations(memory, bank_id)
+        assert not any(old_tag in (o.tags or []) for o in observations_v2), (
+            "An observation is still scoped to the renamed-away tag"
+        )
+
+    finally:
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+
+def test_renamed_scopes_only_remaps_a_single_tag_rename():
+    spec = [["a"], ["a", "b"]]
+    assert _renamed_scopes(spec, ["a", "b"], ["c", "b"]) == [["c"], ["c", "b"]]
+    assert _renamed_scopes(json.dumps(spec), ["a", "b"], ["c", "b"]) == [["c"], ["c", "b"]]
+    # Two tags swapped at once cannot be paired without guessing: left as-is.
+    assert _renamed_scopes(spec, ["a", "b"], ["c", "d"]) == spec
+    assert _renamed_scopes(spec, ["a", "b"], ["b"]) == spec
+    assert _renamed_scopes("per_tag", ["a"], ["c"]) == "per_tag"
+    assert _renamed_scopes(spec, None, ["c"]) == spec
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "scopes",
+    ["shared", [["project:x"]]],
+    ids=["shared", "explicit"],
+)
+async def test_tag_change_outside_the_scopes_keeps_observations(
+    memory: MemoryEngine, request_context: RequestContext, scopes
+):
+    """When the tags are not the scope, a tag change moves no observation (#5593).
+
+    A volatile provenance tag changing between two retains — and then a tags PATCH — must
+    leave every observation in place and requeue nothing: they would be rebuilt into the
+    exact same scopes. Covers ``shared`` and an explicit scope list that does not name the
+    changing tag.
+    """
+    bank_id = f"test_retag_obs_keep_{uuid.uuid4().hex[:8]}"
+    document_id = "mobile-room-key"
+
+    try:
+        await _retain(memory, bank_id, document_id, _DOCUMENT_V1, ["project:x", "session:1"], request_context, scopes)
+        await memory.run_consolidation(bank_id=bank_id, request_context=request_context)
+        observations_v1 = {o.unit_id for o in await _observations(memory, bank_id)}
+        assert observations_v1, "Setup: consolidation should have produced observations"
+
+        await _retain(
+            memory,
+            bank_id,
+            document_id,
+            _DOCUMENT_V1,
+            ["project:x", "session:1", "parent:1"],
+            request_context,
+            scopes,
+        )
+        await memory.update_document(
+            document_id=document_id,
+            bank_id=bank_id,
+            tags=["project:x", "session:2"],
+            request_context=request_context,
+        )
+
+        facts = await _facts(memory, bank_id)
+        assert facts and all(set(f.tags or []) == {"project:x", "session:2"} for f in facts), (
+            "Setup: facts should be relabelled"
+        )
+        assert observations_v1 <= {o.unit_id for o in await _observations(memory, bank_id)}, (
+            f"A tag change under observation_scopes={scopes!r} deleted observations it cannot have moved"
+        )
+        assert all(f.consolidated_at is not None for f in facts), (
+            f"A tag change under observation_scopes={scopes!r} requeued memories for re-consolidation"
+        )
+
+    finally:
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+
+# Every scope mode crossed with the tag sets that matter, each with the scopes it writes to
+# written out BY HAND — not derived from `_resolve_write_scopes` — so the all-pairs test
+# below checks the consolidator's mapping too, not just that the check agrees with itself.
+_E = frozenset()
+_A, _B, _C = frozenset({"a"}), frozenset({"b"}), frozenset({"c"})
+_AB, _AC = frozenset({"a", "b"}), frozenset({"a", "c"})
+_SCOPE_STATES = [
+    # (observation_scopes, tags, the scopes it writes to)
+    (None, [], {_E}),
+    (None, ["a"], {_A}),
+    (None, ["a", "b"], {_AB}),
+    ("combined", ["b", "a"], {_AB}),
+    ("combined", ["a", "c"], {_AC}),
+    ('"combined"', ["a"], {_A}),
+    ("per_tag", [], {_E}),
+    ("per_tag", ["a"], {_A}),
+    ("per_tag", ["a", "b"], {_A, _B}),
+    ("per_tag", ["b", "a"], {_A, _B}),
+    ("per_tag", ["a", "c"], {_A, _C}),
+    ('"per_tag"', ["a", "b"], {_A, _B}),
+    ("all_combinations", [], {_E}),
+    ("all_combinations", ["a"], {_A}),
+    ("all_combinations", ["a", "b"], {_A, _B, _AB}),
+    ("all_combinations", ["a", "c"], {_A, _C, _AC}),
+    ("shared", [], {_E}),
+    ("shared", ["a", "b"], {_E}),
+    ("shared", ["a", "c"], {_E}),
+    ('"shared"', ["c"], {_E}),
+    ([["a"]], ["a"], {_A}),
+    ([["a"]], ["a", "b"], {_A}),
+    ('[["a"]]', ["c"], {_A}),
+    ([["b"]], ["a", "b"], {_B}),
+    ([["a"], ["a", "b"]], ["a", "b"], {_A, _AB}),
+    ([["a", "b"], ["a"]], ["a", "c"], {_A, _AB}),
+    ([["b", "a"]], ["c"], {_AB}),
+    ([[]], ["a"], {_E}),
+    # A degenerate empty explicit list falls back to the combined pass over the tags.
+    ([], ["a", "b"], {_AB}),
+    ([], ["a", "c"], {_AC}),
+]
+
+
+@pytest.mark.parametrize("before", _SCOPE_STATES, ids=lambda s: f"{s[0]!r}/{s[1]}")
+@pytest.mark.parametrize("after", _SCOPE_STATES, ids=lambda s: f"{s[0]!r}/{s[1]}")
+def test_write_scopes_changed_every_transition(before, after):
+    """Every pair of (scope mode, tags) states: the memory counts as moved exactly when the
+    scopes it writes to differ — whatever changed, the tags, the mode, or both."""
+    old_scopes, old_tags, old_written = before
+    new_scopes, new_tags, new_written = after
+    assert write_scopes_changed(old_tags, old_scopes, new_tags, new_scopes) == (old_written != new_written)

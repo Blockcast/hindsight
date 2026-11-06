@@ -16,7 +16,7 @@ from .ops import (
     TagListingParts,
     UpdatedWindow,
     bank_serialization_sql,
-    document_serialization_sql,
+    key_serialization_sql,
     memory_unit_columns,
 )
 from .result import ResultRow
@@ -26,7 +26,7 @@ def pg_search_vector_expr(
     config,
     *,
     text_col: str = "text",
-    context_col: str = "context",
+    context_col: str | None = "context",
     signals_col: str | None = "text_signals",
     native_inline: bool = True,
 ) -> str | None:
@@ -41,8 +41,9 @@ def pg_search_vector_expr(
     nothing to build.
 
     The ``*_col`` arguments are the SQL for each text source (a column name or a
-    bind placeholder); pass ``signals_col=None`` for a two-column table like
-    ``mental_models`` (name + content). Pass ``native_inline=False`` when the
+    bind placeholder); pass ``None`` to leave a source out — ``signals_col=None`` for a
+    two-column table like ``mental_models`` (name + content), both for an observation,
+    whose ``search_vector`` covers its text alone. Pass ``native_inline=False`` when the
     table's native ``search_vector`` is a GENERATED column that populates itself
     (``mental_models``) — writing it inline would fail; only vchord's plain
     bm25vector column then needs an explicit value.
@@ -50,7 +51,7 @@ def pg_search_vector_expr(
     ``text_search_extension_native_language`` is validated as a PG identifier in
     ``HindsightConfig.validate()``, so embedding it as a SQL literal is safe.
     """
-    cols = [text_col, context_col] + ([signals_col] if signals_col is not None else [])
+    cols = [c for c in (text_col, context_col, signals_col) if c is not None]
     combined = " || ' ' || ".join(f"COALESCE({c}, '')" for c in cols)
     if config.text_search_extension == "vchord":
         return f"tokenize({combined}, 'llmlingua2')::bm25_catalog.bm25vector"
@@ -82,6 +83,38 @@ class PostgreSQLOps(DataAccessOps):
     @property
     def uses_observation_sources_table(self) -> bool:
         return False  # PG uses native array ops on source_memory_ids
+
+    async def fetch_reconcilable_batch_parents(self, conn: DatabaseConnection, table: str) -> list[ResultRow]:
+        # Matches children with `->>` equality rather than the `@>` containment the
+        # locked recheck (and the result_metadata GIN index) uses: `@>` against a
+        # per-parent expression forces a nested loop of index probes, one per
+        # pending parent, which is the cost this discovery pass exists to remove
+        # (51k parents took 7m46s before #5178). `->>` lets the planner hash the
+        # child set once and anti-join it.
+        #
+        # The two predicates are not identical, and the asymmetry is deliberately
+        # the safe way round: every child `->>` matches, `@>` matches too, so a
+        # parent this query skips is one the recheck would also have left alone.
+        # The reverse can happen (`@>` also matches a child whose result_metadata
+        # is a JSON array wrapping the object), which only makes discovery
+        # over-inclusive — the locked recheck below is authoritative and leaves
+        # such a parent pending.
+        return await conn.fetch(
+            f"""
+            SELECT parent.operation_id, parent.bank_id
+            FROM {table} parent
+            WHERE parent.operation_type = 'batch_retain'
+              AND parent.status = 'pending'
+              AND parent.task_payload IS NULL
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM {table} child
+                  WHERE child.bank_id = parent.bank_id
+                    AND child.result_metadata->>'parent_operation_id' = parent.operation_id::text
+                    AND child.status NOT IN ('completed', 'failed')
+              )
+            """
+        )
 
     async def bulk_upsert_chunks(
         self,
@@ -264,7 +297,11 @@ class PostgreSQLOps(DataAccessOps):
                     LEAST(ml.from_unit_id, ml.to_unit_id),
                     GREATEST(ml.from_unit_id, ml.to_unit_id),
                     ml.link_type,
-                    COALESCE(ml.entity_id, '00000000-0000-0000-0000-000000000000'::uuid)
+                    COALESCE(ml.entity_id, '00000000-0000-0000-0000-000000000000'::uuid),
+                    -- Without this the key ties for a pair written both ways (x->y and
+                    -- y->x), so two writers could lock the pair's rows in opposite
+                    -- orders and deadlock (#6051). Must stay in step with retain.py.
+                    ml.from_unit_id
                 FOR UPDATE OF ml
             )
             DELETE FROM {table} ml
@@ -300,9 +337,9 @@ class PostgreSQLOps(DataAccessOps):
         # into the one INSERT keeps this to a single round-trip — no extra query
         # and no surrounding transaction needed. (Oracle's immediate FK has no
         # such window and uses exists_clause via its own bulk_insert_links.)
-        from ..schema import fq_table
+        from ..schema import fq_store_table
 
-        mu_table = fq_table("memory_units")
+        mu_table = fq_store_table("memory_units")
         from_ids = [lnk[0] for lnk in sorted_links]
         to_ids = [lnk[1] for lnk in sorted_links]
         types = [lnk[2] for lnk in sorted_links]
@@ -544,21 +581,67 @@ class PostgreSQLOps(DataAccessOps):
         queue_table: str,
         entities_table: str,
         ue_table: str,
+        units_table: str,
         bank_id: str,
         unit_ids: list,
     ) -> int:
+        # Four statements in the caller's transaction, deliberately not one
+        # (#6175). This used to be a single statement: the queue INSERT as a
+        # data-modifying CTE, feeding a FOR UPDATE scan of the entities and the
+        # UPDATE of their mention_count. When a concurrent transaction has just
+        # changed one of those entity rows — another retain crediting a mention,
+        # or a second append releasing the same old postings — Postgres
+        # re-checks the row (EvalPlanQual), and the re-check re-runs pieces of
+        # the plan that read the INSERT's output. Under concurrent appends that
+        # failed with "ModifyTable should not be called during EvalPlanQual" or
+        # "ON CONFLICT DO UPDATE command cannot affect row a second time". With
+        # the INSERT in a statement of its own, no re-check can reach it.
+        #
         # Read the candidates straight out of unit_entities rather than making
         # callers pass entity ids: every caller runs this immediately before the
-        # rows go, and the join they'd have to write is this one. `doomed` is
-        # that read, aggregated, so one scan serves both halves — the queue
-        # insert wants the ids, the mention release wants the counts.
+        # rows go, and the join they'd have to write is this one. The read is
+        # aggregated so one scan serves both halves — the queue insert wants the
+        # ids, the mention release wants the counts.
         #
-        # `enqueued`'s inner ORDER BY is load-bearing, not cosmetic: it makes the
-        # INSERT take the (bank_id, entity_id) row locks ascending, the same
-        # order claim_entity_maintenance_batch takes them, so a mutation
-        # enqueueing an overlapping candidate set cannot cycle against a worker
-        # draining it. (Same protocol as enqueue_graph_maintenance, which sorts
-        # in Python because its ids arrive as a bind array.)
+        # The memories are locked before their postings are read (#6229). Their
+        # postings are only ever removed by a transaction retiring the memory,
+        # and every one of those comes through here, so holding the memory row
+        # means no one else can change its postings until this commits. Without
+        # it, two transactions retiring one memory (two deletes, a delete racing
+        # a bulk delete) both counted its postings and both debited them, and
+        # two edits replacing its entities had the second clear postings the
+        # first had just written without counting them. Now the second waits
+        # here, and its read below — a new statement — sees what the first left.
+        #
+        # Ascending id, FOR NO KEY UPDATE: the order and strength the
+        # stale-observation sweep locks these same rows with, which runs before
+        # this on every path. NO KEY UPDATE still lets the relinker's FK
+        # KEY SHARE through while it holds queue rows our caller may enqueue
+        # next (see delete_stale_observations). Memory rows come first, then
+        # queue rows, then entity rows.
+        await conn.execute(
+            f"SELECT id FROM {units_table} WHERE id = ANY($1::uuid[]) ORDER BY id FOR NO KEY UPDATE",
+            unit_ids,
+        )
+        doomed = await conn.fetch(
+            f"""
+            SELECT entity_id, COUNT(*) AS n
+            FROM {ue_table}
+            WHERE unit_id = ANY($1::uuid[])
+            GROUP BY entity_id
+            ORDER BY entity_id
+            """,
+            unit_ids,
+        )
+        if not doomed:
+            return 0
+        entity_ids = [row["entity_id"] for row in doomed]
+
+        # The ascending order is load-bearing, not cosmetic: it makes the INSERT
+        # take the (bank_id, entity_id) row locks ascending, the same order
+        # claim_entity_maintenance_batch takes them, so a mutation enqueueing an
+        # overlapping candidate set cannot cycle against a worker draining it.
+        # (Same protocol as enqueue_graph_maintenance.)
         #
         # DO UPDATE (not DO NOTHING) on a duplicate — #3034. The SET is a
         # deliberate no-op preserving enqueued_at; its only purpose is to lock
@@ -568,63 +651,43 @@ class PostgreSQLOps(DataAccessOps):
         # would find the entity still referenced, keep it, and the re-enqueue
         # signal would be lost, stranding the orphan until some later delete
         # happened to name it again.
+        await conn.execute(
+            f"""
+            INSERT INTO {queue_table} (bank_id, entity_id)
+            SELECT $1, v FROM unnest($2::uuid[]) AS t(v)
+            ON CONFLICT (bank_id, entity_id)
+                DO UPDATE SET enqueued_at = {queue_table}.enqueued_at
+            """,
+            bank_id,
+            entity_ids,
+        )
+
+        # Every queue row is now locked, so this transaction holds each
+        # entity's queue row before its `entities` row — the order the drain
+        # takes them in, so a delete and a worker draining the queue cannot
+        # deadlock. The entity locks themselves are taken ascending, the order
+        # restore_entity_postings and prune_orphan_entities use.
         #
-        # Both halves are one statement so the postings are counted in the scan
-        # that already lists them, but the two lock sets still have to be
-        # ordered or a delete and a worker draining the queue deadlock on the
-        # same entity. The invariant is: *an entity's queue row is locked before
-        # its own `entities` row, and queue rows are locked ascending.*
-        #
-        # `victims` referencing `enqueued` is what enforces the first half — an
-        # entity cannot become a victim until the INSERT has produced it. The
-        # second half is `enqueued`'s inner ORDER BY. Together they hold under
-        # every plan shape the statement gets: EXPLAIN picks a nested-loop semi
-        # join here (queue and entity locks interleave per entity, ascending)
-        # and a hashed subplan or a sort under LockRows on other row counts
-        # (every queue lock taken before the first entity lock). Both are safe,
-        # because taking an `entities` row lock always means already holding
-        # that entity's queue row, and the drain takes them in that same order.
-        #
-        # What is deliberately NOT relied on: the order `victims` produces rows
-        # in. `ORDER BY e.id` asks for ascending entity locks, but a lazily
-        # pulled semi join takes them in `doomed` order instead. That is fine
-        # for the reason above — the ascending queue locks are the serialiser,
-        # so two concurrent deletes cannot hold entity rows in opposing orders.
-        #
-        # `victims` re-filters on bank_id even though a posting cannot name
+        # The bank_id filter is not redundant even though a posting cannot name
         # another bank's entity: mention_count is denormalised state, and
         # scoping the write is what keeps that true if the invariant slips.
         result = await conn.execute(
             f"""
-            WITH doomed AS (
-                SELECT ue.entity_id AS id, COUNT(*) AS n
-                FROM {ue_table} ue
-                WHERE ue.unit_id = ANY($2::uuid[])
-                GROUP BY ue.entity_id
-            ),
-            enqueued AS (
-                INSERT INTO {queue_table} (bank_id, entity_id)
-                SELECT $1, s.id FROM (SELECT id FROM doomed ORDER BY 1) s
-                ON CONFLICT (bank_id, entity_id)
-                    DO UPDATE SET enqueued_at = {queue_table}.enqueued_at
-                RETURNING entity_id
-            ),
-            victims AS (
-                SELECT e.id, d.n
-                FROM {entities_table} e
-                JOIN doomed d ON d.id = e.id
-                WHERE e.bank_id = $1
-                  AND e.id IN (SELECT entity_id FROM enqueued)
-                ORDER BY e.id
-                FOR UPDATE OF e
-            )
             UPDATE {entities_table} e
             SET mention_count = GREATEST(e.mention_count - v.n, 0)
-            FROM victims v
+            FROM (
+                SELECT l.id, d.n
+                FROM {entities_table} l
+                JOIN unnest($2::uuid[], $3::bigint[]) AS d(id, n) ON d.id = l.id
+                WHERE l.bank_id = $1
+                ORDER BY l.id
+                FOR UPDATE OF l
+            ) v
             WHERE e.id = v.id
             """,
             bank_id,
-            unit_ids,
+            entity_ids,
+            [row["n"] for row in doomed],
         )
         # asyncpg returns "UPDATE N". Every posting names an existing entity in
         # this bank (FK, and postings are intra-bank by construction), so the
@@ -642,40 +705,51 @@ class PostgreSQLOps(DataAccessOps):
     ) -> int:
         if not entity_ids:
             return 0
-        # One statement, because crediting a mention for a posting that was not
-        # written would be the same bug in the other direction: `posted` returns
-        # exactly the rows the insert added, and only those are credited. Some
-        # of `entity_ids` may have been swept as orphans while the memory sat
-        # archived, which `survivors` filters out, and DO NOTHING covers a
-        # posting that somehow already exists.
+        # Crediting a mention for a posting that was not written would be the
+        # same bug in the other direction: only the postings the insert actually
+        # added are credited. Some of `entity_ids` may have been swept as
+        # orphans while the memory sat archived, which the lock below filters
+        # out, and DO NOTHING covers a posting that somehow already exists.
         #
-        # `survivors` locks the entity rows in ascending id order, the order
+        # Three statements, not one with a modifying CTE, for the reason given
+        # in release_entity_postings (#6175): a concurrent change to one of
+        # these entity rows makes Postgres re-check it, and a re-check must not
+        # reach an INSERT. Locking the survivors first also means the final
+        # UPDATE only touches rows this transaction already holds.
+        #
+        # The entity rows are locked in ascending id order, the order
         # release_entity_postings and prune_orphan_entities take them. No queue
         # row is involved here, so there is no second lock set to sequence.
-        result = await conn.execute(
+        survivors = await conn.fetch(
             f"""
-            WITH survivors AS (
-                SELECT e.id
-                FROM {entities_table} e
-                WHERE e.bank_id = $1
-                  AND e.id = ANY($3::uuid[])
-                ORDER BY e.id
-                FOR UPDATE
-            ),
-            posted AS (
-                INSERT INTO {ue_table} (unit_id, entity_id)
-                SELECT $2, s.id FROM survivors s
-                ON CONFLICT DO NOTHING
-                RETURNING entity_id
-            )
-            UPDATE {entities_table} e
-            SET mention_count = e.mention_count + 1
-            FROM posted p
-            WHERE e.id = p.entity_id
+            SELECT id
+            FROM {entities_table}
+            WHERE bank_id = $1
+              AND id = ANY($2::uuid[])
+            ORDER BY id
+            FOR UPDATE
             """,
             bank_id,
-            unit_id,
             entity_ids,
+        )
+        if not survivors:
+            return 0
+        posted = await conn.fetch(
+            f"""
+            INSERT INTO {ue_table} (unit_id, entity_id)
+            SELECT $1, v FROM unnest($2::uuid[]) AS t(v)
+            ON CONFLICT DO NOTHING
+            RETURNING entity_id
+            """,
+            unit_id,
+            [row["id"] for row in survivors],
+        )
+        if not posted:
+            return 0
+        result = await conn.execute(
+            f"UPDATE {entities_table} SET mention_count = mention_count + 1 WHERE bank_id = $1 AND id = ANY($2::uuid[])",
+            bank_id,
+            [row["entity_id"] for row in posted],
         )
         return int(result.split()[-1]) if isinstance(result, str) and result.startswith("UPDATE") else 0
 
@@ -799,21 +873,22 @@ class PostgreSQLOps(DataAccessOps):
         # made each per-row check cheaper; it kept the per-row structure, so the
         # product blew up again at scale.
         #
-        # `live` groups unit_entities by unit (self-join on unit_id) to emit every
-        # co-occurring (e1<e2) pair in one materialised pass: its cost is driven
-        # by unit degree (entities per unit — small), never by entity degree, so a
-        # hub contributes only its per-unit membership rather than a rescan per
-        # edge. The victims anti-join then hashes against it. MATERIALIZED keeps
-        # the planner from inlining `live` back into a per-row correlated plan.
+        # `live` is built in one materialised pass from unit_entities (self-join
+        # on unit_id), so cost is driven by unit membership, never by a rescan
+        # per edge. The victims anti-join then hashes against it. MATERIALIZED
+        # keeps the planner from inlining `live` back into a per-row correlated
+        # plan.
         #
-        # `live` is seeded from the *candidates'* units rather than the whole
-        # bank's (#3222 composed with #3367): graph maintenance is queue-driven,
-        # so this only has to decide about pairs in `incident`, and every such
-        # pair has a candidate as at least one endpoint. Any unit still
-        # witnessing such a pair therefore references a candidate, and so is in
-        # the seeded set — the scoped build cannot miss a live pair. That keeps
-        # the whole statement proportional to the batch instead of re-deriving
-        # every pair in the bank on every run.
+        # `live` holds only the pairs a *candidate* forms inside its own units
+        # (#3222 composed with #3367), normalised to (LEAST, GREATEST) to match
+        # entity_cooccurrences' entity_id_1 < entity_id_2 order. That is all the
+        # anti-join needs: every pair in `incident` has a candidate endpoint,
+        # and such a pair is live exactly when one of that candidate's units
+        # also holds the other endpoint. Emitting every pair of every candidate
+        # unit instead (the previous shape) gives the same victims, but around
+        # a hub it also expands all the non-candidate pairs of the hub's units,
+        # several times more rows for nothing. Duplicate pairs (both endpoints
+        # candidates, or several shared units) are harmless to the anti-join.
         result = await conn.execute(
             f"""
             WITH incident AS MATERIALIZED (
@@ -826,12 +901,12 @@ class PostgreSQLOps(DataAccessOps):
                 WHERE c.entity_id_2 = ANY($1::uuid[])
             ),
             live AS MATERIALIZED (
-                SELECT u1.entity_id AS e1, u2.entity_id AS e2
-                FROM {ue_table} seed
-                JOIN {ue_table} u1 ON u1.unit_id = seed.unit_id
-                JOIN {ue_table} u2 ON u2.unit_id = u1.unit_id
-                                  AND u2.entity_id > u1.entity_id
-                WHERE seed.entity_id = ANY($1::uuid[])
+                SELECT LEAST(s.entity_id, u.entity_id) AS e1,
+                       GREATEST(s.entity_id, u.entity_id) AS e2
+                FROM {ue_table} s
+                JOIN {ue_table} u ON u.unit_id = s.unit_id
+                                 AND u.entity_id <> s.entity_id
+                WHERE s.entity_id = ANY($1::uuid[])
             ),
             victims AS (
                 SELECT c.entity_id_1, c.entity_id_2
@@ -861,17 +936,9 @@ class PostgreSQLOps(DataAccessOps):
         unit_ids: list[str],
     ) -> list[ResultRow]:
         # Cast only canonical UUID text inputs, never the indexed column. The old
-        # ``id::text = ANY($1)`` predicate made the uuid primary-key index unusable
-        # and sequentially scanned every row (~1M in production, 5.4s per call).
-        #
-        # A bare ``id = ANY($1::uuid[])`` would fix the index but change behavior:
-        # the text comparison silently ignored malformed, uppercase, braced and
-        # unhyphenated inputs, while a uuid[] cast raises on them. Filtering before
-        # the cast preserves the old leniency and lets the primary-key index serve
-        # the lookup.
-        #
-        # Ported from upstream vectorize-io/hindsight b475f5cca ("perf: eliminate
-        # redundant graph seed and UUID scans", #2968, first released in v0.8.6).
+        # ``id::text`` predicate silently ignored malformed, uppercase, braced,
+        # and unhyphenated inputs; filtering before the cast preserves that
+        # behavior while allowing the primary-key index to serve the lookup.
         return await conn.fetch(
             f"""
             SELECT id, event_date, fact_type
@@ -1055,7 +1122,7 @@ class PostgreSQLOps(DataAccessOps):
         per_entity_limit: int,
         window: UpdatedWindow,
     ) -> LinkExpansionRows:
-        # v0.5.6 array ops: unnest, &&, COUNT(DISTINCT) on source_memory_ids.
+        # Array ops on source_memory_ids: unnest, a per-source @> GIN probe, COUNT(DISTINCT).
         #
         # The window bounds the observations that come *back*, not the source facts
         # traversed to reach them: an observation is in the window when it was itself
@@ -1091,7 +1158,22 @@ class PostgreSQLOps(DataAccessOps):
         # O(sum of degree) rather than O(entities x per_entity_limit). Measured at
         # parity up to ~12k-degree hubs and +50% traversal cost at 38k. If banks
         # grow hubs far past that, re-measure before assuming this is still the
-        # right shape.
+        # right shape. Re-measured for #4715 at 138k-degree hubs with the
+        # `observation-hubs` perf suite: the whole call is ~0.2-0.4s, so the
+        # window still holds once the candidate probe below is per-source.
+        #
+        # `candidate_ids` probes the source_memory_ids GIN index once per connected
+        # source with a one-element `@>`, not once with `&& <all connected sources>`
+        # (issue #4715). On hub-heavy banks connected_sources reaches ~17k ids, and
+        # rechecking `&&` against a 17k-element array costs every matched row
+        # O(len x 17k): 5-21s per call, so 8 parallel consolidation recalls passed
+        # the 60s timeout. `x && ARRAY[a, b, ...]` holds exactly when some
+        # `x @> ARRAY[a]` does, so the candidate set is unchanged. Two traps, both
+        # measured on the reporter's bank: keep `fact_type` out of the probe and
+        # keep the OFFSET 0 fence. With the filter inside (or flattened in from
+        # `candidates`), the planner ANDs every probe with a full scan of
+        # idx_memory_units_observations and the query took 84-185s. A per-source
+        # `&&` instead of `@>` took 137s.
         #
         # Entity/source traversal and semantic/causal expansion run as ONE query
         # (#3857): the observation entity arm is fused into the semantic/causal CTE
@@ -1130,18 +1212,24 @@ class PostgreSQLOps(DataAccessOps):
                       SELECT 1 FROM seed_sources ss WHERE ss.source_id = t.unit_id
                   )
             ),
-            connected_array AS (
-                SELECT array_agg(source_id) AS source_ids FROM connected_sources
+            candidate_ids AS (
+                SELECT DISTINCT o.id
+                FROM connected_sources cs
+                CROSS JOIN LATERAL (
+                    SELECT m.id
+                    FROM {mu_table} m
+                    WHERE m.source_memory_ids @> ARRAY[cs.source_id]
+                    OFFSET 0
+                ) o
             ),
             candidates AS (
                 SELECT
                     {memory_unit_columns("mu", indent=20)},
                     mu.source_memory_ids
-                FROM {mu_table} mu, connected_array ca
+                FROM {mu_table} mu
+                JOIN candidate_ids ci ON ci.id = mu.id
                 WHERE mu.fact_type = 'observation'
                   AND mu.id != ALL($1::uuid[])
-                  AND ca.source_ids IS NOT NULL
-                  AND mu.source_memory_ids && ca.source_ids
                   {window.clause("mu")}
             ),
             scored AS (
@@ -1593,7 +1681,7 @@ class PostgreSQLOps(DataAccessOps):
         if claimed_ids:
             return await conn.fetch(
                 f"""
-                SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id
+                SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id, o.created_at
                 FROM {table} o
                 WHERE o.status = 'pending'
                   AND o.task_payload IS NOT NULL
@@ -1610,7 +1698,7 @@ class PostgreSQLOps(DataAccessOps):
             )
         return await conn.fetch(
             f"""
-            SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id
+            SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id, o.created_at
             FROM {table} o
             WHERE o.status = 'pending'
               AND o.task_payload IS NOT NULL
@@ -1651,7 +1739,7 @@ class PostgreSQLOps(DataAccessOps):
         extra = " AND ".join(conditions)
         return await conn.fetch(
             f"""
-            SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id
+            SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id, o.created_at
             FROM {table} o
             WHERE o.status = 'pending'
               AND o.task_payload IS NOT NULL
@@ -1693,7 +1781,7 @@ class PostgreSQLOps(DataAccessOps):
         extra_clause = (" AND " + " AND ".join(conditions)) if conditions else ""
         return await conn.fetch(
             f"""
-            SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id
+            SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id, o.created_at
             FROM {table} o
             WHERE o.status = 'pending'
               AND o.task_payload IS NOT NULL
@@ -1719,14 +1807,14 @@ class PostgreSQLOps(DataAccessOps):
         """
         return await conn.fetch(
             f"""
-            SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id
+            SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count, o.serialization_key, o.bank_id, o.created_at
             FROM {table} o
             WHERE o.status = 'pending'
               AND o.task_payload IS NOT NULL
               AND o.operation_type = $1
               AND (o.next_retry_at IS NULL OR o.next_retry_at <= NOW())
               AND {bank_serialization_sql(table, "o")}
-              AND {document_serialization_sql(table, "o")}
+              AND {key_serialization_sql(table, "o")}
             ORDER BY o.created_at
             LIMIT $2
             FOR UPDATE SKIP LOCKED
@@ -1780,7 +1868,7 @@ class PostgreSQLOps(DataAccessOps):
         cursor off the result. Within the rotated bank the row is index-ordered
         rather than that bank's oldest — sorting by ``created_at`` there would
         need an index on ``(bank_id, created_at)`` and cost 12 s without one, and
-        per-document order is held by ``document_serialization_sql`` regardless.
+        per-key order is held by ``key_serialization_sql`` regardless.
         """
         params: list = [bank_cursor]
         exclusion = ""
@@ -1797,7 +1885,7 @@ class PostgreSQLOps(DataAccessOps):
               AND o.operation_type != 'consolidation'
               AND (o.next_retry_at IS NULL OR o.next_retry_at <= NOW())
               AND {bank_serialization_sql(table, "o")}
-              AND {document_serialization_sql(table, "o")}{exclusion}"""
+              AND {key_serialization_sql(table, "o")}{exclusion}"""
 
         return await conn.fetch(
             f"""
@@ -1819,7 +1907,7 @@ class PostgreSQLOps(DataAccessOps):
                 SELECT * FROM rot UNION ALL SELECT * FROM fifo
             )
             SELECT o.operation_id, o.operation_type, o.task_payload, o.retry_count,
-                   o.serialization_key, o.bank_id, c.tier
+                   o.serialization_key, o.bank_id, o.created_at, c.tier
             FROM cand c
             JOIN {table} o ON o.operation_id = c.operation_id
             WHERE {claimable}

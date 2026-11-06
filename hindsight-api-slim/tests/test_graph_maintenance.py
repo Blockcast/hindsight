@@ -19,12 +19,12 @@ import pytest
 
 from hindsight_api import RequestContext
 from hindsight_api.engine.graph_maintenance import (
-    MAX_SEMANTIC_LINKS_PER_UNIT,
-    MAX_TEMPORAL_LINKS_PER_UNIT,
     enqueue_entity_prune_candidates,
     enqueue_relink_victims,
     run_graph_maintenance_job,
 )
+from hindsight_api.engine.memories.pg.graph import MAX_SEMANTIC_LINKS_PER_UNIT
+from hindsight_api.engine.memories.pg.links import MAX_TEMPORAL_LINKS_PER_UNIT
 from hindsight_api.engine.memory_engine import MemoryEngine
 
 # Every test here seeds memory_units / memory_links / entities with raw INSERTs and
@@ -865,6 +865,42 @@ class TestStaleCooccurrencePrune:
         result = await run_graph_maintenance_job(memory, bank_id, request_context)
         assert result["stale_cooccurrences_pruned"] == 1
 
+    @pytest.mark.asyncio
+    async def test_keeps_live_pair_when_only_the_second_endpoint_is_a_candidate(
+        self, memory: MemoryEngine, request_context: RequestContext
+    ):
+        """``live`` is built from the candidate's side of each pair and
+        normalised with LEAST/GREATEST. When the candidate sorts second, the
+        pair it forms must still be emitted in (entity_id_1, entity_id_2) order,
+        or the anti-join misses it and a grounded edge is deleted. The third
+        entity gives the candidate a second pair in the same unit, so the
+        grounded pair is not the only row ``live`` emits."""
+        bank_id = f"test-gm-keep2-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(memory, bank_id, request_context)
+
+        pool = await memory._get_pool()
+        async with pool.acquire() as conn:
+            ent_a = await _insert_entity(conn, bank_id, "alice")
+            ent_b = await _insert_entity(conn, bank_id, "bob")
+            ent_c = await _insert_entity(conn, bank_id, "carol")
+            first, second = sorted([ent_a, ent_b])
+            await _insert_cooccurrence(conn, ent_a, ent_b, count=4)
+            unit = await _insert_unit(conn, bank_id, "alice-bob-carol")
+            for ent in (ent_a, ent_b, ent_c):
+                await _link_unit_entity(conn, unit, ent)
+            await _seed_entity_candidates(conn, bank_id, [second])
+
+        result = await run_graph_maintenance_job(memory, bank_id, request_context)
+        assert result["stale_cooccurrences_pruned"] == 0
+
+        async with pool.acquire() as conn:
+            still_there = await conn.fetchval(
+                "SELECT cooccurrence_count FROM entity_cooccurrences WHERE entity_id_1 = $1 AND entity_id_2 = $2",
+                first,
+                second,
+            )
+            assert still_there == 4
+
 
 # ---------------------------------------------------------------------------
 # Delta enqueue: what a delete captures before the cascade
@@ -948,6 +984,30 @@ class TestEnqueueEntityPruneCandidates:
             # The drain consumed every candidate it enqueued.
             assert await _queue_entity_ids(conn, bank_id) == []
 
+    @pytest.mark.asyncio
+    async def test_delete_memory_unit_reconciles_vector_indexes_for_an_observation(
+        self, memory: MemoryEngine, request_context: RequestContext, monkeypatch
+    ):
+        """Deleting an observation shrinks the bank as much as deleting a fact does. The
+        reconcile used to be keyed on the graph-maintenance bank, which is only set for
+        world/experience units, so an observation delete never reconciled."""
+        bank_id = f"test-gm-delobs-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(memory, bank_id, request_context)
+        submitted: list[str] = []
+
+        async def record(bank: str, _ctx, *, after: str, grew: bool) -> None:
+            submitted.append(bank)
+
+        monkeypatch.setattr(memory, "_submit_vector_index_maintenance_quietly", record)
+
+        pool = await memory._get_pool()
+        async with pool.acquire() as conn:
+            obs = await _insert_unit(conn, bank_id, "an observation", fact_type="observation")
+
+        await memory.delete_memory_unit(str(obs), request_context=request_context)
+
+        assert submitted == [bank_id]
+
 
 # ---------------------------------------------------------------------------
 # Time budget
@@ -1029,6 +1089,7 @@ class TestEveryDeleteSiteEnqueues:
                     "replacement text",
                     is_first_batch=True,
                     ops=backend.ops,
+                    store_document_text=True,
                 )
 
         async with pool.acquire() as conn:
@@ -1149,10 +1210,7 @@ class TestTimeBudget:
 
 
 def test_caps_match_retain_defaults():
-    """If retain bumps its caps but graph_maintenance stays put, top-up will
-    silently never reach the retain ceiling — the asserts here exist so a
-    future cap change forces a paired update."""
-    from hindsight_api.engine.retain.link_utils import MAX_TEMPORAL_LINKS_PER_UNIT as RETAIN_TEMPORAL
-
-    assert MAX_TEMPORAL_LINKS_PER_UNIT == RETAIN_TEMPORAL
+    """The relink pass tops semantic links up to this cap; retain's ANN defaults to the
+    same top_k, so a change to one forces a paired update of the other. (The temporal cap
+    is a single constant both passes import, so it cannot drift.)"""
     assert MAX_SEMANTIC_LINKS_PER_UNIT == 50  # mirrors compute_semantic_links_ann's top_k default

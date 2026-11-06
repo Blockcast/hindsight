@@ -8,6 +8,27 @@ import { DEFAULT_REFLECT_TIMEOUT_MS } from "../core/config";
 const HOOK_HARNESS_NAMES = Object.keys(HOOK_HARNESSES) as HookHarnessName[];
 
 describe("HOOK_HARNESSES lifecycle contract", () => {
+  it("uses the hook working directory when Devin omits its project variable", () => {
+    const devin = HOOK_HARNESSES["devin-cli"];
+    const original = process.env.DEVIN_PROJECT_DIR;
+    const event = { session_id: "s1", prompt: "hello" };
+
+    try {
+      for (const value of ["/explicit/project", "", undefined]) {
+        if (value === undefined) delete process.env.DEVIN_PROJECT_DIR;
+        else process.env.DEVIN_PROJECT_DIR = value;
+
+        const expected = value || process.cwd();
+        expect(devin.sessionStart.parse(event).cwd).toBe(expected);
+        expect(devin.prompt.parse(event).cwd).toBe(expected);
+        expect(devin.retain.parse(event).cwd).toBe(expected);
+      }
+    } finally {
+      if (original === undefined) delete process.env.DEVIN_PROJECT_DIR;
+      else process.env.DEVIN_PROJECT_DIR = original;
+    }
+  });
+
   it("declares every lifecycle once for every hook-based harness", () => {
     for (const harness of HOOK_HARNESS_NAMES) {
       expect(Object.keys(HOOK_HARNESSES[harness].install).sort()).toEqual([
@@ -38,15 +59,44 @@ describe("HOOK_HARNESSES lifecycle contract", () => {
       cwd: "/c",
       last_assistant_message: "[{'type': 'text', 'text': 'hi'}]",
     };
+    // Claude Code sends the reply's text, never a serialized block list.
+    const plainText = new Set<string>(["claude-code"]);
     for (const harness of HOOK_HARNESS_NAMES) {
       const spec = HOOK_HARNESSES[harness].retain;
-      if (spec.parse(probe).lastAssistantMessage === undefined) continue;
+      if (spec.parse(probe).lastAssistantMessage === undefined || plainText.has(harness)) continue;
       expect(
         spec.readLastMessage,
         `${harness} reads last_assistant_message but never decodes it`
       ).toBeDefined();
       // And the decoder must actually reduce a block list to its text, not pass the repr through.
       expect(spec.readLastMessage!(probe.last_assistant_message)).toBe("hi");
+    }
+  });
+
+  // The @genie/agent-cli engine pastes a hook's raw stdout into the model's context whenever
+  // additionalContext is absent, and its SessionStart payload carries no cwd.
+  it("keeps WorkBuddy/CodeBuddy hook JSON out of the model context and finds the project dir", () => {
+    const original = process.env.CODEBUDDY_PROJECT_DIR;
+    try {
+      process.env.CODEBUDDY_PROJECT_DIR = "/w/repo";
+      for (const harness of ["workbuddy", "codebuddy"] as const) {
+        const spec = HOOK_HARNESSES[harness];
+        expect(spec.sessionStart.emit({ systemMessage: "banner" })).toEqual({
+          systemMessage: "banner",
+          hookSpecificOutput: { hookEventName: "SessionStart" },
+          suppressOutput: true,
+        });
+        expect(spec.prompt.emit("ctx", "notice")).toEqual({
+          systemMessage: "notice",
+          hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: "ctx" },
+          suppressOutput: true,
+        });
+        expect(spec.sessionStart.parse({ session_id: "s1" }).cwd).toBe("/w/repo");
+        expect(spec.sessionStart.parse({ session_id: "s1", cwd: "/given" }).cwd).toBe("/given");
+      }
+    } finally {
+      if (original === undefined) delete process.env.CODEBUDDY_PROJECT_DIR;
+      else process.env.CODEBUDDY_PROJECT_DIR = original;
     }
   });
 
@@ -141,6 +191,16 @@ describe("HOOK_HARNESSES lifecycle contract", () => {
       lastAssistantMessage: "done",
     });
 
+    // Stop can fire before the final reply is flushed to the transcript (#5790).
+    expect(
+      HOOK_HARNESSES["claude-code"].retain.parse({
+        session_id: "s1",
+        transcript_path: "/tmp/s1.jsonl",
+        cwd: "/repo",
+        last_assistant_message: "done",
+      }).lastAssistantMessage
+    ).toBe("done");
+
     const droid = HOOK_HARNESSES["factory-droid"];
     expect(droid.additionalHooks).toEqual([
       { event: "Notification", entry: "droid-stop-hook.js", timeout: 60 },
@@ -179,6 +239,52 @@ describe("HOOK_HARNESSES lifecycle contract", () => {
       zcode.retain.journal?.assistantText({ responseText: "", responsePreview: "trunc" })
     ).toBe("trunc");
     expect(zcode.retain.journal?.assistantText({})).toBe("");
+
+    const traecode = HOOK_HARNESSES.traecode;
+    expect(traecode.configStyle).toBe("nested");
+    expect(traecode.install).toMatchObject({
+      sessionStart: { event: "SessionStart", entry: "traecode-sessionstart-hook.js", timeout: 30 },
+      prompt: { event: "UserPromptSubmit", entry: "traecode-hook.js", timeout: 30 },
+      stop: { event: "Stop", entry: "traecode-stop-hook.js", timeout: 60 },
+    });
+    expect(traecode.prompt.parse({ prompt: "hi", cwd: "/repo", session_id: "s1" })).toEqual({
+      prompt: "hi",
+      cwd: "/repo",
+      sessionId: "s1",
+    });
+    // The Stop payload carries the full reply, and the journal closes the turn with it.
+    expect(traecode.retain.journal?.assistantText({ last_assistant_message: " reply " })).toBe(
+      "reply"
+    );
+    expect(traecode.retain.journal?.assistantText({})).toBe("");
+
+    // Payloads captured from the real @moonshot-ai/kimi-code 2.1.1 CLI. Its prompt is a BLOCK ARRAY,
+    // not a string: reading it as a string made runHook throw on `.trim()` and recall never ran.
+    const kimi = HOOK_HARNESSES["kimi-code"];
+    expect(kimi.configStyle).toBe("toml-array");
+    expect(
+      kimi.prompt.parse({
+        hook_event_name: "UserPromptSubmit",
+        session_id: "session_413e",
+        cwd: "/repo",
+        client_type: "kimi_code_cli",
+        prompt: [
+          { type: "text", text: "which statuses" },
+          { type: "image_url", image_url: { url: "data:" } },
+          { type: "text", text: "are retryable?" },
+        ],
+        is_steer: false,
+      })
+    ).toEqual({
+      prompt: "which statuses\nare retryable?",
+      cwd: "/repo",
+      sessionId: "session_413e",
+    });
+    expect(kimi.prompt.parse({ prompt: "not blocks" }).prompt).toBe("");
+    // `message` is Kimi's only injection channel; SessionStart output is dropped by the host.
+    expect(kimi.prompt.emit("context", "visible")).toEqual({ message: "context" });
+    expect(kimi.prompt.emit("", "visible")).toEqual({ message: "visible" });
+    expect(kimi.sessionStart.emit({ systemMessage: "s", additionalContext: "c" })).toEqual({});
   });
 
   /**

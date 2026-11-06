@@ -56,7 +56,7 @@ NAMED_RESULT_FAMILIES = [
         {"GraphRetrieval"},
     ),
     (
-        "engine/search/link_expansion_retrieval.py",
+        "engine/memories/pg/link_expansion.py",
         ["retrieve"],
         {"GraphRetrieval"},
     ),
@@ -64,11 +64,6 @@ NAMED_RESULT_FAMILIES = [
         "engine/reflect/prompts.py",
         ["_fit_structured_delta_prompt_parts"],
         {"FittedDeltaPrompt"},
-    ),
-    (
-        "engine/reflect/delta_ops.py",
-        ["_validate_operations_list"],
-        {"ValidatedOperations"},
     ),
     (
         "engine/retain/entity_processing.py",

@@ -9,7 +9,9 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from hindsight_api.engine.memory_engine import Budget, MemoryEngine
+from hindsight_api.engine.memory_engine import MemoryEngine
+from hindsight_api.engine.response_models import Budget
+from tests.consolidation_answers import fact_answer
 from tests.llm_judge import assert_meets_criteria
 
 logger = logging.getLogger(__name__)
@@ -2837,7 +2839,7 @@ def test_retain_mission_in_user_preamble_not_cached_prefix():
     config.retain_extract_causal_links = False
 
     # The mission is absent from the (cacheable, bank-agnostic) system prompt...
-    prompt, _ = _build_extraction_prompt_and_schema(config)
+    prompt = _build_extraction_prompt_and_schema(config).system_prompt
     assert spec not in prompt
     assert "FOCUS" not in prompt
     # ...and present in the per-request user-message preamble instead.
@@ -2847,7 +2849,7 @@ def test_retain_mission_in_user_preamble_not_cached_prefix():
 
     # Mode-independent: verbose mode → same mission-free prompt, same preamble.
     config.retain_extraction_mode = "verbose"
-    prompt_verbose, _ = _build_extraction_prompt_and_schema(config)
+    prompt_verbose = _build_extraction_prompt_and_schema(config).system_prompt
     assert spec not in prompt_verbose
     assert spec in _retain_mission_preamble(config)
 
@@ -2856,9 +2858,9 @@ def test_retain_mission_in_user_preamble_not_cached_prefix():
     # instead of one cache per mission.
     config.retain_extraction_mode = "concise"
     config.retain_mission = "Track project A architecture decisions."
-    prompt_a, _ = _build_extraction_prompt_and_schema(config)
+    prompt_a = _build_extraction_prompt_and_schema(config).system_prompt
     config.retain_mission = "Track customer B support incidents."
-    prompt_b, _ = _build_extraction_prompt_and_schema(config)
+    prompt_b = _build_extraction_prompt_and_schema(config).system_prompt
     assert prompt_a == prompt_b
 
 
@@ -2896,15 +2898,15 @@ def test_retain_cacheable_prefix_invariant_to_per_bank_freetext(mode):
         defaults.update(overrides)
         return SimpleNamespace(**defaults)
 
-    baseline, _ = _build_extraction_prompt_and_schema(make())
+    baseline = _build_extraction_prompt_and_schema(make()).system_prompt
 
     # The mission must not change the cacheable prefix, whatever its value.
     for mission in ["Track A decisions.", '{"focus": "compliance"}', "Ünïcödé brief", "x" * 600]:
-        prompt, _ = _build_extraction_prompt_and_schema(make(retain_mission=mission))
+        prompt = _build_extraction_prompt_and_schema(make(retain_mission=mission)).system_prompt
         assert prompt == baseline, f"retain_mission leaked into the cacheable {mode} prefix"
 
     # Custom instructions are a custom-mode field; they must not touch concise/verbose.
-    prompt, _ = _build_extraction_prompt_and_schema(make(retain_custom_instructions="Do X with {braces}"))
+    prompt = _build_extraction_prompt_and_schema(make(retain_custom_instructions="Do X with {braces}")).system_prompt
     assert prompt == baseline, f"retain_custom_instructions leaked into the cacheable {mode} prefix"
 
 
@@ -2920,7 +2922,7 @@ def test_retain_mission_absent_when_not_set():
     config.retain_custom_instructions = None
     config.retain_extract_causal_links = False
 
-    prompt, _ = _build_extraction_prompt_and_schema(config)
+    prompt = _build_extraction_prompt_and_schema(config).system_prompt
     assert "FOCUS" not in prompt
     assert "retain_mission_section" not in prompt
 
@@ -3268,11 +3270,9 @@ def _make_mock_llm_call():
     """Create a mock LLM call function that returns deterministic facts."""
 
     async def mock_llm_call(*args, **kwargs):
-        from hindsight_api.engine.consolidation.consolidator import _ConsolidationBatchResponse
-
         if kwargs.get("scope") == "consolidation":
             return LLMCallResult(
-                content=_ConsolidationBatchResponse(),
+                content=fact_answer(),
                 usage=TokenUsage(input_tokens=0, output_tokens=0),
             )
 
@@ -3906,3 +3906,34 @@ class TestFactExtractionQuality:
             )
         finally:
             await memory.delete_bank(bank_id, request_context=request_context)
+
+
+@pytest.mark.asyncio
+async def test_multi_document_retain_bounds_group_fan_out_on_sql_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A multi-document retain on the SQL path (no store-owned session) must not run every
+    document at once. Each in-flight document holds a pool connection while acquiring another,
+    so a fan-out wider than the pool deadlocks it (#5442). The groups run through the recursive
+    ``retain_batch`` call, so wrapping it counts how many are in flight at the same time.
+    """
+    from hindsight_api.engine.response_models import TokenUsage
+    from hindsight_api.engine.retain import orchestrator
+    from hindsight_api.engine.retain.types import RetainBatchResult
+
+    real_retain_batch = orchestrator.retain_batch
+    in_flight = 0
+    peak = 0
+
+    async def counting_group(*args: object, contents_dicts: list, **kwargs: object) -> RetainBatchResult:
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        await asyncio.sleep(0.01)
+        in_flight -= 1
+        return RetainBatchResult([[] for _ in contents_dicts], TokenUsage(), 0)
+
+    monkeypatch.setattr(orchestrator, "retain_batch", counting_group)
+
+    docs = [{"content": f"item {i}", "document_id": f"doc-{i}"} for i in range(40)]
+    await real_retain_batch(None, None, None, None, None, "bank", docs, None)
+
+    assert 1 < peak <= 8

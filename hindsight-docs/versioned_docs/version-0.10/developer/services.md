@@ -1,6 +1,11 @@
+import Figure from '@site/src/components/Figure';
+import services from '@site/figures/services.json';
+
 # Services
 
 Hindsight consists of three services that can run together or separately depending on your deployment needs.
+
+<Figure doc={services} />
 
 ## API Service
 

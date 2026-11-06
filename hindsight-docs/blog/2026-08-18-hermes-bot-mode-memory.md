@@ -11,6 +11,13 @@ hide_table_of_contents: true
 
 ![Hermes Bot Mode with Hindsight: give each named bot its own memory bank, or share one across a collaborating room](/img/blog/hermes-bot-mode-memory.png)
 
+:::info Setup has changed since this post
+Hindsight is no longer bundled with Hermes. Nous Research moved every memory provider out of the
+Hermes core tree, so new installs now run `hermes plugins install hindsight` before
+`hermes memory setup`. Existing setups migrate themselves. See
+[What Changes Now That Hindsight Is a Hermes Plugin](/blog/2026/10/01/hindsight-hermes-plugin-what-changed).
+:::
+
 Nous Research just shipped [Bot Mode](https://x.com/NousResearch/status/2089429432612147572) for Hermes. Your agent profiles become a roster of named **Bots**, and each one carries its own role, model, skills, and profile picture. Bots can use any model and even talk to each other in a shared room. Build a specialist once, and use it forever.
 
 The line in that announcement that matters most for us is a small one: **each Bot has its own memory.** That is exactly the seam where [Hindsight](https://vectorize.io/hindsight) fits, and where a roster of bots either becomes a genuine team or a set of goldfish with names.
@@ -66,7 +73,7 @@ In Hermes Desktop, this lives in **Settings → Memory & Context**, and it is sc
 
 Prefer the terminal? The same settings live at `~/.hermes/hindsight/config.json` (the `bank_id` field, default `hermes`, or set `HINDSIGHT_BANK_ID`). Either way, auto-recall runs on a `pre_llm_call` hook and auto-retain on `post_llm_call`, and the provider recalls fresh memory per message even in gateway mode, so a bot stays coherent across platforms and across turns.
 
-Memory can live in [Hindsight Cloud](https://ui.hindsight.vectorize.io/signup) or a server you run. Because both Hermes and Hindsight are MIT licensed and Hindsight self-hosts in one Docker command, a whole roster of bots with persistent memory can run entirely on your own hardware.
+Memory can live in [Hindsight Cloud](https://ui.hindsight.vectorize.io) or a server you run. Because both Hermes and Hindsight are MIT licensed and Hindsight self-hosts in one Docker command, a whole roster of bots with persistent memory can run entirely on your own hardware.
 
 ## Two setups worth copying
 
@@ -78,7 +85,7 @@ Memory can live in [Hindsight Cloud](https://ui.hindsight.vectorize.io/signup) o
 
 Bot Mode gave every bot a slot for memory. Hindsight fills it with something durable and scoped: persistent across sessions, isolated or shared by a single bank id, self-hostable, and already wired into Hermes as a native provider. The bank model maps almost exactly onto how you would draw a team of specialists on a whiteboard, which is the sign of a good primitive.
 
-Spin up your roster, decide who shares a brain and who keeps their own, and let them get better every time they run. Start free on [Hindsight Cloud](https://ui.hindsight.vectorize.io/signup), or read the [Hermes integration guide](https://hindsight.vectorize.io/sdks/integrations/hermes) first.
+Spin up your roster, decide who shares a brain and who keeps their own, and let them get better every time they run. Start free on [Hindsight Cloud](https://ui.hindsight.vectorize.io), or read the [Hermes integration guide](https://hindsight.vectorize.io/sdks/integrations/hermes) first.
 
 ---
 

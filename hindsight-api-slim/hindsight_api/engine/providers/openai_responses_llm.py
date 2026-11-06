@@ -11,15 +11,12 @@ The Responses API models the chain-of-thought as a first-class reasoning item, s
 reasoning and function tools coexist. This provider issues requests against
 ``responses.create``, translating the engine's chat-shaped inputs:
 
-- chat messages → Responses ``input`` items (assistant ``tool_calls`` →
-  ``function_call`` items, ``role="tool"`` results → ``function_call_output``),
-- nested ``{"type":"function","function":{...}}`` tools → flattened
-  ``{"type":"function","name":...,"parameters":...}``,
+- chat messages → Responses ``input`` message items,
 - the flat ``reasoning_effort`` scalar → a ``reasoning={"effort": ...}`` object,
 - ``response_format`` → ``text={"format": {...}}``,
 
-and reads ``response.output_text`` plus ``function_call`` items out of
-``response.output``.
+and reads ``response.output_text``. No request carries tools: reflect's tool calls
+are replies to a response schema (see ``tools_via_schema``).
 
 It is OpenAI-only (unlike the multi-vendor ``OpenAICompatibleLLM``, it carries no
 groq/ollama/deepseek special-casing) and stands alone on ``LLMInterface`` so the
@@ -43,15 +40,13 @@ from openai import APIConnectionError, APIStatusError, AsyncOpenAI
 
 from hindsight_api.config import get_config
 from hindsight_api.engine.bank_attribution import apply_bank_attribution
+from hindsight_api.engine.cache_affinity import apply_opencode_session
 from hindsight_api.engine.llm_interface import (
-    LLM_TOOL_CHOICE_AUTO,
     LLMInterface,
-    LLMToolChoice,
-    LLMToolChoiceMode,
     OutputTooLongError,
 )
 from hindsight_api.engine.llm_trace import LLMResponseUsage, stash_response_usage
-from hindsight_api.engine.llm_transport import build_sdk_timeout, describe_transport_error
+from hindsight_api.engine.llm_transport import build_sdk_timeout, describe_llm_error
 from hindsight_api.engine.providers.llm_debug import dump_request_on_4xx
 from hindsight_api.engine.providers.openai_compatible_headers import with_openai_compatible_user_agent
 
@@ -63,7 +58,8 @@ from hindsight_api.engine.providers.openai_compatible_llm import (
     _strip_code_fences,
     _strip_reasoning_tags,
 )
-from hindsight_api.engine.response_models import LLMToolCall, LLMToolCallResult, TokenUsage
+from hindsight_api.engine.remote_retry import jittered_backoff
+from hindsight_api.engine.response_models import TokenUsage
 from hindsight_api.engine.structured_output import provider_json_schema, strict_json_schema
 from hindsight_api.metrics import get_metrics_collector
 from hindsight_api.worker.stage import set_stage
@@ -73,75 +69,59 @@ from ..response_models import LLMCallResult
 logger = logging.getLogger(__name__)
 
 
-def _tools_to_responses(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Convert chat/completions tool schemas to the flattened Responses shape.
+class RetryableResponsesError(Exception):
+    """A transient failure a subclass detected outside an HTTP status (e.g. mid-stream).
 
-    Chat nests the function under a ``function`` key; Responses lifts ``name`` /
-    ``description`` / ``parameters`` to the top level. Anything already flattened
-    (or a built-in tool) is passed through unchanged.
+    ``_run_with_retries`` backs off and retries it like a connection error.
     """
-    converted: list[dict[str, Any]] = []
-    for tool in tools:
-        function = tool.get("function") if isinstance(tool, dict) else None
-        if tool.get("type") == "function" and isinstance(function, dict):
-            item: dict[str, Any] = {
-                "type": "function",
-                "name": function.get("name"),
-                "parameters": function.get("parameters", {}),
-            }
-            if function.get("description") is not None:
-                item["description"] = function["description"]
-            if "strict" in function:
-                item["strict"] = function["strict"]
-            converted.append(item)
+
+
+def _to_responses_content(content: Any, role: str | None) -> Any:
+    """Translate an OpenAI chat content-part list into Responses input parts.
+
+    Retain assembles multimodal messages in the chat part vocabulary (``text`` /
+    ``image_url`` / ``file``, see ``attachment_content._prompt_part``), which the
+    Responses API rejects with HTTP 400. Text becomes ``input_text``
+    (``output_text`` on an assistant turn), ``image_url`` becomes ``input_image``
+    with the URL as a plain string, and ``file`` becomes ``input_file`` with its
+    fields lifted to the top level.
+
+    A plain string, which is what every text-only call sends, passes straight
+    through; parts of any other type (including ones already in Responses shape)
+    are left untouched.
+    """
+    if not isinstance(content, list):
+        return content
+
+    text_type = "output_text" if role == "assistant" else "input_text"
+    parts: list[Any] = []
+    for part in content:
+        kind = part.get("type") if isinstance(part, dict) else None
+        if kind == "text":
+            parts.append({"type": text_type, "text": part.get("text", "")})
+        elif kind == "image_url":
+            image = part.get("image_url")
+            url = image.get("url") if isinstance(image, dict) else image
+            detail = (image.get("detail") if isinstance(image, dict) else None) or "auto"
+            parts.append({"type": "input_image", "image_url": url, "detail": detail})
+        elif kind == "file":
+            file = part.get("file") or {}
+            fields = {key: file[key] for key in ("file_id", "file_data", "filename") if key in file}
+            parts.append({"type": "input_file", **fields})
         else:
-            converted.append(tool)
-    return converted
+            parts.append(part)
+    return parts
 
 
 def _messages_to_responses_input(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Convert chat/completions messages to Responses ``input`` items.
-
-    - ``role="tool"`` result → ``function_call_output`` keyed by ``call_id``,
-    - assistant ``tool_calls`` → ``function_call`` items (plus a message item when
-      the assistant turn also carried text),
-    - every other message → a role/content message item.
-    """
-    items: list[dict[str, Any]] = []
-    for message in messages:
-        role = message.get("role")
-
-        if role == "tool":
-            content = message.get("content")
-            items.append(
-                {
-                    "type": "function_call_output",
-                    "call_id": message.get("tool_call_id"),
-                    "output": content if isinstance(content, str) else json.dumps(content, ensure_ascii=False),
-                }
-            )
-            continue
-
-        if role == "assistant" and message.get("tool_calls"):
-            text = message.get("content")
-            if isinstance(text, str) and text:
-                items.append({"role": "assistant", "content": text})
-            for tool_call in message["tool_calls"]:
-                function = tool_call.get("function", {})
-                arguments = function.get("arguments")
-                items.append(
-                    {
-                        "type": "function_call",
-                        "call_id": tool_call.get("id"),
-                        "name": function.get("name"),
-                        "arguments": arguments if isinstance(arguments, str) else json.dumps(arguments or {}),
-                    }
-                )
-            continue
-
-        content = message.get("content")
-        items.append({"role": role, "content": content if content is not None else ""})
-    return items
+    """Convert chat/completions messages to Responses ``input`` message items."""
+    return [
+        {
+            "role": m.get("role"),
+            "content": _to_responses_content(m.get("content"), m.get("role")) if m.get("content") is not None else "",
+        }
+        for m in messages
+    ]
 
 
 def _inject_schema_into_input(input_items: list[dict[str, Any]], schema: dict[str, Any]) -> list[dict[str, Any]]:
@@ -240,9 +220,9 @@ class OpenAIResponsesLLM(LLMInterface):
         )
 
     def _supports_reasoning_model(self) -> bool:
-        """Whether the model is an OpenAI reasoning model (gpt-5.x, o1, o3)."""
+        """Whether the model is an OpenAI reasoning model (gpt-5.x, gpt-6, o1, o3)."""
         model_lower = self.model.lower()
-        return any(x in model_lower for x in ["gpt-5", "o1", "o3"])
+        return any(x in model_lower for x in ["gpt-5", "gpt-6", "o1", "o3"])
 
     def supports_vision(self) -> bool:
         """OpenAI's own Responses API — every model it serves reads images."""
@@ -311,9 +291,8 @@ class OpenAIResponsesLLM(LLMInterface):
         span_messages: list[dict[str, Any]],
         response_content: Any,
         finish_reason: str,
-        tool_calls_dict: list[dict[str, Any]] | None = None,
     ) -> None:
-        """Record metrics + a trace span for a successful call (shared by both paths)."""
+        """Record metrics + a trace span for a successful call."""
         get_metrics_collector().record_llm_call(
             provider=self.provider,
             model=self.model,
@@ -340,8 +319,16 @@ class OpenAIResponsesLLM(LLMInterface):
             finish_reason=finish_reason,
             error=None,
             cached_tokens=usage.cached_tokens,
-            tool_calls=tool_calls_dict,
+            thoughts_tokens=usage.thoughts_tokens,
         )
+
+    async def _create_response(self, params: dict[str, Any]) -> Any:
+        """Send one Responses request and return the final response object.
+
+        The hook subclasses override to change transport (``chatgpt`` streams
+        and swaps the bearer token per call); everything around it stays shared.
+        """
+        return await self._client.responses.create(**params)
 
     async def _run_with_retries(
         self,
@@ -367,13 +354,17 @@ class OpenAIResponsesLLM(LLMInterface):
             try:
                 async with attempt_context() if attempt_context is not None else nullcontext():
                     set_stage(f"llm.{self.provider}.{scope}.attempt={attempt + 1}/{max_retries + 1}")
-                    response = await self._client.responses.create(**params)
+                    # Wall-clock cap: the SDK's timeout is per phase and its read timeout restarts
+                    # on every byte, so an upstream trickling keep-alive whitespace never trips it
+                    # and the call pins its worker slot forever (#4763).
+                    response = await asyncio.wait_for(self._create_response(params), timeout=self.timeout)
                 usage = self._extract_usage(response)
                 stash_response_usage(
                     LLMResponseUsage(
                         input_tokens=usage.input_tokens,
                         output_tokens=usage.output_tokens,
                         cached_tokens=usage.cached_tokens,
+                        thoughts_tokens=usage.thoughts_tokens,
                     )
                 )
                 return parse(response)
@@ -390,14 +381,14 @@ class OpenAIResponsesLLM(LLMInterface):
                     continue
                 raise
 
-            except APIConnectionError as e:
+            except (APIConnectionError, TimeoutError, RetryableResponsesError) as e:
                 last_exception = e
                 status_code = getattr(e, "status_code", None) or getattr(
                     getattr(e, "response", None), "status_code", None
                 )
                 logger.warning(
-                    f"APIConnectionError ({self.provider}/{self.model}, scope={scope}, HTTP {status_code}, "
-                    f"attempt {attempt + 1}/{max_retries + 1}): {str(e)[:200]} [{describe_transport_error(e)}]"
+                    f"Connection error ({self.provider}/{self.model}, scope={scope}, HTTP {status_code}, "
+                    f"attempt {attempt + 1}/{max_retries + 1}): {describe_llm_error(e)}"
                 )
                 if attempt < max_retries:
                     await asyncio.sleep(min(initial_backoff * (2**attempt), max_backoff))
@@ -420,9 +411,7 @@ class OpenAIResponsesLLM(LLMInterface):
                         f"APIStatusError ({self.provider}/{self.model}, scope={scope}, "
                         f"attempt {attempt + 1}/{max_retries + 1}): HTTP {e.status_code}"
                     )
-                    backoff = min(initial_backoff * (2**attempt), max_backoff)
-                    jitter = backoff * 0.2 * (2 * (time.time() % 1) - 1)
-                    await asyncio.sleep(backoff + jitter)
+                    await asyncio.sleep(jittered_backoff(attempt, initial_backoff, max_backoff))
                     continue
                 logger.error(
                     f"API error after {max_retries + 1} attempts "
@@ -449,7 +438,7 @@ class OpenAIResponsesLLM(LLMInterface):
         attempt_context: Callable[[], AbstractAsyncContextManager[None]] | None = None,
     ) -> LLMCallResult:
         """Make a Responses API call with retry logic (see ``LLMInterface.call``)."""
-        start_time = time.time()
+        start_time = time.perf_counter()
         is_reasoning_model = self._supports_reasoning_model()
 
         input_items = _messages_to_responses_input(messages)
@@ -490,11 +479,14 @@ class OpenAIResponsesLLM(LLMInterface):
                 params["text"] = {"format": {"type": "json_object"}}
 
         apply_bank_attribution(params)
+        # opencode-go's /v1/responses requires x-opencode-session the same way
+        # /v1/chat/completions does (#4071); the host check inside decides.
+        apply_opencode_session(params, base_url=self.base_url)
 
         def parse(response: Any) -> Any:
             self._raise_if_truncated(response)
             usage = self._extract_usage(response)
-            duration = time.time() - start_time
+            duration = time.perf_counter() - start_time
             content = _strip_reasoning_tags(response.output_text or "")
 
             if response_format is not None:
@@ -517,123 +509,6 @@ class OpenAIResponsesLLM(LLMInterface):
                     f"input_tokens={usage.input_tokens}, output_tokens={usage.output_tokens}, time={duration:.3f}s"
                 )
             return LLMCallResult(content=result, usage=usage)
-
-        return await self._run_with_retries(
-            params,
-            scope=scope,
-            parse=parse,
-            max_retries=max_retries,
-            initial_backoff=initial_backoff,
-            max_backoff=max_backoff,
-            attempt_context=attempt_context,
-        )
-
-    async def call_with_tools(
-        self,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        max_completion_tokens: int | None = None,
-        temperature: float | None = None,
-        scope: str = "tools",
-        max_retries: int = 5,
-        initial_backoff: float = 1.0,
-        max_backoff: float = 30.0,
-        tool_choice: LLMToolChoice = LLM_TOOL_CHOICE_AUTO,
-        attempt_context: Callable[[], AbstractAsyncContextManager[None]] | None = None,
-    ) -> LLMToolCallResult:
-        """Make a Responses API call with tools (see ``LLMInterface.call_with_tools``).
-
-        Unlike chat/completions, ``reasoning`` and ``tools`` are sent together —
-        the reason this provider exists.
-        """
-        start_time = time.time()
-        is_reasoning_model = self._supports_reasoning_model()
-
-        responses_tools = _tools_to_responses(tools)
-
-        request_tool_choice: str | dict[str, Any] | None
-        if tool_choice.mode is LLMToolChoiceMode.NAMED:
-            forced_name = tool_choice.selected_function_name
-            filtered = [tool for tool in responses_tools if tool.get("name") == forced_name]
-            if len(filtered) != 1:
-                raise ValueError(
-                    f"Named tool_choice must reference exactly one declared tool; "
-                    f"found {len(filtered)} definitions for {forced_name!r}"
-                )
-            responses_tools = filtered
-            request_tool_choice = {"type": "function", "name": forced_name}
-        elif tool_choice.mode is LLMToolChoiceMode.AUTO:
-            request_tool_choice = None
-        else:
-            request_tool_choice = tool_choice.mode.value
-
-        params: dict[str, Any] = {
-            "model": self.model,
-            "input": _messages_to_responses_input(messages),
-            "tools": responses_tools,
-            "store": False,
-        }
-        if request_tool_choice is not None:
-            params["tool_choice"] = request_tool_choice
-        if max_completion_tokens is not None:
-            params["max_output_tokens"] = max_completion_tokens
-        if temperature is not None and not is_reasoning_model:
-            params["temperature"] = temperature
-        # Only when the operator configured a level: unset means the model runs at the
-        # Responses API's own default effort rather than one Hindsight picked.
-        if is_reasoning_model and self.reasoning_effort is not None:
-            params["reasoning"] = {"effort": self.reasoning_effort}
-        if self.openai_service_tier:
-            params["service_tier"] = self.openai_service_tier
-        if self._config_extra_body:
-            params["extra_body"] = {**self._config_extra_body}
-
-        apply_bank_attribution(params)
-
-        def parse(response: Any) -> LLMToolCallResult:
-            self._raise_if_truncated(response)
-            usage = self._extract_usage(response)
-            duration = time.time() - start_time
-
-            tool_calls: list[LLMToolCall] = []
-            for item in getattr(response, "output", None) or []:
-                if getattr(item, "type", None) != "function_call":
-                    continue
-                raw_args = getattr(item, "arguments", "") or ""
-                try:
-                    arguments = json.loads(raw_args) if raw_args else {}
-                except json.JSONDecodeError:
-                    arguments = {"_raw": raw_args}
-                tool_calls.append(
-                    LLMToolCall(id=getattr(item, "call_id", None), name=getattr(item, "name", ""), arguments=arguments)
-                )
-
-            content = response.output_text or None
-            finish_reason = "tool_calls" if tool_calls else getattr(response, "status", "completed")
-
-            self._record_success(
-                scope=scope,
-                usage=usage,
-                duration=duration,
-                span_messages=params["input"],
-                response_content=content,
-                finish_reason=finish_reason,
-                tool_calls_dict=(
-                    [{"id": tc.id, "name": tc.name, "arguments": tc.arguments} for tc in tool_calls]
-                    if tool_calls
-                    else None
-                ),
-            )
-
-            return LLMToolCallResult(
-                content=content,
-                tool_calls=tool_calls,
-                finish_reason=finish_reason,
-                input_tokens=usage.input_tokens,
-                output_tokens=usage.output_tokens,
-                cached_tokens=usage.cached_tokens,
-                thoughts_tokens=usage.thoughts_tokens,
-            )
 
         return await self._run_with_retries(
             params,

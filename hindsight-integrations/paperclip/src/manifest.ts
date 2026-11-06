@@ -1,13 +1,9 @@
 import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
 
-// Injected by esbuild `define` from package.json at build time — keep in lockstep
-// with the published package version instead of hand-editing this constant.
-declare const __PLUGIN_VERSION__: string;
-
 const manifest: PaperclipPluginManifestV1 = {
   id: "paperclip-plugin-hindsight",
   apiVersion: 1,
-  version: __PLUGIN_VERSION__,
+  version: "0.4.2",
   displayName: "Hindsight Memory",
   author: "Vectorize <support@vectorize.io>",
   description:
@@ -39,10 +35,26 @@ const manifest: PaperclipPluginManifestV1 = {
         default: "https://api.hindsight.vectorize.io",
       },
       hindsightApiKeyRef: {
-        type: "string",
+        // `format` drives the host's secret picker; the picker writes a
+        // { type: "secret_ref", secretId } object, and the host validates the raw
+        // config with Ajv before extracting refs — so the schema has to admit that
+        // object as well as a plain string (a pasted value or a legacy UUID).
+        format: "secret-ref",
         title: "Hindsight API Key (secret ref)",
         description:
-          "Name of the Paperclip secret holding your Hindsight Cloud API key. Leave empty for self-hosted.",
+          "Paperclip secret holding your Hindsight Cloud API key. Leave empty for self-hosted.",
+        oneOf: [
+          { type: "string" },
+          {
+            type: "object",
+            required: ["type", "secretId"],
+            properties: {
+              type: { const: "secret_ref" },
+              secretId: { type: "string" },
+              version: { type: "string" },
+            },
+          },
+        ],
       },
       dynamicBankId: {
         type: "boolean",
@@ -72,24 +84,20 @@ const manifest: PaperclipPluginManifestV1 = {
         enum: ["low", "mid", "high"],
         default: "mid",
       },
+      requestTimeoutMs: {
+        type: "number",
+        title: "Request Timeout (ms)",
+        description:
+          "Timeout for each request to Hindsight. Raise it for self-hosted instances where recall on long issue descriptions takes longer than the default.",
+        minimum: 1000,
+        default: 15000,
+      },
       autoRetain: {
         type: "boolean",
-        title: "Auto-retain on Run Finished",
-        description: "Automatically retain agent run output to Hindsight when a run completes.",
-        default: true,
-      },
-      seedBankEnabled: {
-        type: "boolean",
-        title: "Seed Bank Lifecycle Hook",
+        title: "Auto-retain Issue Comments",
         description:
-          "Create/touch each new agent's canonical bank and optionally queue seed-bank work when an agent is created.",
+          "Automatically retain the full body of every issue comment to Hindsight. Agents can still store memories explicitly with the hindsight_retain tool when this is off.",
         default: true,
-      },
-      seedBankWebhookUrl: {
-        type: "string",
-        title: "Seed Bank Webhook URL",
-        description:
-          "Optional operator-provided queue endpoint. When set, agent.created posts one seed job with the canonical bank id and deterministic query plan.",
       },
       enabledAgentIds: {
         type: "array",

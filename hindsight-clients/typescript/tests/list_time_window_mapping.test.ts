@@ -49,6 +49,15 @@ describe("list time window mapping", () => {
     expect(query.end_date).toBe("2024-02-01T00:00:00Z");
   });
 
+  test("listMemories maps the tag filter onto the query", async () => {
+    // Same rule, for the tag filter the control plane's entity panel sends (#5031).
+    await client.listMemories("bank", { tags: ["user:dan"], tagsMatch: "any_strict" });
+
+    const query = mockedListMemories.mock.calls[0][0].query as any;
+    expect(query.tags).toEqual(["user:dan"]);
+    expect(query.tags_match).toBe("any_strict");
+  });
+
   test("listDocuments maps the window onto the query", async () => {
     await client.listDocuments("bank", {
       timeField: "created_at",
@@ -58,6 +67,13 @@ describe("list time window mapping", () => {
     const query = mockedListDocuments.mock.calls[0][0].query as any;
     expect(query.time_field).toBe("created_at");
     expect(query.start_date).toBe("2024-01-01T00:00:00Z");
+  });
+
+  test("listDocuments forwards the search text", async () => {
+    await client.listDocuments("bank", { q: "onboarding" });
+
+    const query = mockedListDocuments.mock.calls[0][0].query as any;
+    expect(query.q).toBe("onboarding");
   });
 
   test("the window is absent unless asked for", async () => {

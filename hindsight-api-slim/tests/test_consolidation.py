@@ -4,18 +4,15 @@ These tests exercise the real consolidation implementation with actual database 
 Note: Consolidation runs automatically after retain via SyncTaskBackend in tests.
 """
 
-from hindsight_api.engine.response_models import LLMCallResult, TokenUsage
 import uuid
 from datetime import datetime, timezone
-from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from hindsight_api.config import _get_raw_config
 from hindsight_api.engine.consolidation.consolidator import (
     _aggregate_source_fields,
-    _build_response_model,
     _count_observations_for_scope,
     _find_related_observations,
     run_consolidation_job,
@@ -27,6 +24,7 @@ from hindsight_api.engine.reflect.tools import (
     tool_search_observations,
 )
 from tests.llm_judge import assert_meets_criteria
+from tests.consolidation_answers import batch_fact_ids, batch_fact_texts, fact_answer
 
 
 async def _unconsolidated(memory: MemoryEngine, bank_id: str, request_context) -> int:
@@ -489,12 +487,12 @@ class TestConsolidationIntegration:
     async def test_consolidation_reduces_count_for_near_duplicate_facts(
         self, memory_real_llm: MemoryEngine, request_context
     ):
-        """Consolidation with a real LLM should merge near-duplicate facts.
+        """Consolidation with a real LLM should merge near-duplicate facts without losing any.
 
         MockLLM always emits one observation per fact — it never merges.  This test
         verifies that the real consolidation prompt actually collapses semantically
-        redundant information.  Three phrasings of the same email address should
-        yield fewer than three observations.
+        redundant information (three phrasings of the same email address) while every
+        distinct fact — the email, the role, the city — survives.
         """
         memory = memory_real_llm
         bank_id = f"test-consolidation-count-{uuid.uuid4().hex[:8]}"
@@ -527,15 +525,24 @@ class TestConsolidationIntegration:
                 )
             )["items"]
 
-            obs_count = len(observations)
-            obs_texts = [o["text"] for o in observations]
-
-            # 5 input facts, 3 are near-duplicates — real consolidation must merge some
-            assert obs_count < 5, (
-                f"Expected fewer than 5 observations after merging near-duplicates. Got {obs_count}: {obs_texts}"
+            texts = [o["text"] for o in observations]
+            observation_list = "\n".join(f"{n}. {t}" for n, t in enumerate(texts, 1))
+            # How the model groups facts into observations is its call — it may fold the role
+            # and the city into one sentence — so the count of observations is not asserted
+            # (#6109). What must hold either way: the restated email collapsed, and no
+            # distinct fact was lost. The address is an identifier copied verbatim, so its
+            # presence is checked exactly; a judge reading for it passed lists without it.
+            with_email = [t for t in texts if "sarah@example.com" in t.lower()]
+            assert with_email, f"Consolidation lost the email fact. Observations:\n{observation_list}"
+            assert len(with_email) < 3, f"The three restated emails were not merged:\n{observation_list}"
+            await assert_meets_criteria(
+                response=observation_list,
+                criteria=(
+                    "The observations say that Sarah is a product manager AND that Sarah is based in "
+                    "Austin, Texas. Fail if either of the two is missing."
+                ),
+                context="Several facts may be folded into one observation; that is fine.",
             )
-            # The two distinct facts should still have representation
-            assert obs_count >= 2, f"Expected at least 2 observations for distinct facts. Got {obs_count}: {obs_texts}"
         finally:
             await memory.delete_bank(bank_id, request_context=request_context)
 
@@ -1348,6 +1355,9 @@ class TestObservationDrillDown:
                     bank_id=bank_id,
                     memory_ids=obs["source_fact_ids"][:2],  # Take first 2
                     depth="chunk",
+                    tags=None,
+                    tags_match="any",
+                    tag_groups=None,
                 )
 
             assert "results" in expand_result
@@ -2308,6 +2318,37 @@ class TestConsolidationSourceFactsConfig:
             await memory.delete_bank(bank_id, request_context=request_context)
 
     @pytest.mark.asyncio
+    async def test_recall_with_precomputed_query_embedding_skips_embedder(self, memory: MemoryEngine, request_context):
+        """A recall handed its query vector uses it instead of embedding the query again (#5647)."""
+        from hindsight_api.engine import memory_engine as engine_mod
+
+        bank_id = f"test-precomputed-emb-{uuid.uuid4().hex[:8]}"
+        await memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
+        [vector] = await engine_mod.embedding_utils.generate_embeddings_batch(
+            memory.embeddings, ["test query"], input_type="query"
+        )
+        try:
+            with patch.object(
+                engine_mod.embedding_utils,
+                "generate_embeddings_batch",
+                wraps=engine_mod.embedding_utils.generate_embeddings_batch,
+            ) as embed:
+                await _find_related_observations(
+                    memory_engine=memory,
+                    bank_id=bank_id,
+                    query="test query",
+                    request_context=request_context,
+                    query_embedding=vector,
+                )
+                embed.assert_not_called()
+                await _find_related_observations(
+                    memory_engine=memory, bank_id=bank_id, query="test query", request_context=request_context
+                )
+                embed.assert_called_once()
+        finally:
+            await memory.delete_bank(bank_id, request_context=request_context)
+
+    @pytest.mark.asyncio
     async def test_consolidation_passes_source_facts_per_obs_tokens_to_recall(
         self, memory: MemoryEngine, request_context
     ):
@@ -2346,213 +2387,6 @@ class TestConsolidationSourceFactsConfig:
 # ---------------------------------------------------------------------------
 # max_observations_per_scope tests
 # ---------------------------------------------------------------------------
-
-
-class TestBuildResponseModel:
-    """Unit tests for _build_response_model (consolidation response-model factory)."""
-
-    def test_no_limit_returns_base_model(self):
-        from hindsight_api.engine.consolidation.consolidator import _ConsolidationBatchResponse
-
-        for max_creates in (None, -1):
-            assert _build_response_model(max_creates) is _ConsolidationBatchResponse
-
-    def test_schema_contains_max_items_by_default(self):
-        for max_creates in (0, 3, 50):
-            schema = _build_response_model(max_creates).model_json_schema()
-            creates_prop = schema["properties"]["creates"]
-            assert creates_prop.get("maxItems") == max_creates
-
-    def test_schema_omits_max_items_when_unsupported(self):
-        """Regression for #2500: Bedrock rejects maxItems in response schemas."""
-        from hindsight_api.engine.consolidation.consolidator import _ConsolidationBatchResponse
-
-        for max_creates in (0, 3, 50):
-            model = _build_response_model(max_creates, supports_max_items=False)
-            assert model is _ConsolidationBatchResponse
-            assert "maxItems" not in model.model_json_schema()["properties"]["creates"]
-
-    def test_model_enforces_cap_by_default(self):
-        from pydantic import ValidationError
-
-        model = _build_response_model(2)
-        with pytest.raises(ValidationError):
-            model(
-                creates=[
-                    {"text": "obs1", "source_fact_ids": ["a"]},
-                    {"text": "obs2", "source_fact_ids": ["b"]},
-                    {"text": "obs3", "source_fact_ids": ["c"]},
-                ],
-                updates=[],
-                deletes=[],
-            )
-
-    def test_model_accepts_over_cap_when_max_items_unsupported(self):
-        model = _build_response_model(2, supports_max_items=False)
-        result = model(
-            creates=[
-                {"text": "obs1", "source_fact_ids": ["a"]},
-                {"text": "obs2", "source_fact_ids": ["b"]},
-                {"text": "obs3", "source_fact_ids": ["c"]},
-            ],
-            updates=[],
-            deletes=[],
-        )
-        assert len(result.creates) == 3
-
-    def test_updates_and_deletes_unconstrained(self):
-        """The creates cap never constrained updates or deletes (unchanged)."""
-        model = _build_response_model(0)
-        result = model(
-            creates=[],
-            updates=[
-                {"text": "updated", "observation_id": "x", "source_fact_ids": ["a"]},
-                {"text": "updated2", "observation_id": "y", "source_fact_ids": ["b"]},
-            ],
-            deletes=[{"observation_id": "z"}],
-        )
-        assert len(result.updates) == 2
-        assert len(result.deletes) == 1
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(("remaining_slots", "expected_creates"), [(0, 0), (2, 2)])
-    async def test_unsupported_max_items_still_truncates_creates(
-        self, remaining_slots: int, expected_creates: int
-    ) -> None:
-        """The operation config controls the schema while the runtime cap remains hard."""
-        from hindsight_api.engine.consolidation.consolidator import (
-            _consolidate_batch_with_llm,
-            _ConsolidationBatchResponse,
-            _CreateAction,
-        )
-
-        creates = [_CreateAction(text=f"observation {index}", source_fact_ids=[f"fact-{index}"]) for index in range(3)]
-        llm_config = SimpleNamespace(
-            _provider_impl=None,
-            call=AsyncMock(
-                return_value=LLMCallResult(content=_ConsolidationBatchResponse(creates=creates), usage=TokenUsage())
-            ),
-        )
-        config = SimpleNamespace(
-            llm_output_language=None,
-            observations_mission=None,
-            llm_strict_schema_consolidation=False,
-            llm_supports_max_items=False,
-            consolidation_max_attempts=1,
-            consolidation_llm_max_retries=None,
-            consolidation_max_completion_tokens=None,
-            llm_temperature_consolidation=0.0,
-        )
-
-        result = await _consolidate_batch_with_llm(
-            llm_config=llm_config,
-            memories=[{"id": "fact-0", "text": "a fact"}],
-            union_observations=[],
-            union_source_facts={},
-            config=config,
-            remaining_observation_slots=remaining_slots,
-            max_observations_per_scope=2,
-        )
-
-        response_model = llm_config.call.await_args.kwargs["response_format"]
-        assert response_model is _ConsolidationBatchResponse
-        assert len(result.creates) == expected_creates
-
-
-class TestDedupeUpdates:
-    """`_dedupe_updates` collapses LLM responses that target one observation_id
-    multiple times — without this, the second `_execute_update_action` call
-    silently overwrites the first (see horse-test trace, retain #9)."""
-
-    def _make_update(self, obs_id: str, text: str, source_fact_ids: list[str]):
-        from hindsight_api.engine.consolidation.consolidator import _UpdateAction
-
-        return _UpdateAction(text=text, observation_id=obs_id, source_fact_ids=source_fact_ids)
-
-    def test_empty_passes_through(self):
-        from hindsight_api.engine.consolidation.consolidator import _dedupe_updates
-
-        assert _dedupe_updates([], batch_label="t") == []
-
-    def test_single_update_passes_through(self):
-        from hindsight_api.engine.consolidation.consolidator import _dedupe_updates
-
-        u = self._make_update("obs-1", "one", ["fact-a"])
-        out = _dedupe_updates([u], batch_label="t")
-        assert len(out) == 1
-        assert out[0] is u  # same object, no copy on fast path
-
-    def test_distinct_observation_ids_kept_separately(self):
-        from hindsight_api.engine.consolidation.consolidator import _dedupe_updates
-
-        u1 = self._make_update("obs-1", "one", ["fact-a"])
-        u2 = self._make_update("obs-2", "two", ["fact-b"])
-        out = _dedupe_updates([u1, u2], batch_label="t")
-        ids = {u.observation_id for u in out}
-        assert ids == {"obs-1", "obs-2"}
-
-    def test_duplicate_observation_id_collapsed_keeping_last_text(self, caplog):
-        """The exact failure mode from horse-test retain #9: two updates to one
-        observation_id, both from the same fact, second silently clobbering
-        the first. After dedup we have one update with the last text and the
-        union of source_fact_ids."""
-        import logging
-
-        from hindsight_api.engine.consolidation.consolidator import _dedupe_updates
-
-        u1 = self._make_update("obs-shadow", "User owns a horse named Midnight.", ["fact-9"])
-        u2 = self._make_update("obs-shadow", "User owns a horse named Shadow.", ["fact-9"])
-
-        with caplog.at_level(logging.WARNING, logger="hindsight_api.engine.consolidation.consolidator"):
-            out = _dedupe_updates([u1, u2], batch_label="horse-batch-9")
-
-        assert len(out) == 1
-        merged = out[0]
-        assert merged.observation_id == "obs-shadow"
-        assert merged.text == "User owns a horse named Shadow.", "last text wins"
-        assert merged.source_fact_ids == ["fact-9"], "duplicate fact ids deduped via union"
-
-        # The collision must be logged loudly enough to surface in observability.
-        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-        assert any("horse-batch-9" in r.message for r in warnings), (
-            "warning must include the batch label for traceability"
-        )
-        assert any("duplicate update" in r.message.lower() for r in warnings)
-
-    def test_source_fact_ids_union_preserves_order_and_deduplicates(self):
-        from hindsight_api.engine.consolidation.consolidator import _dedupe_updates
-
-        u1 = self._make_update("obs-1", "first", ["fact-a", "fact-b"])
-        u2 = self._make_update("obs-1", "second", ["fact-b", "fact-c"])
-        out = _dedupe_updates([u1, u2], batch_label="t")
-        assert len(out) == 1
-        assert out[0].source_fact_ids == ["fact-a", "fact-b", "fact-c"]
-
-    def test_three_way_collision_collapses_to_one(self):
-        from hindsight_api.engine.consolidation.consolidator import _dedupe_updates
-
-        u1 = self._make_update("obs-1", "v1", ["fact-a"])
-        u2 = self._make_update("obs-1", "v2", ["fact-b"])
-        u3 = self._make_update("obs-1", "v3", ["fact-c"])
-        out = _dedupe_updates([u1, u2, u3], batch_label="t")
-        assert len(out) == 1
-        assert out[0].text == "v3"
-        assert out[0].source_fact_ids == ["fact-a", "fact-b", "fact-c"]
-
-    def test_collisions_mixed_with_unique_updates(self):
-        from hindsight_api.engine.consolidation.consolidator import _dedupe_updates
-
-        u1 = self._make_update("obs-1", "one-a", ["fa1"])
-        u2 = self._make_update("obs-2", "two", ["fb"])
-        u3 = self._make_update("obs-1", "one-b", ["fa2"])
-        u4 = self._make_update("obs-3", "three", ["fc"])
-        out = _dedupe_updates([u1, u2, u3, u4], batch_label="t")
-        assert len(out) == 3
-        by_id = {u.observation_id: u for u in out}
-        assert by_id["obs-1"].text == "one-b"
-        assert by_id["obs-1"].source_fact_ids == ["fa1", "fa2"]
-        assert by_id["obs-2"].text == "two"
-        assert by_id["obs-3"].text == "three"
 
 
 def test_max_observations_per_scope_config():
@@ -2646,7 +2480,6 @@ async def _insert_memories_with_tags(conn, bank_id: str, texts: list[str], tags:
 def _make_mock_llm_one_obs_per_fact():
     """Return a MockLLM that creates one observation per fact in the batch."""
     from hindsight_api.engine.consolidation.consolidator import (
-        _ConsolidationBatchResponse,
         _CreateAction,
     )
     from hindsight_api.engine.providers.mock_llm import MockLLM
@@ -2655,17 +2488,19 @@ def _make_mock_llm_one_obs_per_fact():
 
     def callback(messages, scope):
         if scope != "consolidation":
-            return _ConsolidationBatchResponse()
+            return fact_answer()
         # Parse all fact UUIDs from the prompt — one create per fact. Read only
         # the user message(s): consolidation sends the facts there, while the
         # stable (cacheable) system message carries example UUIDs in its OUTPUT
         # FORMAT samples that must not be mistaken for real facts.
-        import re
 
         prompt = "\n".join(m.get("content", "") for m in messages if m.get("role") == "user")
-        fact_ids = re.findall(r"\[([0-9a-f-]{36})\]", prompt)
-        creates = [_CreateAction(text=f"Observation about fact {fid[:8]}", source_fact_ids=[fid]) for fid in fact_ids]
-        return _ConsolidationBatchResponse(creates=creates)
+        fact_ids = batch_fact_ids(prompt)
+        creates = [
+            _CreateAction(text=f"Observation about {batch_fact_texts(prompt)[fid]}", source_fact_ids=[fid])
+            for fid in fact_ids
+        ]
+        return fact_answer(creates=creates)
 
     mock_llm.set_response_callback(callback)
 
@@ -2721,7 +2556,7 @@ async def test_max_observations_per_scope_limits_creates(memory: MemoryEngine, r
                 count = await _count_observations_for_scope(conn, bank_id, ["scope:test"])
                 assert count == 2, f"Expected exactly 2 observations (limit=2), got {count}"
 
-                # Verify the LLM was called and some creates were blocked by the response model
+                # Verify the LLM was called and some creates were cut by the cap
                 consolidation_calls = [c for c in mock_llm.get_mock_calls() if c["scope"] == "consolidation"]
                 assert len(consolidation_calls) >= 1, "LLM should have been called at least once"
         finally:
@@ -2790,7 +2625,6 @@ async def test_max_observations_per_scope_zero_forbids_all_creates(memory: Memor
 async def test_max_observations_per_scope_allows_updates_at_capacity(memory: MemoryEngine, request_context):
     """At capacity, the LLM can still update existing observations."""
     from hindsight_api.engine.consolidation.consolidator import (
-        _ConsolidationBatchResponse,
         _CreateAction,
         _UpdateAction,
     )
@@ -2816,22 +2650,19 @@ async def test_max_observations_per_scope_allows_updates_at_capacity(memory: Mem
         def callback(messages, scope):
             nonlocal call_count, existing_obs_id
             if scope != "consolidation":
-                return _ConsolidationBatchResponse()
+                return fact_answer()
             call_count += 1
-            import re
 
             # Facts live in the user message; the system message (stable, cached)
             # carries example UUIDs in its OUTPUT samples — read user only.
             prompt = "\n".join(m.get("content", "") for m in messages if m.get("role") == "user")
-            fact_ids = re.findall(r"\[([0-9a-f-]{36})\]", prompt)
+            fact_ids = batch_fact_ids(prompt)
             if call_count == 1 and fact_ids:
                 # First call: create an observation
-                return _ConsolidationBatchResponse(
-                    creates=[_CreateAction(text="Alice hikes.", source_fact_ids=[fact_ids[0]])]
-                )
+                return fact_answer(creates=[_CreateAction(text="Alice hikes.", source_fact_ids=[fact_ids[0]])])
             elif call_count >= 2 and fact_ids and existing_obs_id:
                 # Second+ call: update the existing observation
-                return _ConsolidationBatchResponse(
+                return fact_answer(
                     updates=[
                         _UpdateAction(
                             text="Alice hikes and runs trails.",
@@ -2840,7 +2671,7 @@ async def test_max_observations_per_scope_allows_updates_at_capacity(memory: Mem
                         )
                     ]
                 )
-            return _ConsolidationBatchResponse()
+            return fact_answer()
 
         mock_llm.set_response_callback(callback)
         wrapper = MagicMock()
@@ -3183,7 +3014,7 @@ def test_consolidation_prompt_split_is_cacheable_and_complete():
     assert "{facts_text}" not in sys_prompt
     assert "{observations_text}" not in sys_prompt
     # JSON examples are unescaped (single braces), i.e. .format() ran.
-    assert '{"creates"' in sys_prompt
+    assert '{"facts"' in sys_prompt
     assert "{{" not in sys_prompt
     # The stable observation-format boilerplate lives in the cached prefix.
     assert "proof_count" in sys_prompt
@@ -3251,3 +3082,160 @@ async def test_create_observation_populates_search_vector_native(memory, request
     assert row["search_vector"] is not None, "search_vector must be populated for BM25 retrieval under native backend"
 
     await memory.delete_bank(bank_id, request_context=request_context)
+
+
+@pytest.mark.asyncio
+async def test_consolidation_strategy_source_facts_limits_reach_the_scope_recall(memory: MemoryEngine, request_context):
+    """A consolidation strategy's source-facts token limits apply to its scope's pass.
+
+    The limits are consumed by the related-observation recall, which used to resolve
+    the bank config on its own — so a per-scope override would have been silently
+    ignored there while the mission beside it applied. This runs a real fan-out
+    consolidation and checks what each scope's recall was actually given.
+    """
+    bank_id = f"test-strategy-sf-{uuid.uuid4().hex[:8]}"
+    await memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
+    bank_defaults = await memory._config_resolver.resolve_full_config(bank_id, request_context)
+    await memory.update_bank_config(
+        bank_id,
+        {
+            "consolidation_strategies": [
+                {
+                    "scopes": [{"tags": ["company:*"]}],
+                    "consolidation_source_facts_max_tokens": 777,
+                    "consolidation_source_facts_max_tokens_per_observation": 77,
+                }
+            ]
+        },
+        request_context=request_context,
+    )
+
+    try:
+        with patch.object(memory, "recall_async", wraps=memory.recall_async) as mock_recall:
+            await memory.retain_batch_async(
+                bank_id=bank_id,
+                contents=[
+                    {
+                        "content": "Dana met the Northwind founders; they are moving to open-weight models.",
+                        "tags": ["user:dana", "company:acme"],
+                        "observation_scopes": [["user:dana"], ["company:acme"]],
+                    }
+                ],
+                request_context=request_context,
+            )
+
+        limits_by_scope = {
+            tuple(call.kwargs["tags"]): (
+                call.kwargs["max_source_facts_tokens"],
+                call.kwargs["max_source_facts_tokens_per_observation"],
+            )
+            for call in mock_recall.call_args_list
+            if call.kwargs.get("fact_type") == ["observation"] and call.kwargs.get("tags")
+        }
+
+        assert limits_by_scope[("company:acme",)] == (777, 77)
+        assert limits_by_scope[("user:dana",)] == (
+            bank_defaults.consolidation_source_facts_max_tokens,
+            bank_defaults.consolidation_source_facts_max_tokens_per_observation,
+        ), "a scope no strategy claims keeps the bank-wide limits"
+    finally:
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+
+def test_action_source_fact_ids_drop_repeats():
+    """A looping model can repeat one fact id thousands of times (#4799); keep each once, in order."""
+    from hindsight_api.engine.consolidation.consolidator import _CreateAction, _UpdateAction
+
+    ids = ["a"] * 1000 + ["b", "a", "c"]
+    assert _CreateAction(text="t", source_fact_ids=ids).source_fact_ids == ["a", "b", "c"]
+    assert _UpdateAction(text="t", observation_id="o", source_fact_ids=ids).source_fact_ids == ["a", "b", "c"]
+    assert _CreateAction(text="t", source_fact_ids="a").source_fact_ids == ["a"]
+
+
+def test_build_observations_for_llm_shows_each_source_once():
+    """Rows written before #4799 may repeat ids; the prompt must not repeat the fact text per copy."""
+    from hindsight_api.engine.consolidation.consolidator import _build_observations_for_llm
+    from hindsight_api.engine.response_models import MemoryFact
+
+    obs = MemoryFact(id="obs", text="Alice hikes.", fact_type="observation", source_fact_ids=["f1"] * 3000 + ["f2"])
+    facts = {fid: MemoryFact(id=fid, text=f"fact {fid}", fact_type="experience") for fid in ("f1", "f2")}
+
+    [serialized] = _build_observations_for_llm([obs], facts)
+
+    assert serialized["proof_count"] == 2
+    assert [m["text"] for m in serialized["source_memories"]] == ["fact f1", "fact f2"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
+async def test_repeated_source_ids_are_stored_once(memory: MemoryEngine, request_context):
+    """Repeated ids in an LLM create/update, and duplicates already on the row, are stored once (#4799)."""
+
+    from hindsight_api.engine.consolidation.consolidator import (
+        _CreateAction,
+        _UpdateAction,
+    )
+    from hindsight_api.engine.providers.mock_llm import MockLLM
+
+    bank_id = f"test-dup-src-{uuid.uuid4().hex[:8]}"
+    await memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
+    obs_id = None
+
+    def callback(messages, scope):
+        if scope != "consolidation":
+            return fact_answer()
+        prompt = "\n".join(m.get("content", "") for m in messages if m.get("role") == "user")
+        fact_ids = batch_fact_ids(prompt)
+        if not fact_ids:
+            return fact_answer()
+        if obs_id is None:
+            return fact_answer(creates=[_CreateAction(text="Alice hikes.", source_fact_ids=[fact_ids[0]] * 50)])
+        return fact_answer(
+            updates=[
+                _UpdateAction(
+                    text="Alice hikes and runs trails.",
+                    observation_id=str(obs_id),
+                    source_fact_ids=[fact_ids[0]] * 50,
+                )
+            ]
+        )
+
+    mock_llm = MockLLM(provider="mock", api_key="", base_url="", model="mock-model")
+    mock_llm.set_response_callback(callback)
+    wrapper = MagicMock()
+    wrapper.with_config.return_value = mock_llm
+    original_llm = memory._consolidation_llm_config
+    memory._consolidation_llm_config = wrapper
+
+    try:
+        async with memory._pool.acquire() as conn:
+            [first] = await _insert_memories_with_tags(conn, bank_id, ["Alice loves hiking."])
+        await run_consolidation_job(memory_engine=memory, bank_id=bank_id, request_context=request_context)
+
+        [obs] = (await memory.list_memory_units(bank_id, fact_type="observation", request_context=request_context))[
+            "items"
+        ]
+        assert obs["source_memory_ids"] == [str(first)]
+        assert obs["proof_count"] == 1
+        obs_id = obs["id"]
+
+        async with memory._pool.acquire() as conn:
+            # Forge a row written before the fix (one source repeated many times);
+            # no public API can produce this state any more.
+            await conn.execute(
+                "UPDATE memory_units SET source_memory_ids = $1, proof_count = 200 WHERE id = $2",
+                [first] * 200,
+                uuid.UUID(obs_id),
+            )
+            [second] = await _insert_memories_with_tags(conn, bank_id, ["Alice runs on trails."])
+        await run_consolidation_job(memory_engine=memory, bank_id=bank_id, request_context=request_context)
+
+        [obs] = (await memory.list_memory_units(bank_id, fact_type="observation", request_context=request_context))[
+            "items"
+        ]
+        assert "trails" in obs["text"]
+        assert obs["source_memory_ids"] == [str(first), str(second)]
+        assert obs["proof_count"] == 2
+    finally:
+        memory._consolidation_llm_config = original_llm
+        await memory.delete_bank(bank_id, request_context=request_context)

@@ -6,6 +6,9 @@
 
 export type Budget = "low" | "mid" | "high";
 
+export const OBSERVATION_SCOPES = ["combined", "shared", "per_tag", "all_combinations"] as const;
+export type ObservationScopes = (typeof OBSERVATION_SCOPES)[number];
+
 export type TagMatch = "any" | "all" | "any_strict" | "all_strict";
 
 /** A leaf tag filter. `all_strict` = AND match that also excludes untagged memories. */
@@ -24,6 +27,7 @@ export type TagGroup = TagLeaf | TagAnd;
 
 export interface RetainOptions {
   tags?: string[];
+  observationScopes?: ObservationScopes;
   metadata?: Record<string, string>;
   /** ISO 8601 timestamp, or "unset" for timeless content. */
   timestamp?: string;
@@ -77,3 +81,10 @@ export interface ReflectOptions {
   /** Compound tag filter (mutually exclusive with `tags`). */
   tagGroups?: TagGroup[];
 }
+
+/**
+ * Which time a note's facts are dated with. `created` (default) suits journals;
+ * `updated` suits living documents, so edits aren't back-dated to creation (#5712).
+ */
+export const TIMESTAMP_SOURCES = ["created", "updated"] as const;
+export type TimestampSource = (typeof TIMESTAMP_SOURCES)[number];

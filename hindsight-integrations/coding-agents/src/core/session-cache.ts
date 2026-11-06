@@ -10,7 +10,12 @@ import type { UsageCursorStore } from "./usage";
  * bank state. */
 export interface SessionCache {
   turns?: number;
-  reflectAnswer?: string; // present (even "") = reflect already ran this session
+  reflectAnswer?: string; // present (even "") = reflect already resolved this session
+  /** How many times auto-inject has been ATTEMPTED this session — every source, not just reflect.
+   *  A failure leaves `reflectAnswer` unset so a later turn can retry; this bounds that retry (see
+   *  HOOK_INJECT_ATTEMPTS). Named for reflect like `reflectAnswer` above, whose name also predates
+   *  the other two sources. */
+  reflectAttempts?: number;
   /** SessionStart saw a new/empty bank; consume this on prompt one, then allow reflect. */
   deferInitialReflect?: boolean;
   pages?: { atTurn: number; list: PageRef[] };
@@ -58,6 +63,45 @@ export function writeSessionCache(cacheFile: string, cache: SessionCache): void 
     writeFileAtomic(cacheFile, JSON.stringify(cache));
   } catch {
     /* session state is best-effort */
+  }
+}
+
+/** Context a prompt hook could not deliver itself, waiting for the session's next tool hook (see
+ *  HookSpec.toolHook). Its own file: `buildHookOutput` rewrites the session cache every turn. */
+function pendingContextFile(harness: string, sessionId: string): string {
+  return join(tmpdir(), `hindsight-${harness}`, `${sessionId}.pending`);
+}
+
+/** Add a block to the session's pending context. A block already waiting is not added again, so a
+ *  session that goes several turns without a tool call is not handed the same roster N times. */
+export function stashPendingContext(harness: string, sessionId: string, context: string): void {
+  const path = pendingContextFile(harness, sessionId);
+  let existing = "";
+  try {
+    existing = readFileSync(path, "utf8");
+  } catch {
+    /* nothing pending yet */
+  }
+  if (existing.includes(context)) return;
+  try {
+    writeFileAtomic(path, existing ? `${existing}\n\n${context}` : context);
+  } catch {
+    /* best-effort, like the session cache */
+  }
+}
+
+/** Claim and clear the session's pending context. The rename is the claim: tool hooks can run in
+ *  parallel, and only the one whose rename succeeds delivers the block. */
+export function takePendingContext(harness: string, sessionId: string): string | undefined {
+  const path = pendingContextFile(harness, sessionId);
+  const claimed = `${path}.${process.pid}.claim`;
+  try {
+    renameSync(path, claimed);
+    return readFileSync(claimed, "utf8") || undefined;
+  } catch {
+    return undefined;
+  } finally {
+    rmSync(claimed, { force: true });
   }
 }
 

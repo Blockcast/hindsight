@@ -73,7 +73,8 @@ cd hindsight-system-tests && uv run pytest tests/ -v
 
 ### Documentation Site (Docusaurus)
 ```bash
-./scripts/dev/start-docs.sh
+./scripts/dev/start-docs.sh          # pages compile on first visit (~1 GB)
+./scripts/dev/start-docs.sh --full   # compile every page up front, like the build (~3.5 GB)
 ```
 
 
@@ -100,9 +101,6 @@ uv run run-amb --dataset longmemeval --split s -- --category single-session-user
 ./scripts/benchmarks/run-perf-test.sh                      # System perf (mock LLM + pg0)
 ./scripts/benchmarks/run-perf-test.sh --scale tiny          # Quick smoke test
 ./scripts/benchmarks/run-consolidation.sh
-
-# GitHub Actions perf artifacts intentionally retain for 1 day; durable
-# history is published to the performance dashboard instead.
 ```
 
 ## Architecture
@@ -122,28 +120,29 @@ uv run run-amb --dataset longmemeval --split s -- --category single-session-user
 - **hindsight-system-evals/**: End-to-end quality evaluation suites scored by independent LLM judges against real providers
 - **hindsight-integration-tests/**: E2E and integration test suites requiring a running server (live API or docker-compose)
 - **hindsight-extensions/**: Server extension slots (tenancy/auth, HTTP endpoints, MCP tools, operation validators, memory defense)
-- **hindsight-tools/**: Published agent tools SDK (`@vectorize-io/hindsight-agent-sdk`, harness-agnostic agent knowledge tools)
 - **hindsight-dev/**: Development tools and benchmarks
 
 ### Core Engine (hindsight-api-slim/hindsight_api/engine/)
 - `memory_engine.py`: Main orchestrator for retain/recall/reflect operations
-- `llm_wrapper.py`: LLM abstraction supporting OpenAI, Anthropic, Gemini, VertexAI, Groq, MiniMax, Ollama, LM Studio, LiteLLM, Claude Code, GitHub Copilot, DeepSeek, Fireworks, Codex (openai-codex), xAI (xai-oauth), Llama.cpp, Nous, etc. (See `hindsight-docs/docs/developer/configuration.md` for full provider lists)
+- `llm_wrapper.py`: LLM abstraction supporting OpenAI, Anthropic, Gemini, VertexAI, Groq, MiniMax, Ollama, LM Studio, LiteLLM, Claude Code, GitHub Copilot, DeepSeek, Fireworks, Codex (openai-codex), xAI (xai-oauth), Llama.cpp, Nous, etc. (See `hindsight-docs/docs/developer/configuration.mdx` for full provider lists)
 - `embeddings.py`: Embedding generation supporting local (SentenceTransformers) and standalone/remote providers (in-process: onnx; remote: tei, openai, cohere, zeroentropy, litellm, google, etc.)
-- `cross_encoder.py`: Reranking supporting local (CrossEncoder) and standalone/remote providers (in-process: flashrank, jina-mlx; remote: tei, cohere, siliconflow, zeroentropy, litellm, google, alibaba, etc.)
-- `entity_resolver.py`: Entity extraction and normalization
+- `cross_encoder.py`: Reranking supporting local (CrossEncoder) and standalone/remote providers (in-process: flashrank, onnx, jina-mlx; remote: tei, cohere, siliconflow, zeroentropy, litellm, google, alibaba, etc.)
 - `query_analyzer.py`: Query intent analysis
 
 **retain/**: Memory ingestion pipeline
 - `orchestrator.py`: Coordinates the retain flow
 - `fact_extraction.py`: LLM-based fact extraction from content
-- `link_utils.py`: Entity link creation and management
 
 **search/**: Multi-strategy retrieval
 - `retrieval.py`: Main retrieval orchestrator
 - `graph_retrieval.py`: Graph retrieval abstract base class
-- `link_expansion_retrieval.py`: Link expansion graph retrieval
 - `fusion.py`: Reciprocal rank fusion for combining results
 - `reranking.py`: Cross-encoder reranking
+
+**memories/**: The memories store, which owns every table a memory touches (`base.py` is the interface, `postgres.py` + `pg/` the default Postgres store — the only code allowed to name those tables)
+- `pg/entity_resolver.py`: Entity extraction and normalization
+- `pg/links.py`: Entity link creation and management
+- `pg/link_expansion.py`: Link expansion graph retrieval
 
 ### API Layer (hindsight-api-slim/hindsight_api/api/)
 - `http.py`: FastAPI HTTP routers for all REST endpoints
@@ -161,60 +160,12 @@ PostgreSQL with pgvector (also supports Oracle 23ai). Schema managed via Alembic
 
 Key tables: `banks`, `documents`, `chunks`, `entities`, `memory_units`, `unit_entities`, `memory_links`
 
-### Keeping Postgres Indexes Usable
-
-Two query shapes silently lost their index in production (2026-09-03, fixed in #24).
-Both regress invisibly — same results, orders of magnitude slower — so treat them as
-conventions, not one-off fixes.
-
-**Bank-scoped ANN queries must go through `_fetch_with_per_bank_index_plan`**
-(`hindsight-api-slim/hindsight_api/engine/search/retrieval.py`), never `conn.fetch`
-directly. The per-bank HNSW indexes are *partial* (`WHERE fact_type = '...' AND bank_id
-= '...'`). Under a cached generic plan the planner cannot prove a `bank_id = $n` bind
-implies that predicate, so every per-bank index drops out and the arm sequentially
-scans. The helper wraps the fetch in `SET LOCAL plan_cache_mode = force_custom_plan`.
-Do not inline `bank_id` as a literal to dodge this — it is caller-controlled tenant text.
-
-**Cast the parameter, never the indexed column.** `id::text = ANY($1)` makes the uuid
-primary-key index unusable; filter the input text and cast that instead — see
-`fetch_unit_dates` in `hindsight-api-slim/hindsight_api/engine/db/ops_postgresql.py`.
-
-Both shapes are guarded by `hindsight-api-slim/tests/test_partial_index_plans.py`
-(pure unit tests, no database required).
-
-### Helm Operations
-
-Helm liveness probes must stay process-local so database pressure does not restart healthy pods: API and worker liveness both use `/health/live`, which performs no database access. Readiness is DB-independent as well — see **Helm Health Probes** below. The default embedded-PostgreSQL chart values intentionally cap API DB pools and worker/retain concurrency; do not raise those defaults without validating connection pressure under retain/consolidation backlog.
-
-### Helm Health Probes
-
-Keep readiness probes independent of database health so database pressure does not
-cascade into Kubernetes probe failures. The API readiness probe uses `/version`,
-and the worker readiness probe uses `/metrics`.
-
-The API serves three monitoring endpoints: `/health/live` (in-process only, never
-touches the database — point `livenessProbe` here), `/health/ready` (503 when the
-database is unreachable), and `/health` (a supported alias of `/health/ready`, so it
-is the database-aware check). `/health/live` requires a v0.9.1 or newer image;
-v0.9.0 and earlier serve `/health` only and would 404 the probe.
-
 ### Adding Database Migrations
 
 Hindsight runs the same Alembic tree against PostgreSQL and Oracle 23ai. Each
 migration file dispatches through `run_for_dialect`, which calls either
 `_pg_upgrade` or `_oracle_upgrade` based on the live connection. A pytest lint
 (`tests/test_migration_shape.py`) fails CI if a migration omits the dispatcher.
-
-**Keep bulk data repairs out of migrations.** Migrations run automatically on API
-startup, so a backfill over a large table's historical residue holds row locks and WAL
-pressure for the whole migration transaction — blocking startup and competing with live
-recall. Keep the migration to the schema change (a docstring may record the rollout) and
-ship the data repair as a `hindsight-admin` command that commits small
-`FOR UPDATE SKIP LOCKED` batches: that is resumable, safe to run concurrently, and paced
-by the operator rather than by pod startup. Pattern to copy:
-`backfill-observation-search-vector` in
-`hindsight-api-slim/hindsight_api/admin/cli.py`, with the now-inert migration at
-`hindsight-api-slim/hindsight_api/alembic/versions/c3f7a1b9d2e4_backfill_observation_search_vector.py`.
 
 1. **Create a new migration file** in `hindsight-api-slim/hindsight_api/alembic/versions/`:
    - File name format: `<revision_id>_<description>.py` (e.g., `f1a2b3c4d5e6_add_new_index.py`)
@@ -301,7 +252,8 @@ by the operator rather than by pod startup. Pattern to copy:
 
 **Always run the lint script after making Python or TypeScript/Node changes:**
 ```bash
-./scripts/hooks/lint.sh
+./scripts/hooks/lint.sh            # packages that differ from origin/main
+LINT_ALL=1 ./scripts/hooks/lint.sh # everything, as CI does
 ```
 
 Dead-code detection runs in CI (the `check-unused-code` job) at two levels:
@@ -359,12 +311,6 @@ Rules of thumb:
 - Bank isolation is strict - no cross-bank data leakage
 - Legacy profile and background endpoints are retired (return HTTP 410) in favor of Bank Config
 
-### Helm Worker Capacity
-
-For the default embedded database, keep `helm/hindsight/values.yaml` at two total
-worker slots with one reserved for consolidation. Cap retain at one concurrent task
-without assigning it a dedicated slot, so the remaining slot stays shared across queues.
-
 ### API Design
 - All endpoints operate on a single bank per request
 - Multi-bank queries are client responsibility to orchestrate
@@ -399,11 +345,12 @@ document it retains, so the control plane can show its logo instead of another
 - tag `harness:<id>` — the same value, so the documents list can filter on it
 
 The ids are defined by that integration's HookSpecs
-(`src/harness/hook-lifecycle.ts`, 11 harnesses) and persistent-plugin
+(`src/harness/hook-lifecycle.ts`, 15 harnesses) and persistent-plugin
 entrypoints (`src/harness/registry.ts`, 7 harnesses):
-currently `antigravity-cli`, `claude-code`, `cline-cli`, `codex`, `copilot-cli`,
-`cursor-cli`, `dcode`, `devin-cli`, `dsh`, `factory-droid`, `grok-build`,
-`kilo`, `opencode`, `opencode2`, `pi`, `prime-agent`, `qwen-code`, `zcode`.
+currently `antigravity-cli`, `claude-code`, `cline-cli`, `codebuddy`, `codex`,
+`copilot-cli`, `cursor-cli`, `dcode`, `devin-cli`, `dsh`, `factory-droid`,
+`grok-build`, `kilo`, `kimi-code`, `opencode`, `opencode2`, `pi`,
+`prime-agent`, `qwen-code`, `traecode`, `workbuddy`, `zcode`.
 
 The control plane resolves the value in
 `hindsight-control-plane/src/lib/harness-logo.ts` (metadata wins over the tag) and
@@ -433,6 +380,24 @@ the agent-only half (tools, crediting, corrections) lives in `skill-src/preamble
 `src/docs-freshness.test.ts` fails on a stale skill or an undocumented `RawConfig` field. Run
 `./scripts/hooks/lint.sh` BEFORE regenerating — prettier re-pads the README's tables, and a
 generated file built from unformatted source fails the byte comparison in CI.
+
+### Hermes docs are generated from one README
+
+Same arrangement, one generator: `hindsight-integrations/hermes/README.md` is the single source for
+the Hermes integration page. **Never edit `hindsight-docs/docs-integrations/hermes.md` by hand** —
+it is generated:
+
+```bash
+node hindsight-docs/scripts/sync-hermes-doc.mjs                  # README -> docs page
+```
+
+The docs build runs the same script with `--check`, so a stale page fails the build. Sections listed
+in the script's `DROP_SECTIONS` (currently `Development`) stay repo-only, which is where
+maintainer-facing notes belong — anything else in the README ships to the public page.
+
+Shipping a change to that directory reaches no user until the Hermes plugin catalog pin moves: open
+a follow-up PR against `NousResearch/hermes-agent` bumping `sha` and `version` together in
+`plugin-catalog/hindsight.yaml`.
 
 ### Adding New Integrations
 
@@ -494,7 +459,7 @@ Fields must be categorized as either **hierarchical** (can be overridden per-ten
    value = config.my_static_field
    ```
 
-5. **Documentation** (`hindsight-docs/docs/developer/configuration.md`):
+5. **Documentation** (`hindsight-docs/docs/developer/configuration.mdx`):
    - Add to appropriate section table with Variable, Description, Default
    - Mark if it's hierarchical (can be overridden per-bank)
 
@@ -546,7 +511,7 @@ Common server settings:
 - `HINDSIGHT_CP_DATAPLANE_API_URL`: Control Plane backend URL (default: `http://localhost:8888`)
 
 LLM settings:
-- `HINDSIGHT_API_LLM_PROVIDER`: openai, anthropic, gemini, deepseek, groq, minimax, ollama, lmstudio, fireworks, openai-codex, xai-oauth, etc. (See `hindsight-docs/docs/developer/configuration.md` for full provider lists)
+- `HINDSIGHT_API_LLM_PROVIDER`: openai, anthropic, gemini, deepseek, groq, minimax, ollama, lmstudio, fireworks, openai-codex, xai-oauth, etc. (See `hindsight-docs/docs/developer/configuration.mdx` for full provider lists)
 - `HINDSIGHT_API_LLM_API_KEY`: API key for providers that require one
 - `HINDSIGHT_API_LLM_MODEL`: Model name (defaults are provider-specific)
 

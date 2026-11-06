@@ -5,9 +5,11 @@ import { useTranslations } from "next-intl";
 import { client, type TagGroup, type TagsMatch } from "@/lib/api";
 import { formatAbsoluteDateTime, formatRelativeTime } from "@/lib/relative-time";
 import { CompactMarkdown } from "./compact-markdown";
+import { downloadMarkdown, mentalModelDownload, printPage } from "@/lib/page-download";
 import { useBank } from "@/lib/bank-context";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { toast } from "sonner";
@@ -34,8 +36,10 @@ import {
   Plus,
   Sparkles,
   Trash2,
+  Download,
   Eraser,
   RefreshCw,
+  RotateCcw,
   ChevronLeft,
   ChevronRight,
   ChevronsLeft,
@@ -63,8 +67,13 @@ import {
 } from "./mental-model-trigger-fields";
 import { NextRefresh } from "./next-refresh";
 import { StalenessBadge } from "./staleness-badge";
+import { useRefreshAttempts, type RefreshAttempt } from "@/lib/use-refresh-attempts";
 import { FreshnessLine } from "./freshness-line";
 import { TagChip } from "@/components/ui/facet-chip";
+
+// How often the in-flight refreshes are re-read. A retry gap is 60s by default,
+// so this is fast enough to see one open and close without polling per row.
+const MENTAL_MODEL_POLL_MS = 12000;
 
 interface ReflectResponseBasedOnFact {
   id: string;
@@ -90,6 +99,7 @@ interface MentalModel {
     mode?: "full" | "delta";
     refresh_after_consolidation: boolean;
     refresh_cron?: string | null;
+    full_refresh_cron?: string | null;
     min_refresh_interval_seconds?: number | null;
     fact_types?: Array<"world" | "experience" | "observation">;
     exclude_mental_models?: boolean;
@@ -109,6 +119,10 @@ interface MentalModel {
   last_memory_seen_at: string | null;
   /** Whether a memory in this model's own scope has been written since it last read them. */
   is_stale?: boolean | null;
+  /** When the last refresh failed, or null when it succeeded. Set = automatic refreshes paused. */
+  last_refresh_failed_at?: string | null;
+  /** When a refresh last ran in full mode. */
+  last_full_refreshed_at?: string | null;
   created_at: string;
   reflect_response?: ReflectResponse;
 }
@@ -117,6 +131,7 @@ type ViewMode = "dashboard" | "files";
 
 export function MentalModelsView() {
   const t = useTranslations("mentalModels");
+  const tDetail = useTranslations("mentalModelDetailModal");
   const { currentBank } = useBank();
   const [mentalModels, setMentalModels] = useState<MentalModel[]>([]);
   const [loading, setLoading] = useState(false);
@@ -130,6 +145,8 @@ export function MentalModelsView() {
   const [filesSelectedId, setFilesSelectedId] = useState<string | null>(null);
   const [selectedTags, setSelectedTags] = useState<string[]>([]);
   const [tagsMatch, setTagsMatch] = useState<"any" | "all">("any");
+  // Off by default: knowledge pages are mental models too, and are listed unless hidden.
+  const [hideKnowledgePages, setHideKnowledgePages] = useState(false);
   const [showUpdateDialog, setShowUpdateDialog] = useState(false);
   const [mentalModelToUpdate, setMentalModelToUpdate] = useState<MentalModel | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<{
@@ -168,6 +185,7 @@ export function MentalModelsView() {
         tags: selectedTags.length > 0 ? selectedTags : undefined,
         tagsMatch: selectedTags.length > 0 ? tagsMatch : undefined,
         detail: "content",
+        excludeKnowledgePages: hideKnowledgePages,
       });
       setMentalModels(all);
     } catch (error) {
@@ -179,12 +197,19 @@ export function MentalModelsView() {
 
   const [refreshingIds, setRefreshingIds] = useState<Set<string>>(new Set());
 
-  const handleRowRefresh = async (m: MentalModel) => {
+  // Refreshes still in flight, so a model the worker is still retrying is not
+  // reported as paused (#4532). Polled on the same cadence the list uses.
+  const refreshAttempts = useRefreshAttempts(currentBank, MENTAL_MODEL_POLL_MS);
+
+  // A full refresh costs a whole rewrite, so it is confirmed first.
+  const [fullRefreshTarget, setFullRefreshTarget] = useState<MentalModel | null>(null);
+
+  const handleRowRefresh = async (m: MentalModel, mode?: "full") => {
     if (!currentBank) return;
     const originalAt = m.last_refreshed_at;
     setRefreshingIds((prev) => new Set(prev).add(m.id));
     try {
-      await client.refreshMentalModel(currentBank, m.id);
+      await client.refreshMentalModel(currentBank, m.id, mode ? { mode } : undefined);
       const maxAttempts = 120;
       for (let i = 0; i < maxAttempts; i++) {
         await new Promise((r) => setTimeout(r, 1000));
@@ -245,7 +270,7 @@ export function MentalModelsView() {
     if (currentBank) {
       loadData();
     }
-  }, [currentBank, selectedTags, tagsMatch]);
+  }, [currentBank, selectedTags, tagsMatch, hideKnowledgePages]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -309,6 +334,10 @@ export function MentalModelsView() {
               onMatchModeChange={setTagsMatch}
               className="flex-1 min-w-[260px]"
             />
+            <label className="flex items-center gap-2 h-9 text-sm text-muted-foreground">
+              <Switch checked={hideKnowledgePages} onCheckedChange={setHideKnowledgePages} />
+              {t("hideKnowledgePages")}
+            </label>
             <Button onClick={() => setShowCreateMentalModel(true)} size="sm">
               <Plus className="w-4 h-4 mr-2" />
               {t("addMentalModel")}
@@ -401,6 +430,7 @@ export function MentalModelsView() {
                                 setShowUpdateDialog(true);
                               }}
                               onRefresh={handleRowRefresh}
+                              onFullRefresh={setFullRefreshTarget}
                               onClear={(target) =>
                                 setClearTarget({ id: target.id, name: target.name })
                               }
@@ -438,6 +468,8 @@ export function MentalModelsView() {
                               trigger={m.trigger}
                               lastRefreshedAt={m.last_refreshed_at}
                               lastMemorySeenAt={m.last_memory_seen_at}
+                              refreshFailedAt={m.last_refresh_failed_at}
+                              attempt={refreshAttempts.get(m.id)}
                             />
                           </div>
                         </CardContent>
@@ -455,11 +487,13 @@ export function MentalModelsView() {
                   onSelect={setFilesSelectedId}
                   onOpenDetail={setSelectedMentalModel}
                   refreshingIds={refreshingIds}
+                  refreshAttempts={refreshAttempts}
                   onEdit={(target) => {
                     setMentalModelToUpdate(target);
                     setShowUpdateDialog(true);
                   }}
                   onRefresh={handleRowRefresh}
+                  onFullRefresh={setFullRefreshTarget}
                   onClear={(target) => setClearTarget({ id: target.id, name: target.name })}
                   onDelete={(target) => setDeleteTarget({ id: target.id, name: target.name })}
                 />
@@ -586,6 +620,28 @@ export function MentalModelsView() {
         </AlertDialogContent>
       </AlertDialog>
 
+      <AlertDialog
+        open={!!fullRefreshTarget}
+        onOpenChange={(open) => !open && setFullRefreshTarget(null)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{tDetail("fullRefreshDialogTitle")}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {tDetail("fullRefreshDialogDescription")}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter className="flex-row justify-end space-x-2">
+            <AlertDialogCancel className="mt-0">{t("cancelButton")}</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => fullRefreshTarget && handleRowRefresh(fullRefreshTarget, "full")}
+            >
+              {tDetail("fullRefreshDialogConfirm")}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
       <MentalModelDetailModal
         mentalModelId={selectedMentalModel?.id ?? null}
         onClose={() => setSelectedMentalModel(null)}
@@ -626,6 +682,7 @@ function RowActionsMenu({
   refreshing,
   onEdit,
   onRefresh,
+  onFullRefresh,
   onClear,
   onDelete,
   triggerClassName,
@@ -634,11 +691,13 @@ function RowActionsMenu({
   refreshing: boolean;
   onEdit: (m: MentalModel) => void;
   onRefresh: (m: MentalModel) => void;
+  onFullRefresh: (m: MentalModel) => void;
   onClear: (m: MentalModel) => void;
   onDelete: (m: MentalModel) => void;
   triggerClassName?: string;
 }) {
   const t = useTranslations("mentalModels");
+  const tDetail = useTranslations("mentalModelDetailModal");
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
@@ -660,6 +719,24 @@ function RowActionsMenu({
         <DropdownMenuItem onClick={() => onRefresh(m)} disabled={refreshing}>
           <RefreshCw className={`h-4 w-4 mr-2 ${refreshing ? "animate-spin" : ""}`} />
           {t("actionRefresh")}
+        </DropdownMenuItem>
+        {/* Only a delta model drifts; a full-mode one rewrites on every refresh. */}
+        {m.trigger?.mode === "delta" && (
+          <DropdownMenuItem onClick={() => onFullRefresh(m)} disabled={refreshing}>
+            <RotateCcw className="h-4 w-4 mr-2" />
+            {tDetail("actionFullRefresh")}
+          </DropdownMenuItem>
+        )}
+        <DropdownMenuItem onClick={() => printPage(mentalModelDownload(m))} disabled={!m.content}>
+          <Download className="h-4 w-4 mr-2" />
+          {t("actionDownloadPdf")}
+        </DropdownMenuItem>
+        <DropdownMenuItem
+          onClick={() => downloadMarkdown(mentalModelDownload(m))}
+          disabled={!m.content}
+        >
+          <Download className="h-4 w-4 mr-2" />
+          {t("actionDownloadMarkdown")}
         </DropdownMenuItem>
         <DropdownMenuItem onClick={() => onClear(m)}>
           <Eraser className="h-4 w-4 mr-2" />
@@ -1021,8 +1098,10 @@ function FilesView({
   onSelect,
   onOpenDetail,
   refreshingIds,
+  refreshAttempts,
   onEdit,
   onRefresh,
+  onFullRefresh,
   onClear,
   onDelete,
 }: {
@@ -1031,8 +1110,10 @@ function FilesView({
   onSelect: (id: string) => void;
   onOpenDetail: (m: MentalModel) => void;
   refreshingIds: Set<string>;
+  refreshAttempts: Map<string, RefreshAttempt>;
   onEdit: (m: MentalModel) => void;
   onRefresh: (m: MentalModel) => void;
+  onFullRefresh: (m: MentalModel) => void;
   onClear: (m: MentalModel) => void;
   onDelete: (m: MentalModel) => void;
 }) {
@@ -1071,6 +1152,8 @@ function FilesView({
                       <StalenessBadge
                         isStale={m.is_stale}
                         trigger={m.trigger}
+                        refreshFailedAt={m.last_refresh_failed_at}
+                        retrying={refreshAttempts.has(m.id)}
                         variant="dot"
                         className="ml-auto"
                       />
@@ -1087,7 +1170,12 @@ function FilesView({
                       </div>
                     )}
                     <div className="text-[10px] text-muted-foreground/70 truncate mt-0.5">
-                      {t("nextRefreshLabel")}: <NextRefresh trigger={m.trigger} />
+                      {t("nextRefreshLabel")}:{" "}
+                      <NextRefresh
+                        trigger={m.trigger}
+                        refreshFailedAt={m.last_refresh_failed_at}
+                        attempt={refreshAttempts.get(m.id)}
+                      />
                     </div>
                   </div>
                 </button>
@@ -1115,6 +1203,8 @@ function FilesView({
                     trigger={selected.trigger}
                     lastRefreshedAt={selected.last_refreshed_at}
                     lastMemorySeenAt={selected.last_memory_seen_at}
+                    refreshFailedAt={selected.last_refresh_failed_at}
+                    attempt={refreshAttempts.get(selected.id)}
                   />
                   {selected.tags.length > 0 && (
                     <div className="flex flex-wrap gap-1 mt-2">
@@ -1133,6 +1223,7 @@ function FilesView({
                     refreshing={refreshingIds.has(selected.id)}
                     onEdit={onEdit}
                     onRefresh={onRefresh}
+                    onFullRefresh={onFullRefresh}
                     onClear={onClear}
                     onDelete={onDelete}
                   />

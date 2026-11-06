@@ -1,11 +1,11 @@
 """Pure unit tests for the markdown (Open Knowledge Format) serializer.
 
-These exercise hindsight_api/api/page_markdown.py with plain dicts — no DB, no LLM — so
+These exercise hindsight_api/engine/page_markdown.py with plain dicts — no DB, no LLM — so
 they pin the markdown contract (frontmatter projection, type-from-tag, shared-tag
 graph) deterministically and fast.
 """
 
-from hindsight_api.api import page_markdown
+from hindsight_api.engine import page_markdown
 
 
 def _mm(**overrides):
@@ -86,6 +86,26 @@ class TestRenderDocument:
         doc = page_markdown.render_document(_mm(content=""))
         assert doc.count("---") == 2
         assert doc.rstrip().endswith("---")
+
+    def test_empty_body_can_say_so_for_a_reader(self):
+        """The read surfaces opt in; the export bundle does not.
+
+        Frontmatter and nothing else reads as a page that failed to render rather
+        than one nobody has written, which is what sends an agent off to create a
+        second page for the topic. It stays off by default because this same
+        renderer writes the export bundle, where the notice would come back as
+        ordinary content the next time the bundle is read.
+        """
+        doc = page_markdown.render_document(_mm(content=""), notice_when_empty=True)
+        assert page_markdown.EMPTY_PAGE_NOTICE in doc
+
+        exported = page_markdown.render_document(_mm(content=""))
+        assert page_markdown.EMPTY_PAGE_NOTICE not in exported
+
+    def test_a_real_body_is_never_replaced_by_the_notice(self):
+        doc = page_markdown.render_document(_mm(), notice_when_empty=True)
+        assert "One row per order." in doc
+        assert page_markdown.EMPTY_PAGE_NOTICE not in doc
 
 
 class TestReservedFiles:

@@ -36,15 +36,24 @@ from typing import Any
 
 from ....config import get_config
 from ...db.base import DatabaseConnection
-from ...retain.link_utils import (
+from ...db_utils import acquire_with_retry
+from ...search.tags import TagGroup, TagsMatch, build_tag_filter_clause
+from ..base import GRAPH_MAX_EDGES, EntityPrunePassResult, RelinkPassResult
+from .links import (
     MAX_TEMPORAL_LINKS_PER_UNIT,
     _bulk_insert_links,
     _normalize_datetime,
     compute_semantic_links_ann,
 )
-from ..base import EntityPrunePassResult, RelinkPassResult
 
 logger = logging.getLogger(__name__)
+
+
+def _as_uuid(value: Any) -> uuid_module.UUID:
+    """Coerce an id to UUID. ``id::text`` comes back as str on PostgreSQL, but the Oracle
+    backend drops the cast and decodes RAW(16) id columns straight to UUID."""
+    return value if isinstance(value, uuid_module.UUID) else uuid_module.UUID(str(value))
+
 
 # Mirrors the ``top_k`` default in ``compute_semantic_links_ann`` at retain
 # time. If you change one, change the other — otherwise victims would either
@@ -92,10 +101,6 @@ _PRUNE_BATCH_MAX_RETRIES = 3
 # 1000-element IN-list limit (ops_oracle expands ``= ANY(...)`` into a literal
 # list), which a bulk delete would otherwise blow straight through.
 _ENQUEUE_LOOKUP_CHUNK = 500
-
-# Cap at 10k edges — the UI can't usefully render more, and uncapped queries
-# on highly-connected graphs (e.g. 1000 nodes with 500k+ edges) are too slow.
-_GRAPH_MAX_EDGES = 10000
 
 # Columns the graph view renders: nodes take id/text/date/context/entities,
 # the table rows take the rest, and `source_memory_ids` is what lets the caller
@@ -171,7 +176,8 @@ async def graph_units(
     document_id: str | None = None,
     chunk_id: str | None = None,
     tags: list[str] | None = None,
-    tags_match: str = "all_strict",
+    tags_match: TagsMatch = "all_strict",
+    tag_groups: list[TagGroup] | None = None,
     limit: int = 1000,
 ) -> dict[str, Any]:
     """Memory nodes for the graph view, plus the total matching count.
@@ -182,7 +188,7 @@ async def graph_units(
     observation whose *sources* carry them, since observations have neither of
     their own.
     """
-    from ...search.tags import build_tags_where_clause_simple
+    from ...search.tags import build_tag_groups_where_clause, build_tags_where_clause_simple
 
     ops = _ops_for(conn)
     conditions: list[str] = []
@@ -221,6 +227,10 @@ async def graph_units(
         # Exact match with no tags is the "global" scope: rows carrying no tags at
         # all. (Other modes treat empty tags as "no filter".)
         conditions.append("(tags IS NULL OR tags = '{}')")
+    if tag_groups:
+        groups = build_tag_groups_where_clause(tag_groups, len(params) + 1)
+        conditions.append(groups.sql.removeprefix("AND "))
+        params.extend(groups.params)
 
     where_clause = "WHERE " + " AND ".join(conditions) if conditions else ""
 
@@ -310,7 +320,7 @@ async def graph_direct_links(
         LIMIT $2
         """,
         _as_uuids(unit_ids),
-        _GRAPH_MAX_EDGES,
+        GRAPH_MAX_EDGES,
     )
     return [dict(row) for row in rows]
 
@@ -324,8 +334,15 @@ async def entity_memory_counts(
     fq_table: Callable[[str], str],
     bank_id: str,
     entity_ids: list[str] | None = None,
+    tags: list[str] | None = None,
+    tags_match: TagsMatch = "any",
+    tag_groups: list | None = None,
 ) -> dict[str, int]:
     """Live memory count per entity id, for the entities in ``bank_id``.
+
+    ``tags``/``tags_match``/``tag_groups`` count only the matching memories. The clause runs in an
+    unaliased subquery because the Oracle rewriter needs a bare ``tags`` column
+    (see ``visible_entity_stats_sql``); with no filter the query is unchanged.
 
     The GROUP BY is what makes this an orphan test: an entity with no surviving
     `unit_entities` row produces no group, so it is simply absent from the
@@ -335,7 +352,11 @@ async def entity_memory_counts(
     and joining is what keeps the count to *live* memories (deleted units take
     their postings with them via ON DELETE CASCADE).
     """
-    params: list[Any] = [bank_id]
+    built = build_tag_filter_clause(tags, tags_match, tag_groups, param_offset=2)
+    params: list[Any] = [bank_id, *built.params]
+    tag_filter = ""
+    if built.sql:
+        tag_filter = f"AND mu.id IN (SELECT id FROM {fq_table('memory_units')} WHERE bank_id = $1 {built.sql})"
     entity_filter = ""
     if entity_ids is not None:
         if not entity_ids:
@@ -349,6 +370,7 @@ async def entity_memory_counts(
         FROM {fq_table("unit_entities")} ue
         JOIN {fq_table("memory_units")} mu ON mu.id = ue.unit_id
         WHERE mu.bank_id = $1
+        {tag_filter}
         {entity_filter}
         GROUP BY ue.entity_id
         """,
@@ -506,7 +528,7 @@ async def resolve_entity_names(
     uuids: list = []
     for raw in {str(e) for e in entity_ids}:
         try:
-            uuids.append(uuid_module.UUID(raw))
+            uuids.append(_as_uuid(raw))
         except (ValueError, AttributeError, TypeError):
             continue
     if not uuids:
@@ -620,7 +642,7 @@ async def relink_pass(
     probe — so it has to acquire its own.
 
     ``config`` is the caller's resolved configuration. The Postgres pass takes
-    its caps from retain's link_utils (so relink and retain agree on what "full"
+    its caps from retain's links module (so relink and retain agree on what "full"
     means) and never reads it; it is accepted so a store that *does* tune its
     relinking gets it.
 
@@ -643,8 +665,6 @@ async def relink_pass(
         if deadline is not None and time.monotonic() >= deadline:
             drained = False
             break
-
-        from ...memory_engine import acquire_with_retry
 
         async with acquire_with_retry(backend) as conn:
             async with conn.transaction():
@@ -691,7 +711,7 @@ async def _relink_batch(
     # Load each victim's metadata. Victims whose units were deleted between
     # enqueue and now silently drop out — exactly the no-op behaviour we want
     # for stale queue rows.
-    victim_uuids = [uuid_module.UUID(vid) for vid in victim_ids]
+    victim_uuids = [_as_uuid(vid) for vid in victim_ids]
     victim_rows = await conn.fetch(
         f"""
         SELECT id::text AS id, event_date, fact_type, embedding::text AS embedding
@@ -707,7 +727,7 @@ async def _relink_batch(
     if not victim_rows:
         return 0
 
-    alive_uuids = [uuid_module.UUID(row["id"]) for row in victim_rows]
+    alive_uuids = [_as_uuid(row["id"]) for row in victim_rows]
 
     # Count current outgoing temporal/semantic links per victim so we only
     # probe for the ones genuinely below cap. Saves the bulk of the work when
@@ -733,7 +753,7 @@ async def _relink_batch(
     new_links: list[tuple] = []
 
     if temporal_needs:
-        lateral_unit_ids = [uuid_module.UUID(r["id"]) for r in temporal_needs if r["event_date"] is not None]
+        lateral_unit_ids = [_as_uuid(r["id"]) for r in temporal_needs if r["event_date"] is not None]
         lateral_event_dates = [
             _normalize_datetime(r["event_date"]) for r in temporal_needs if r["event_date"] is not None
         ]
@@ -769,8 +789,6 @@ async def _relink_batch(
         if counts.get((r["id"], "semantic"), 0) < MAX_SEMANTIC_LINKS_PER_UNIT and r["embedding"] is not None
     ]
     if semantic_needs:
-        from ...memory_engine import acquire_with_retry
-
         seed_ids = [r["id"] for r in semantic_needs]
         seed_embs = [r["embedding"] for r in semantic_needs]
         seed_ftypes = [r["fact_type"] for r in semantic_needs]
@@ -843,7 +861,9 @@ async def enqueue_entity_prune_candidates(
     queue_table = fq_table("entity_maintenance_queue")
     ue_table = fq_table("unit_entities")
     entities_table = fq_table("entities")
-    unit_uuids = _as_uuids(list(affected_unit_ids))
+    # Sorted before chunking: each chunk locks its memory rows ascending, so the
+    # whole call does too and two overlapping bulk releases cannot cycle (#6229).
+    unit_uuids = sorted(_as_uuids(list(affected_unit_ids)))
 
     # Chunked because a bulk delete can hand in thousands of unit ids and the
     # lookup binds them with `= ANY(...)`, which ops_oracle expands into a
@@ -855,6 +875,7 @@ async def enqueue_entity_prune_candidates(
             queue_table,
             entities_table,
             ue_table,
+            fq_table("memory_units"),
             bank_id,
             unit_uuids[start : start + _ENQUEUE_LOOKUP_CHUNK],
         )
@@ -915,7 +936,6 @@ async def entity_prune_pass(
         deadline stopped the drain with rows still queued.
     """
     from ...db_utils import retry_with_backoff
-    from ...memory_engine import acquire_with_retry
 
     examined = 0
     orphans_pruned = 0

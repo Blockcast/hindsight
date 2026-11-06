@@ -18,12 +18,16 @@ import * as sdk from "../generated/sdk.gen";
 jest.mock("../generated/sdk.gen");
 
 const mockedExport = sdk.exportBankTransfer as jest.MockedFunction<typeof sdk.exportBankTransfer>;
+const mockedExportDocuments = sdk.exportDocuments as jest.MockedFunction<
+  typeof sdk.exportDocuments
+>;
 const mockedImport = sdk.importBankTransfer as jest.MockedFunction<typeof sdk.importBankTransfer>;
 const mockedStatus = sdk.getOperationStatus as jest.MockedFunction<typeof sdk.getOperationStatus>;
 const mockedClone = sdk.cloneBank as jest.MockedFunction<typeof sdk.cloneBank>;
 
 const OPERATION_ID = "029110c8-a2b2-464c-a206-52c99b76cbf1";
 const DOWNLOAD_URL = "/v1/default/files/download/banks/my-bank/exports/x/transfer.zip";
+const SIGNED_URL = "https://storage.example.com/archive?X-Amz-Signature=abc%2Fdef+ghi";
 const ARCHIVE = new Uint8Array([0x50, 0x4b, 0x03, 0x04]);
 
 describe("exportBank mapping", () => {
@@ -80,6 +84,108 @@ describe("exportBank mapping", () => {
 
     await expect(client.exportBank("my-bank", { pollIntervalMs: 0 })).rejects.toThrow("disk full");
   });
+});
+
+describe("signed export archive downloads", () => {
+  test.each(["exportBank", "exportDocuments"] as const)(
+    "%s uses the signed URL without forwarding API credentials",
+    async (method) => {
+      const originalFetch = globalThis.fetch;
+      const fetchMock = jest.fn().mockResolvedValue({
+        ok: true,
+        arrayBuffer: async () => ARCHIVE.buffer,
+      });
+      globalThis.fetch = fetchMock as typeof fetch;
+      try {
+        const client = new HindsightClient({ baseUrl: "http://localhost:8888", apiKey: "secret" });
+        (client as any).client.get = jest.fn();
+        mockedExport.mockResolvedValue({ data: { operation_id: OPERATION_ID } } as any);
+        mockedExportDocuments.mockResolvedValue({ data: { operation_id: OPERATION_ID } } as any);
+        mockedStatus.mockResolvedValue({
+          data: { status: "completed", result_metadata: { download_url: SIGNED_URL } },
+        } as any);
+
+        const bytes = await client[method]("my-bank", { pollIntervalMs: 0 });
+
+        expect(Array.from(bytes)).toEqual(Array.from(ARCHIVE));
+        expect(fetchMock).toHaveBeenCalledWith(SIGNED_URL, { signal: undefined });
+        expect((client as any).client.get).not.toHaveBeenCalled();
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    }
+  );
+});
+
+test("exportDocuments keeps API-relative downloads on the authenticated client", async () => {
+  const client = new HindsightClient({ baseUrl: "http://localhost:8888", apiKey: "secret" });
+  const clientGet = jest.fn().mockResolvedValue({ data: ARCHIVE.buffer });
+  (client as any).client.get = clientGet;
+  mockedExportDocuments.mockResolvedValue({ data: { operation_id: OPERATION_ID } } as any);
+  mockedStatus.mockResolvedValue({
+    data: { status: "completed", result_metadata: { download_url: DOWNLOAD_URL } },
+  } as any);
+
+  const bytes = await client.exportDocuments("my-bank", { pollIntervalMs: 0 });
+
+  expect(Array.from(bytes)).toEqual(Array.from(ARCHIVE));
+  expect(clientGet.mock.calls[0][0].url).toBe(DOWNLOAD_URL);
+});
+
+describe("export timeoutMs bounds the whole polling phase", () => {
+  let client: HindsightClient;
+  let clientGet: jest.Mock;
+  let lateReply: ReturnType<typeof setTimeout> | undefined;
+
+  afterEach(() => clearTimeout(lateReply));
+
+  beforeEach(() => {
+    client = new HindsightClient({ baseUrl: "http://localhost:8888" });
+    clientGet = jest.fn().mockResolvedValue({ data: ARCHIVE.buffer });
+    (client as any).client.get = clientGet;
+    mockedStatus.mockReset();
+    mockedExport.mockResolvedValue({ data: { operation_id: OPERATION_ID } } as any);
+    mockedExportDocuments.mockResolvedValue({ data: { operation_id: OPERATION_ID } } as any);
+  });
+
+  test.each(["exportBank", "exportDocuments"] as const)(
+    "%s does not wait for a status request that answers after the deadline",
+    async (method) => {
+      mockedStatus.mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            lateReply = setTimeout(
+              () =>
+                resolve({
+                  data: { status: "completed", result_metadata: { download_url: DOWNLOAD_URL } },
+                } as any),
+              5000
+            );
+          }) as any
+      );
+
+      const start = Date.now();
+      await expect(client[method]("my-bank", { pollIntervalMs: 0, timeoutMs: 50 })).rejects.toThrow(
+        "did not complete within 50ms"
+      );
+      expect(Date.now() - start).toBeLessThan(1000);
+      expect(clientGet).not.toHaveBeenCalled();
+    }
+  );
+
+  test.each(["exportBank", "exportDocuments"] as const)(
+    "%s ends the wait when the budget can't fit another poll interval, without another poll",
+    async (method) => {
+      mockedStatus.mockResolvedValue({ data: { status: "processing" } } as any);
+
+      const start = Date.now();
+      await expect(
+        client[method]("my-bank", { pollIntervalMs: 5000, timeoutMs: 50 })
+      ).rejects.toThrow("did not complete within 50ms");
+      expect(Date.now() - start).toBeLessThan(1000);
+      expect(mockedStatus).toHaveBeenCalledTimes(1);
+    }
+  );
 });
 
 describe("importBank mapping", () => {

@@ -12,26 +12,53 @@ import logging
 import uuid
 from dataclasses import replace
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
-from ..chunk_ids import resolve_chunk_id_in
+from ..prompt_utils import truncate_context_for_prompt
+from ..response_models import MemoryFact
+from ..schema import fq_table
+from ..search.tags import TagGroup, TagsMatch, tag_filter_active, tags_satisfy_groups
+from ..source_scope import ids_passing, visible_document_ids
+from .tokenization import count_prompt_tokens
 
 if TYPE_CHECKING:
-    from asyncpg import Connection
-
-    from ...api.http import RequestContext
+    # The engine's own connection abstraction, which is what every caller passes. This said
+    # `asyncpg.Connection` -- the concrete driver type -- which predates that abstraction and
+    # was never what arrived here; only `.fetch()` is used, and both provide it.
+    from ...models import RequestContext
+    from ..db.base import DatabaseConnection
     from ..memory_engine import MemoryEngine
 
 logger = logging.getLogger(__name__)
+
+#: Snippet length for a mental-model search hit, matching the knowledge-page search
+#: API's own ``LEFT(content, 280)`` so both surfaces show a page the same way.
+_SNIPPET_CHARS = 280
+
+#: Default token budget for the pages ``search_mental_models`` returns whole. Pages are
+#: packed in rank order until it is spent; a page that does not fit comes back as a
+#: snippet. One page whole under a fixed 4,000-token limit (#4716) left a bank whose
+#: pages are all larger with no page at all, and the answer is not always in the top
+#: hit (#5787). A bank or a request can change it through
+#: ``reflect_default_options.reflect_search_mental_models_max_tokens``.
+DEFAULT_MENTAL_MODELS_SEARCH_MAX_TOKENS = 16000
+
+#: The budget a mental-model refresh searches pages with: the best page whole, the rest
+#: snippets. At the reflect default, test_refresh_pages_benchmark_cost's refreshes (sibling pages
+#: included) cost ~50% more input (79k -> 120k full, 69k -> 100k delta), mostly sibling
+#: pages a refresh does not need.
+REFRESH_MENTAL_MODELS_SEARCH_MAX_TOKENS = 1
 
 
 #: Retrieval plumbing that the reflect agent never reads, dropped from tool
 #: results before they reach the model.
 #:
-#: These are scoring and provenance internals, not evidence: the agent cites by
-#: ``id``, ``based_on`` persists only id/text/type/context, and the expand tool
-#: takes ``memory_ids`` and resolves chunks server-side -- so nothing downstream
-#: needs them, while on real banks they measure several times the size of the
+#: These are scores and internal pointers, not evidence the agent can reason with
+#: (provenance it CAN reason with is kept -- see ``metadata`` below): the agent cites by
+#: ``id``, ``based_on`` re-reads the cited memories' provenance from the store
+#: (``MemoryEngine._evidence_as_stored``), and the expand tool takes
+#: ``memory_ids`` and resolves chunks server-side -- so nothing downstream needs
+#: them here, while on real banks they measure several times the size of the
 #: observation text they accompany.
 #:
 #: Identity, text, dates, tags and ``source_fact_ids`` are deliberately kept.
@@ -40,17 +67,34 @@ logger = logging.getLogger(__name__)
 #: the surface text ("Bob" in the text vs canonical "Robert Smith"). Reflect's
 #: recalls don't populate it today (``include_entities`` defaults to False), but
 #: trimming it would bake in dropping the names if that ever flips on.
-_UNREAD_RESULT_FIELDS = ("scores", "metadata", "chunk_id", "document_id")
+#:
+#: ``metadata`` used to be dropped here too, and that made a document's own
+#: metadata unusable for reasoning: a bank that stamps where each document came
+#: from (``{"source": "guide"}`` on the handbook, ``{"source": "conversation"}``
+#: on a transcript) had no way to tell reflect which to believe, because the
+#: model never saw the stamp. Once extraction has flattened both into plain
+#: assertions -- "a pull request needs two approvals" and "one approval is enough
+#: for small ones" -- provenance is the ONLY thing left that separates a policy
+#: from someone's opinion, and recency picks the wrong one because the chatter is
+#: newer. So it is sent now, and an operator can rank the sources in the bank's
+#: reflect mission with no new configuration at all.
+#:
+#: The cost is paid only by banks that write metadata: ``_prune_nulls`` drops an
+#: empty bag, so a bank that stamps nothing sends nothing, and a bank that stamps
+#: a lot pays for what it chose to stamp.
+_UNREAD_RESULT_FIELDS = ("scores", "chunk_id", "document_id")
 
 
 def _drop_unread_fields(d: dict[str, Any]) -> dict[str, Any]:
-    """Strip retrieval plumbing from one serialized tool result.
+    """Strip retrieval plumbing from one serialized tool result and cap its ``context``.
 
     Mutates and returns ``d``, which is always a fresh ``model_dump()`` by the
     time it gets here -- never a caller's dict.
     """
     for k in _UNREAD_RESULT_FIELDS:
         d.pop(k, None)
+    if "context" in d:
+        d["context"] = truncate_context_for_prompt(d["context"])
     return d
 
 
@@ -89,13 +133,14 @@ def _document_metadata_from_retain_params(retain_params: Any) -> dict[str, Any] 
 
 async def tool_search_mental_models(
     memory_engine: "MemoryEngine",
-    conn: "Connection",
+    conn: "DatabaseConnection",
     bank_id: str,
     query: str,
     query_embedding: list[float],
     max_results: int = 5,
+    full_pages_max_tokens: int = DEFAULT_MENTAL_MODELS_SEARCH_MAX_TOKENS,
     tags: list[str] | None = None,
-    tags_match: str = "any",
+    tags_match: TagsMatch = "any",
     tag_groups: "list | None" = None,
     exclude_ids: list[str] | None = None,
     last_memory_write_at: datetime | None = None,
@@ -112,6 +157,9 @@ async def tool_search_mental_models(
         query: Search query (for logging/tracing)
         query_embedding: Pre-computed embedding for semantic search
         max_results: Maximum number of mental models to return
+        full_pages_max_tokens: Budget for the pages returned whole, packed in rank order; a page
+            that does not fit is a snippet the model can read with read_mental_models. The
+            best-ranked page is always whole, as in read_mental_models
         tags: Optional tags to filter mental models
         tags_match: How to match tags - "any", "all", "any_strict", "all_strict", or "exact"
         exclude_ids: Optional list of mental model IDs to exclude (e.g., when refreshing a mental model)
@@ -121,7 +169,7 @@ async def tool_search_mental_models(
     Returns:
         Dict with matching mental models including content and freshness info
     """
-    from ..memory_engine import _mental_model_stale_scope_from_row, fq_table
+    from ..memory_engine import _knowledge_snippet, _mental_model_stale_scope_from_row
     from ..search.tags import build_tag_groups_where_clause, build_tags_where_clause
 
     # Build filters dynamically
@@ -221,6 +269,7 @@ async def tool_search_mental_models(
     )
 
     mental_models = []
+    full_pages_spent = 0
 
     for row in rows:
         last_refreshed_at = row["last_refreshed_at"]
@@ -230,11 +279,36 @@ async def tool_search_mental_models(
         is_stale = staleness[str(row["id"])]
         staleness_reason = "new in-scope memories ingested since last refresh" if is_stale else None
 
+        content = row["content"] or ""
+        # Whole pages in rank order, up to the budget, the rest as snippets. A model that
+        # answers from a snippet without reading the page is a measured failure (test_reflect_from_page),
+        # so the best hit is always whole, even alone over the budget: a snippet of it
+        # would leave the search with no page at all (#5787). A lower page that does not
+        # fit is skipped, not the end of packing, so a smaller one after it still can.
+        cost = count_prompt_tokens(content)
+        whole = not mental_models or full_pages_spent + cost <= full_pages_max_tokens
+        if whole:
+            full_pages_spent += cost
         mental_models.append(
             {
                 "id": str(row["id"]),
                 "name": row["name"],
-                "content": row["content"],
+                # Past the budget, a snippet like the knowledge-page search this mirrors:
+                # five unbounded whole pages measured 8.7-19k tokens and were re-sent on
+                # every later turn of the loop, the largest single item in a reflect's
+                # floor (#4533). The model reads the ones it wants with
+                # ``read_mental_models``.
+                **(
+                    {"content": content}
+                    if whole
+                    # ``_knowledge_snippet`` so a page with no body reads as
+                    # empty-on-purpose rather than as a blank match — the same
+                    # wording the knowledge-page search gives for the same state.
+                    else {
+                        "snippet": _knowledge_snippet(content)[:_SNIPPET_CHARS].strip(),
+                        "content_chars": len(content),
+                    }
+                ),
                 "tags": row["tags"] or [],
                 # The store path carries relevance beside the rows (its SELECT hydrates only what
                 # the store does not hold); the SQL path has it as a computed column.
@@ -255,6 +329,70 @@ async def tool_search_mental_models(
     }
 
 
+async def tool_read_mental_models(
+    conn: "DatabaseConnection",
+    bank_id: str,
+    mental_model_ids: list[str],
+    max_tokens: int = 6000,
+    tag_scope: list[TagGroup] | None = None,
+) -> dict[str, Any]:
+    """Read the full text of mental models the search returned as snippets.
+
+    The budget is spent in the order asked for and stops at the first page that
+    would cross it, so one enormous page cannot swallow the reflect's context —
+    the failure ``search_mental_models`` used to have by returning five of them
+    whole (#4533). A page that does not fit at all is reported by name rather
+    than silently missing.
+
+    ``tag_scope`` is the caller's forced tag scope: a page outside it reads as missing,
+    even when the model asks for it by id.
+    """
+    if not mental_model_ids:
+        return {"error": "read_mental_models requires mental_model_ids"}
+
+    rows = await conn.fetch(
+        f"""
+        SELECT id, name, content, tags, last_refreshed_at
+        FROM {fq_table("mental_models")}
+        WHERE bank_id = $1 AND id = ANY($2::text[])
+        """,
+        bank_id,
+        [str(i) for i in mental_model_ids],
+    )
+    by_id = {str(r["id"]): r for r in rows}
+
+    pages: list[dict[str, Any]] = []
+    omitted: list[str] = []
+    spent = 0
+    for wanted in mental_model_ids:
+        row = by_id.get(str(wanted))
+        if row is None or (tag_scope and not tags_satisfy_groups(row["tags"], tag_scope)):
+            omitted.append(str(wanted))
+            continue
+        content = row["content"] or ""
+        cost = count_prompt_tokens(content)
+        if pages and spent + cost > max_tokens:
+            # The id, not the name: ``not_read`` is a retry list, and the model can
+            # only ask again with an id.
+            omitted.append(str(row["id"]))
+            continue
+        spent += cost
+        last_refreshed_at = row["last_refreshed_at"]
+        pages.append(
+            {
+                "id": str(row["id"]),
+                "name": row["name"],
+                "content": content,
+                "tags": row["tags"] or [],
+                "updated_at": last_refreshed_at.isoformat() if last_refreshed_at else None,
+            }
+        )
+    out: dict[str, Any] = {"mental_models": pages}
+    if omitted:
+        out["not_read"] = omitted
+    return out
+
+
 async def tool_search_observations(
     memory_engine: "MemoryEngine",
     bank_id: str,
@@ -262,7 +400,7 @@ async def tool_search_observations(
     request_context: "RequestContext",
     max_tokens: int = 5000,
     tags: list[str] | None = None,
-    tags_match: str = "any",
+    tags_match: TagsMatch = "any",
     tag_groups: "list | None" = None,
     last_consolidated_at: datetime | None = None,
     pending_consolidation: int = 0,
@@ -355,7 +493,7 @@ async def tool_recall(
     request_context: "RequestContext",
     max_tokens: int = 2048,
     tags: list[str] | None = None,
-    tags_match: str = "any",
+    tags_match: TagsMatch = "any",
     tag_groups: "list | None" = None,
     connection_budget: int = 1,
     max_chunk_tokens: int = 1000,
@@ -410,6 +548,9 @@ async def tool_recall(
         max_chunk_tokens=max_chunk_tokens,
     )
 
+    # A chunk is raw source text: "I signed up yesterday" means nothing without the date it was
+    # said on. Its facts carry that date, so the chunk borrows it from the first one.
+    chunk_dates = {m.chunk_id: m.mentioned_at for m in reversed(result.results) if m.chunk_id and m.mentioned_at}
     return {
         "query": query,
         "memories": [_drop_unread_fields(_prune_nulls(m.model_dump())) for m in result.results],
@@ -417,30 +558,78 @@ async def tool_recall(
         # chunk_text / chunk_index / truncated, so it holds none of the fields
         # above and the call would be a no-op. Pinned by
         # test_chunk_info_carries_no_unread_fields.
-        "chunks": {k: _prune_nulls(v.model_dump()) for k, v in (result.chunks or {}).items()},
+        "chunks": {
+            k: _prune_nulls({**v.model_dump(), "mentioned_at": chunk_dates.get(k)})
+            for k, v in (result.chunks or {}).items()
+        },
     }
 
 
+def _iso(value: datetime | None) -> str | None:
+    """A stored date as recall's results carry it."""
+    return value.isoformat() if value else None
+
+
+def returned_memories(tool: str, output: dict[str, Any]) -> list[MemoryFact]:
+    """The memories a `recall` or `expand` call actually handed back.
+
+    Both are evidence the agent read, so both are citable and both reach `based_on`
+    (#5474: only recall's were, so a fact read through `expand` lost its citation).
+    Ids `expand` reported as malformed, missing or outside the tag scope carry no
+    `memory` and stay uncitable.
+    """
+    if tool == "recall":
+        raw = output.get("memories") or []
+    elif tool == "expand":
+        # expand names the fact type `type`; recall, like MemoryFact, `fact_type`.
+        raw = [{**r["memory"], "fact_type": r["memory"]["type"]} for r in output.get("results") or [] if "memory" in r]
+    else:
+        return []
+    return [
+        MemoryFact(
+            id=m["id"],
+            text=m.get("text", ""),
+            fact_type=m.get("fact_type", "world"),
+            context=m.get("context"),
+            occurred_start=m.get("occurred_start"),
+            occurred_end=m.get("occurred_end"),
+        )
+        for m in raw
+        if m.get("id")
+    ]
+
+
 async def tool_expand(
-    conn: "Connection",
+    conn: "DatabaseConnection",
     bank_id: str,
     memory_ids: list[str],
     depth: str,
+    *,
+    tags: list[str] | None,
+    tags_match: TagsMatch,
+    tag_groups: list[TagGroup] | None,
 ) -> dict[str, Any]:
     """
     Expand multiple memories to get chunk or document context.
+
+    The reader's tag filter applies twice (#5030): a memory outside it reads as not
+    found, and a visible memory's chunk or document is returned only when that
+    DOCUMENT passes the filter too — a fact shared through a tag such as ``kind:rule``
+    does not open the rest of a document the reader cannot see. The filter arguments
+    are required so no caller can forget them and expand the whole bank.
 
     Args:
         conn: Database connection
         bank_id: Bank identifier
         memory_ids: List of memory unit IDs
         depth: "chunk" or "document"
+        tags: The reader's tag filter (same as the recall it expands)
+        tags_match: How ``tags`` is matched
+        tag_groups: The reader's compound tag filter, already fuzzy-resolved
 
     Returns:
         Dict with results array, each containing memory, chunk, and optionally document data
     """
-    from ..memory_engine import fq_table
-
     if not memory_ids:
         return {"error": "memory_ids is required and must not be empty"}
 
@@ -459,37 +648,41 @@ async def tool_expand(
 
     valid_uuids = list(uuid_by_id.values())
 
-    # Batch fetch all memory units. A store that keeps memories outside SQL answers by id
-    # through the store; normalize its records to the same UUID-keyed dict shape the SQL rows
-    # have so the result-building below stays store-agnostic.
+    # Batch fetch all memory units. Postgres hands back its rows; a store that keeps memories
+    # outside SQL normalizes its records to the same UUID-keyed mapping shape, so the
+    # result-building below stays store-agnostic.
     from ..memories import get_memories
 
     _store = get_memories()
-    if not _store.store_owned_for(bank_id):
-        memories = await conn.fetch(
-            f"""
-            SELECT id, text, chunk_id, document_id, fact_type, context
-            FROM {fq_table("memory_units")}
-            WHERE id = ANY($1) AND bank_id = $2
-            """,
-            valid_uuids,
-            bank_id,
+    memories = await _store.expand_memories(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=valid_uuids)
+    # A memory outside the reader's filter is dropped here, so below it reads as "not found"
+    # rather than revealing that it exists.
+    scoped = tag_filter_active(tags, tags_match, tag_groups)
+    if scoped:
+        _visible_ids = ids_passing(
+            {str(m["id"]): m["tags"] for m in memories}, tags=tags, tags_match=tags_match, tag_groups=tag_groups
         )
-    else:
-        stored = await _store.get_memories(
-            conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[str(u) for u in valid_uuids]
-        )
-        memories = [
-            {
-                "id": uuid.UUID(s.unit_id),
-                "text": s.text,
-                "chunk_id": s.chunk_id,
-                "document_id": s.document_id,
-                "fact_type": s.fact_type,
-                "context": s.context,
-            }
-            for s in stored
-        ]
+        memories = [m for m in memories if str(m["id"]) in _visible_ids]
+    # Source text follows its document's tags, not the fact's. Resolved before any chunk or
+    # document text is read, so a hidden source is never fetched at all.
+    visible_docs = await visible_document_ids(
+        conn,
+        fq_table,
+        bank_id,
+        (m["document_id"] for m in memories),
+        tags=tags,
+        tags_match=tags_match,
+        tag_groups=tag_groups,
+    )
+    # A chunk with no document on the memory cannot be checked, so under a filter it is
+    # withheld too: fail closed.
+    withheld_ids = {
+        m["id"]
+        for m in memories
+        if (m["document_id"] and m["document_id"] not in visible_docs)
+        or (scoped and m["chunk_id"] and not m["document_id"])
+    }
+    memories = [{**dict(m), "chunk_id": None, "document_id": None} if m["id"] in withheld_ids else m for m in memories]
     memory_map = {row["id"]: row for row in memories}
 
     # Collect chunk_ids and document_ids for batch fetching
@@ -497,94 +690,27 @@ async def tool_expand(
     doc_ids_from_chunks: set[str] = set()
     doc_ids_direct: set[str] = set()
 
-    # Batch fetch all chunks. A store that owns the document store leaves the `chunks` and
-    # `documents` tables empty, so the SQL below would return nothing and `expand` would answer
-    # without the chunk or document it was asked for — the memories read above was routed to the
-    # store but these two were not.
-    _docs_in_store = _store.store_owned_for(bank_id)
+    # Batch fetch all chunks, and the documents behind them — both through the store, which
+    # owns the `chunks` and `documents` rows as well as the memories.
     chunk_map: dict[str, Any] = {}
-    if chunk_ids and _docs_in_store:
-        # The store addresses a chunk by (document_id, index), and the index is what remains
-        # once the known bank/document prefix is removed (see `engine/chunk_ids.py`). Anchored
-        # on the ids in hand rather than split on "_", which a bank or document id containing
-        # one would break.
-        # Deduped by chunk_id: co-located memories share one chunk, and the SQL branch collapses
-        # them through `= ANY($1)`. Without this the store is asked for the same chunk once per
-        # memory sitting in it.
-        refs: list[tuple[str, int]] = []
-        ref_owner: list[dict] = []
-        _seen_chunks: set[str] = set()
-        for m in memories:
-            cid, did = m["chunk_id"], m["document_id"]
-            if not cid or not did:
-                continue
-            if cid in _seen_chunks:
-                continue
-            ref = resolve_chunk_id_in(cid, bank_id)
-            if ref is None or ref.document_id != did:
-                continue
-            index = ref.chunk_index
-            _seen_chunks.add(cid)
-            refs.append((did, index))
-            ref_owner.append({"chunk_id": cid, "document_id": did, "chunk_index": index})
-        if refs:
-            texts = await _store.get_chunk_texts(bank_id=bank_id, refs=refs)
-            for owner, text in zip(ref_owner, texts):
-                if text is None:
-                    continue
-                chunk_map[owner["chunk_id"]] = {**owner, "chunk_text": text}
+    if chunk_ids:
+        chunk_map = await _store.expand_chunks(
+            conn=conn, fq_table=fq_table, bank_id=bank_id, memories=memories, chunk_ids=chunk_ids
+        )
         if depth == "document":
             doc_ids_from_chunks = {c["document_id"] for c in chunk_map.values() if c["document_id"]}
-    elif chunk_ids:
-        chunks = await conn.fetch(
-            f"""
-            SELECT chunk_id, chunk_text, chunk_index, document_id
-            FROM {fq_table("chunks")}
-            WHERE chunk_id = ANY($1)
-            """,
-            chunk_ids,
-        )
-        chunk_map = {row["chunk_id"]: row for row in chunks}
-        if depth == "document":
-            doc_ids_from_chunks = {c["document_id"] for c in chunks if c["document_id"]}
 
     # Collect direct document IDs (memories without chunks)
     if depth == "document":
         for m in memories:
             if not m["chunk_id"] and m["document_id"]:
-                doc_ids_direct.add(m["document_id"])
+                doc_ids_direct.add(cast(str, m["document_id"]))
 
     # Batch fetch all documents
     doc_map: dict[str, Any] = {}
     all_doc_ids = list(doc_ids_from_chunks | doc_ids_direct)
-    if all_doc_ids and _docs_in_store:
-        # One read per document: the store addresses a document by id and has no batch form here.
-        # The set is the documents behind the memories being expanded, which is bounded by the
-        # caller's own memory_ids rather than by corpus size.
-        for did in all_doc_ids:
-            record = await _store.get_document_record(bank_id=bank_id, document_id=did, include_text=True)
-            if record is None:
-                continue
-            # The store has no `retain_params` column; it keeps the retain params inside the
-            # document record's metadata bag, under that key and serialised as JSON. So they are
-            # read back out of the bag rather than reconstructed — `_document_metadata_from_retain_params`
-            # already parses the JSON form, which is the same thing Postgres hands it from JSONB.
-            doc_map[did] = {
-                "id": did,
-                "original_text": record.get("original_text"),
-                "retain_params": (record.get("metadata") or {}).get("retain_params"),
-            }
-    elif all_doc_ids:
-        docs = await conn.fetch(
-            f"""
-            SELECT id, original_text, retain_params
-            FROM {fq_table("documents")}
-            WHERE id = ANY($1) AND bank_id = $2
-            """,
-            all_doc_ids,
-            bank_id,
-        )
-        doc_map = {row["id"]: row for row in docs}
+    if all_doc_ids:
+        doc_map = await _store.expand_documents(conn=conn, fq_table=fq_table, bank_id=bank_id, document_ids=all_doc_ids)
 
     # Build results
     results: list[dict[str, Any]] = []
@@ -598,25 +724,42 @@ async def tool_expand(
             results.append({"memory_id": mid, "error": f"Memory not found: {mid}"})
             continue
 
+        # Recall shows a memory's dates, so expand must too: without them "yesterday" in the
+        # memory, or in its chunk, cannot be placed in time.
+        mentioned_at = _iso(memory["mentioned_at"])
         item: dict[str, Any] = {
             "memory_id": mid,
-            "memory": {
-                "id": str(memory["id"]),
-                "text": memory["text"],
-                "type": memory["fact_type"],
-                "context": memory["context"],
-            },
+            "memory": _prune_nulls(
+                {
+                    "id": str(memory["id"]),
+                    "text": memory["text"],
+                    "type": memory["fact_type"],
+                    "context": truncate_context_for_prompt(memory["context"]),
+                    "occurred_start": _iso(memory["occurred_start"]),
+                    "occurred_end": _iso(memory["occurred_end"]),
+                    "mentioned_at": mentioned_at,
+                }
+            ),
         }
+
+        if memory["id"] in withheld_ids:
+            # Said outright so the agent stops asking, rather than retrying a depth that will
+            # never answer.
+            item["source_withheld"] = "The source of this memory is outside the current tag scope."
 
         # Add chunk if available
         if memory["chunk_id"] and memory["chunk_id"] in chunk_map:
-            chunk = chunk_map[memory["chunk_id"]]
-            item["chunk"] = {
-                "id": chunk["chunk_id"],
-                "text": chunk["chunk_text"],
-                "index": chunk["chunk_index"],
-                "document_id": chunk["document_id"],
-            }
+            chunk = chunk_map[cast(str, memory["chunk_id"])]
+            item["chunk"] = _prune_nulls(
+                {
+                    "id": chunk["chunk_id"],
+                    "text": chunk["chunk_text"],
+                    "index": chunk["chunk_index"],
+                    "document_id": chunk["document_id"],
+                    # The chunk was said when its memory was mentioned (see tool_recall).
+                    "mentioned_at": mentioned_at,
+                }
+            )
             # Add document if depth=document
             if depth == "document" and chunk["document_id"] in doc_map:
                 doc = doc_map[chunk["document_id"]]
@@ -628,7 +771,7 @@ async def tool_expand(
                 }
         elif memory["document_id"] and depth == "document" and memory["document_id"] in doc_map:
             # No chunk, but has document_id
-            doc = doc_map[memory["document_id"]]
+            doc = doc_map[cast(str, memory["document_id"])]
             item["document"] = {
                 "id": doc["id"],
                 "full_text": doc["original_text"],

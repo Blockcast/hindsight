@@ -3,9 +3,12 @@ Embedding generation utilities for memory units.
 """
 
 import logging
+import math
 from typing import Literal, Protocol
 
 from ...config import ENV_EMBEDDINGS_MAX_INPUT_TOKENS, get_config
+from ..llm_interface import ProviderRateLimitResetError
+from ..llm_trace import EMBEDDING_SCOPE_PREFIX, trace_model_call
 from ..token_encoding import count_tokens, truncate_many_to_tokens
 
 logger = logging.getLogger(__name__)
@@ -25,6 +28,18 @@ class EmbeddingsBackend(Protocol):
     async def encode_documents(self, texts: list[str]) -> list[list[float]]: ...
 
 
+def _tokenizer_encoding(backend: EmbeddingsBackend) -> str | None:
+    """The backend's own tokenizer vocabulary, when it declares one.
+
+    `Embeddings.tokenizer_encoding` is an optional capability of the concrete ABC and
+    not part of this duck-typed Protocol, so getattr can hand back anything; only a
+    real string selects an encoding. See #5234 — counting the cap with the configured
+    encoding instead of the model's overshoots OpenAI's 8192 by a handful of tokens.
+    """
+    encoding = getattr(backend, "tokenizer_encoding", None)
+    return encoding if isinstance(encoding, str) and encoding else None
+
+
 def _prefix_tokens(backend: EmbeddingsBackend, input_type: EmbeddingInputType) -> int:
     """Tokens the backend will prepend to every text after this cap is applied.
 
@@ -39,7 +54,9 @@ def _prefix_tokens(backend: EmbeddingsBackend, input_type: EmbeddingInputType) -
     # hand back anything at all. Only a real, non-empty string costs budget.
     attr = "query_prefix" if input_type == "query" else "passage_prefix"
     prefix = getattr(backend, attr, "")
-    return count_tokens(prefix) if isinstance(prefix, str) and prefix else 0
+    if not (isinstance(prefix, str) and prefix):
+        return 0
+    return count_tokens(prefix, _tokenizer_encoding(backend))
 
 
 def _truncate_inputs(
@@ -60,7 +77,7 @@ def _truncate_inputs(
     cap rather than one token past it (#4165).
     """
     budget = max(max_input_tokens - _prefix_tokens(backend, input_type), 0)
-    results = truncate_many_to_tokens(texts, budget)
+    results = truncate_many_to_tokens(texts, budget, _tokenizer_encoding(backend))
     truncated = [result.text for result in results]
     original_token_counts = [r.original_tokens for r in results if r.original_tokens > budget]
     if original_token_counts:
@@ -84,6 +101,16 @@ def _validate_embedding_vector(vector: list[float], *, index: int, expected_dime
         raise RuntimeError(f"embedding {index} has dimension 0; expected {expected_dimension}")
     if actual_dimension != expected_dimension:
         raise RuntimeError(f"embedding {index} has dimension {actual_dimension}; expected {expected_dimension}")
+    # A NaN/Inf vector otherwise travels to the pgvector bind and fails there as an
+    # opaque "NaN not allowed in vector" that names neither the backend nor the vector
+    # (issue #6255). Fail here, loudly, with the index. Left retryable: the observed
+    # case was a transient backend glitch that clean re-embeds of the same text fixed.
+    non_finite = sum(1 for x in vector if not math.isfinite(x))
+    if non_finite:
+        raise RuntimeError(
+            f"embedding {index} contains {non_finite} non-finite value(s) (NaN/Inf) of {actual_dimension}; "
+            "the embedding backend produced an unusable vector"
+        )
     return vector
 
 
@@ -120,9 +147,18 @@ async def generate_embeddings_batch(
         texts = _truncate_inputs(texts, max_input_tokens, embeddings_backend, input_type)
 
     try:
-        embeddings = await _encode_with_input_type(embeddings_backend, texts, input_type)
+        embeddings = await trace_model_call(
+            embeddings_backend,
+            f"{EMBEDDING_SCOPE_PREFIX}{input_type}",
+            len(texts),
+            lambda: _encode_with_input_type(embeddings_backend, texts, input_type),
+            request={"texts": texts},
+        )
+    except ProviderRateLimitResetError:
+        # A control signal, not a failure: the worker parks the operation until then.
+        raise
     except Exception as e:
-        raise Exception(f"Failed to generate batch embeddings: {str(e)}")
+        raise Exception(f"Failed to generate batch embeddings: {str(e)}") from e
 
     # Guarantee 1:1 alignment with input texts. A silent length mismatch here
     # propagates downstream as zip() drops items, eventually surfacing as an

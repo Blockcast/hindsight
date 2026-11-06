@@ -3,22 +3,18 @@ Memory Engine - Core implementation of the memory system.
 
 This package contains all the implementation details of the memory engine:
 - MemoryEngine: Main class for memory operations
-- Utility modules: embedding_utils, link_utils, bank_utils
-- Supporting modules: embeddings, cross_encoder, entity_resolver, etc.
+- Utility modules: embedding_utils, bank_utils
+- Supporting modules: embeddings, cross_encoder, memories (the memories store), etc.
 """
 
+from ..schema_context import get_current_schema
 from .cross_encoder import CrossEncoderModel, LocalSTCrossEncoder, RemoteTEICrossEncoder
 from .db_utils import acquire_with_retry
 from .embeddings import Embeddings, LocalSTEmbeddings, RemoteTEIEmbeddings
 from .llm_wrapper import LLMConfig
-from .memory_engine import (
-    MemoryEngine,
-    UnqualifiedTableError,
-    fq_table,
-    get_current_schema,
-    validate_sql_schema,
-)
+from .memory_engine import MemoryEngine, UnqualifiedTableError, validate_sql_schema
 from .response_models import MemoryFact, RecallResult, ReflectResult
+from .schema import fq_table
 from .search.trace import (
     EntryPoint,
     NodeVisit,

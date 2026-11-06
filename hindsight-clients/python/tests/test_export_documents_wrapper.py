@@ -1,14 +1,17 @@
 """Unit tests for the high-level export_documents convenience wrapper.
 
-These mock the generated sub-clients so no server is needed — they verify the
-submit -> poll -> download orchestration (the value the wrapper adds on top of
-the raw async export operation), not the HTTP behaviour (covered in the API's
-test_document_transfer.py).
+Most tests mock the generated sub-clients to verify submit -> poll -> download
+orchestration. The signed-URL test uses a local HTTP server to check the actual
+download request and credential boundary.
 """
 
+import asyncio
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestServer
 
 from hindsight_client import Hindsight
 
@@ -30,6 +33,9 @@ def _mock_download(client):
     """Stub the low-level download path to return ARCHIVE_BYTES."""
     client._api_client.param_serialize = MagicMock(return_value=("GET", DOWNLOAD_URL, {}, None, []))
     response = MagicMock()
+    response.status = 200
+    response.data = ARCHIVE_BYTES
+    response.getheaders.return_value = {}
     response.read = AsyncMock(return_value=ARCHIVE_BYTES)
     client._api_client.call_api = AsyncMock(return_value=response)
 
@@ -58,6 +64,44 @@ async def test_export_documents_submits_polls_and_downloads():
     # Polled until completed (twice), then downloaded the server-provided URL.
     assert client._operations_api.get_operation_status.await_count == 2
     assert client._api_client.param_serialize.call_args.kwargs["resource_path"] == DOWNLOAD_URL
+
+
+@pytest.mark.parametrize("export_method", ["aexport_documents", "aexport_bank"])
+async def test_export_downloads_signed_url_without_api_credentials(export_method):
+    requests = []
+
+    async def archive(request):
+        requests.append(request)
+        return web.Response(body=ARCHIVE_BYTES)
+
+    app = web.Application()
+    app.router.add_get("/archive", archive)
+    server = TestServer(app)
+    await server.start_server()
+    try:
+        download_url = str(server.make_url("/archive")) + "?X-Amz-Signature=abc%2Fdef+ghi"
+        client = Hindsight(base_url="http://localhost:8888", api_key="secret")
+        client._operations_api.get_operation_status = AsyncMock(
+            return_value=_status("completed", result_metadata={"download_url": download_url})
+        )
+        if export_method == "aexport_documents":
+            client._document_transfer_api.export_documents = AsyncMock(
+                return_value=MagicMock(operation_id=OPERATION_ID)
+            )
+        else:
+            client._bank_transfer_api.export_bank_transfer = AsyncMock(
+                return_value=MagicMock(operation_id=OPERATION_ID)
+            )
+        client._api_client.param_serialize = MagicMock(side_effect=AssertionError("API route used for signed URL"))
+
+        result = await getattr(client, export_method)("my-bank", poll_interval=0)
+
+        assert result == ARCHIVE_BYTES
+        assert len(requests) == 1
+        assert requests[0].raw_path == "/archive?X-Amz-Signature=abc%2Fdef+ghi"
+        assert "Authorization" not in requests[0].headers
+    finally:
+        await server.close()
 
 
 async def test_export_documents_forwards_subset_and_observations():
@@ -111,3 +155,46 @@ async def test_export_documents_raises_without_download_url():
 
     with pytest.raises(RuntimeError, match="download_url"):
         await client.aexport_documents("my-bank", poll_interval=0)
+
+
+def _client_for(export_method):
+    client = _make_client()
+    submitted = AsyncMock(return_value=MagicMock(operation_id=OPERATION_ID))
+    if export_method == "aexport_documents":
+        client._document_transfer_api.export_documents = submitted
+    else:
+        client._bank_transfer_api.export_bank_transfer = submitted
+    _mock_download(client)
+    return client
+
+
+@pytest.mark.parametrize("export_method", ["aexport_documents", "aexport_bank"])
+async def test_export_timeout_bounds_a_slow_status_request(export_method):
+    # A status request that answers "completed" after the deadline must not be
+    # waited for, and the archive must not be downloaded.
+    client = _client_for(export_method)
+
+    async def late_completed(*args, **kwargs):
+        await asyncio.sleep(5)
+        return _status("completed", result_metadata={"download_url": DOWNLOAD_URL})
+
+    client._operations_api.get_operation_status = late_completed
+
+    start = time.monotonic()
+    with pytest.raises(TimeoutError):
+        await getattr(client, export_method)("my-bank", poll_interval=0, timeout=0.05)
+    assert time.monotonic() - start < 1
+    client._api_client.call_api.assert_not_awaited()
+
+
+@pytest.mark.parametrize("export_method", ["aexport_documents", "aexport_bank"])
+async def test_export_timeout_bounds_the_poll_sleep(export_method):
+    # A poll interval the remaining budget can't fit must end the wait, with no extra poll.
+    client = _client_for(export_method)
+    client._operations_api.get_operation_status = AsyncMock(return_value=_status("processing"))
+
+    start = time.monotonic()
+    with pytest.raises(TimeoutError):
+        await getattr(client, export_method)("my-bank", poll_interval=5, timeout=0.05)
+    assert time.monotonic() - start < 1
+    assert client._operations_api.get_operation_status.await_count == 1

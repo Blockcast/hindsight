@@ -44,6 +44,12 @@ class FakeTokenizer:
 class FakeSessionOptions:
     def __init__(self):
         self.enable_cpu_mem_arena = True
+        self.intra_op_num_threads = 0
+        self.inter_op_num_threads = 0
+        self.config_entries: dict[str, str] = {}
+
+    def add_session_config_entry(self, key, value):
+        self.config_entries[key] = value
 
 
 class FakeOnnxSession:
@@ -52,6 +58,9 @@ class FakeOnnxSession:
 
     def get_inputs(self):
         return [SimpleNamespace(name="input_ids"), SimpleNamespace(name="attention_mask")]
+
+    def get_providers(self):
+        return ["CPUExecutionProvider"]
 
     def run(self, output_names, inputs):
         batch = inputs["input_ids"].shape[0]
@@ -216,11 +225,40 @@ async def test_onnx_embeddings_dimension_mismatch_raises_value_error():
     fake_onnxruntime = SimpleNamespace(
         InferenceSession=MagicMock(return_value=FakeOnnxSession()),
         SessionOptions=FakeSessionOptions,
+        get_available_providers=MagicMock(return_value=["CPUExecutionProvider"]),
     )
 
     with patch.dict(sys.modules, {"transformers": fake_transformers, "onnxruntime": fake_onnxruntime}):
         with pytest.raises(ValueError, match="does not match model output"):
             await emb.initialize()
+
+
+class NaNOnnxSession(FakeOnnxSession):
+    def run(self, output_names, inputs):
+        return [np.full((inputs["input_ids"].shape[0], 3, 2), np.nan, dtype=np.float32)]
+
+
+@pytest.mark.asyncio
+async def test_onnx_embeddings_nan_startup_probe_fails_initialize():
+    """A model that computes NaN must fail at startup, not hours later at the pgvector bind (#6255)."""
+    emb = OnnxEmbeddings(
+        model_id="intfloat/multilingual-e5-small",
+        model_path="/models/e5/onnx/model.onnx",
+        tokenizer_name_or_path="/models/e5",
+    )
+    fake_transformers = SimpleNamespace(
+        AutoTokenizer=SimpleNamespace(from_pretrained=MagicMock(return_value=FakeTokenizer()))
+    )
+    fake_onnxruntime = SimpleNamespace(
+        InferenceSession=MagicMock(return_value=NaNOnnxSession()),
+        SessionOptions=FakeSessionOptions,
+        get_available_providers=MagicMock(return_value=["CPUExecutionProvider"]),
+    )
+
+    with patch.dict(sys.modules, {"transformers": fake_transformers, "onnxruntime": fake_onnxruntime}):
+        with pytest.raises(RuntimeError, match=r"Embeddings\[onnx:intfloat/multilingual-e5-small\].*non-finite"):
+            await emb.initialize()
+    assert emb._session is None
 
 
 @pytest.mark.asyncio
@@ -232,7 +270,11 @@ async def test_onnx_embeddings_downloads_external_data_sidecar_when_needed():
     fake_transformers = SimpleNamespace(
         AutoTokenizer=SimpleNamespace(from_pretrained=MagicMock(return_value=FakeTokenizer()))
     )
-    fake_onnxruntime = SimpleNamespace(InferenceSession=session, SessionOptions=FakeSessionOptions)
+    fake_onnxruntime = SimpleNamespace(
+        InferenceSession=session,
+        SessionOptions=FakeSessionOptions,
+        get_available_providers=MagicMock(return_value=["CPUExecutionProvider"]),
+    )
 
     with patch.dict(
         sys.modules,
@@ -272,6 +314,8 @@ def test_create_embeddings_from_env_supports_onnx_provider():
     mock_config.embeddings_onnx_output_name = None
     mock_config.embeddings_onnx_batch_size = 16
     mock_config.embeddings_onnx_cpu_mem_arena = False
+    mock_config.embeddings_onnx_device = "cpu"
+    mock_config.embeddings_onnx_cuda_device_id = 0
 
     with patch("hindsight_api.config.get_config", return_value=mock_config):
         emb = create_embeddings_from_env()
@@ -333,18 +377,24 @@ def test_onnx_batch_size_and_arena_come_from_env(monkeypatch, _fresh_config):
     monkeypatch.setenv("HINDSIGHT_API_EMBEDDINGS_PROVIDER", "onnx")
     monkeypatch.setenv("HINDSIGHT_API_EMBEDDINGS_ONNX_BATCH_SIZE", "8")
     monkeypatch.setenv("HINDSIGHT_API_EMBEDDINGS_ONNX_CPU_MEM_ARENA", "true")
+    monkeypatch.setenv("HINDSIGHT_API_EMBEDDINGS_ONNX_DEVICE", "cuda")
+    monkeypatch.setenv("HINDSIGHT_API_EMBEDDINGS_ONNX_CUDA_DEVICE_ID", "2")
 
     embeddings = create_embeddings_from_env()
 
     assert isinstance(embeddings, OnnxEmbeddings)
     assert embeddings.batch_size == 8
     assert embeddings.cpu_mem_arena is True
+    assert embeddings.device == "cuda"
+    assert embeddings.cuda_device_id == 2
 
 
 def test_onnx_batch_size_and_arena_defaults(monkeypatch, _fresh_config):
     monkeypatch.setenv("HINDSIGHT_API_EMBEDDINGS_PROVIDER", "onnx")
     monkeypatch.delenv("HINDSIGHT_API_EMBEDDINGS_ONNX_BATCH_SIZE", raising=False)
     monkeypatch.delenv("HINDSIGHT_API_EMBEDDINGS_ONNX_CPU_MEM_ARENA", raising=False)
+    monkeypatch.delenv("HINDSIGHT_API_EMBEDDINGS_ONNX_DEVICE", raising=False)
+    monkeypatch.delenv("HINDSIGHT_API_EMBEDDINGS_ONNX_CUDA_DEVICE_ID", raising=False)
 
     embeddings = create_embeddings_from_env()
 
@@ -352,3 +402,5 @@ def test_onnx_batch_size_and_arena_defaults(monkeypatch, _fresh_config):
     assert embeddings.batch_size == DEFAULT_EMBEDDINGS_ONNX_BATCH_SIZE
     # Off by default: an enabled arena never returns freed blocks to the OS.
     assert embeddings.cpu_mem_arena is False
+    assert embeddings.device == "cpu"
+    assert embeddings.cuda_device_id == 0

@@ -18,6 +18,7 @@ query — and it is the kind of default a refactor silently flattens.
 from __future__ import annotations
 
 import pytest
+from hindsight_client_api.api.bank_templates_api import BankTemplatesApi
 from hindsight_client_api.exceptions import ApiException
 
 from hindsight_system_tests import reflect_loop
@@ -95,6 +96,8 @@ async def test_a_page_is_findable_by_searching_its_content(client, bank_id, bank
 
     assert [result.id for result in found.results] == [bank_with_page.page_id]
     assert found.results[0].name == PAGE_NAME
+    # The hit says what the page is for, not only how it opens.
+    assert found.results[0].source_query == SOURCE_QUERY
     # The score is normalized onto 0..1, so the one page every arm ranks first
     # scores exactly 1.0. It used to be the raw RRF term (1/61 per arm, ~0.033
     # fused), which read as "no match" to anyone assuming a relevance scale.
@@ -113,16 +116,46 @@ async def test_deleting_a_page_leaves_the_facts_alone(client, bank_id, bank_with
     assert [m.text for m in memories.items] == ["Alice moved to Berlin | Involving: Alice"]
 
 
+async def test_a_page_with_nothing_to_say_yet_is_stored_empty_and_reads_as_empty(client, bank_id, settled):
+    """A page created in a bank with nothing to synthesize from carries an empty
+    body, not a sentence describing its own state.
+
+    The body is embedded and BM25-indexed, so a placeholder sentence is not an
+    inert label — it is indexed text, and a bank whose pages are all waiting on
+    their first refresh would carry a copy of it per page.
+    """
+    created = await client.knowledge_base.create_knowledge_page(
+        bank_id, {"name": PAGE_NAME, "source_query": SOURCE_QUERY}
+    )
+    await settled(bank_id)
+
+    read = await client.knowledge_base.get_knowledge_page(bank_id, created.page_id)
+    assert not (read.body or "").strip(), f"page body should be empty, got {read.body!r}"
+    # The rendered document says what the empty body cannot. Frontmatter and nothing
+    # else reads as a page that failed to render rather than one nobody has written.
+    assert "No content yet." in read.markdown
+
+    # Still a search hit, and it says why it is bare. Hiding an empty page would be
+    # worse than showing one: an agent that cannot find the page concludes the topic
+    # is uncovered and creates a second page for it. The marker is built when the row
+    # is read, so the stored body above stays empty and the index never carries it.
+    found = await client.knowledge_base.search_knowledge_base(bank_id, q=PAGE_NAME)
+    hit = next(result for result in found.results if result.id == created.page_id)
+    assert hit.snippet == "No content yet."
+
+
 async def test_a_bank_default_trigger_shapes_new_pages(client, llm, bank_id, settled):
     """``knowledge_page_default_trigger`` is merged over the built-in page default.
 
     The configured fields win (here an hourly cron, which also replaces the
-    built-in refresh-after-consolidation), everything unmentioned keeps the page
-    contract, and a trigger sent with the create request still beats the bank.
+    built-in refresh-after-consolidation, and a refresh budget), everything
+    unmentioned keeps the page contract, and a trigger sent with the create
+    request still beats the bank — for the fields it names.
     """
     reflect_loop(llm, answer=ANSWER)
     await client.banks.update_bank_config(
-        bank_id, {"updates": {"knowledge_page_default_trigger": {"refresh_cron": "0 * * * *"}}}
+        bank_id,
+        {"updates": {"knowledge_page_default_trigger": {"refresh_cron": "0 * * * *", "budget": "high"}}},
     )
 
     scheduled = await client.knowledge_base.create_knowledge_page(
@@ -143,10 +176,14 @@ async def test_a_bank_default_trigger_shapes_new_pages(client, llm, bank_id, set
     assert page.mode == "delta"
     assert page.fact_types == ["observation"]
     assert page.exclude_mental_models is True
+    assert page.budget == "high"
 
     override = triggers[explicit.page_id]
     assert override.refresh_after_consolidation is True
     assert override.refresh_cron is None
+    # The create named only the refresh trigger, so the bank's budget still
+    # applies: a partial trigger patches the default, it does not replace it.
+    assert override.budget == "high"
 
 
 async def test_an_invalid_bank_default_trigger_is_rejected(client, bank_id):
@@ -157,3 +194,40 @@ async def test_an_invalid_bank_default_trigger_is_rejected(client, bank_id):
         )
     assert exc.value.status == 400
     assert "knowledge_page_default_trigger" in str(exc.value.body)
+
+
+async def _standalone_model(client, bank_id, settled) -> str:
+    created = await client.mental_models.create_mental_model(
+        bank_id, {"name": "Alice housing", "source_query": SOURCE_QUERY}
+    )
+    await settled(bank_id)
+    return created.mental_model_id
+
+
+async def test_the_model_list_tells_pages_from_standalone_models(client, bank_id, bank_with_page, settled):
+    """A page is stored as a mental model, so the model list carries both — and
+    must say which is which, or the Mental Models view shows every page as a
+    model and counts it twice (#5665). Hiding pages is opt-in: the default list
+    is unchanged."""
+    standalone_id = await _standalone_model(client, bank_id, settled)
+
+    everything = await client.alist_mental_models(bank_id)
+    assert everything.total == 2
+    assert {(m.id, m.is_knowledge_page) for m in everything.items} == {
+        (bank_with_page.mental_model_id, True),
+        (standalone_id, False),
+    }
+
+    standalone_only = await client.alist_mental_models(bank_id, exclude_knowledge_pages=True)
+    assert standalone_only.total == 1
+    assert [m.id for m in standalone_only.items] == [standalone_id]
+
+
+async def test_a_template_carries_standalone_models_but_not_pages(client, bank_id, bank_with_page, settled):
+    """A template has no pages, so a page's model exported into one would come
+    back on import as a standalone model that nobody created (#5665)."""
+    standalone_id = await _standalone_model(client, bank_id, settled)
+
+    template = await BankTemplatesApi(client.banks.api_client).export_bank_template(bank_id)
+
+    assert [m.id for m in template.mental_models] == [standalone_id]

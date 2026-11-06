@@ -16,17 +16,20 @@ from dataclasses import dataclass, fields, replace
 from functools import lru_cache
 from types import UnionType
 from typing import TYPE_CHECKING, Any, Union, get_args, get_origin
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from hindsight_api.config import (
     RECALL_BUDGET_FUNCTIONS,
     HindsightConfig,
     _get_raw_config,
     normalize_config_dict,
+    validate_observation_scopes,
     validate_retain_chunking_config,
     validate_retain_completion_token_budget,
     validate_retain_image_chunking_config,
 )
-from hindsight_api.engine.memory_engine import fq_table
+from hindsight_api.engine.response_models import MentalModelTrigger, ReflectDefaultOptions
+from hindsight_api.engine.schema import fq_table
 from hindsight_api.extensions.tenant import TenantExtension
 from hindsight_api.models import RequestContext
 
@@ -601,12 +604,39 @@ class ConfigResolver:
                 if not isinstance(strategy_overrides, dict):
                     raise ValueError(f"Invalid retain strategy {strategy_name!r}: must be an object")
                 try:
-                    _validate_config_value_types(normalize_config_dict(strategy_overrides))
+                    normalized_overrides = normalize_config_dict(strategy_overrides)
+                    _validate_config_value_types(normalized_overrides)
+                    # The type check above only sees "str | list"; a strategy's default scopes are
+                    # stamped onto its items, so they need the same shape check as the top level.
+                    if normalized_overrides.get("default_observation_scopes") is not None:
+                        validate_observation_scopes(
+                            normalized_overrides["default_observation_scopes"], "default_observation_scopes"
+                        )
                 except ValueError as e:
                     raise ValueError(f"Invalid retain strategy {strategy_name!r}: {e}") from e
 
+        # Validate consolidation_strategies: the config type is a plain list, so
+        # without this a typo ("scope" for "scopes", a string where the tag list
+        # belongs) is stored happily and then ignored for the life of the bank —
+        # the strategy simply never applies, with nothing to show why.
+        if normalized_updates.get("consolidation_strategies") is not None:
+            _validate_consolidation_strategies(normalized_updates["consolidation_strategies"])
+
+        if normalized_updates.get("default_observation_scopes") is not None:
+            validate_observation_scopes(normalized_updates["default_observation_scopes"], "default_observation_scopes")
+
         # Validate recall budget fields
         _validate_recall_budget_updates(normalized_updates)
+
+        # A zone name nothing can load would break every retain on the bank.
+        if normalized_updates.get("default_timezone") is not None:
+            try:
+                ZoneInfo(normalized_updates["default_timezone"])
+            except (ZoneInfoNotFoundError, ValueError, TypeError):
+                raise ValueError(
+                    f"default_timezone must be an IANA zone name such as 'Europe/Rome', "
+                    f"got {normalized_updates['default_timezone']!r}"
+                ) from None
 
         # Validate disposition trait fields (1-5 integer scale)
         _validate_disposition_updates(normalized_updates)
@@ -817,16 +847,36 @@ def _validate_against_model(key: str, value: dict[str, Any], model: "type[BaseMo
 
 def _validate_knowledge_page_default_trigger(value: dict[str, Any]) -> None:
     """Reject unknown trigger fields and values ``MentalModelTrigger`` refuses."""
-    from hindsight_api.api.http import MentalModelTrigger
-
     _validate_against_model("knowledge_page_default_trigger", value, MentalModelTrigger, "trigger")
 
 
 def _validate_reflect_default_options(value: dict[str, Any]) -> None:
     """Reject unknown option fields and values ``ReflectDefaultOptions`` refuses."""
-    from hindsight_api.api.http import ReflectDefaultOptions
-
     _validate_against_model("reflect_default_options", value, ReflectDefaultOptions, "options")
+
+
+def _validate_consolidation_strategies(value: Any) -> None:
+    """Reject a consolidation_strategies value whose shape cannot work.
+
+    Shape only: an incomplete draft (a rule with no tags yet, a strategy with no
+    setting) is accepted, because the control plane saves strategies as typed and
+    consolidation ignores the unusable ones. What is rejected is what could only
+    be a mistake — an entry that is not an object, an unknown key, a tag list that
+    is not a list of strings, an unknown tags_match.
+    """
+    from pydantic import ValidationError
+
+    from .engine.response_models import StrictConsolidationStrategySpec
+
+    if not isinstance(value, list):
+        raise ValueError(f"consolidation_strategies must be a list, got {type(value).__name__}")
+    for index, entry in enumerate(value):
+        try:
+            StrictConsolidationStrategySpec.model_validate(entry)
+        except ValidationError as e:
+            first = e.errors()[0]
+            location = ".".join(str(part) for part in first["loc"]) or "entry"
+            raise ValueError(f"Invalid consolidation strategy at index {index}: {location}: {first['msg']}") from e
 
 
 def _validate_config_value_types(updates: dict[str, Any]) -> None:

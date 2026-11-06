@@ -150,6 +150,7 @@ async def _build_overlap_bank(conn, mu, ue, ml, bank_id: str, entities_table: st
     }
 
 
+@pytest.mark.memory_backend_incompatible
 @pytest.mark.asyncio
 async def test_observation_expansion_performs_one_fetch(memory, request_context):
     """A normal observation expansion performs one fetch, not two (#3857).
@@ -157,14 +158,18 @@ async def test_observation_expansion_performs_one_fetch(memory, request_context)
     The single fetch must still carry all three arms: the entity/source
     traversal plus the semantic and causal neighbours.
     """
-    from hindsight_api.engine.task_backend import fq_table
+    from hindsight_api.engine.schema import fq_store_table_explicit
 
     bank_id = f"test_obs_one_fetch_{uuid.uuid4().hex[:8]}"
     try:
         pool = await memory._get_pool()
         backend = await memory._get_backend()
-        mu, ue, ml = fq_table("memory_units"), fq_table("unit_entities"), fq_table("memory_links")
-        entities_table = fq_table("entities")
+        mu, ue, ml = (
+            fq_store_table_explicit("memory_units"),
+            fq_store_table_explicit("unit_entities"),
+            fq_store_table_explicit("memory_links"),
+        )
+        entities_table = fq_store_table_explicit("entities")
 
         async with pool.acquire() as conn:
             await _ensure_bank(conn, bank_id)
@@ -190,6 +195,7 @@ async def test_observation_expansion_performs_one_fetch(memory, request_context)
         await memory.delete_bank(bank_id=bank_id, request_context=request_context)
 
 
+@pytest.mark.memory_backend_incompatible
 @pytest.mark.asyncio
 async def test_fusion_preserves_ids_scores_counts_and_ordering(memory, request_context):
     """IDs, scores, counts, and ordering survive the fusion unchanged.
@@ -198,14 +204,18 @@ async def test_fusion_preserves_ids_scores_counts_and_ordering(memory, request_c
     entities shared by several seeds are not double-counted); ordering is by
     score descending; each arm keeps its own budget limit.
     """
-    from hindsight_api.engine.task_backend import fq_table
+    from hindsight_api.engine.schema import fq_store_table_explicit
 
     bank_id = f"test_obs_fused_{uuid.uuid4().hex[:8]}"
     try:
         pool = await memory._get_pool()
         backend = await memory._get_backend()
-        mu, ue, ml = fq_table("memory_units"), fq_table("unit_entities"), fq_table("memory_links")
-        entities_table = fq_table("entities")
+        mu, ue, ml = (
+            fq_store_table_explicit("memory_units"),
+            fq_store_table_explicit("unit_entities"),
+            fq_store_table_explicit("memory_links"),
+        )
+        entities_table = fq_store_table_explicit("entities")
 
         async with pool.acquire() as conn:
             await _ensure_bank(conn, bank_id)
@@ -263,6 +273,7 @@ async def test_fusion_preserves_ids_scores_counts_and_ordering(memory, request_c
         await memory.delete_bank(bank_id=bank_id, request_context=request_context)
 
 
+@pytest.mark.memory_backend_incompatible
 @pytest.mark.asyncio
 async def test_time_window_binds_every_fused_arm(memory, request_context):
     """created_after/created_before narrow the fused arms alike ($3/$4 binds).
@@ -271,14 +282,18 @@ async def test_time_window_binds_every_fused_arm(memory, request_context):
     both placeholder positions must bind correctly for every arm — the arms
     share one param list, so a mis-numbered window would fail everywhere.
     """
-    from hindsight_api.engine.task_backend import fq_table
+    from hindsight_api.engine.schema import fq_store_table_explicit
 
     bank_id = f"test_obs_window_{uuid.uuid4().hex[:8]}"
     try:
         pool = await memory._get_pool()
         backend = await memory._get_backend()
-        mu, ue, ml = fq_table("memory_units"), fq_table("unit_entities"), fq_table("memory_links")
-        entities_table = fq_table("entities")
+        mu, ue, ml = (
+            fq_store_table_explicit("memory_units"),
+            fq_store_table_explicit("unit_entities"),
+            fq_store_table_explicit("memory_links"),
+        )
+        entities_table = fq_store_table_explicit("entities")
 
         async with pool.acquire() as conn:
             await _ensure_bank(conn, bank_id)
@@ -329,6 +344,7 @@ async def test_time_window_binds_every_fused_arm(memory, request_context):
         await memory.delete_bank(bank_id=bank_id, request_context=request_context)
 
 
+@pytest.mark.memory_backend_incompatible
 @pytest.mark.asyncio
 async def test_seed_without_sources_keeps_semantic_and_causal_arms(memory, request_context):
     """A seed with no source facts yields an empty entity arm, and that is all.
@@ -338,13 +354,17 @@ async def test_seed_without_sources_keeps_semantic_and_causal_arms(memory, reque
     CTE is empty, so the whole entity half of the fused query finds nothing —
     the semantic and causal neighbours must still come back.
     """
-    from hindsight_api.engine.task_backend import fq_table
+    from hindsight_api.engine.schema import fq_store_table_explicit
 
     bank_id = f"test_obs_nosrc_{uuid.uuid4().hex[:8]}"
     try:
         pool = await memory._get_pool()
         backend = await memory._get_backend()
-        mu, ue, ml = fq_table("memory_units"), fq_table("unit_entities"), fq_table("memory_links")
+        mu, ue, ml = (
+            fq_store_table_explicit("memory_units"),
+            fq_store_table_explicit("unit_entities"),
+            fq_store_table_explicit("memory_links"),
+        )
 
         async with pool.acquire() as conn:
             await _ensure_bank(conn, bank_id)
@@ -416,6 +436,37 @@ async def test_postgresql_fused_query_is_one_statement():
     # Bind order: seeds, budget, then the window bounds.
     assert params == (seeds, 100, after, before)
     assert sql.count("$1::uuid[]") >= 4, "the seed bind reaches every arm"
+
+
+@pytest.mark.asyncio
+async def test_postgresql_candidates_probe_gin_once_per_connected_source():
+    """Structural (no live DB): pins the #4715 candidate lookup.
+
+    One `&& <every connected source>` probe rechecks each matched row against a
+    ~17k-element array on hub-heavy banks (5-21s, 8 in parallel timed out). The
+    per-source `@>` probe must stay fenced with OFFSET 0 and keep `fact_type`
+    out, or the planner ANDs every probe with a full observations-index scan
+    (84-185s on the reporter's bank).
+    """
+    conn = AsyncMock()
+    conn.fetch.return_value = []
+    await PostgreSQLOps().expand_observations(
+        conn,
+        "memory_units",
+        "unit_entities",
+        "memory_links",
+        [uuid.uuid4()],
+        100,
+        200,
+        UpdatedWindow(after=None, before=None, first_param_index=3),
+    )
+    sql = " ".join(conn.fetch.await_args.args[0].split())
+
+    assert "array_agg(" not in sql, "connected sources must not be collapsed into one probe array"
+    probe = sql[sql.index("candidate_ids AS (") : sql.index("candidates AS (")]
+    assert "m.source_memory_ids @> ARRAY[cs.source_id]" in probe
+    assert "OFFSET 0" in probe, "the fence keeps fact_type from being pushed into the probe"
+    assert "fact_type" not in probe
 
 
 @pytest.mark.asyncio

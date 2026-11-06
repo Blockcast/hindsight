@@ -13,7 +13,7 @@ print_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
 print_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 print_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
-VALID_INTEGRATIONS=("ag2" "agent-framework" "agent-plugin" "agentcore" "agno" "aider" "ai-sdk" "autogen" "chat" "claude-agent-sdk" "claude-code" "cline" "cloudflare-oauth-proxy" "coding-agents" "codex" "composio" "continue" "copilot-cli" "crewai" "cursor" "cursor-cli" "devin-desktop" "dify" "eliza" "eve" "flowise" "gemini-spark" "github-copilot" "google-adk" "haystack" "langgraph" "litellm" "llamaindex" "n8n" "nemoclaw" "obsidian" "omo" "openai-agents" "openclaw" "opencode" "openhands" "paperclip" "pipecat" "pydantic-ai" "roo-code" "smolagents" "strands" "superagent" "vapi" "zcode" "zed")
+VALID_INTEGRATIONS=("ag2" "agent-framework" "agent-plugin" "agentcore" "agno" "aider" "ai-sdk" "autogen" "chat" "claude-agent-sdk" "cloudflare-oauth-proxy" "coding-agents" "composio" "continue" "crewai" "cursor" "devin-desktop" "dify" "eliza" "eve" "flowise" "gemini-spark" "github-copilot" "google-adk" "grok-bot" "haystack" "hermes" "langgraph" "litellm" "llamaindex" "meta-muse" "n8n" "nemoclaw" "obsidian" "omo" "openai-agents" "openclaw" "openhands" "paperclip" "pipecat" "pydantic-ai" "roo-code" "smolagents" "strands" "superagent" "vapi" "zed")
 
 usage() {
     print_error "Usage: $0 <integration> <version>"
@@ -149,6 +149,15 @@ if [ -f "$INTEGRATION_DIR/pyproject.toml" ]; then
     print_info "Updating version in $INTEGRATION_DIR/pyproject.toml"
     sed -i.bak "s/^version = \".*\"/version = \"$VERSION\"/" "$INTEGRATION_DIR/pyproject.toml"
     rm "$INTEGRATION_DIR/pyproject.toml.bak"
+    # hermes also ships a Hermes plugin manifest whose `version` is what `hermes plugins list` and
+    # the Hermes catalog card show. pyproject.toml is not read by Hermes at all, so bumping only
+    # that would leave the version users actually see stuck at whatever it was born with — the
+    # same trap package-lock.json fell into below.
+    if [ -f "$INTEGRATION_DIR/plugin.yaml" ]; then
+        print_info "Updating version in $INTEGRATION_DIR/plugin.yaml"
+        sed -i.bak "s/^version: .*/version: $VERSION/" "$INTEGRATION_DIR/plugin.yaml"
+        rm "$INTEGRATION_DIR/plugin.yaml.bak"
+    fi
 elif [ -f "$INTEGRATION_DIR/package.json" ]; then
     print_info "Updating version in $INTEGRATION_DIR/package.json"
     sed -i.bak "s/\"version\": \".*\"/\"version\": \"$VERSION\"/" "$INTEGRATION_DIR/package.json"
@@ -158,6 +167,8 @@ elif [ -f "$INTEGRATION_DIR/package.json" ]; then
     # was born with (coding-agents still said 0.0.5 at v0.3.2). `npm version` rewrites exactly
     # those two fields and nothing else; `--package-lock-only` was rejected because it re-resolves
     # dependencies, which would smuggle dependency bumps into a release commit.
+    # It also runs the package's own `version` lifecycle script, which obsidian relies on to bump
+    # manifest.json + versions.json (#5969) — so never add --ignore-scripts here.
     if [ -f "$INTEGRATION_DIR/package-lock.json" ]; then
         print_info "Syncing $INTEGRATION_DIR/package-lock.json"
         (cd "$INTEGRATION_DIR" && npm version "$VERSION" --no-git-tag-version --allow-same-version >/dev/null)
@@ -169,10 +180,21 @@ elif [ -f "$INTEGRATION_DIR/package.json" ]; then
         sed -i.bak "s/\"version\": \".*\"/\"version\": \"$VERSION\"/" "$INTEGRATION_DIR/plugin.json"
         rm "$INTEGRATION_DIR/plugin.json.bak"
     fi
+    # paperclip declares its version in the TypeScript manifest the host reads, so the plugin list
+    # showed 0.2.0 long after 0.3.0 shipped. Keep it in lockstep with package.json.
+    if [ "$INTEGRATION" = "paperclip" ]; then
+        print_info "Updating version in $INTEGRATION_DIR/src/manifest.ts"
+        sed -i.bak "s/^  version: \".*\",/  version: \"$VERSION\",/" "$INTEGRATION_DIR/src/manifest.ts"
+        rm "$INTEGRATION_DIR/src/manifest.ts.bak"
+    fi
 elif [ -f "$INTEGRATION_DIR/.claude-plugin/plugin.json" ]; then
     print_info "Updating version in $INTEGRATION_DIR/.claude-plugin/plugin.json"
     sed -i.bak "s/\"version\": \".*\"/\"version\": \"$VERSION\"/" "$INTEGRATION_DIR/.claude-plugin/plugin.json"
     rm "$INTEGRATION_DIR/.claude-plugin/plugin.json.bak"
+elif [ -f "$INTEGRATION_DIR/.cursor-plugin/plugin.json" ]; then
+    print_info "Updating version in $INTEGRATION_DIR/.cursor-plugin/plugin.json"
+    sed -i.bak "s/\"version\": \".*\"/\"version\": \"$VERSION\"/" "$INTEGRATION_DIR/.cursor-plugin/plugin.json"
+    rm "$INTEGRATION_DIR/.cursor-plugin/plugin.json.bak"
 elif [ -f "$INTEGRATION_DIR/plugin.json" ]; then
     print_info "Updating version in $INTEGRATION_DIR/plugin.json"
     sed -i.bak "s/\"version\": \".*\"/\"version\": \"$VERSION\"/" "$INTEGRATION_DIR/plugin.json"
@@ -182,17 +204,17 @@ elif [ -f "$INTEGRATION_DIR/settings.json" ] && grep -q '"version"' "$INTEGRATIO
     sed -i.bak "s/\"version\": \".*\"/\"version\": \"$VERSION\"/" "$INTEGRATION_DIR/settings.json"
     rm "$INTEGRATION_DIR/settings.json.bak"
 else
-    print_error "No pyproject.toml, package.json, plugin.json, or versioned settings.json found in $INTEGRATION_DIR"
+    print_error "No pyproject.toml, package.json, plugin.json (incl. .claude-plugin/ and .cursor-plugin/), or versioned settings.json found in $INTEGRATION_DIR"
     exit 1
 fi
 
-# The Claude Code plugin ships via the marketplace manifest (no package
-# registry). `claude plugin marketplace add vectorize-io/hindsight` only ever
-# reads the root .claude-plugin/marketplace.json, so its "version" must be
-# bumped in lockstep with the plugin so the published catalog reflects the new
-# release (see #2386).
-if [ "$INTEGRATION" = "claude-code" ]; then
-    MARKETPLACE_FILE=".claude-plugin/marketplace.json"
+# The Cursor Marketplace, which Grok Bot installs from, reads the root
+# .cursor-plugin/marketplace.json, so its "version" is what the published catalog card
+# shows and must move with the plugin manifest. The sed is file-wide, which is correct
+# while the catalog lists one plugin — test_marketplace_lists_this_plugin asserts the two
+# versions stay equal, so a second plugin would have to make this selective.
+if [ "$INTEGRATION" = "grok-bot" ]; then
+    MARKETPLACE_FILE=".cursor-plugin/marketplace.json"
     print_info "Updating marketplace version in $MARKETPLACE_FILE"
     sed -i.bak "s/\"version\": \".*\"/\"version\": \"$VERSION\"/" "$MARKETPLACE_FILE"
     rm "$MARKETPLACE_FILE.bak"
@@ -217,8 +239,8 @@ print_info "Regenerating docs skill..."
 # Commit version bump + changelog + regenerated skill together
 print_info "Committing changes..."
 git add "hindsight-integrations/$INTEGRATION/" "hindsight-docs/src/pages/changelog/integrations/$INTEGRATION.md" "skills/"
-# claude-code also bumps the root marketplace manifest (no-op stage for other integrations)
-git add ".claude-plugin/marketplace.json"
+# grok-bot also bumps a root marketplace manifest (no-op stage for the others)
+git add ".cursor-plugin/marketplace.json"
 git commit --no-verify -m "release($INTEGRATION): v$VERSION"
 
 # Create annotated tag

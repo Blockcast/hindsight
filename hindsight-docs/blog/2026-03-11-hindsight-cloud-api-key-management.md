@@ -1,12 +1,13 @@
 ---
 title: "What's New in Hindsight Cloud: Programmatic API Key Management"
+description: "Hindsight Cloud keys can now create, list and revoke child keys limited to specific banks, straight from the API."
 authors: [benfrank241]
 date: 2026-03-11T12:00
 tags: [hindsight-cloud, release, api]
 hide_table_of_contents: true
 ---
 
-[Hindsight Cloud](https://ui.hindsight.vectorize.io/signup) now supports programmatic API key management. API keys with the **Key Creator** capability can create, list, and revoke bank-scoped child keys via the API — no admin or UI access required.
+[Hindsight Cloud](https://ui.hindsight.vectorize.io) now supports programmatic API key management. API keys with the **Key Creator** capability can create, list, and revoke bank-scoped child keys via the API — no admin or UI access required.
 
 <!-- truncate -->
 
@@ -27,4 +28,4 @@ Combined with [bank-scoped API keys](/blog/2026/03/09/hindsight-document-upload#
 
 ## Get Started
 
-Programmatic API key management is available now in [Hindsight Cloud](https://ui.hindsight.vectorize.io/signup). Create a key with the Key Creator capability to start provisioning child keys via the API.
+Programmatic API key management is available now in [Hindsight Cloud](https://ui.hindsight.vectorize.io). Create a key with the Key Creator capability to start provisioning child keys via the API.

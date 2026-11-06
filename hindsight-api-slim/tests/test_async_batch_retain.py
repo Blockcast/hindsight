@@ -136,6 +136,46 @@ async def test_shared_and_distinct_document_ids_sync(memory, request_context):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("queued", [False, True], ids=["sync", "async"])
+async def test_item_without_document_id_not_absorbed(memory, request_context, queued):
+    """An item without a document_id next to ONE item that has one gets its own
+    document; it is not folded into the other item's document, whose replace
+    would otherwise delete its facts too (issue #4931). The queued and in-process
+    paths must agree."""
+    bank_id = f"test_idless_not_absorbed_{uuid.uuid4().hex}"
+    contents = [
+        {"content": "Alice works at Google", "document_id": "report-2024"},
+        {"content": "Bob loves Python"},
+    ]
+    try:
+        if queued:
+            submitted = await memory.submit_async_retain(
+                bank_id=bank_id, contents=contents, request_context=request_context
+            )
+            # SyncTaskBackend runs the children on submit.
+            await asyncio.sleep(0.1)
+            status = await memory.get_operation_status(
+                bank_id=bank_id, operation_id=submitted["operation_id"], request_context=request_context
+            )
+            assert status["status"] == "completed"
+        else:
+            result = await memory.retain_batch_async(
+                bank_id=bank_id, contents=contents, request_context=request_context
+            )
+            assert len(result) == 2
+            assert result[1]
+
+        docs = await memory.list_documents(bank_id=bank_id, request_context=request_context)
+        assert docs["total"] == 2
+
+        report = await memory.get_document("report-2024", bank_id, request_context=request_context)
+        assert "Alice works at Google" in report["original_text"]
+        assert "Bob loves Python" not in report["original_text"]
+    finally:
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+
+@pytest.mark.asyncio
 async def test_shared_document_id_folds_sync_large_batch(memory, request_context):
     """A shared-document batch large enough to exceed the auto-split token
     threshold still folds into one document with NO lost content. Splitting one
@@ -1214,6 +1254,66 @@ async def test_request_context_retry_count_propagated_to_validator(memory_no_llm
 
 
 @pytest.mark.asyncio
+async def test_request_context_operation_id_propagated_to_validator(memory_no_llm_verify, request_context):
+    """_handle_batch_retain forwards the task's _operation_id as
+    RequestContext.operation_id, so a validator can act on the exact operation
+    it is deciding about. Missing (a direct, non-worker call) surfaces as None.
+    """
+    from hindsight_api.extensions import (
+        OperationValidatorExtension,
+        RecallContext,
+        ReflectContext,
+        RetainContext,
+        ValidationResult,
+    )
+
+    captured: dict[str, str | None] = {}
+
+    class CapturingValidator(OperationValidatorExtension):
+        def __init__(self):
+            super().__init__({})
+
+        async def validate_retain(self, ctx: RetainContext) -> ValidationResult:
+            captured["operation_id"] = ctx.request_context.operation_id
+            return ValidationResult.accept()
+
+        async def validate_recall(self, ctx: RecallContext) -> ValidationResult:
+            return ValidationResult.accept()
+
+        async def validate_reflect(self, ctx: ReflectContext) -> ValidationResult:
+            return ValidationResult.accept()
+
+    memory_no_llm_verify._operation_validator = CapturingValidator()
+
+    bank_id = f"test-opid-propagate-{uuid.uuid4().hex[:8]}"
+    pool = await memory_no_llm_verify._get_pool()
+    await _ensure_bank(pool, bank_id)
+
+    operation_id = str(uuid.uuid4())
+    await memory_no_llm_verify._handle_batch_retain(
+        {
+            "type": "batch_retain",
+            "bank_id": bank_id,
+            "contents": [{"content": "operation-id propagate test"}],
+            "_tenant_id": "default",
+            "_operation_id": operation_id,
+        }
+    )
+    assert captured["operation_id"] == operation_id
+
+    captured.clear()
+    await memory_no_llm_verify._handle_batch_retain(
+        {
+            "type": "batch_retain",
+            "bank_id": bank_id,
+            "contents": [{"content": "operation-id propagate default test"}],
+            "_tenant_id": "default",
+        }
+    )
+    assert captured["operation_id"] is None
+
+
+@pytest.mark.asyncio
 async def test_submit_async_operation_leaves_claimable_row_when_submit_task_fails(memory):
     """Regression for the crash-window orphan bug fixed in #1091.
 
@@ -1780,3 +1880,58 @@ async def test_async_retain_survives_nul_and_surrogate_in_any_field(memory, requ
     # Nothing hostile may remain anywhere in the round-tripped payload.
     assert nul not in json.dumps(payload)
     assert surrogate not in json.dumps(payload)
+
+
+# ── retrying a deferred operation runs it now ───────────────────────────────
+# A provider can report a quota reset days out (#5684). Retry is the user's way
+# to run a parked operation now instead of waiting out a stale window.
+
+
+@pytest.mark.asyncio
+async def test_retry_deferred_operation_clears_next_retry_at(memory, request_context):
+    from hindsight_api.engine.db_utils import acquire_with_retry
+
+    bank_id = f"retry-deferred-{uuid.uuid4().hex[:8]}"
+    op_id = uuid.uuid4()
+    backend = await memory._get_backend()
+    async with acquire_with_retry(backend) as conn:
+        await conn.execute("INSERT INTO banks (bank_id, name) VALUES ($1, $1)", bank_id)
+        await conn.execute(
+            "INSERT INTO async_operations (operation_id, bank_id, operation_type, status, task_payload, next_retry_at) "
+            "VALUES ($1, $2, 'retain', 'pending', $3::jsonb, NOW() + INTERVAL '3 days')",
+            op_id,
+            bank_id,
+            json.dumps({"contents": []}),
+        )
+
+    result = await memory.retry_operation(bank_id, str(op_id), request_context=request_context)
+    assert result["success"] is True
+
+    async with acquire_with_retry(backend) as conn:
+        row = await conn.fetchrow("SELECT status, next_retry_at FROM async_operations WHERE operation_id = $1", op_id)
+    assert row["status"] == "pending"
+    assert row["next_retry_at"] is None, "retry must release the park so a worker claims it now"
+
+
+@pytest.mark.asyncio
+async def test_retry_queued_operation_is_rejected(memory, request_context):
+    # A plain queued op (no future next_retry_at) is not deferred: nothing to do.
+    from hindsight_api.engine.db_utils import acquire_with_retry
+    from hindsight_api.extensions import OperationValidationError
+
+    bank_id = f"retry-deferred-{uuid.uuid4().hex[:8]}"
+    op_id = uuid.uuid4()
+    backend = await memory._get_backend()
+    async with acquire_with_retry(backend) as conn:
+        await conn.execute("INSERT INTO banks (bank_id, name) VALUES ($1, $1)", bank_id)
+        await conn.execute(
+            "INSERT INTO async_operations (operation_id, bank_id, operation_type, status, task_payload) "
+            "VALUES ($1, $2, 'retain', 'pending', $3::jsonb)",
+            op_id,
+            bank_id,
+            json.dumps({"contents": []}),
+        )
+
+    with pytest.raises(OperationValidationError) as exc:
+        await memory.retry_operation(bank_id, str(op_id), request_context=request_context)
+    assert exc.value.status_code == 409

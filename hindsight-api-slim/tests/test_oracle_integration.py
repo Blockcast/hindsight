@@ -9,17 +9,18 @@ produces identical behavior through the database abstraction layer.
 """
 
 import asyncio
+import json
 import logging
 import uuid
 from datetime import datetime, timezone
 from typing import Any, NoReturn
 
 import pytest
-import pytest_asyncio
 
 from hindsight_api import MemoryEngine, RequestContext
 from hindsight_api.engine.db import DatabaseConnection
-from hindsight_api.engine.memory_engine import Budget
+from hindsight_api.engine.response_models import Budget
+from hindsight_api.engine.retain.types import embedding_to_pgvector
 from tests import consolidation_actions
 from tests.test_bank_config_atomicity import (
     assert_one_sided_budget_update_sees_stored_state,
@@ -625,6 +626,165 @@ class TestRetainPipeline:
                 document_id="meta-doc", bank_id=bank_id, request_context=request_context
             )
             assert doc is not None
+        finally:
+            await _safe_cleanup(oracle_memory, bank_id, request_context)
+
+
+# ===================================================================
+# Retain SQL that used to be PostgreSQL-only
+#
+# Early in the file for the same reason as Tier 1b: the Oracle Free container
+# tends to drop every connection during the edge-case tier at the end.
+# ===================================================================
+
+
+class TestOracleRetainSql:
+    """Seeds rows through the backend ops, so no LLM is involved (#4629, #4630, #4631)."""
+
+    @staticmethod
+    async def _seed(conn, backend, bank_id: str, dim: int) -> tuple[str, list[str]]:
+        doc_id, chunk_id = "doc-1", f"{bank_id}_doc-1_0"
+        await conn.execute(
+            "INSERT INTO documents (id, bank_id, original_text, content_hash) VALUES ($1, $2, 'x', 'h')",
+            doc_id,
+            bank_id,
+        )
+        await backend.ops.bulk_upsert_chunks(conn, "chunks", [chunk_id], [doc_id], [bank_id], ["x"], [0], ["h"])
+        near = [1.0] + [0.0] * (dim - 1)
+        also_near = [0.99, 0.01] + [0.0] * (dim - 2)
+        n = 2
+        unit_ids = await backend.ops.insert_facts_batch(
+            conn,
+            bank_id,
+            # The second text is past VARCHAR2's 4000 bytes, behind a short first row:
+            # executemany typed the column from row one and failed with ORA-01461 (#4630).
+            fact_texts=["short fact", "long fact " + "é" * 3000],
+            embeddings=[embedding_to_pgvector(near), embedding_to_pgvector(also_near)],
+            # event_date is NOT NULL on Oracle; the other temporal columns are optional.
+            event_dates=[datetime(2024, 1, 1, tzinfo=timezone.utc)] * n,
+            occurred_starts=[None] * n,
+            occurred_ends=[None] * n,
+            mentioned_ats=[None] * n,
+            contexts=[""] * n,
+            fact_types=["world"] * n,
+            metadata_jsons=["{}"] * n,
+            chunk_ids=[chunk_id] * n,
+            document_ids=[doc_id] * n,
+            tags_list=["[]"] * n,
+            observation_scopes_list=[None] * n,
+            text_signals_list=[None] * n,
+            attachment_ids_list=[None] * n,
+        )
+        return chunk_id, unit_ids
+
+    @pytest.mark.asyncio
+    async def test_semantic_ann_links_delete_chunks(self, oracle_memory: MemoryEngine, request_context: RequestContext):
+        from hindsight_api.engine.memories.pg.links import compute_semantic_links_ann
+        from hindsight_api.engine.retain.chunk_storage import delete_chunks_by_ids
+
+        bank_id = _bank_id("retainsql")
+        dim = oracle_memory.embeddings.dimension
+        try:
+            await oracle_memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
+            backend = await oracle_memory._get_backend()
+            async with backend.transaction() as conn:
+                chunk_id, unit_ids = await self._seed(conn, backend, bank_id, dim)
+
+            # Raw SQL throughout: this checks the Oracle SQL paths themselves -- the stored
+            # CLOB length, and that the chunks row and the link rows went with the delete,
+            # which no engine read method exposes.
+            async with backend.acquire() as conn:
+                long_len = await conn.fetchval(
+                    "SELECT DBMS_LOB.GETLENGTH(text) FROM memory_units WHERE id = $1", unit_ids[1]
+                )
+                assert long_len == len("long fact ") + 3000
+
+                # #4629: the ANN probe finds the stored neighbour instead of failing on PG-only SQL.
+                links = await compute_semantic_links_ann(
+                    conn,
+                    bank_id,
+                    ["seed"],
+                    [[1.0] + [0.0] * (dim - 1)],
+                    fact_types=["world"],
+                    top_k=5,
+                    threshold=0.9,
+                )
+                assert {lnk[1] for lnk in links} == {str(u) for u in unit_ids}
+                assert all(lnk[0] == "seed" and lnk[2] == "semantic" for lnk in links)
+
+            async with backend.transaction() as conn:
+                await conn.execute(
+                    "INSERT INTO memory_links (from_unit_id, to_unit_id, link_type, weight, bank_id) "
+                    "VALUES ($1, $2, 'semantic', 0.9, $3)",
+                    unit_ids[0],
+                    unit_ids[1],
+                    bank_id,
+                )
+                # #4631: re-retaining a document deletes its changed chunks.
+                await delete_chunks_by_ids(conn, [chunk_id], bank_id, ops=backend.ops)
+
+            async with backend.acquire() as conn:
+                for table in ("chunks", "memory_units", "memory_links"):
+                    count = await conn.fetchval(f"SELECT COUNT(*) FROM {table} WHERE bank_id = $1", bank_id)
+                    assert count == 0, f"{table} still has rows for the deleted chunk"
+        finally:
+            await _safe_cleanup(oracle_memory, bank_id, request_context)
+
+    @pytest.mark.asyncio
+    async def test_batch_parent_siblings_lookup_and_rollup(
+        self, oracle_memory: MemoryEngine, request_context: RequestContext
+    ):
+        """result_metadata @> is the parent/sibling lookup: on Oracle it must
+        filter on the bound key. The generic JSON_EXISTS(..., '$' PASSING :N)
+        rewrite matched no row at all, so a batch_retain parent never found its
+        children and stayed pending forever."""
+        bank_id = _bank_id("batchparent")
+        parent_id, child_a, child_b, stray = (uuid.uuid4() for _ in range(4))
+        try:
+            await oracle_memory.ensure_bank_profile(bank_id=bank_id, request_context=request_context)
+            backend = await oracle_memory._get_backend()
+            async with backend.transaction() as conn:
+                await conn.execute(
+                    "INSERT INTO async_operations (operation_id, bank_id, operation_type, status) "
+                    "VALUES ($1, $2, 'batch_retain', 'pending')",
+                    parent_id,
+                    bank_id,
+                )
+                for child_id in (child_a, child_b):
+                    await conn.execute(
+                        "INSERT INTO async_operations (operation_id, bank_id, operation_type, status, "
+                        "result_metadata, completed_at) VALUES ($1, $2, 'retain', 'completed', $3, now())",
+                        child_id,
+                        bank_id,
+                        json.dumps({"parent_operation_id": str(parent_id)}),
+                    )
+                # Unrelated op in the same bank: containment must not match it.
+                await conn.execute(
+                    "INSERT INTO async_operations (operation_id, bank_id, operation_type, status, result_metadata) "
+                    "VALUES ($1, $2, 'retain', 'pending', $3)",
+                    stray,
+                    bank_id,
+                    json.dumps({"other": True}),
+                )
+
+            # The rollup's own query shape: only the two children are siblings.
+            async with backend.acquire() as conn:
+                siblings = await conn.fetch(
+                    "SELECT status FROM async_operations WHERE bank_id = $1 AND result_metadata::jsonb @> $2::jsonb",
+                    bank_id,
+                    json.dumps({"parent_operation_id": str(parent_id)}),
+                )
+                assert len(siblings) == 2
+
+            async with backend.transaction() as conn:
+                await oracle_memory._maybe_update_parent_operation(str(child_a), conn)
+
+            async with backend.acquire() as conn:
+                status = await conn.fetchval(
+                    "SELECT status FROM async_operations WHERE operation_id = $1",
+                    parent_id,
+                )
+                assert status == "completed"
         finally:
             await _safe_cleanup(oracle_memory, bank_id, request_context)
 
@@ -1543,5 +1703,45 @@ class TestEdgeCases:
             docs_after = await oracle_memory.list_documents(bank_id=bank_id, request_context=request_context)
             items_after = docs_after.get("items", docs_after.get("documents", []))
             assert len(items_after) >= 2
+        finally:
+            await _safe_cleanup(oracle_memory, bank_id, request_context)
+
+
+class TestOracleDocumentHistory:
+    """The history is read out of async_operations.result_metadata. Oracle needs its own JSON path
+    filter there (the rewriter turns any `result_metadata @> :N` into a parent-operation lookup), so
+    the round trip — events written onto operations, then found again by document — runs here too."""
+
+    @pytest.mark.asyncio
+    async def test_retain_and_edit_events_round_trip(
+        self, oracle_memory: MemoryEngine, request_context: RequestContext
+    ):
+        bank_id = _bank_id("dochist")
+        doc_id = "call-1"
+        try:
+            await oracle_memory.submit_async_retain(
+                bank_id,
+                [{"content": "Alice started physio on Monday after her knee surgery.", "document_id": doc_id}],
+                request_context=request_context,
+            )
+            page = await oracle_memory.list_memory_units(
+                bank_id, document_id=doc_id, fact_type=["world", "experience"], request_context=request_context
+            )
+            facts = [m["id"] for m in page["items"]]
+            assert facts
+
+            await oracle_memory.update_memory_unit(
+                bank_id, facts[0], occurred_start="2026-10-01T10:00:00Z", request_context=request_context
+            )
+
+            history = await oracle_memory.get_document_history(bank_id, doc_id, request_context=request_context)
+            assert history is not None
+            kinds = [e.kind for e in history.items]
+            assert "retain" in kinds and "fact_edited" in kinds, kinds
+            assert all(e.document_id == doc_id for e in history.items)
+            assert history.total >= 2
+
+            other = await oracle_memory.get_document_history(bank_id, "another-doc", request_context=request_context)
+            assert other is not None and other.items == []
         finally:
             await _safe_cleanup(oracle_memory, bank_id, request_context)

@@ -4,8 +4,6 @@
  * Gives Paperclip agents persistent long-term memory via Hindsight.
  *
  * Lifecycle:
- *   agent.created          → create/touch the agent's canonical bank and queue
- *                            an optional seed-bank job.
  *   agent.run.started      → fetch the run's issue, recall relevant memories,
  *                            cache them in plugin state for the run.
  *   issue.comment.created  → retain the full comment body to Hindsight (this is
@@ -20,26 +18,24 @@
  */
 
 import { definePlugin, runWorker } from "@paperclipai/plugin-sdk";
-import type { Agent, ToolRunContext } from "@paperclipai/plugin-sdk";
+import type { EnvSecretRefBinding, PluginContext, ToolRunContext } from "@paperclipai/plugin-sdk";
 import { HindsightClient, formatMemories } from "./client.js";
 import { deriveBankId, extractUserFromIssue } from "./bank.js";
 
 interface PluginConfig {
   hindsightApiUrl: string;
-  hindsightApiKeyRef?: string;
+  /**
+   * Reference stored by the host's secret picker for the `format: "secret-ref"`
+   * field. The host fails closed on a bare string, so it travels through as-is.
+   */
+  hindsightApiKeyRef?: EnvSecretRefBinding;
   bankId?: string;
   dynamicBankId?: boolean;
   bankGranularity?: Array<"company" | "agent" | "user">;
   recallBudget?: "low" | "mid" | "high";
+  requestTimeoutMs?: number;
   autoRetain?: boolean;
-  seedBankEnabled?: boolean;
-  seedBankWebhookUrl?: string;
   enabledAgentIds?: string[];
-}
-
-interface AgentCreatedPayload {
-  agentId?: string;
-  agent?: Agent;
 }
 
 interface RunStartedPayload {
@@ -60,135 +56,6 @@ interface CommentCreatedPayload {
   runId?: string | null;
 }
 
-export const DEFAULT_MAX_RECALL_QUERY_BYTES = 1200;
-
-function normalizeRecallQueryPart(value: unknown): string {
-  return typeof value === "string" ? value.replace(/\s+/g, " ").trim() : "";
-}
-
-function truncateUtf8(input: string, maxBytes: number): string {
-  if (maxBytes <= 0) return "";
-  if (Buffer.byteLength(input, "utf8") <= maxBytes) return input;
-
-  let out = "";
-  let used = 0;
-  for (const char of input) {
-    const bytes = Buffer.byteLength(char, "utf8");
-    if (used + bytes > maxBytes) break;
-    out += char;
-    used += bytes;
-  }
-  return out.trimEnd();
-}
-
-export function buildRecallQuery(
-  issue: { title?: string | null; description?: string | null },
-  maxBytes = DEFAULT_MAX_RECALL_QUERY_BYTES
-): string {
-  const title = normalizeRecallQueryPart(issue.title);
-  const description = normalizeRecallQueryPart(issue.description);
-  if (!title && !description) return "";
-
-  const full = [title, description].filter(Boolean).join("\n");
-  if (Buffer.byteLength(full, "utf8") <= maxBytes) return full;
-
-  if (!title) return truncateUtf8(description, maxBytes);
-  const titleBytes = Buffer.byteLength(title, "utf8");
-  if (titleBytes >= maxBytes) return truncateUtf8(title, maxBytes);
-
-  const remainingDescriptionBytes = maxBytes - titleBytes - 1; // newline
-  const clippedDescription = truncateUtf8(description, remainingDescriptionBytes);
-  return [title, clippedDescription].filter(Boolean).join("\n").trim();
-}
-
-class SeedBankQueueError extends Error {
-  readonly status?: number;
-
-  constructor(message: string, status?: number) {
-    super(message);
-    this.name = "SeedBankQueueError";
-    this.status = status;
-  }
-}
-
-function readStringArray(value: unknown): string[] {
-  if (!Array.isArray(value)) return [];
-  return value
-    .map((item) => {
-      if (typeof item === "string") return item;
-      if (item && typeof item === "object") {
-        const record = item as Record<string, unknown>;
-        const candidate = record.slug ?? record.id ?? record.name;
-        if (typeof candidate === "string") return candidate;
-      }
-      return "";
-    })
-    .map((item) => item.trim())
-    .filter(Boolean);
-}
-
-function desiredSkillSlugs(agent: Agent): string[] {
-  const metadata = agent.metadata ?? {};
-  return [
-    ...readStringArray(metadata.desiredSkills),
-    ...readStringArray(metadata.desiredSkillSlugs),
-    ...readStringArray(metadata.skills),
-  ];
-}
-
-function uniqueNonEmpty(items: string[]): string[] {
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const item of items) {
-    const normalized = item.trim().replace(/\s+/g, " ");
-    if (!normalized || seen.has(normalized)) continue;
-    seen.add(normalized);
-    out.push(normalized);
-  }
-  return out;
-}
-
-function deriveSeedBankQueries(agent: Agent, reportingParent?: Agent | null): string[] {
-  return uniqueNonEmpty([
-    agent.capabilities ?? "",
-    ...desiredSkillSlugs(agent).map((slug) => `Skill: ${slug}`),
-    reportingParent?.capabilities
-      ? `Reporting parent capabilities: ${reportingParent.capabilities}`
-      : "",
-  ]);
-}
-
-async function queueSeedBankJob(
-  webhookUrl: string,
-  payload: {
-    agentId: string;
-    companyId: string;
-    bankId: string;
-    mode: "seed";
-    queries: string[];
-  }
-): Promise<void> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 15_000);
-  try {
-    const response = await fetch(webhookUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-      signal: controller.signal,
-    });
-    if (!response.ok) {
-      const text = await response.text().catch(() => "");
-      throw new SeedBankQueueError(
-        `HTTP ${response.status} from seed-bank webhook: ${text}`,
-        response.status
-      );
-    }
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
 async function getConfig(ctx: {
   config: { get(): Promise<Record<string, unknown>> };
 }): Promise<PluginConfig> {
@@ -196,13 +63,22 @@ async function getConfig(ctx: {
 }
 
 async function resolveApiKey(
-  ctx: { secrets: { resolve(ref: string): Promise<string | null> } },
-  config: PluginConfig
+  ctx: Pick<PluginContext, "secrets">,
+  config: PluginConfig,
+  companyId: string
 ): Promise<string | undefined> {
   if (!config.hindsightApiKeyRef) return undefined;
-  const resolved = await ctx.secrets.resolve(config.hindsightApiKeyRef);
+  // configPath identifies which binding to read when a plugin holds several
+  // secrets; companyId scopes the lookup to the run's company.
+  const resolved = await ctx.secrets.resolve(config.hindsightApiKeyRef, {
+    companyId,
+    configPath: "hindsightApiKeyRef",
+  });
   return resolved ?? undefined;
 }
+
+const DISABLED_FOR_AGENT =
+  "Hindsight memory is not enabled for this agent (see the plugin's enabledAgentIds setting).";
 
 function isAgentEnabled(config: PluginConfig, agentId: string | undefined | null): boolean {
   const allowlist = config.enabledAgentIds;
@@ -213,64 +89,6 @@ function isAgentEnabled(config: PluginConfig, agentId: string | undefined | null
 const plugin = definePlugin({
   async setup(ctx) {
     ctx.logger.info("Hindsight memory plugin starting");
-
-    // ---------------------------------------------------------------------------
-    // agent.created — create/touch bank and optionally queue deterministic seeding
-    // ---------------------------------------------------------------------------
-    ctx.events.on("agent.created", async (event) => {
-      const config = await getConfig(ctx);
-      if (config.seedBankEnabled === false) return;
-
-      const companyId = event.companyId;
-      const payload = (event.payload ?? {}) as AgentCreatedPayload;
-      const payloadAgent = payload.agent;
-      const agentId = payload.agentId ?? payloadAgent?.id;
-      if (!companyId || !agentId) return;
-
-      const bankId = deriveBankId({ companyId, agentId }, config);
-      try {
-        const agent = payloadAgent ?? (await ctx.agents.get(agentId, companyId));
-        if (!agent) return;
-
-        const reportingParent = agent.reportsTo
-          ? await ctx.agents.get(agent.reportsTo, companyId).catch(() => null)
-          : null;
-        const apiKey = await resolveApiKey(ctx, config);
-        const client = new HindsightClient(config.hindsightApiUrl, apiKey);
-        await client.touchBank(bankId);
-
-        const webhookUrl = config.seedBankWebhookUrl?.trim();
-        if (webhookUrl) {
-          await queueSeedBankJob(webhookUrl, {
-            agentId,
-            companyId,
-            bankId,
-            mode: "seed",
-            queries: deriveSeedBankQueries(agent, reportingParent),
-          });
-        }
-
-        ctx.logger.info("Seed bank lifecycle hook completed", { agentId, bankId });
-      } catch (err) {
-        const status = err instanceof SeedBankQueueError ? err.status : undefined;
-        await ctx.state.set(
-          { scopeKind: "agent", scopeId: agentId, stateKey: "seed-bank-failure" },
-          {
-            retryable: true,
-            status,
-            bankId,
-            error: String(err),
-            failedAt: new Date().toISOString(),
-          }
-        );
-        ctx.logger.warn("Failed to run seed bank lifecycle hook", {
-          agentId,
-          bankId,
-          status,
-          error: String(err),
-        });
-      }
-    });
 
     // ---------------------------------------------------------------------------
     // agent.run.started — recall memories using the issue's title + description
@@ -300,7 +118,7 @@ const plugin = definePlugin({
       }
       if (!issue) return;
 
-      const query = buildRecallQuery(issue);
+      const query = [issue.title, issue.description].filter(Boolean).join("\n");
       if (!query.trim()) return;
 
       // Extract userId from the specific issue being worked on (not an
@@ -316,8 +134,8 @@ const plugin = definePlugin({
       }
 
       try {
-        const apiKey = await resolveApiKey(ctx, config);
-        const client = new HindsightClient(config.hindsightApiUrl, apiKey);
+        const apiKey = await resolveApiKey(ctx, config, companyId);
+        const client = new HindsightClient(config.hindsightApiUrl, apiKey, config.requestTimeoutMs);
         const bankId = deriveBankId({ companyId, agentId, userId }, config);
 
         const response = await client.recall(bankId, query, config.recallBudget ?? "mid");
@@ -327,6 +145,12 @@ const plugin = definePlugin({
           await ctx.state.set(
             { scopeKind: "run", scopeId: runId, stateKey: "recalled-memories" },
             memories
+          );
+          // Remember which query produced the cache, so the recall tool only
+          // reuses it for that same query.
+          await ctx.state.set(
+            { scopeKind: "run", scopeId: runId, stateKey: "recalled-query" },
+            query
           );
           ctx.logger.info("Recalled memories for run", {
             runId,
@@ -416,8 +240,8 @@ const plugin = definePlugin({
       }
 
       try {
-        const apiKey = await resolveApiKey(ctx, config);
-        const client = new HindsightClient(config.hindsightApiUrl, apiKey);
+        const apiKey = await resolveApiKey(ctx, config, companyId);
+        const client = new HindsightClient(config.hindsightApiUrl, apiKey, config.requestTimeoutMs);
         const bankId = deriveBankId({ companyId, agentId: bankAgentId, userId }, config);
         await client.retain(bankId, body, commentId, {
           agentId: bankAgentId,
@@ -473,6 +297,13 @@ const plugin = definePlugin({
         const { query } = params as { query: string };
         const config = await getConfig(ctx);
 
+        // The allowlist has to be enforced here too, not just in the event
+        // handlers: the tools are registered for every agent, so without this
+        // an agent left out of enabledAgentIds could still read its bank.
+        if (!isAgentEnabled(config, runCtx.agentId)) {
+          return { content: DISABLED_FOR_AGENT };
+        }
+
         // Read userId cached by agent.run.started for consistent bank derivation
         let userId: string | undefined;
         if (config.bankGranularity?.includes("user")) {
@@ -489,20 +320,36 @@ const plugin = definePlugin({
           config
         );
 
-        // Return cached memories from run start if available
+        // Reuse the run-start recall only when the agent asks the same query;
+        // any other query must hit Hindsight, otherwise mid-run lookups would
+        // always get the issue-level memories back.
         const cached = await ctx.state.get({
           scopeKind: "run",
           scopeId: runCtx.runId,
           stateKey: "recalled-memories",
         });
-        if (cached && typeof cached === "string") {
+        const cachedQuery = await ctx.state.get({
+          scopeKind: "run",
+          scopeId: runCtx.runId,
+          stateKey: "recalled-query",
+        });
+        if (
+          cached &&
+          typeof cached === "string" &&
+          typeof cachedQuery === "string" &&
+          cachedQuery.trim() === query.trim()
+        ) {
           return { content: cached };
         }
 
         // Live recall fallback
         try {
-          const apiKey = await resolveApiKey(ctx, config);
-          const client = new HindsightClient(config.hindsightApiUrl, apiKey);
+          const apiKey = await resolveApiKey(ctx, config, runCtx.companyId);
+          const client = new HindsightClient(
+            config.hindsightApiUrl,
+            apiKey,
+            config.requestTimeoutMs
+          );
           const response = await client.recall(bankId, query, config.recallBudget ?? "mid");
           const memories = formatMemories(response.results);
           return { content: memories || "No relevant memories found." };
@@ -536,6 +383,12 @@ const plugin = definePlugin({
         const { content } = params as { content: string };
         const config = await getConfig(ctx);
 
+        // Same gate as the recall tool: enabledAgentIds must hold on the tool
+        // path, otherwise an excluded agent could still write to its bank.
+        if (!isAgentEnabled(config, runCtx.agentId)) {
+          return { content: DISABLED_FOR_AGENT };
+        }
+
         // Read userId cached by agent.run.started for consistent bank derivation
         let userId: string | undefined;
         if (config.bankGranularity?.includes("user")) {
@@ -553,8 +406,12 @@ const plugin = definePlugin({
         );
 
         try {
-          const apiKey = await resolveApiKey(ctx, config);
-          const client = new HindsightClient(config.hindsightApiUrl, apiKey);
+          const apiKey = await resolveApiKey(ctx, config, runCtx.companyId);
+          const client = new HindsightClient(
+            config.hindsightApiUrl,
+            apiKey,
+            config.requestTimeoutMs
+          );
           await client.retain(bankId, content, undefined, {
             agentId: runCtx.agentId,
             companyId: runCtx.companyId,
@@ -581,7 +438,7 @@ const plugin = definePlugin({
     }
 
     try {
-      const client = new HindsightClient(c.hindsightApiUrl);
+      const client = new HindsightClient(c.hindsightApiUrl, undefined, c.requestTimeoutMs);
       const healthy = await client.health();
       if (!healthy) {
         return {

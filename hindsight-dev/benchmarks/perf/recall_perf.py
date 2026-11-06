@@ -43,11 +43,15 @@ import os
 import statistics
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from rich.console import Console
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 from rich.table import Table
+
+if TYPE_CHECKING:
+    from hindsight_api.engine.search.reranking import RerankResult
+    from hindsight_api.engine.search.types import MergedCandidate
 
 console = Console()
 
@@ -830,9 +834,9 @@ async def _insert_synthetic_observations(pool: Any, bank_id: str, sources_per_ob
     import random
     import uuid
 
-    from hindsight_api.engine.task_backend import fq_table
+    from hindsight_api.engine.schema import fq_store_table_explicit
 
-    table = fq_table("memory_units")
+    table = fq_store_table_explicit("memory_units")
 
     # Fetch all non-observation units
     rows = await pool.fetch(
@@ -935,9 +939,9 @@ async def _wait_for_operation(pool: Any, operation_id: str, timeout: float = 864
     """
     import uuid
 
-    from hindsight_api.engine.task_backend import fq_table
+    from hindsight_api.engine.schema import fq_table_explicit
 
-    table = fq_table("async_operations")
+    table = fq_table_explicit("async_operations")
     deadline = asyncio.get_event_loop().time() + timeout
     parent_uuid = uuid.UUID(operation_id)
 
@@ -1106,12 +1110,13 @@ class _RRFReranker:
     async def ensure_initialized(self) -> None:
         pass
 
-    async def rerank(self, query: str, candidates: list) -> list:
+    async def rerank(self, query: str, candidates: list["MergedCandidate"]) -> "RerankResult":
+        from hindsight_api.engine.search.reranking import RerankResult
         from hindsight_api.engine.search.types import ScoredResult
 
         scored = [ScoredResult(candidate=c, weight=c.rrf_score) for c in candidates]
         scored.sort(key=lambda x: x.weight, reverse=True)
-        return scored
+        return RerankResult(results=scored, provider_name="rrf")
 
 
 # ---------------------------------------------------------------------------
@@ -1240,7 +1245,7 @@ async def cmd_benchmark(
         request_context = RequestContext()
 
         async def recall_one() -> float:
-            from hindsight_api.engine.memory_engine import Budget
+            from hindsight_api.engine.response_models import Budget
 
             t0 = time.perf_counter()
             result = await engine.recall_async(

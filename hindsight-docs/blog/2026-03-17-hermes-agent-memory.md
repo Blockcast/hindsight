@@ -1,5 +1,6 @@
 ---
 title: "Give the Only Self-Improving AI Agent (Hermes) a Memory Upgrade It Deserves"
+description: "Swap Hermes Agent's file-based memory for Hindsight with one pip install. This plugin is now deprecated in favour of the Hermes plugin catalog."
 authors: [benfrank241]
 date: 2026-03-17T12:00
 tags: [hermes, agents, python, memory, tutorial, plugin]
@@ -9,7 +10,7 @@ image: /img/blog/hermes-agent-memory.png
 ![How to Add Persistent Memory to Hermes Agent](/img/blog/hermes-agent-memory.png)
 
 :::warning Deprecated
-The `hindsight-hermes` pip plugin described in this post is deprecated. Hermes now ships with a native Hindsight memory provider. See [Hindsight Is Now a Native Memory Provider in Hermes Agent](/blog/2026/04/06/hermes-native-memory-provider) for the current setup guide.
+The `hindsight-hermes` pip plugin described in this post is deprecated. Hindsight is now a Hermes memory provider installed from the Hermes plugin catalog: `hermes plugins install hindsight`, then `hermes memory setup`. See [What Changes Now That Hindsight Is a Hermes Plugin](/blog/2026/10/01/hindsight-hermes-plugin-what-changed) for the current setup guide.
 :::
 
 [Hermes Agent](https://github.com/NousResearch/hermes-agent) is a self-improving AI agent with 40+ tools and a plugin system. Its built-in memory saves to local files. `hindsight-hermes` replaces it with structured fact extraction, entity resolution, and multi-strategy retrieval — via one pip install and three environment variables.
@@ -20,7 +21,7 @@ The `hindsight-hermes` pip plugin described in this post is deprecated. Hermes n
 - Hermes Agent's built-in memory is local file-based — no structure, no retrieval intelligence, no cross-machine sync
 - `hindsight-hermes` is a pip-installable plugin that registers Hindsight retain/recall/reflect as native Hermes tools
 - One `pip install`, three environment variables, disable the built-in `memory` tool, and you're done
-- Works with [Hindsight Cloud](https://ui.hindsight.vectorize.io/signup) (zero infra) or self-hosted
+- Works with [Hindsight Cloud](https://ui.hindsight.vectorize.io) (zero infra) or self-hosted
 
 ## The problem: good memory, but it could go further
 
@@ -57,7 +58,7 @@ You have two options: Hindsight Cloud (no setup) or self-hosted.
 
 **Option A: Hindsight Cloud**
 
-1. [Sign up at Hindsight Cloud](https://ui.hindsight.vectorize.io/signup)
+1. [Sign up at Hindsight Cloud](https://ui.hindsight.vectorize.io)
 2. Create a memory bank in the dashboard and copy your API key
 3. Your base URL is `https://api.hindsight.vectorize.io`
 

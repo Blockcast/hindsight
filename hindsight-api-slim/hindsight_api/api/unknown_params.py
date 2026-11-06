@@ -23,6 +23,10 @@ And the body is read through the same ``Request`` object FastAPI will use, whose
 The names are handed to the observability middleware through the ASGI scope
 rather than set as a header here, so that -- as before -- the header survives on
 responses produced by an exception handler above this layer.
+
+This route class also carries bank-alias resolution, for the same reason it
+carries the check above: it is the one place every bank endpoint already passes
+through. See :meth:`UnknownParamsRoute.get_route_handler`.
 """
 
 from __future__ import annotations
@@ -36,7 +40,8 @@ from fastapi import APIRouter, Request, Response
 from fastapi.routing import APIRoute, request_response
 from pydantic import BaseModel
 
-from .observability import SCOPE_IGNORED_PARAMS
+from ..extensions.tenant import AuthenticationError
+from .observability import SCOPE_IGNORED_PARAMS, SCOPE_RESOLVED_ALIAS
 
 logger = logging.getLogger(__name__)
 
@@ -79,9 +84,19 @@ class UnknownParamsRoute(APIRoute):
 
         `dependant` is FastAPI's resolved view of the endpoint, so both the
         parameter name and any alias a client may legitimately send are covered.
+        Sub-dependants are walked too: query params declared by a ``Depends()`` helper
+        (the knowledge-base tag filter) live there, and reading only the top level
+        reported them as ignored while FastAPI was in fact applying them. Walked by
+        hand rather than via ``fastapi.dependencies.utils.get_flat_dependant``, which
+        newer FastAPI releases removed.
         """
         self._known_query: set[str] = set()
-        for param in self.dependant.query_params:
+        pending, query_params = [self.dependant], []
+        while pending:
+            dependant = pending.pop()
+            query_params.extend(dependant.query_params)
+            pending.extend(dependant.dependencies)
+        for param in query_params:
             self._known_query.add(param.name)
             if isinstance(getattr(param, "alias", None), str):
                 self._known_query.add(param.alias)
@@ -92,6 +107,12 @@ class UnknownParamsRoute(APIRoute):
         original_route_handler = super().get_route_handler()
 
         async def custom_route_handler(request: Request) -> Response:
+            # Not precomputed from `self._path_params`: FastAPI calls
+            # get_route_handler() from APIRoute.__init__, before our __init__ body
+            # has run, so that attribute does not exist yet. A dict lookup per
+            # request costs nothing, and routes with no bank in the path leave
+            # after it.
+            await self._resolve_bank_alias(request)
             ignored = await self._collect_ignored(request)
             if ignored:
                 joined = ", ".join(ignored)
@@ -107,6 +128,48 @@ class UnknownParamsRoute(APIRoute):
             return await original_route_handler(request)
 
         return custom_route_handler
+
+    @staticmethod
+    async def _resolve_bank_alias(request: Request) -> None:
+        """Rewrite an aliased ``bank_id`` in the path to the bank's canonical id.
+
+        This runs after routing -- so ``request.path_params`` is populated -- and
+        before FastAPI solves the endpoint's own parameters out of that same dict,
+        so the endpoint and every dependency below it receive the canonical id and
+        need no change. That ordering is what the whole feature rests on;
+        ``test_unknown_params.py`` pins it, so a FastAPI change that moved path-param
+        extraction earlier fails loudly instead of quietly serving the alias.
+
+        It has to happen here rather than deeper in the engine: ~337
+        ``WHERE bank_id = $1`` queries across 36 modules never pass through the
+        engine's bank-existence helpers, so resolving there would leave all of them
+        keyed on the alias.
+
+        The resolver is supplied by ``create_app`` (``app.state.resolve_bank_alias``)
+        because it needs the request's tenant schema, which only the app's engine and
+        auth wiring can work out. An app without one -- a bare test app, say --
+        simply keeps the id it was given. Failures are swallowed for the same reason:
+        an alias lookup that cannot run must not turn a request for a real bank into
+        a 500, and an unresolved id behaves exactly as it did before aliases existed.
+        """
+        bank_id = request.path_params.get("bank_id")
+        if not isinstance(bank_id, str) or not bank_id:
+            return
+        resolver = getattr(request.app.state, "resolve_bank_alias", None)
+        if resolver is None:
+            return
+        try:
+            canonical = await resolver(request, bank_id)
+        except AuthenticationError:
+            # Expected on unauthenticated requests: auth rejects them later anyway.
+            logger.debug("Bank alias resolution skipped for %r: not authenticated", bank_id)
+            return
+        except Exception:  # noqa: BLE001
+            logger.warning("Bank alias resolution failed for %r; using it as-is", bank_id, exc_info=True)
+            return
+        if canonical != bank_id:
+            request.path_params["bank_id"] = canonical
+            request.scope[SCOPE_RESOLVED_ALIAS] = bank_id
 
     async def _collect_ignored(self, request: Request) -> list[str]:
         ignored: list[str] = []

@@ -43,7 +43,7 @@ export type AsyncOperationSubmitResponse = {
 /**
  * AuditLogEntry
  *
- * A single audit log entry.
+ * A single audit log entry with its full request/response bodies.
  */
 export type AuditLogEntry = {
   /**
@@ -77,6 +77,12 @@ export type AuditLogEntry = {
    */
   duration_ms?: number | null;
   /**
+   * Metadata
+   */
+  metadata: {
+    [key: string]: unknown;
+  };
+  /**
    * Request
    */
   request: {
@@ -88,12 +94,6 @@ export type AuditLogEntry = {
   response: {
     [key: string]: unknown;
   } | null;
-  /**
-   * Metadata
-   */
-  metadata: {
-    [key: string]: unknown;
-  };
 };
 
 /**
@@ -120,8 +120,10 @@ export type AuditLogListResponse = {
   offset: number;
   /**
    * Items
+   *
+   * Entries without request/response bodies; fetch one entry by id for its bodies.
    */
-  items: Array<AuditLogEntry>;
+  items: Array<AuditLogSummary>;
 };
 
 /**
@@ -175,6 +177,50 @@ export type AuditLogStatsResponse = {
 };
 
 /**
+ * AuditLogSummary
+ *
+ * An audit log entry without its request/response bodies, as the list returns it.
+ */
+export type AuditLogSummary = {
+  /**
+   * Id
+   */
+  id: string;
+  /**
+   * Action
+   */
+  action: string;
+  /**
+   * Transport
+   */
+  transport: string;
+  /**
+   * Bank Id
+   */
+  bank_id: string | null;
+  /**
+   * Started At
+   */
+  started_at: string | null;
+  /**
+   * Ended At
+   */
+  ended_at: string | null;
+  /**
+   * Duration Ms
+   *
+   * Server-computed duration in milliseconds (started_at → ended_at). Null if not yet completed.
+   */
+  duration_ms?: number | null;
+  /**
+   * Metadata
+   */
+  metadata: {
+    [key: string]: unknown;
+  };
+};
+
+/**
  * BackgroundResponse
  *
  * Response model for background update. Deprecated: use MissionResponse instead.
@@ -191,6 +237,44 @@ export type BackgroundResponse = {
    */
   background?: string | null;
   disposition?: DispositionTraits | null;
+};
+
+/**
+ * BankAliasEntry
+ *
+ * One id a bank answers to.
+ */
+export type BankAliasEntry = {
+  /**
+   * Alias
+   */
+  alias: string;
+  /**
+   * Primary
+   *
+   * Whether this alias is shown in place of the bank's own id. Display only — the bank keeps its id, and everything that names a bank still uses it. At most one alias per bank can be primary, and none has to be.
+   */
+  primary?: boolean;
+};
+
+/**
+ * BankAliasesResponse
+ *
+ * Response model for a bank's aliases.
+ */
+export type BankAliasesResponse = {
+  /**
+   * Bank Id
+   *
+   * The bank's own id, which an alias never replaces
+   */
+  bank_id: string;
+  /**
+   * Aliases
+   *
+   * Extra ids that also reach this bank, the primary one first then oldest first
+   */
+  aliases: Array<BankAliasEntry>;
 };
 
 /**
@@ -282,6 +366,18 @@ export type BankListItem = {
    * When anything was last written to this bank: a document retained (including appends to an existing document) or a fact stored. Null if the bank is empty.
    */
   last_write_at?: string | null;
+  /**
+   * Display Alias
+   *
+   * The alias this bank is presented under, when one was promoted. Display only: `bank_id` remains the bank's identity everywhere else. Null when no alias is primary, in which case show `bank_id`.
+   */
+  display_alias?: string | null;
+  /**
+   * Matched Aliases
+   *
+   * Aliases of this bank that matched the search `q`. Empty when no search was made, or when the bank matched on its own id or name — so a non-empty value explains a result whose `bank_id` does not contain the search text.
+   */
+  matched_aliases?: Array<string>;
 };
 
 /**
@@ -539,6 +635,24 @@ export type BankTemplateConfig = {
    */
   enable_reranking?: boolean | null;
   /**
+   * Reflect Use Decision Model
+   *
+   * When the server has a decision model, reflect lets it prune evidence and decide when to stop
+   */
+  reflect_use_decision_model?: boolean | null;
+  /**
+   * Mental Model Refresh Use Decision Model
+   *
+   * The same, for knowledge-page refreshes
+   */
+  mental_model_refresh_use_decision_model?: boolean | null;
+  /**
+   * Mental Model Delta Use Decision Model
+   *
+   * When the server has a decision model, a delta knowledge-page refresh asks it which new memories could change the page instead of running reflect
+   */
+  mental_model_delta_use_decision_model?: boolean | null;
+  /**
    * Disposition Skepticism
    *
    * Skepticism trait (1-5)
@@ -627,11 +741,29 @@ export type BankTemplateConfig = {
   /**
    * Observation Scope Limits
    *
-   * Per-scope overrides of max_observations_per_scope: [{"scope": ["run_*", "shared"], "limit": 1}]. Each scope is a list of fnmatch tag-globs; a consolidation scope matches under exact cover (every tag matched by a glob and every glob matched by a tag). The first matching rule wins; unmatched scopes fall back to max_observations_per_scope.
+   * DEPRECATED — use consolidation_strategies, which carries the mission too. Still honoured, but consulted only after consolidation_strategies. Per-scope overrides of max_observations_per_scope: [{"scope": ["run_*", "shared"], "limit": 1}]. Each scope is a list of fnmatch tag-globs; a consolidation scope matches under exact cover (every tag matched by a glob and every glob matched by a tag). The first matching rule wins; unmatched scopes fall back to max_observations_per_scope.
    */
   observation_scope_limits?: Array<{
     [key: string]: unknown;
   }> | null;
+  /**
+   * Default Observation Scopes
+   *
+   * observation_scopes applied at retain to items that send none ('combined' when unset). A list of tag lists may use globs, e.g. [['topic:*']] scopes each memory by its own topic tags.
+   */
+  default_observation_scopes?:
+    | "per_tag"
+    | "combined"
+    | "all_combinations"
+    | "shared"
+    | Array<Array<string>>
+    | null;
+  /**
+   * Consolidation Strategies
+   *
+   * Per-scope consolidation settings: [{"scopes": [{"tags": ["company:*"]}], "observations_mission": "Record only generalized trends.", "max_observations_per_scope": 20}]. Each strategy lists the rules it claims scopes with — a rule's tags are fnmatch globs that must all be on the scope, and its "tags_match" decides whether the scope may carry others ("all", the default) or not ("exact"). The rules are alternatives: any one matching claims the scope. A strategy may set any of observations_mission, max_observations_per_scope, consolidation_source_facts_max_tokens and consolidation_source_facts_max_tokens_per_observation; each is optional. Exactly one strategy applies to a scope: the first in the list that claims it. Whatever that strategy leaves unset — and every scope no strategy claims — uses the bank-wide value; a later strategy never fills the gaps. Supersedes observation_scope_limits. Lets one bank be federated across user/team/company tag scopes, each consolidating under its own brief.
+   */
+  consolidation_strategies?: Array<ConsolidationStrategySpec> | null;
   /**
    * Reflect Source Facts Max Tokens
    *
@@ -733,11 +865,23 @@ export type BankTemplateConfig = {
    */
   store_document_text?: boolean | null;
   /**
+   * Default Timezone
+   *
+   * IANA zone (e.g. 'Europe/Rome') a retain timestamp, or a time the LLM extracts, is read in when it carries no UTC offset.
+   */
+  default_timezone?: string | null;
+  /**
    * Enable Auto Consolidation
    *
    * Automatically consolidate observations after retain
    */
   enable_auto_consolidation?: boolean | null;
+  /**
+   * Consolidation Use Decision Model
+   *
+   * When the server has a decision model, consolidation lets it settle restatements and chatter before the LLM call
+   */
+  consolidation_use_decision_model?: boolean | null;
   /**
    * Consolidation Max Memories Per Round
    *
@@ -756,6 +900,24 @@ export type BankTemplateConfig = {
    * Include raw chunks in recall results
    */
   recall_include_chunks?: boolean | null;
+  /**
+   * Recall Prefer Observations
+   *
+   * Default for recall prefer_observations when the request omits it
+   */
+  recall_prefer_observations?: boolean | null;
+  /**
+   * Recall Decision Model Prune
+   *
+   * Default for recall prune when the request omits it (decision-model reranker only)
+   */
+  recall_decision_model_prune?: boolean | null;
+  /**
+   * Recall Decision Model Dedup
+   *
+   * Default for recall dedup when the request omits it (decision-model reranker only)
+   */
+  recall_decision_model_dedup?: boolean | null;
   /**
    * Recall Max Tokens
    *
@@ -1277,6 +1439,152 @@ export type ConsolidationResponse = {
 };
 
 /**
+ * ConsolidationScopePattern
+ *
+ * One rule of a consolidation strategy: tags, and how they must match.
+ *
+ * ``tags`` may be empty — that is a rule still being filled in, which the editor
+ * saves as typed and consolidation ignores. The type pins the *shape*, not
+ * completeness: a string where the tag list belongs is rejected at the door
+ * instead of being stored and silently ignored for the life of the bank.
+ *
+ * Unknown keys are rejected too, but by :class:`StrictConsolidationStrategySpec`
+ * on the write path rather than by ``extra="forbid"`` here: that would put
+ * ``additionalProperties: false`` in the schema, which openapi-generator cannot
+ * process ("Codegen Property not yet supported in getPydanticType").
+ */
+export type ConsolidationScopePattern = {
+  /**
+   * Tags
+   *
+   * fnmatch tag patterns, e.g. company:*
+   */
+  tags?: Array<string>;
+  /**
+   * Tags Match
+   *
+   * "all" (the default when omitted): the scope has every tag in the rule, other tags allowed. "exact": exactly these tags and no others.
+   */
+  tags_match?: string | null;
+};
+
+/**
+ * ConsolidationStrategiesPreview
+ *
+ * Which existing observation scopes each consolidation strategy would apply to.
+ */
+export type ConsolidationStrategiesPreview = {
+  /**
+   * Strategies
+   */
+  strategies: Array<StrategyPreview>;
+  default: DefaultScopesPreview;
+  /**
+   * Scopes Scanned
+   *
+   * Distinct scopes the preview was computed over
+   */
+  scopes_scanned: number;
+  /**
+   * Complete
+   *
+   * False when the bank has more distinct scopes than the preview scans; counts are then lower bounds
+   */
+  complete: boolean;
+};
+
+/**
+ * ConsolidationStrategiesPreviewRequest
+ *
+ * A draft consolidation_strategies value to preview against existing scopes.
+ */
+export type ConsolidationStrategiesPreviewRequest = {
+  /**
+   * Strategies
+   *
+   * Draft consolidation_strategies value
+   */
+  strategies: Array<ConsolidationStrategySpec>;
+  /**
+   * Sample Limit
+   *
+   * Example scopes returned per rule
+   */
+  sample_limit?: number;
+};
+
+/**
+ * ConsolidationStrategySpec
+ *
+ * One `consolidation_strategies` entry: the rules it claims scopes with, and
+ * the observation settings those scopes use. Every setting is optional; unset
+ * ones come from the bank-wide values.
+ */
+export type ConsolidationStrategySpec = {
+  /**
+   * Scopes
+   *
+   * Alternatives: the strategy claims a scope when any rule matches it
+   */
+  scopes?: Array<ConsolidationScopePattern>;
+  /**
+   * Observations Mission
+   */
+  observations_mission?: string | null;
+  /**
+   * Max Observations Per Scope
+   */
+  max_observations_per_scope?: number | null;
+  /**
+   * Consolidation Source Facts Max Tokens
+   */
+  consolidation_source_facts_max_tokens?: number | null;
+  /**
+   * Consolidation Source Facts Max Tokens Per Observation
+   */
+  consolidation_source_facts_max_tokens_per_observation?: number | null;
+};
+
+/**
+ * Content
+ *
+ * The raw content to retain or extract from. Either a plain string or an ordered list of content blocks.
+ */
+export type Content =
+  | string
+  | Array<
+      | ({
+          type: "text";
+        } & TextContentBlock)
+      | ({
+          type: "image";
+        } & ImageContentBlock)
+      | ({
+          type: "file";
+        } & FileContentBlock)
+    >;
+
+/**
+ * CreateBankAliasRequest
+ *
+ * Request model for adding an alias to a bank.
+ */
+export type CreateBankAliasRequest = {
+  /**
+   * Alias
+   *
+   * The extra bank id. Same rules as a bank id (non-empty, at most 192 bytes of UTF-8, no control characters, no leading underscore), and it must not already name a bank or another alias.
+   */
+  alias: string;
+  /**
+   * Primary
+   *
+   * Also show the bank under this alias, replacing whichever alias is shown today.
+   */
+  primary?: boolean;
+};
+
+/**
  * CreateBankRequest
  *
  * Request model for creating/updating a bank.
@@ -1606,6 +1914,26 @@ export type CreateWebhookRequest = {
 };
 
 /**
+ * DefaultScopesPreview
+ *
+ * The scopes no strategy claims — they consolidate under the bank-wide settings.
+ */
+export type DefaultScopesPreview = {
+  /**
+   * Match Count
+   */
+  match_count: number;
+  /**
+   * Observation Count
+   */
+  observation_count: number;
+  /**
+   * Samples
+   */
+  samples: Array<StrategyScopePreview>;
+};
+
+/**
  * DeleteDocumentResponse
  *
  * Response model for delete document endpoint.
@@ -1770,6 +2098,64 @@ export type DispositionTraits = {
 };
 
 /**
+ * DocumentEvent
+ *
+ * One change to a document, and its effect on the facts and observations built from it.
+ */
+export type DocumentEvent = {
+  /**
+   * Document Id
+   */
+  document_id: string;
+  kind: DocumentEventKind;
+  /**
+   * Created At
+   */
+  created_at?: string;
+  /**
+   * Operation Id
+   *
+   * The operation this event was recorded on (filled in when read).
+   */
+  operation_id?: string | null;
+  /**
+   * Fact Id
+   *
+   * The fact a fact_* event changed.
+   */
+  fact_id?: string | null;
+  /**
+   * Facts Added
+   */
+  facts_added?: number;
+  /**
+   * Facts Removed
+   */
+  facts_removed?: number;
+  observations_created?: ObservationIdSample;
+  observations_updated?: ObservationIdSample;
+  observations_removed?: ObservationIdSample;
+};
+
+/**
+ * DocumentEventKind
+ *
+ * What a change was. A named enum, not a Literal: inline enums are named after their field by
+ * the generated Rust client, and ``kind`` already names the knowledge-base node enum there.
+ */
+export type DocumentEventKind =
+  | "retain"
+  | "append"
+  | "reprocess"
+  | "retag"
+  | "fact_edited"
+  | "fact_invalidated"
+  | "fact_restored"
+  | "fact_deleted"
+  | "observations_cleared"
+  | "consolidation";
+
+/**
  * DocumentExportSubmitResponse
  *
  * Response for the async document-export endpoint (202).
@@ -1788,6 +2174,35 @@ export type DocumentExportSubmitResponse = {
    * Status
    */
   status?: string;
+};
+
+/**
+ * DocumentHistoryResponse
+ *
+ * A document's change history, newest first. ``total``, ``limit`` and ``offset`` count operations:
+ * one operation can carry several events for the same document (an oversized retain in slices).
+ */
+export type DocumentHistoryResponse = {
+  /**
+   * Document Id
+   */
+  document_id: string;
+  /**
+   * Total
+   */
+  total: number;
+  /**
+   * Limit
+   */
+  limit: number;
+  /**
+   * Offset
+   */
+  offset: number;
+  /**
+   * Items
+   */
+  items: Array<DocumentEvent>;
 };
 
 /**
@@ -1883,6 +2298,12 @@ export type DocumentListItem = {
    * Tags associated with this document
    */
   tags?: Array<string>;
+  /**
+   * Matched Fields
+   *
+   * Which fields matched the `q` search: 'id', 'original_text', or both. Empty when no `q` is given.
+   */
+  matched_fields?: Array<"id" | "original_text">;
 };
 
 /**
@@ -1974,11 +2395,9 @@ export type DocumentResponse = {
  */
 export type DryRunExtractRequest = {
   /**
-   * Content
-   *
-   * Text to extract facts from (e.g. a document or a single chunk).
+   * The raw content to extract facts from. Either a plain string, or an ordered list of content blocks (text, image, file) so images/attachments sit inline where they actually appear.
    */
-  content: string;
+  content: Content;
   /**
    * Context
    *
@@ -2415,6 +2834,38 @@ export type ExtractedFact = {
    * Index into `chunks` of the chunk this fact came from; null if it could not be attributed.
    */
   chunk_index?: number | null;
+  /**
+   * Attachments
+   *
+   * Attachments from user input that this fact is attributed to / associated with.
+   */
+  attachments?: Array<ExtractedFactAttachment>;
+};
+
+/**
+ * ExtractedFactAttachment
+ *
+ * An attachment from multimodal input associated with an extracted fact.
+ */
+export type ExtractedFactAttachment = {
+  /**
+   * Block Index
+   *
+   * Index of the content block in user's input (0-based)
+   */
+  block_index: number;
+  /**
+   * AttachmentType
+   *
+   * Content block type ('image' or 'file')
+   */
+  type: "image" | "file";
+  /**
+   * Media Type
+   *
+   * MIME media type of the attachment, e.g. 'image/png'
+   */
+  media_type: string;
 };
 
 /**
@@ -2523,12 +2974,10 @@ export type FeaturesInfo = {
 /**
  * FileContentBlock
  *
- * A non-image attachment — a PDF, a spreadsheet — in the position it was written.
+ * A non-image attachment — a PDF, a spreadsheet — in its input position.
  *
- * Split from ``image`` rather than folded into one type because the providers
- * split it: Anthropic has distinct image and document blocks, OpenAI has
- * image_url and file parts. Carrying the caller's own distinction through means
- * the per-provider conversion never has to guess from the media type alone.
+ * This stays distinct from ``image`` because providers use different request
+ * parts for images and documents; retaining the caller's kind avoids guessing.
  */
 export type FileContentBlock = {
   /**
@@ -2690,7 +3139,13 @@ export type KnowledgeNode = {
    */
   is_stale?: boolean | null;
   /**
-   * Pages only: the page's refresh settings — when it rebuilds itself (`refresh_after_consolidation` or `refresh_cron`), in which mode, and over which facts. This is the EFFECTIVE policy: a setting the page never stored is reported at its default, so compare the fields you care about rather than the whole object against a patch you sent. Absent on folders, which have no backing mental model, and on a page with no trigger stored.
+   * Last Refresh Failed At
+   *
+   * Pages only: when this page's most recent refresh failed, in ISO format, or null when the last one succeeded. While it is set the page does not rebuild itself on its trigger — see the same field on the mental model. An explicit refresh still runs.
+   */
+  last_refresh_failed_at?: string | null;
+  /**
+   * Pages only: the page's refresh settings — when it rebuilds itself (`refresh_after_consolidation` or `refresh_cron`, plus any `full_refresh_cron`), in which mode, and over which facts. This is the EFFECTIVE policy: a setting the page never stored is reported at its default, so compare the fields you care about rather than the whole object against a patch you sent. Absent on folders, which have no backing mental model, and on a page with no trigger stored.
    */
   trigger?: MentalModelTriggerOutput | null;
   /**
@@ -2766,13 +3221,13 @@ export type KnowledgePageResponse = {
   /**
    * Body
    *
-   * The page's synthesized markdown body.
+   * The page's synthesized markdown body, exactly as stored. Empty until a refresh writes one — unlike `markdown`, which says so in words. Build a UI's own empty state off this field; read `markdown` to show the document itself.
    */
   body?: string | null;
   /**
    * Markdown
    *
-   * The full markdown document: YAML frontmatter + markdown body.
+   * The full markdown document: YAML frontmatter + markdown body. A page with no body yet renders 'No content yet.' as its body rather than frontmatter alone, which reads as a page that failed to render. The notice is added here on the way out; the stored body in `body` stays empty, and the export bundle keeps the bare document.
    */
   markdown: string;
 };
@@ -2812,7 +3267,15 @@ export type KnowledgePageSearchResult = {
    */
   mental_model_id?: string | null;
   /**
+   * Source Query
+   *
+   * The question the page answers.
+   */
+  source_query?: string | null;
+  /**
    * Snippet
+   *
+   * The page's opening text. A page whose body is still empty says so in words — 'No content yet.' — rather than coming back blank, so a caller can tell an unwritten page from a page whose snippet simply did not render. The marker is produced on the way out; the stored body stays empty and out of the search index.
    */
   snippet: string;
   /**
@@ -2930,6 +3393,10 @@ export type LlmRequestEntry = {
    */
   cached_tokens: number | null;
   /**
+   * Thoughts Tokens
+   */
+  thoughts_tokens: number | null;
+  /**
    * Total Tokens
    */
   total_tokens: number | null;
@@ -2985,6 +3452,26 @@ export type LlmRequestListResponse = {
    * Items
    */
   items: Array<LlmRequestEntry>;
+  /**
+   * Retention Days
+   */
+  retention_days?: number | null;
+};
+
+/**
+ * LLMRequestSeriesSums
+ *
+ * Calls and tokens (total + reasoning) of one model or operation within a time bucket.
+ */
+export type LlmRequestSeriesSums = {
+  /**
+   * Calls
+   */
+  calls: number;
+  /**
+   * Tokens
+   */
+  tokens: number;
 };
 
 /**
@@ -3008,6 +3495,12 @@ export type LlmRequestStatsBucket = {
    */
   total: number;
   tokens: LlmRequestTokenSums;
+  /**
+   * Series
+   */
+  series?: {
+    [key: string]: LlmRequestSeriesSums;
+  } | null;
 };
 
 /**
@@ -3036,6 +3529,10 @@ export type LlmRequestStatsResponse = {
    * Buckets
    */
   buckets: Array<LlmRequestStatsBucket>;
+  /**
+   * Retention Days
+   */
+  retention_days?: number | null;
 };
 
 /**
@@ -3056,6 +3553,10 @@ export type LlmRequestTokenSums = {
    * Cached
    */
   cached: number;
+  /**
+   * Thoughts
+   */
+  thoughts?: number | null;
   /**
    * Total
    */
@@ -3200,6 +3701,12 @@ export type ListDocumentsResponse = {
    * Offset
    */
   offset: number;
+  /**
+   * Total Is Estimate
+   *
+   * True when a `q` search stopped at its match cap, so `total` is a lower bound rather than an exact count. Always false without `q`.
+   */
+  total_is_estimate?: boolean;
 };
 
 /**
@@ -3623,8 +4130,6 @@ export type MemoryGraphTableRow = {
  */
 export type MemoryItem = {
   /**
-   * Content
-   *
    * The raw content to retain. Either a plain string, or an ordered list of content blocks so images sit inline where they actually appear:
    *
    * [{"type": "text", "text": "click the button shown:"},
@@ -3633,19 +4138,7 @@ export type MemoryItem = {
    *
    * The block form requires a vision-capable retain LLM; a retain carrying images against a text-only model is rejected rather than silently dropping them. A single text block is equivalent to the plain string form.
    */
-  content:
-    | string
-    | Array<
-        | ({
-            type: "text";
-          } & TextContentBlock)
-        | ({
-            type: "image";
-          } & ImageContentBlock)
-        | ({
-            type: "file";
-          } & FileContentBlock)
-      >;
+  content: Content;
   /**
    * Timestamp
    *
@@ -3665,7 +4158,7 @@ export type MemoryItem = {
   /**
    * Document Id
    *
-   * Optional document ID for this memory item. Provide a distinct document_id per source document — items sharing a document_id are grouped into the same document. Auto-generated when omitted.
+   * Optional document ID for this memory item. Provide a distinct document_id per source document — items sharing a document_id are grouped into the same document. Auto-generated when omitted: if no item in the request has one, they all share one generated document (a request split into parts for size gets one per part); otherwise each item without one gets its own.
    */
   document_id?: string | null;
   /**
@@ -3689,7 +4182,7 @@ export type MemoryItem = {
   /**
    * ObservationScopes
    *
-   * How to scope observations during consolidation. 'per_tag' runs one consolidation pass per individual tag, creating separate observations for each tag. 'combined' (default) runs a single pass with all tags together. 'shared' runs a single pass over one global, untagged scope, so memories consolidate together regardless of their tags — useful for deduplicating across volatile per-call provenance tags (e.g. per-session ids) while keeping those tags on the source facts. A list of tag lists runs one pass per inner list, giving full control over which combinations to use.
+   * How to scope observations during consolidation. 'per_tag' runs one consolidation pass per individual tag, creating separate observations for each tag. 'combined' (default) runs a single pass with all tags together. 'shared' runs a single pass over one global, untagged scope, so memories consolidate together regardless of their tags — useful for deduplicating across volatile per-call provenance tags (e.g. per-session ids) while keeping those tags on the source facts. A list of tag lists runs one pass per inner list, giving full control over which combinations to use. An entry containing '*' is a glob matched against the memory's own tags — e.g. [['topic:*', 'user:*']] scopes by the memory's topic and user tags (including tags added by entity labels at retain) and ignores the rest; a scope whose globs match nothing is skipped. When omitted, the bank's default_observation_scopes applies ('combined' unless configured).
    */
   observation_scopes?:
     | "per_tag"
@@ -4323,13 +4816,31 @@ export type MentalModelResponse = {
    */
   last_memory_seen_at?: string | null;
   /**
+   * Last Refresh Failed At
+   *
+   * When this model's most recent refresh failed, in ISO format, or null when the last one succeeded. While this is set the automatic triggers (`refresh_after_consolidation`, `refresh_cron`, `full_refresh_cron`) skip the model — a refresh that cannot succeed is not retried on every tick. An explicit refresh still runs, and a successful one clears this. The failure itself, with its reason, is in the model's history.
+   */
+  last_refresh_failed_at?: string | null;
+  /**
+   * Last Full Refreshed At
+   *
+   * When a refresh last ran in full mode for this model, in ISO format — requested (`mode: 'full'`, a `full_refresh_cron` tick, a full-mode model) or fallen back to by a delta refresh. `trigger.full_refresh_cron` comes due against this, not `last_refreshed_at`, which every delta refresh moves. Null when no full refresh has completed since this was first tracked.
+   */
+  last_full_refreshed_at?: string | null;
+  /**
    * Created At
    */
   created_at?: string | null;
   /**
+   * Is Knowledge Page
+   *
+   * True when this model holds a knowledge page's content rather than being a standalone mental model. Set by the list and get endpoints.
+   */
+  is_knowledge_page?: boolean | null;
+  /**
    * Reflect Response
    *
-   * Full reflect API response payload including based_on facts and observations
+   * Full reflect API response payload including based_on facts and observations. On a single-model read, each world/experience/observation entry in based_on also carries `attachments`: the retained images and files that memory was extracted from.
    */
   reflect_response?: {
     [key: string]: unknown;
@@ -4450,23 +4961,18 @@ export type MentalModelTraceToolCall = {
  *
  * Trigger settings for a mental model.
  *
- * Inherits the reflect options an operator can also default per bank
- * (``reflect_default_options``): set here they apply to this model's refreshes
- * only, and win over the bank default.
+ * A refresh is not an ad-hoc reflect with different arguments: it synthesizes a
+ * whole document, so it wants its own retrieval and iteration settings. This
+ * trigger is therefore the only source for them — a bank's
+ * ``reflect_default_options`` deliberately does not reach a refresh. The
+ * per-bank default for these fields is ``knowledge_page_default_trigger``,
+ * which is merged over this same shape when a page is created.
  */
 export type MentalModelTriggerInput = {
   /**
-   * Reflect Search Observations Max Tokens
-   *
-   * Token budget for reflect's search_observations tool when the model names none. Observation evidence is often the largest contributor to the reflect context; lowering it trades the lowest-ranked observations for a smaller LLM context. None means use the shipped default (5000).
+   * How many agent iterations a refresh may spend, as a multiple of reflect_max_iterations: 'low' halves it, 'mid' keeps it, 'high' doubles it. A refresh is the heaviest reflect there is — it writes a whole document, and with exclude_mental_models it must read raw facts first — so null means 'mid', not the 'low' an ad-hoc reflect defaults to.
    */
-  reflect_search_observations_max_tokens?: number | null;
-  /**
-   * Reflect Search Observations Include Entities
-   *
-   * Whether search_observations attaches resolved entity names to each observation. Entities can be more than half the serialized tool payload; turning them off keeps the same observations and ranking with a much smaller context. None means enabled.
-   */
-  reflect_search_observations_include_entities?: boolean | null;
+  budget?: Budget | null;
   /**
    * Mode
    *
@@ -4486,9 +4992,15 @@ export type MentalModelTriggerInput = {
    */
   refresh_cron?: string | null;
   /**
+   * Full Refresh Cron
+   *
+   * Cron expression (UTC, standard 5-field syntax, e.g. '0 3 * * 0' for Sundays at 03:00 UTC) for a scheduled full refresh: on this schedule the model is refreshed in 'full' mode whatever its `mode` says, regenerating the content from scratch to clear the drift many delta edits accumulate. Independent of `refresh_cron` and `refresh_after_consolidation` — a delta model can refresh after consolidation and still get a weekly full refresh — and it does not change `mode`. A tick is skipped when no refresh has run since the last full one (there is nothing to correct). Like `refresh_cron`, it honours `min_refresh_interval_seconds` and pauses while the last refresh failed. null = no schedule.
+   */
+  full_refresh_cron?: string | null;
+  /**
    * Min Refresh Interval Seconds
    *
-   * Minimum seconds between two automatic refreshes of this mental model. A triggered refresh that arrives sooner is not dropped: it is queued and parked until the window expires, and every further trigger in the meantime folds into that one queued refresh, so a burst of retains costs one refresh instead of one per retain. Applies to both refresh_after_consolidation and refresh_cron. Explicit refreshes (API, MCP, control plane) ignore it and run immediately. 0 disables the floor for this model; null falls back to the bank/global mental_model_min_refresh_interval_seconds setting (itself 0 by default, i.e. no floor).
+   * Minimum seconds between two automatic refreshes of this mental model. A triggered refresh that arrives sooner is not dropped: it is queued and parked until the window expires, and every further trigger in the meantime folds into that one queued refresh, so a burst of retains costs one refresh instead of one per retain. Applies to every automatic trigger: refresh_after_consolidation, refresh_cron and full_refresh_cron. Explicit refreshes (API, MCP, control plane) ignore it and run immediately. 0 disables the floor for this model; null falls back to the bank/global mental_model_min_refresh_interval_seconds setting (itself 0 by default, i.e. no floor).
    */
   min_refresh_interval_seconds?: number | null;
   /**
@@ -4512,7 +5024,7 @@ export type MentalModelTriggerInput = {
   /**
    * Tags Match
    *
-   * Override how the model's tags filter memories during refresh. If not set, defaults to 'all_strict' when the model has tags (security isolation) or 'any' when the model has no tags. Under 'all_strict' a memory must carry EVERY one of the model's tags and untagged memories are excluded, which is why a model tagged with labels its memories do not carry refreshes to empty content. Set to 'all' to keep requiring the tags while including untagged memories, or to 'any' to include untagged memories alongside any single tag match.
+   * Override how the model's tags filter memories during refresh. If not set, defaults to 'all_strict' when the model has tags (security isolation) or 'any' when the model has no tags. Under 'all_strict' a memory must carry EVERY one of the model's tags and untagged memories are excluded, which is why a model tagged with labels its memories do not carry refreshes to empty content. Set to 'all' to keep requiring the tags while including untagged memories, or to 'any' to include untagged memories alongside any single tag match. Staleness ignores that widening: an untagged write never marks a tagged model stale, in any mode — only a write that matches the model's tags does.
    */
   tags_match?: "any" | "all" | "any_strict" | "all_strict" | "exact" | null;
   /**
@@ -4540,6 +5052,18 @@ export type MentalModelTriggerInput = {
    */
   recall_chunks_max_tokens?: number | null;
   /**
+   * Reflect Search Observations Max Tokens
+   *
+   * Override the token budget for the refresh's search_observations calls. Observation evidence is often the largest contributor to the reflect context; lowering it trades the lowest-ranked observations for a smaller LLM context. null means the shipped 5000.
+   */
+  reflect_search_observations_max_tokens?: number | null;
+  /**
+   * Reflect Search Observations Include Entities
+   *
+   * Override whether search_observations attaches resolved entity names to each observation. Entities can be more than half the serialized tool payload; turning them off keeps the same observations and ranking with a much smaller context. null means enabled.
+   */
+  reflect_search_observations_include_entities?: boolean | null;
+  /**
    * Response Schema
    *
    * Optional JSON Schema for structured output. When set, each refresh runs the same structured-output extraction as reflect's response_schema and stores the parsed result under reflect_response.structured_output alongside the markdown content.
@@ -4560,23 +5084,18 @@ export type MentalModelTriggerInput = {
  *
  * Trigger settings for a mental model.
  *
- * Inherits the reflect options an operator can also default per bank
- * (``reflect_default_options``): set here they apply to this model's refreshes
- * only, and win over the bank default.
+ * A refresh is not an ad-hoc reflect with different arguments: it synthesizes a
+ * whole document, so it wants its own retrieval and iteration settings. This
+ * trigger is therefore the only source for them — a bank's
+ * ``reflect_default_options`` deliberately does not reach a refresh. The
+ * per-bank default for these fields is ``knowledge_page_default_trigger``,
+ * which is merged over this same shape when a page is created.
  */
 export type MentalModelTriggerOutput = {
   /**
-   * Reflect Search Observations Max Tokens
-   *
-   * Token budget for reflect's search_observations tool when the model names none. Observation evidence is often the largest contributor to the reflect context; lowering it trades the lowest-ranked observations for a smaller LLM context. None means use the shipped default (5000).
+   * How many agent iterations a refresh may spend, as a multiple of reflect_max_iterations: 'low' halves it, 'mid' keeps it, 'high' doubles it. A refresh is the heaviest reflect there is — it writes a whole document, and with exclude_mental_models it must read raw facts first — so null means 'mid', not the 'low' an ad-hoc reflect defaults to.
    */
-  reflect_search_observations_max_tokens?: number | null;
-  /**
-   * Reflect Search Observations Include Entities
-   *
-   * Whether search_observations attaches resolved entity names to each observation. Entities can be more than half the serialized tool payload; turning them off keeps the same observations and ranking with a much smaller context. None means enabled.
-   */
-  reflect_search_observations_include_entities?: boolean | null;
+  budget?: Budget | null;
   /**
    * Mode
    *
@@ -4596,9 +5115,15 @@ export type MentalModelTriggerOutput = {
    */
   refresh_cron?: string | null;
   /**
+   * Full Refresh Cron
+   *
+   * Cron expression (UTC, standard 5-field syntax, e.g. '0 3 * * 0' for Sundays at 03:00 UTC) for a scheduled full refresh: on this schedule the model is refreshed in 'full' mode whatever its `mode` says, regenerating the content from scratch to clear the drift many delta edits accumulate. Independent of `refresh_cron` and `refresh_after_consolidation` — a delta model can refresh after consolidation and still get a weekly full refresh — and it does not change `mode`. A tick is skipped when no refresh has run since the last full one (there is nothing to correct). Like `refresh_cron`, it honours `min_refresh_interval_seconds` and pauses while the last refresh failed. null = no schedule.
+   */
+  full_refresh_cron?: string | null;
+  /**
    * Min Refresh Interval Seconds
    *
-   * Minimum seconds between two automatic refreshes of this mental model. A triggered refresh that arrives sooner is not dropped: it is queued and parked until the window expires, and every further trigger in the meantime folds into that one queued refresh, so a burst of retains costs one refresh instead of one per retain. Applies to both refresh_after_consolidation and refresh_cron. Explicit refreshes (API, MCP, control plane) ignore it and run immediately. 0 disables the floor for this model; null falls back to the bank/global mental_model_min_refresh_interval_seconds setting (itself 0 by default, i.e. no floor).
+   * Minimum seconds between two automatic refreshes of this mental model. A triggered refresh that arrives sooner is not dropped: it is queued and parked until the window expires, and every further trigger in the meantime folds into that one queued refresh, so a burst of retains costs one refresh instead of one per retain. Applies to every automatic trigger: refresh_after_consolidation, refresh_cron and full_refresh_cron. Explicit refreshes (API, MCP, control plane) ignore it and run immediately. 0 disables the floor for this model; null falls back to the bank/global mental_model_min_refresh_interval_seconds setting (itself 0 by default, i.e. no floor).
    */
   min_refresh_interval_seconds?: number | null;
   /**
@@ -4622,7 +5147,7 @@ export type MentalModelTriggerOutput = {
   /**
    * Tags Match
    *
-   * Override how the model's tags filter memories during refresh. If not set, defaults to 'all_strict' when the model has tags (security isolation) or 'any' when the model has no tags. Under 'all_strict' a memory must carry EVERY one of the model's tags and untagged memories are excluded, which is why a model tagged with labels its memories do not carry refreshes to empty content. Set to 'all' to keep requiring the tags while including untagged memories, or to 'any' to include untagged memories alongside any single tag match.
+   * Override how the model's tags filter memories during refresh. If not set, defaults to 'all_strict' when the model has tags (security isolation) or 'any' when the model has no tags. Under 'all_strict' a memory must carry EVERY one of the model's tags and untagged memories are excluded, which is why a model tagged with labels its memories do not carry refreshes to empty content. Set to 'all' to keep requiring the tags while including untagged memories, or to 'any' to include untagged memories alongside any single tag match. Staleness ignores that widening: an untagged write never marks a tagged model stale, in any mode — only a write that matches the model's tags does.
    */
   tags_match?: "any" | "all" | "any_strict" | "all_strict" | "exact" | null;
   /**
@@ -4651,6 +5176,18 @@ export type MentalModelTriggerOutput = {
    * Override the token budget for raw chunks returned by the internal recall during refresh. None means use the bank/global config default (recall_chunks_max_tokens).
    */
   recall_chunks_max_tokens?: number | null;
+  /**
+   * Reflect Search Observations Max Tokens
+   *
+   * Override the token budget for the refresh's search_observations calls. Observation evidence is often the largest contributor to the reflect context; lowering it trades the lowest-ranked observations for a smaller LLM context. null means the shipped 5000.
+   */
+  reflect_search_observations_max_tokens?: number | null;
+  /**
+   * Reflect Search Observations Include Entities
+   *
+   * Override whether search_observations attaches resolved entity names to each observation. Entities can be more than half the serialized tool payload; turning them off keeps the same observations and ranking with a much smaller context. null means enabled.
+   */
+  reflect_search_observations_include_entities?: boolean | null;
   /**
    * Response Schema
    *
@@ -4713,7 +5250,7 @@ export type MinScores = {
   /**
    * Reranker
    *
-   * Post-query: minimum normalized reranker score (0-1). Applied to every returned result.
+   * Post-query: minimum normalized reranker score (0-1). Applied to every returned result. Rejected with HTTP 400 when the reranker scores by rank position (TypeSafe), since a floor would only keep a fixed share of the results.
    */
   reranker?: number | null;
   /**
@@ -4722,6 +5259,22 @@ export type MinScores = {
    * Post-query: minimum final ranking score. Applied to every returned result.
    */
   final?: number | null;
+};
+
+/**
+ * ObservationIdSample
+ *
+ * How many observations an event touched, and (up to ``MAX_IDS``) which.
+ */
+export type ObservationIdSample = {
+  /**
+   * Count
+   */
+  count?: number;
+  /**
+   * Ids
+   */
+  ids?: Array<string>;
 };
 
 /**
@@ -4837,6 +5390,18 @@ export type OperationResponse = {
    */
   task_type: string;
   /**
+   * Operation Id
+   *
+   * Same as `id`; the name the single-operation read uses.
+   */
+  operation_id?: string | null;
+  /**
+   * Operation Type
+   *
+   * Same as `task_type`; the name the single-operation read uses.
+   */
+  operation_type?: string | null;
+  /**
    * Items Count
    */
   items_count: number;
@@ -4853,7 +5418,7 @@ export type OperationResponse = {
   /**
    * Mental Model Id
    *
-   * Mental model this operation acted on (refresh_mental_model); null for other task types. Without it the list cannot say which model an operation refreshed — `document_id` is null for these, and the list carries no result_metadata. The single-operation read exposes the same value under `result_metadata`.
+   * Mental model this operation acted on (refresh_mental_model); null for other task types. Without it the list cannot say which model an operation refreshed — `document_id` is null for these, and the list carries no result_metadata.
    */
   mental_model_id?: string | null;
   /**
@@ -4914,6 +5479,24 @@ export type OperationStatusResponse = {
    * Operation Type
    */
   operation_type?: string | null;
+  /**
+   * Id
+   *
+   * Same as `operation_id`; the name the operations list uses.
+   */
+  id?: string | null;
+  /**
+   * Task Type
+   *
+   * Same as `operation_type`; the name the operations list uses.
+   */
+  task_type?: string | null;
+  /**
+   * Mental Model Id
+   *
+   * Mental model this operation acted on (refresh_mental_model); null for other task types.
+   */
+  mental_model_id?: string | null;
   /**
    * Created At
    */
@@ -5197,9 +5780,13 @@ export type RecallRequest = {
   /**
    * Prefer Observations
    *
-   * When recalling raw facts ('world'/'experience') together with 'observation', drop any raw fact that an observation in the results was consolidated from, so the observation supersedes it and you don't get duplicate content. The freed slots are backfilled with the next results, keeping the result count at the requested budget. Disabled by default; set to true to enable. No effect unless 'observation' and at least one raw type are both requested.
+   * When recalling raw facts ('world'/'experience') together with 'observation', drop any raw fact that an observation in the results was consolidated from, so the observation supersedes it and you don't get duplicate content. The freed slots are backfilled with the next results, keeping the result count at the requested budget. When omitted, uses the bank/global recall_prefer_observations config (false unless configured). No effect unless 'observation' and at least one raw type are both requested.
    */
-  prefer_observations?: boolean;
+  prefer_observations?: boolean | null;
+  /**
+   * What the decision-model reranker does beyond ordering: drop results that do not help (`prune`) or that repeat a better-ranked one (`dedup`). Each field left unset uses the bank/global config. No effect unless a decision model is set up for recall.
+   */
+  rerank?: RerankOptions | null;
   budget?: Budget;
   /**
    * Max Tokens
@@ -5359,7 +5946,7 @@ export type RecallResult = {
   /**
    * Attachments
    *
-   * Attachments this fact was drawn from, as recorded per fact at extraction time — the same edge the memory read endpoints return, not everything its chunk happened to carry. A fact stated in prose reports none. Omitted when there are none.
+   * Attachments this fact was drawn from, as recorded per fact at extraction time — the same edge the memory read endpoints return, not everything its chunk happened to carry. A fact stated in prose reports none; an observation reports those of the facts it was consolidated from. Omitted when there are none.
    */
   attachments?: Array<ChunkAttachment> | null;
 };
@@ -5498,6 +6085,34 @@ export type ReflectFact = {
    * Occurred End
    */
   occurred_end?: string | null;
+  /**
+   * Mentioned At
+   */
+  mentioned_at?: string | null;
+  /**
+   * Document Id
+   */
+  document_id?: string | null;
+  /**
+   * Chunk Id
+   */
+  chunk_id?: string | null;
+  /**
+   * Tags
+   */
+  tags?: Array<string> | null;
+  /**
+   * Metadata
+   */
+  metadata?: {
+    [key: string]: string;
+  } | null;
+  /**
+   * Attachments
+   *
+   * Attachments this memory was drawn from — the same per-fact edge recall reports. An observation reports those of the facts it was consolidated from. Omitted when there are none.
+   */
+  attachments?: Array<ChunkAttachment> | null;
 };
 
 /**
@@ -5580,6 +6195,12 @@ export type ReflectRequest = {
    * Whether search_observations attaches resolved entity names to each observation. Entities can be more than half the serialized tool payload; turning them off keeps the same observations and ranking with a much smaller context. None means enabled.
    */
   reflect_search_observations_include_entities?: boolean | null;
+  /**
+   * Reflect Search Mental Models Max Tokens
+   *
+   * Token budget for the mental models search_mental_models returns in full, packed in rank order. The best-ranked one is always in full; the others that do not fit come back as a snippet the model can read with read_mental_models. Raise it for banks with long pages or answers spread across pages; lower it to cut the reflect context. None means use the shipped default (16000).
+   */
+  reflect_search_mental_models_max_tokens?: number | null;
   /**
    * Query
    */
@@ -5810,6 +6431,20 @@ export type RefreshMentalModelOperationDetails = {
 };
 
 /**
+ * RefreshMentalModelRequest
+ *
+ * Optional body of POST /mental-models/{id}/refresh.
+ */
+export type RefreshMentalModelRequest = {
+  /**
+   * Mode
+   *
+   * 'full' regenerates the content from scratch for this refresh only, whatever `trigger.mode` says; the stored trigger is not changed. null runs the model's own mode.
+   */
+  mode?: "full" | null;
+};
+
+/**
  * ReprocessDocumentResponse
  *
  * Response model for reprocess document endpoint.
@@ -5827,6 +6462,27 @@ export type ReprocessDocumentResponse = {
    * Items Count
    */
   items_count: number;
+};
+
+/**
+ * RerankOptions
+ *
+ * What the decision-model reranker does beyond ordering. Each field left unset (null) uses the
+ * bank/global config; neither has any effect unless a decision model is set up for recall.
+ */
+export type RerankOptions = {
+  /**
+   * Prune
+   *
+   * Drop the results the decision model judges no help to the query, instead of only ranking them last. Costs no extra request. When omitted, uses the bank/global recall_decision_model_prune config (false unless configured).
+   */
+  prune?: boolean | null;
+  /**
+   * Dedup
+   *
+   * Drop a result that repeats a better-ranked one, so the same fact comes back once. Costs one more decision-model request after the ranking one. When omitted, uses the bank/global recall_decision_model_dedup config (false unless configured).
+   */
+  dedup?: boolean | null;
 };
 
 /**
@@ -5958,6 +6614,20 @@ export type RunSettingModel = {
 };
 
 /**
+ * SetBankAliasPrimaryRequest
+ *
+ * Request model for showing (or no longer showing) an alias in place of the bank id.
+ */
+export type SetBankAliasPrimaryRequest = {
+  /**
+   * Primary
+   *
+   * True to present the bank under this alias; False to go back to its own id.
+   */
+  primary: boolean;
+};
+
+/**
  * SourceFactsIncludeOptions
  *
  * Options for including source facts for observation-type results.
@@ -5975,6 +6645,90 @@ export type SourceFactsIncludeOptions = {
    * Maximum tokens of source facts per observation (-1 = unlimited)
    */
   max_tokens_per_observation?: number;
+};
+
+/**
+ * StrategyPreview
+ *
+ * Preview of one strategy, aligned by position with the request.
+ */
+export type StrategyPreview = {
+  /**
+   * Active
+   *
+   * False when the server would ignore this strategy (no usable rule, or no setting)
+   */
+  active: boolean;
+  /**
+   * Claimed Count
+   *
+   * Existing scopes this strategy actually applies to
+   */
+  claimed_count: number;
+  /**
+   * Rules
+   *
+   * One entry per rule, aligned with the request
+   */
+  rules: Array<StrategyRulePreview>;
+};
+
+/**
+ * StrategyRulePreview
+ *
+ * What one rule (one entry of a strategy's `scopes`) matches among existing scopes.
+ */
+export type StrategyRulePreview = {
+  /**
+   * Match Count
+   *
+   * Existing scopes this rule matches
+   */
+  match_count: number;
+  /**
+   * Taken Count
+   *
+   * Of those, how many an earlier strategy wins, so this one has no effect
+   */
+  taken_count: number;
+  /**
+   * Observation Count
+   *
+   * Observations across the matching scopes
+   */
+  observation_count: number;
+  /**
+   * Samples
+   *
+   * The most populous matching scopes, up to sample_limit
+   */
+  samples: Array<StrategyScopePreview>;
+};
+
+/**
+ * StrategyScopePreview
+ *
+ * One existing observation scope in a consolidation-strategy preview.
+ */
+export type StrategyScopePreview = {
+  /**
+   * Tags
+   *
+   * The scope's tags (sorted)
+   */
+  tags: Array<string>;
+  /**
+   * Count
+   *
+   * Observations in this scope
+   */
+  count: number;
+  /**
+   * Handled By
+   *
+   * Index of the strategy that actually applies to this scope (the first that claims it), or null when no strategy does and Default applies
+   */
+  handled_by: number | null;
 };
 
 /**
@@ -6253,6 +7007,18 @@ export type UpdateDocumentRequest = {
    * The complete new set of tags for the document and its memory units — this REPLACES the existing tags rather than adding to them, so omitting a tag drops it and `[]` clears them all. Triggers observation invalidation and re-consolidation.
    */
   tags?: Array<string> | null;
+  /**
+   * UpdateDocumentObservationScopes
+   *
+   * New observation scoping for the document's memories, with the same values retain accepts (send 'combined' to scope by each memory's full tag set). Use it to move memories retained under one scoping to another — e.g. per-session documents to 'shared' — without re-extracting them. Memories whose resolved scopes change lose their observations and are re-consolidated; the rest keep theirs. Also becomes the scoping a later reprocess of the document uses.
+   */
+  observation_scopes?:
+    | "per_tag"
+    | "combined"
+    | "all_combinations"
+    | "shared"
+    | Array<Array<string>>
+    | null;
 };
 
 /**
@@ -6302,6 +7068,12 @@ export type UpdateMemoryRequest = {
    * New occurred-range end (ISO 8601). '' clears it; omit to leave unchanged.
    */
   occurred_end?: string | null;
+  /**
+   * Mentioned At
+   *
+   * New mention time — when the fact was said or written (ISO 8601). '' clears it; omit to leave unchanged.
+   */
+  mentioned_at?: string | null;
   /**
    * Fact Type
    *
@@ -6513,6 +7285,10 @@ export type WebhookDeliveryResponse = {
    * Id
    */
   id: string;
+  /**
+   * Event Id
+   */
+  event_id?: string | null;
   /**
    * Webhook Id
    */
@@ -6771,6 +7547,8 @@ export type GetGraphData = {
     limit?: number;
     /**
      * Q
+     *
+     * Case-insensitive substring filter on memory text and context. Not indexed: it scans the bank, so it slows as the bank grows. Meant for browsing and inspection, not for high-volume or latency-sensitive workloads — use recall for that.
      */
     q?: string | null;
     /**
@@ -6780,7 +7558,7 @@ export type GetGraphData = {
     /**
      * Tags Match
      */
-    tags_match?: string;
+    tags_match?: "any" | "all" | "any_strict" | "all_strict" | "exact";
     /**
      * Document Id
      */
@@ -6836,6 +7614,8 @@ export type ListMemoriesData = {
     type?: string | null;
     /**
      * Q
+     *
+     * Case-insensitive substring filter on memory text and context. Not indexed: it scans the bank, so it slows as the bank grows. Meant for browsing and inspection, not for high-volume or latency-sensitive workloads — use recall for that.
      */
     q?: string | null;
     /**
@@ -7394,6 +8174,24 @@ export type ListEntitiesData = {
      * Offset for pagination
      */
     offset?: number;
+    /**
+     * Tags
+     *
+     * Only count memories carrying these tags. An entity is returned only when a matching memory mentions it, and its mention count and dates cover the matching memories only.
+     */
+    tags?: Array<string> | null;
+    /**
+     * Tags Match
+     *
+     * How `tags` match (same modes as listing memories).
+     */
+    tags_match?: "any" | "all" | "any_strict" | "all_strict" | "exact";
+    /**
+     * Tag Groups
+     *
+     * Compound tag filter as a JSON-encoded list of tag groups — the same shape `tag_groups` takes in a recall body (leaves {tags, match, resolve} and {and: [...]}, {or: [...]}, {not: ...}; groups are AND-ed). Mutually exclusive with `tags`.
+     */
+    tag_groups?: string | null;
   };
   url: "/v1/default/banks/{bank_id}/entities";
 };
@@ -7447,6 +8245,24 @@ export type GetEntityGraphData = {
      * Minimum cooccurrence_count to include an edge
      */
     min_count?: number;
+    /**
+     * Tags
+     *
+     * Only count memories carrying these tags. Edges and node mention counts are computed from the matching memories only.
+     */
+    tags?: Array<string> | null;
+    /**
+     * Tags Match
+     *
+     * How `tags` match (same modes as listing memories).
+     */
+    tags_match?: "any" | "all" | "any_strict" | "all_strict" | "exact";
+    /**
+     * Tag Groups
+     *
+     * Compound tag filter as a JSON-encoded list of tag groups — the same shape `tag_groups` takes in a recall body (leaves {tags, match, resolve} and {and: [...]}, {or: [...]}, {not: ...}; groups are AND-ed). Mutually exclusive with `tags`.
+     */
+    tag_groups?: string | null;
   };
   url: "/v1/default/banks/{bank_id}/entities/graph";
 };
@@ -7491,7 +8307,26 @@ export type GetEntityData = {
      */
     entity_id: string;
   };
-  query?: never;
+  query?: {
+    /**
+     * Tags
+     *
+     * Only count memories carrying these tags. The entity is a 404 when no matching memory mentions it; its mention count and dates cover the matching memories only.
+     */
+    tags?: Array<string> | null;
+    /**
+     * Tags Match
+     *
+     * How `tags` match (same modes as listing memories).
+     */
+    tags_match?: "any" | "all" | "any_strict" | "all_strict" | "exact";
+    /**
+     * Tag Groups
+     *
+     * Compound tag filter as a JSON-encoded list of tag groups — the same shape `tag_groups` takes in a recall body (leaves {tags, match, resolve} and {and: [...]}, {or: [...]}, {not: ...}; groups are AND-ed). Mutually exclusive with `tags`.
+     */
+    tag_groups?: string | null;
+  };
   url: "/v1/default/banks/{bank_id}/entities/{entity_id}";
 };
 
@@ -7596,6 +8431,12 @@ export type ListMentalModelsData = {
      * Offset
      */
     offset?: number;
+    /**
+     * Exclude Knowledge Pages
+     *
+     * Leave out the mental models that hold knowledge page content (list standalone models only).
+     */
+    exclude_knowledge_pages?: boolean;
   };
   url: "/v1/default/banks/{bank_id}/mental-models";
 };
@@ -7825,7 +8666,10 @@ export type GetMentalModelHistoryResponses = {
 };
 
 export type RefreshMentalModelData = {
-  body?: never;
+  /**
+   * Request
+   */
+  body?: RefreshMentalModelRequest | null;
   headers?: {
     /**
      * Authorization
@@ -7961,7 +8805,26 @@ export type GetKnowledgeBaseTreeData = {
      */
     bank_id: string;
   };
-  query?: never;
+  query?: {
+    /**
+     * Tags
+     *
+     * Only return pages carrying these tags (matched per `tags_match`, like recall).
+     */
+    tags?: Array<string> | null;
+    /**
+     * Tags Match
+     *
+     * How `tags` match a page's tags: any, all, any_strict, all_strict, exact. 'any'/'all' also return untagged pages; the _strict modes and 'exact' do not.
+     */
+    tags_match?: "any" | "all" | "any_strict" | "all_strict" | "exact";
+    /**
+     * Tag Groups
+     *
+     * JSON-encoded compound tag filter, same shape as recall's `tag_groups`, e.g. `[{"or":[{"tags":["user:kate"],"match":"all_strict"},{"tags":["team"]}]}]`. Top-level groups are AND-ed, and AND-ed with `tags`.
+     */
+    tag_groups?: string | null;
+  };
   url: "/v1/default/banks/{bank_id}/knowledge-base/tree";
 };
 
@@ -8132,6 +8995,24 @@ export type SearchKnowledgeBaseData = {
      * Maximum results to return
      */
     limit?: number;
+    /**
+     * Tags
+     *
+     * Only return pages carrying these tags (matched per `tags_match`, like recall).
+     */
+    tags?: Array<string> | null;
+    /**
+     * Tags Match
+     *
+     * How `tags` match a page's tags: any, all, any_strict, all_strict, exact. 'any'/'all' also return untagged pages; the _strict modes and 'exact' do not.
+     */
+    tags_match?: "any" | "all" | "any_strict" | "all_strict" | "exact";
+    /**
+     * Tag Groups
+     *
+     * JSON-encoded compound tag filter, same shape as recall's `tag_groups`, e.g. `[{"or":[{"tags":["user:kate"],"match":"all_strict"},{"tags":["team"]}]}]`. Top-level groups are AND-ed, and AND-ed with `tags`.
+     */
+    tag_groups?: string | null;
   };
   url: "/v1/default/banks/{bank_id}/knowledge-base/search";
 };
@@ -8517,7 +9398,7 @@ export type ListDocumentsData = {
     /**
      * Q
      *
-     * Case-insensitive substring filter on document ID (e.g. 'report' matches 'report-2024')
+     * Case-insensitive substring filter on document ID or document text (e.g. 'report' matches 'report-2024' or any document containing 'report'). Meant for browsing and inspection, not for high-volume or latency-sensitive workloads — use recall for that. Matches are capped: past the cap, `total` is a lower bound and `total_is_estimate` is true. A store-owned backend may match approximately; each item's `matched_fields` says what matched.
      */
     q?: string | null;
     /**
@@ -8529,9 +9410,9 @@ export type ListDocumentsData = {
     /**
      * Tags Match
      *
-     * How to match tags: 'any', 'all', 'any_strict', 'all_strict'
+     * How to match tags: 'any', 'all', 'any_strict', 'all_strict', 'exact'
      */
-    tags_match?: string;
+    tags_match?: "any" | "all" | "any_strict" | "all_strict" | "exact";
     /**
      * Time Field
      *
@@ -8637,6 +9518,60 @@ export type ListDocumentChunksResponses = {
 
 export type ListDocumentChunksResponse =
   ListDocumentChunksResponses[keyof ListDocumentChunksResponses];
+
+export type GetDocumentHistoryData = {
+  body?: never;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+    /**
+     * Document Id
+     */
+    document_id: string;
+  };
+  query?: {
+    /**
+     * Limit
+     *
+     * Maximum number of operations to read
+     */
+    limit?: number;
+    /**
+     * Offset
+     *
+     * Offset for pagination, in operations
+     */
+    offset?: number;
+  };
+  url: "/v1/default/banks/{bank_id}/documents/{document_id}/history";
+};
+
+export type GetDocumentHistoryErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type GetDocumentHistoryError = GetDocumentHistoryErrors[keyof GetDocumentHistoryErrors];
+
+export type GetDocumentHistoryResponses = {
+  /**
+   * Successful Response
+   */
+  200: DocumentHistoryResponse;
+};
+
+export type GetDocumentHistoryResponse =
+  GetDocumentHistoryResponses[keyof GetDocumentHistoryResponses];
 
 export type ReprocessDocumentData = {
   body?: never;
@@ -9249,6 +10184,159 @@ export type AddBankBackgroundResponses = {
 
 export type AddBankBackgroundResponse =
   AddBankBackgroundResponses[keyof AddBankBackgroundResponses];
+
+export type ListBankAliasesData = {
+  body?: never;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+  };
+  query?: never;
+  url: "/v1/default/banks/{bank_id}/aliases";
+};
+
+export type ListBankAliasesErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type ListBankAliasesError = ListBankAliasesErrors[keyof ListBankAliasesErrors];
+
+export type ListBankAliasesResponses = {
+  /**
+   * Successful Response
+   */
+  200: BankAliasesResponse;
+};
+
+export type ListBankAliasesResponse = ListBankAliasesResponses[keyof ListBankAliasesResponses];
+
+export type CreateBankAliasData = {
+  body: CreateBankAliasRequest;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+  };
+  query?: never;
+  url: "/v1/default/banks/{bank_id}/aliases";
+};
+
+export type CreateBankAliasErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type CreateBankAliasError = CreateBankAliasErrors[keyof CreateBankAliasErrors];
+
+export type CreateBankAliasResponses = {
+  /**
+   * Successful Response
+   */
+  201: BankAliasesResponse;
+};
+
+export type CreateBankAliasResponse = CreateBankAliasResponses[keyof CreateBankAliasResponses];
+
+export type DeleteBankAliasData = {
+  body?: never;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+    /**
+     * Alias
+     */
+    alias: string;
+  };
+  query?: never;
+  url: "/v1/default/banks/{bank_id}/aliases/{alias}";
+};
+
+export type DeleteBankAliasErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type DeleteBankAliasError = DeleteBankAliasErrors[keyof DeleteBankAliasErrors];
+
+export type DeleteBankAliasResponses = {
+  /**
+   * Successful Response
+   */
+  200: BankAliasesResponse;
+};
+
+export type DeleteBankAliasResponse = DeleteBankAliasResponses[keyof DeleteBankAliasResponses];
+
+export type SetBankAliasPrimaryData = {
+  body: SetBankAliasPrimaryRequest;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+    /**
+     * Alias
+     */
+    alias: string;
+  };
+  query?: never;
+  url: "/v1/default/banks/{bank_id}/aliases/{alias}";
+};
+
+export type SetBankAliasPrimaryErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type SetBankAliasPrimaryError = SetBankAliasPrimaryErrors[keyof SetBankAliasPrimaryErrors];
+
+export type SetBankAliasPrimaryResponses = {
+  /**
+   * Successful Response
+   */
+  200: BankAliasesResponse;
+};
+
+export type SetBankAliasPrimaryResponse =
+  SetBankAliasPrimaryResponses[keyof SetBankAliasPrimaryResponses];
 
 export type DeleteBankData = {
   body?: never;
@@ -9970,6 +11058,48 @@ export type ListObservationScopesResponses = {
 export type ListObservationScopesResponse =
   ListObservationScopesResponses[keyof ListObservationScopesResponses];
 
+export type PreviewConsolidationStrategiesData = {
+  body: ConsolidationStrategiesPreviewRequest;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+  };
+  query?: never;
+  url: "/v1/default/banks/{bank_id}/consolidation-strategies/preview";
+};
+
+export type PreviewConsolidationStrategiesErrors = {
+  /**
+   * The bank does not exist.
+   */
+  404: unknown;
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type PreviewConsolidationStrategiesError =
+  PreviewConsolidationStrategiesErrors[keyof PreviewConsolidationStrategiesErrors];
+
+export type PreviewConsolidationStrategiesResponses = {
+  /**
+   * Successful Response
+   */
+  200: ConsolidationStrategiesPreview;
+};
+
+export type PreviewConsolidationStrategiesResponse =
+  PreviewConsolidationStrategiesResponses[keyof PreviewConsolidationStrategiesResponses];
+
 export type RecoverConsolidationData = {
   body?: never;
   headers?: {
@@ -10673,6 +11803,50 @@ export type AuditLogStatsResponses = {
 
 export type AuditLogStatsResponse2 = AuditLogStatsResponses[keyof AuditLogStatsResponses];
 
+export type GetAuditLogData = {
+  body?: never;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+    /**
+     * Log Id
+     */
+    log_id: string;
+  };
+  query?: never;
+  url: "/v1/default/banks/{bank_id}/audit-logs/{log_id}";
+};
+
+export type GetAuditLogErrors = {
+  /**
+   * Bank or audit log entry not found
+   */
+  404: unknown;
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type GetAuditLogError = GetAuditLogErrors[keyof GetAuditLogErrors];
+
+export type GetAuditLogResponses = {
+  /**
+   * Successful Response
+   */
+  200: AuditLogEntry;
+};
+
+export type GetAuditLogResponse = GetAuditLogResponses[keyof GetAuditLogResponses];
+
 export type ListLlmRequestsData = {
   body?: never;
   headers?: {
@@ -10706,6 +11880,12 @@ export type ListLlmRequestsData = {
      * Filter by call scope
      */
     scope?: string | null;
+    /**
+     * Call Type
+     *
+     * Filter by kind of model call, told apart by scope: embedding (embedding_*), rerank, decision (decision_*), or llm (every other scope)
+     */
+    call_type?: "llm" | "embedding" | "rerank" | "decision" | null;
     /**
      * Provider
      *
@@ -10808,11 +11988,23 @@ export type LlmRequestStatsData = {
      */
     operation?: string | null;
     /**
+     * Call Type
+     *
+     * Filter by kind of model call: llm, embedding, rerank or decision
+     */
+    call_type?: "llm" | "embedding" | "rerank" | "decision" | null;
+    /**
      * Period
      *
-     * Time period: 1d, 7d, or 30d
+     * Time period: 1d (by hour), 7d, or 30d (by day)
      */
     period?: string;
+    /**
+     * Split By
+     *
+     * Also split each bucket by model or by operation (returned in `series`)
+     */
+    split_by?: "model" | "operation" | null;
   };
   url: "/v1/default/banks/{bank_id}/llm-requests/stats";
 };

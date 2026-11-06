@@ -18,7 +18,7 @@ pip install hindsight-smolagents
 
 ## Quick Start
 
-> ✨ **Recommended: [Hindsight Cloud](https://ui.hindsight.vectorize.io/signup)** — free tier, no self-hosting required. Sign up and grab an API key in under a minute.
+> ✨ **Recommended: [Hindsight Cloud](https://ui.hindsight.vectorize.io)** — free tier, no self-hosting required. Sign up and grab an API key in under a minute.
 
 ```python
 from smolagents import CodeAgent, HfApiModel
@@ -149,11 +149,11 @@ tools = create_hindsight_tools(bank_id="user-123")
 | `client` | `None` | Pre-configured Hindsight client |
 | `hindsight_api_url` | `None` | API URL (used if no client provided) |
 | `api_key` | `None` | API key (used if no client provided) |
-| `budget` | `"mid"` | Recall/reflect budget level (low/mid/high) |
-| `max_tokens` | `4096` | Maximum tokens for recall results |
+| `budget` | `None` | Uses configured budget, or `"mid"` when unconfigured; an explicit value overrides configuration |
+| `max_tokens` | `None` | Uses configured token limit, or `4096` when unconfigured; an explicit value overrides configuration |
 | `tags` | `None` | Tags applied when storing memories |
 | `recall_tags` | `None` | Tags to filter when searching |
-| `recall_tags_match` | `"any"` | Tag matching mode |
+| `recall_tags_match` | `None` | Uses configured matching mode, or `"any"` when unconfigured; an explicit value overrides configuration |
 | `enable_retain` | `True` | Include the retain (store) tool |
 | `enable_recall` | `True` | Include the recall (search) tool |
 | `enable_reflect` | `True` | Include the reflect (synthesize) tool |

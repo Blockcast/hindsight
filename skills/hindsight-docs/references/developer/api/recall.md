@@ -12,7 +12,7 @@ When you **recall**, Hindsight runs four retrieval strategies in parallel — se
 Learn about the four retrieval strategies (semantic, keyword, graph, temporal) and RRF fusion in the [Recall Architecture](../retrieval.md) guide.
 > **💡 Prerequisites**
 >
-Make sure you've completed the [Quick Start](./quickstart) to install the client and start the server.
+Make sure you've completed the [Quick Start](./quickstart.md) to install the client and start the server.
 ## Basic Recall
 
 ### Python
@@ -76,7 +76,25 @@ hindsight memory recall my-bank "What does Alice do?"
 ### Go
 
 ```go
-# Section 'recall-basic' not found in api/recall.go
+response, _, _ := client.MemoryAPI.RecallMemories(ctx, "my-bank").
+	RecallRequest(hindsight.RecallRequest{
+		Query: "What does Alice do?",
+	}).Execute()
+
+// response.Results is a slice of RecallResult, each with:
+// - Id:            fact ID
+// - Text:          the extracted fact
+// - Type:          "world", "experience", or "observation"
+// - Context:       context label set during retain
+// - Tags:          []string of tags
+// - Entities:      []string of entity names linked to this fact
+// - OccurredStart: ISO datetime of when the event started
+// - OccurredEnd:   ISO datetime of when the event ended
+// - MentionedAt:   ISO datetime of when the fact was retained
+// - DocumentId:    document this fact belongs to
+for _, r := range response.GetResults() {
+	fmt.Println(r.GetText())
+}
 ```
 
 ---
@@ -141,13 +159,28 @@ hindsight memory recall my-bank "query" --fact-type world,observation
 ### Go
 
 ```go
-# Section 'recall-world-only' not found in api/recall.go
+// Only world facts (objective information)
+client.MemoryAPI.RecallMemories(ctx, "my-bank").
+	RecallRequest(hindsight.RecallRequest{
+		Query: "Where does Alice work?",
+		Types: []string{"world"},
+	}).Execute()
 ```
 ```go
-# Section 'recall-experience-only' not found in api/recall.go
+// Only experience (conversations and events)
+client.MemoryAPI.RecallMemories(ctx, "my-bank").
+	RecallRequest(hindsight.RecallRequest{
+		Query: "What have I recommended?",
+		Types: []string{"experience"},
+	}).Execute()
 ```
 ```go
-# Section 'recall-observations-only' not found in api/recall.go
+// Only observations (consolidated knowledge)
+client.MemoryAPI.RecallMemories(ctx, "my-bank").
+	RecallRequest(hindsight.RecallRequest{
+		Query: "What patterns have I learned?",
+		Types: []string{"observation"},
+	}).Execute()
 ```
 
 > **💡 About Observations**
@@ -157,7 +190,16 @@ Observations are deduplicated, evidence-grounded beliefs consolidated from multi
 
 Because observations are consolidated from raw facts, recalling `observation` alongside `world` and `experience` can return the same information twice — once as the raw fact and once folded into an observation. With `prefer_observations` you get the best of both: you still recall every type, but whenever an observation in the results was built from a raw fact, that raw fact is dropped so the observation supersedes it. The freed slots are backfilled with the next-best results, so you don't lose coverage.
 
-This lets you ask for everything without choosing between "raw facts only" (no consolidation) and "observations only" (which may lag behind the latest retains while consolidation catches up). **Disabled by default** — set it to `true` to opt in. It has no effect unless both `observation` and at least one of `world`/`experience` are included in `types`.
+This lets you ask for everything without choosing between "raw facts only" (no consolidation) and "observations only" (which may lag behind the latest retains while consolidation catches up). Off unless the request or the bank turns it on. When a request leaves it out, the bank's `recall_prefer_observations` config decides (env `HINDSIGHT_API_RECALL_PREFER_OBSERVATIONS`, `false` unless configured), so a deployment can turn it on for clients that never pass it, such as MCP connectors. It has no effect unless both `observation` and at least one of `world`/`experience` are included in `types`.
+
+### rerank
+
+With a [decision model set up for recall](../configuration.md#decision-model), recall can drop results instead of only ranking them. Both options go in the `rerank` object, e.g. `"rerank": {"prune": true, "dedup": true}`:
+
+- `prune` drops the results judged no help to the query. It reuses the ranking answers, so it costs no extra request, and the best result always stays.
+- `dedup` drops a result that repeats a better-ranked one, so the same fact retained from several documents comes back once. It costs one more decision-model request, after the ranking one.
+
+When a request leaves either out, the bank's `recall_decision_model_prune` / `recall_decision_model_dedup` config decides (env `HINDSIGHT_API_RECALL_DECISION_MODEL_PRUNE` / `_DEDUP`, `false` unless configured). Both are ignored without a decision model.
 
 ### budget
 
@@ -196,7 +238,20 @@ hindsight memory recall my-bank "How are Alice and Bob connected?" --budget high
 ### Go
 
 ```go
-# Section 'recall-budget-levels' not found in api/recall.go
+budgetLow := hindsight.LOW
+// Quick lookup
+client.MemoryAPI.RecallMemories(ctx, "my-bank").
+	RecallRequest(hindsight.RecallRequest{
+		Query:  "Alice's email",
+		Budget: &budgetLow,
+	}).Execute()
+
+// Deep exploration
+client.MemoryAPI.RecallMemories(ctx, "my-bank").
+	RecallRequest(hindsight.RecallRequest{
+		Query:  "How are Alice and Bob connected?",
+		Budget: &budgetHigh,
+	}).Execute()
 ```
 
 ### max_tokens
@@ -239,7 +294,21 @@ hindsight memory recall my-bank "Alice's email" --max-tokens 500
 ### Go
 
 ```go
-# Section 'recall-token-budget' not found in api/recall.go
+// Fill up to 4K tokens of context with relevant memories
+mt4k := int32(4096)
+client.MemoryAPI.RecallMemories(ctx, "my-bank").
+	RecallRequest(hindsight.RecallRequest{
+		Query:     "What do I know about Alice?",
+		MaxTokens: &mt4k,
+	}).Execute()
+
+// Smaller budget for quick lookups
+mt500 := int32(500)
+client.MemoryAPI.RecallMemories(ctx, "my-bank").
+	RecallRequest(hindsight.RecallRequest{
+		Query:     "Alice's email",
+		MaxTokens: &mt500,
+	}).Execute()
 ```
 
 ### query_timestamp
@@ -269,6 +338,8 @@ When enabled, the response includes the raw source text chunks from which each f
 > **📝 Note**
 >
 When `include_chunks` is enabled, chunks are fetched based on the top-scored reranked results before token filtering. The last chunk is truncated (not dropped) to fit exactly within the budget, and each chunk carries a `truncated` flag indicating whether it was cut.
+
+With a tag filter (`tags`, `tags_match`, `tag_groups`), a chunk is returned only when its **document's** tags pass the filter too. A fact can match through its own tags — for example a `kind:rule` fact projected from an [entity label](./memory-banks.md#entity-labels) — while the document it came from does not, and that document's other text must not come back with it. Such a fact is still returned; its chunk is not.
 #### source_facts
 
 When enabled and `types` includes `observation`, each observation result is accompanied by the original contributing facts it was synthesized from. Source facts are returned in a top-level `source_facts` dict keyed by fact ID, and each observation result carries a `source_fact_ids` list for cross-referencing. Facts are deduplicated across observations. The `max_tokens` sub-option (default `4096`) limits the total token budget for source facts.
@@ -331,7 +402,26 @@ hindsight memory recall my-bank "What patterns have I learned about Alice?" \
 ### Go
 
 ```go
-# Section 'recall-source-facts' not found in api/recall.go
+// Recall observations and include their source facts
+maxSFTokens := int32(4096)
+sfOpts := hindsight.SourceFactsIncludeOptions{MaxTokens: &maxSFTokens}
+obsResponse, _, _ := client.MemoryAPI.RecallMemories(ctx, "my-bank").
+	RecallRequest(hindsight.RecallRequest{
+		Query: "What patterns have I learned about Alice?",
+		Types: []string{"observation"},
+		Include: &hindsight.IncludeOptions{
+			SourceFacts: *hindsight.NewNullableSourceFactsIncludeOptions(&sfOpts),
+		},
+	}).Execute()
+
+for _, obs := range obsResponse.GetResults() {
+	fmt.Printf("Observation: %s\n", obs.GetText())
+	for _, factID := range obs.GetSourceFactIds() {
+		if fact, ok := obsResponse.GetSourceFacts()[factID]; ok {
+			fmt.Printf("  - [%s] %s\n", fact.GetType(), fact.GetText())
+		}
+	}
+}
 ```
 
 #### entities
@@ -419,7 +509,14 @@ hindsight memory recall my-bank "communication preferences" \
 ### Go
 
 ```go
-# Section 'recall-with-tags' not found in api/recall.go
+// Filter recall to only memories tagged for a specific user
+tagsMatch := "any"
+client.MemoryAPI.RecallMemories(ctx, "my-bank").
+	RecallRequest(hindsight.RecallRequest{
+		Query:     "What feedback did the user give?",
+		Tags:      []string{"user:alice"},
+		TagsMatch: &tagsMatch,
+	}).Execute()
 ```
 
 Use this for **shared global knowledge + user-specific** patterns, where untagged memories represent information everyone should see.
@@ -463,7 +560,14 @@ hindsight memory recall my-bank "communication preferences" \
 ### Go
 
 ```go
-# Section 'recall-tags-strict' not found in api/recall.go
+// Strict mode: only return memories that have matching tags (exclude untagged)
+tagsMatchStrict := "any_strict"
+client.MemoryAPI.RecallMemories(ctx, "my-bank").
+	RecallRequest(hindsight.RecallRequest{
+		Query:     "What did the user say?",
+		Tags:      []string{"user:alice"},
+		TagsMatch: &tagsMatchStrict,
+	}).Execute()
 ```
 
 Use this when memories are **fully partitioned by tags** and untagged memories should never be visible.
@@ -507,7 +611,14 @@ hindsight memory recall my-bank "communication tools" \
 ### Go
 
 ```go
-# Section 'recall-tags-all-mode' not found in api/recall.go
+// AND matching, includes untagged memories
+tagsMatchAllMode := "all"
+client.MemoryAPI.RecallMemories(ctx, "my-bank").
+	RecallRequest(hindsight.RecallRequest{
+		Query:     "communication tools",
+		Tags:      []string{"user:alice", "team"},
+		TagsMatch: &tagsMatchAllMode,
+	}).Execute()
 ```
 
 Use this when memories must belong to a **specific intersection** of scopes (e.g., only memories relevant to both a user and a project), while still surfacing shared global knowledge.
@@ -551,7 +662,14 @@ hindsight memory recall my-bank "communication tools" \
 ### Go
 
 ```go
-# Section 'recall-tags-all' not found in api/recall.go
+// AND matching: require ALL specified tags to be present
+tagsMatchAll := "all_strict"
+client.MemoryAPI.RecallMemories(ctx, "my-bank").
+	RecallRequest(hindsight.RecallRequest{
+		Query:     "What bugs were reported?",
+		Tags:      []string{"user:alice", "bug-report"},
+		TagsMatch: &tagsMatchAll,
+	}).Execute()
 ```
 
 Use this for strict scope enforcement where a memory must explicitly belong to **all** specified contexts.
@@ -687,6 +805,8 @@ Because freed slots are **not** backfilled, any floor can return fewer results t
 
 **Use floors with care.** The reranker's scores are reliable for *ordering* but not as *absolute* values — a clearly-relevant memory can score `~0.001` on one query and `~1.0` on another, so a fixed cutoff risks silently dropping good results. Calibrate any threshold against the scores you actually observe (recall with no `min_scores` first and inspect the [`scores`](#scores) object). See the note under [`scores`](#scores) on why the scale is relative, not absolute, before relying on a fixed threshold.
 
+**Not available with the TypeSafe reranker.** TypeSafe ranks the whole pool at once and returns each memory's rank position, not a relevance score: the top memory is `1.0` on every query, so a `reranker` floor would only keep a fixed share of the results. Recall rejects `min_scores.reranker` with HTTP 400 when TypeSafe is the configured reranker (and skips the floor if a failover chain falls back to it). Use `final` instead.
+
 ---
 
 ## Response
@@ -752,7 +872,7 @@ For `observation`-type results only: the IDs of the original facts this observat
 An object of the per-stage scores for this result. `null` for `source_facts` entries, which are attached by provenance rather than ranked. Fields:
 
 - **`final`** — the score this fact was ranked by (cross-encoder relevance × recency/temporal/evidence boosts). `results` is ordered by it descending. A relative signal, not a calibrated probability (see the note above).
-- **`reranker`** — the cross-encoder's normalized relevance (`0`–`1`). `null` when the deployment uses a passthrough reranker (RRF/interleave modes).
+- **`reranker`** — the cross-encoder's normalized relevance (`0`–`1`). `null` when the deployment uses a passthrough reranker (RRF/interleave modes), or a reranker that returns rank positions instead of scores (TypeSafe).
 - **`semantic`** — the raw vector cosine similarity (`0`–`1`). `null` if this result was not surfaced by semantic search.
 - **`keyword`** — the raw keyword/full-text (BM25) score (`≥ 0`, unbounded). `null` if this result was not surfaced by keyword search.
 

@@ -21,6 +21,7 @@ import socket
 import sys
 import time
 import warnings
+from typing import Any
 
 import uvicorn
 
@@ -435,7 +436,13 @@ def main():
         except ImportError:
             print("uvloop not installed, using default asyncio event loop")
 
-    uvicorn_config = {
+    # `dict[str, Any]`, explicitly: this is a kwargs BAG, assembled conditionally from parsed
+    # CLI args below, and unpacked into a signature with ~30 differently-typed parameters.
+    # Inferred, its value type is the union of everything put in it, and the `**` unpack is
+    # then checked as if every key could be every type -- one diagnostic per uvicorn
+    # parameter, none of them a real defect. The types that matter here are argparse's, and
+    # they are checked where the args are declared.
+    uvicorn_config: dict[str, Any] = {
         "app": "hindsight_api.server:app" if use_import_string else app,
         "host": args.host,
         "port": args.port,
@@ -475,7 +482,10 @@ def main():
             llm_provider=config.llm_provider,
             llm_model=config.llm_model,
             embeddings_provider=config.embeddings_provider,
-            reranker_provider=config.reranker_provider,
+            # Recall ranks with the decision model instead when one is set up for it.
+            reranker_provider=(
+                "decision model" if config.decision_model_config("recall") else config.reranker_provider
+            ),
             mcp_enabled=config.mcp_enabled,
             version=__version__,
             vector_extension=config.vector_extension,

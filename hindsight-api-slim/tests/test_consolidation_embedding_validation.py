@@ -34,7 +34,7 @@ class _FakeMemoryEngine:
 class _WriteForbiddenConn:
     """Backend connection allowing only the pre-embed liveness probe.
 
-    The preflight (``_any_live_source_memory``) runs ``fetchval``; the write path
+    The preflight (``_live_source_ids``) runs a read; the write path
     (``transaction``/``fetchrow``/``execute``/``executemany``) must never be reached,
     because the zero-length embedding is rejected first.
     """
@@ -61,12 +61,15 @@ class _WriteForbiddenConn:
 class _NoLiveConn:
     """Backend connection whose liveness probe reports no live source.
 
-    Correct code short-circuits at the preflight (``fetchval`` -> None) and never embeds
-    or writes; every write method fails hard as a backstop.
+    Correct code short-circuits at the preflight (no live row) and never embeds or writes;
+    every write method fails hard as a backstop.
     """
 
     async def fetchval(self, *args, **kwargs):
         return None  # no live source -> skip before embedding
+
+    async def fetch(self, *args, **kwargs):
+        return []  # no live source -> skip before embedding
 
     def transaction(self):
         raise AssertionError("write transaction entered after all sources were dead")
@@ -121,6 +124,9 @@ async def test_create_observation_rejects_zero_length_embedding_before_insert():
 
 
 @pytest.mark.asyncio
+# Seeds source liveness through a mocked `conn`, which a store-owned bank never reads: the
+# preflight asks the store, finds nothing, and short-circuits before the behaviour under test.
+@pytest.mark.memory_backend_incompatible
 async def test_create_observation_skips_before_embedding_when_all_sources_dead(monkeypatch):
     # All sources gone -> the create must short-circuit at the preflight, BEFORE the embedder
     # (patched to explode if reached). No write may run.
@@ -136,6 +142,9 @@ async def test_create_observation_skips_before_embedding_when_all_sources_dead(m
 
 
 @pytest.mark.asyncio
+# Seeds source liveness through a mocked `conn`, which a store-owned bank never reads: the
+# preflight asks the store, finds nothing, and short-circuits before the behaviour under test.
+@pytest.mark.memory_backend_incompatible
 async def test_update_action_skips_before_embedding_when_all_sources_dead(monkeypatch):
     # Same preflight contract on the UPDATE path: all sources gone -> skip (return None) BEFORE
     # the embedder runs. The existing real-DB update test asserts only post-state, so it would

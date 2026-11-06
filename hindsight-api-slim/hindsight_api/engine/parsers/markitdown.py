@@ -1,15 +1,17 @@
 """Markitdown parser implementation."""
 
 import asyncio
+import codecs
 import importlib.util
 import logging
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from hindsight_api.config import DEFAULT_FILE_PARSER_MARKITDOWN_OCR_PROMPT
 
+from ..providers.openai_compatible_headers import with_openai_compatible_user_agent
 from .base import FileParser
 
 if TYPE_CHECKING:
@@ -124,13 +126,15 @@ class MarkitdownParser(FileParser):
 
         self._markitdown: "MarkItDown | None" = None
         self._ocr_enabled = ocr_enabled
-        self._ocr_kwargs = dict(
-            api_key=ocr_api_key,
-            base_url=ocr_base_url,
-            model=ocr_model,
-            prompt=ocr_prompt,
-            default_headers=ocr_default_headers,
-        )
+        # Five fields, not one kwargs dict: the dict's value type is the union of everything in
+        # it, so unpacking it into `_build_ocr_options` checked every parameter against that union
+        # instead of against its own declared type -- the call is the one place these values are
+        # constrained, and routing it through a bag was what made that check meaningless.
+        self._ocr_api_key = ocr_api_key
+        self._ocr_base_url = ocr_base_url
+        self._ocr_model = ocr_model
+        self._ocr_prompt = ocr_prompt
+        self._ocr_default_headers = ocr_default_headers
 
     def _get_markitdown(self) -> "MarkItDown":
         """Build the MarkItDown instance on first use (see __init__ for why)."""
@@ -138,7 +142,13 @@ class MarkitdownParser(FileParser):
             from markitdown import MarkItDown
 
             if self._ocr_enabled:
-                ocr_options = self._build_ocr_options(**self._ocr_kwargs)
+                ocr_options = self._build_ocr_options(
+                    api_key=self._ocr_api_key,
+                    base_url=self._ocr_base_url,
+                    model=self._ocr_model,
+                    prompt=self._ocr_prompt,
+                    default_headers=self._ocr_default_headers,
+                )
                 self._markitdown = MarkItDown(
                     llm_client=ocr_options.llm_client,
                     llm_model=ocr_options.llm_model,
@@ -170,12 +180,14 @@ class MarkitdownParser(FileParser):
         except ImportError as e:
             raise RuntimeError("openai package is required when Markitdown OCR is enabled.") from e
 
-        client_kwargs: dict[str, object] = {
+        # A kwargs BAG, assembled conditionally below. Inferred, its value type is the union of
+        # everything in it, so the `**` unpack is checked as if every key could be every type --
+        # one diagnostic per parameter of the callee, none of them real.
+        client_kwargs: dict[str, Any] = {
             "api_key": api_key,
             "base_url": base_url.strip(),
+            "default_headers": with_openai_compatible_user_agent(default_headers),
         }
-        if default_headers:
-            client_kwargs["default_headers"] = default_headers
 
         return MarkitdownOcrOptions(
             # Sync client on purpose: markitdown's image captioning calls
@@ -241,12 +253,15 @@ class MarkitdownParser(FileParser):
             # a native/Rust-backed buffer object) that has no ``.decode``; coerce
             # through the buffer protocol before the UTF-8 probe. The ``tmp.write``
             # in the caller already relies only on the same buffer protocol.
-            bytes(file_data).decode("utf-8")
+            data = bytes(file_data)
+            data.decode("utf-8")
         except UnicodeDecodeError:
             return None
         from markitdown import StreamInfo
 
-        return StreamInfo(charset="utf-8")
+        # ``utf-8-sig`` drops a leading byte-order mark (Windows Notepad writes one);
+        # plain ``utf-8`` would keep it as U+FEFF at the start of the text.
+        return StreamInfo(charset="utf-8-sig" if data.startswith(codecs.BOM_UTF8) else "utf-8")
 
     @staticmethod
     def _is_image_file(filename: str) -> bool:

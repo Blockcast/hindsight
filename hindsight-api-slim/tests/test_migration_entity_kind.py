@@ -7,17 +7,15 @@ rows per bank from the bank's ``entity_labels`` config, and rebuilds the
 trigram index as a partial index excluding label rows.
 
 The backfill is the risky part — it re-runs the resolver's ``is_label_entity``
-classification inside the migration — so this test migrates a dedicated pg0 to
+classification inside the migration — so this test migrates a database of its own to
 the revision *before* the change, seeds a bank with an ``entity_labels`` config
 plus pre-existing label/regular entity rows, and verifies the upgrade
 classifies exactly the label rows.
 
-Uses a dedicated pg0 instance (mirrors test_migration_drop_access_count) so it
-controls exactly which migrations have run and never stamps the shared test
-instance.
+Uses a database of its own (the ``fresh_db_url`` fixture) so it controls exactly
+which migrations have run and never stamps the shared test database.
 """
 
-import asyncio
 import json
 from pathlib import Path
 
@@ -26,7 +24,7 @@ from alembic import command
 from alembic.config import Config
 from sqlalchemy import create_engine, text
 
-# Single worker for the module: the tests share one module-scoped pg0 instance
+# Single worker for the module: the tests share one module-scoped database
 # and the downgrade test re-migrates a DB the others read.
 pytestmark = pytest.mark.xdist_group("migration-entity-kind-pg0")
 
@@ -78,31 +76,15 @@ def _index_def(conn, name: str) -> str | None:
 
 
 @pytest.fixture(scope="module")
-def head_db_url():
-    """pg0 migrated to just before the change, seeded, then upgraded to head."""
-    from hindsight_api.pg0 import EmbeddedPostgres
-
-    # port=None lets pg0 auto-assign a free port; a hardcoded port is not xdist-safe.
-    pg0 = EmbeddedPostgres(name="hindsight-entity-kind-test", port=None)
-    loop = asyncio.new_event_loop()
-    try:
-        url = loop.run_until_complete(pg0.ensure_running())
-    finally:
-        loop.close()
+def head_db_url(fresh_db_url):
+    """A database of its own migrated to just before the change, seeded, then upgraded to head."""
+    url = fresh_db_url
 
     cfg = _alembic_cfg(url)
 
-    # pg0 instances persist between test runs, so a previous session leaves the
-    # DB at head with the seed rows already present (and already backfilled).
-    # Reset to an empty schema so the pre-revision seeding below is genuinely
-    # pre-migration on every run; the migration chain recreates extensions.
-    engine = create_engine(url)
-    with engine.begin() as conn:
-        conn.execute(text("DROP SCHEMA public CASCADE"))
-        conn.execute(text("CREATE SCHEMA public"))
-
     command.upgrade(cfg, _PRE_REVISION)
 
+    engine = create_engine(url)
     try:
         with engine.begin() as conn:
             conn.execute(
@@ -123,7 +105,9 @@ def head_db_url():
     finally:
         engine.dispose()
 
-    command.upgrade(cfg, "heads")
+    # Pinned to this revision, not heads: 7c2e5a9d1f40 later replaces the
+    # partial index this module asserts on.
+    command.upgrade(cfg, _REVISION)
     return url
 
 
@@ -185,6 +169,6 @@ def test_downgrade_restores_full_index_and_drops_column(head_db_url):
             assert _index_def(conn, _NEW_INDEX) is not None
             assert _index_def(conn, _OLD_INDEX) is None
     finally:
-        # Leave the module fixture's instance at head for any later user.
-        command.upgrade(cfg, "heads")
+        # Leave the module fixture's instance where the fixture put it.
+        command.upgrade(cfg, _REVISION)
         engine.dispose()

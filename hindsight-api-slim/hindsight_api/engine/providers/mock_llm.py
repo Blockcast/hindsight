@@ -10,7 +10,7 @@ from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
 from typing import Any
 
-from ..llm_interface import LLM_TOOL_CHOICE_AUTO, LLMInterface, LLMToolChoice, LLMToolChoiceMode
+from ..llm_interface import LLM_TOOL_CHOICE_AUTO, LLMInterface, LLMToolChoice, LLMToolChoiceMode, PromptCachePrefix
 from ..response_models import LLMCallResult, LLMToolCall, LLMToolCallResult, TokenUsage
 
 logger = logging.getLogger(__name__)
@@ -114,6 +114,9 @@ class MockLLM(LLMInterface):
         skip_validation: bool = False,
         strict_schema: bool = False,
         attempt_context: Callable[[], AbstractAsyncContextManager[None]] | None = None,
+        # Tests hand MockLLM straight to retain/consolidation where an LLMProvider
+        # is expected, so it takes the provider-level cache request and ignores it.
+        prompt_cache: PromptCachePrefix | None = None,
     ) -> LLMCallResult:
         """
         Make a mock LLM API call.
@@ -220,6 +223,7 @@ class MockLLM(LLMInterface):
         max_backoff: float = 30.0,
         tool_choice: LLMToolChoice = LLM_TOOL_CHOICE_AUTO,
         attempt_context: Callable[[], AbstractAsyncContextManager[None]] | None = None,
+        declared_tools: list[dict[str, Any]] | None = None,
     ) -> LLMToolCallResult:
         """
         Make a mock LLM API call with tool/function calling support.
@@ -230,6 +234,7 @@ class MockLLM(LLMInterface):
             messages: List of message dicts. Can include tool results with role='tool'.
             tools: List of tool definitions in OpenAI format.
             max_completion_tokens: Not used in mock.
+            declared_tools: Not used in mock (the prompt it would shape is never rendered).
             temperature: Recorded on the call record for test assertions.
             scope: Scope identifier for tracking.
             max_retries: Not used in mock.
@@ -432,30 +437,15 @@ class MockLLM(LLMInterface):
                 user_text = _user_text_of(m.get("content", ""))
                 break
 
-        # Extract fact UUIDs from the prompt (format: "[<uuid>] <text>")
-        fact_entries = re.findall(r"\[([0-9a-f-]{36})\]\s*(.+?)(?:\n|$)", user_text)
+        # Extract fact ids from the prompt (format: "[F1] <text>")
+        fact_entries = re.findall(r"^\[(F\d+)\]\s*(.+?)(?:\n|$)", user_text, re.MULTILINE)
 
-        if not fact_entries:
-            # No facts to consolidate — return empty response
-            try:
-                return response_format()
-            except Exception:
-                return {"creates": [], "updates": [], "deletes": []}
-
-        # Create one observation per fact to preserve entity separation
-        creates = []
-        for fact_id, fact_text in fact_entries:
-            creates.append({"text": fact_text.strip(), "source_fact_ids": [fact_id]})
-
-        try:
-            return response_format(
-                creates=creates,
-                updates=[],
-                deletes=[],
-            )
-        except Exception:
-            # Fallback if response_format constructor doesn't accept these args
-            return {"creates": creates, "updates": [], "deletes": []}
+        # One new observation per fact, to preserve entity separation
+        entries = [
+            {"fact_id": fact_id, "kind": "lasting", "adds": "yes", "new": [fact_text.strip()]}
+            for fact_id, fact_text in fact_entries
+        ]
+        return response_format.model_validate({"facts": entries})
 
     async def cleanup(self) -> None:
         """Clean up resources (no-op for mock provider)."""

@@ -1,5 +1,6 @@
 ---
 title: "The Open-Source MCP Memory Server Your AI Agent Is Missing"
+description: "Run Hindsight with one Docker command and give any MCP client a memory it can store to, search, and reason over."
 authors: [benfrank241]
 
 date: 2026-03-04T12:00
@@ -88,7 +89,7 @@ The `-v` flag persists your data across container restarts. Without it, memories
 
 Once running, the MCP endpoint is available at `http://localhost:8888/mcp/your_bank_id/` (replace `your_bank_id` with any name you like).
 
-**Or use Hindsight Cloud** — skip Docker entirely. [Sign up for a free account](https://ui.hindsight.vectorize.io/signup), grab your API key, and connect via MCP:
+**Or use Hindsight Cloud** — skip Docker entirely. [Sign up for a free account](https://ui.hindsight.vectorize.io), grab your API key, and connect via MCP:
 
 ```json
 {
