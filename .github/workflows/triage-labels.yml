@@ -14,6 +14,7 @@ jobs:
     # Upstream-only automation (needs the org's GEMINI_API_KEY).
     if: github.repository == 'vectorize-io/hindsight'
     runs-on: {group: default-tools, labels: arc-light}
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - run: python3 scripts/triage-labels.py ${{ github.event.issue.number }}
