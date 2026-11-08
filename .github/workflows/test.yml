@@ -351,9 +351,10 @@ jobs:
         ref: ${{ github.event.pull_request.head.sha || '' }}
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
 
     - name: Set up Python
       uses: actions/setup-python@v6
@@ -393,9 +394,10 @@ jobs:
         ref: ${{ github.event.pull_request.head.sha || '' }}
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
 
     - name: Set up Python ${{ matrix.python-version }}
       uses: actions/setup-python@v6
@@ -446,8 +448,15 @@ jobs:
       uses: actions/setup-node@v6
       with:
         node-version: '20'
-        cache: 'npm'
+        cache: ''
+        package-manager-cache: false
         cache-dependency-path: package-lock.json
+
+    - name: Restore Node cache
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      with:
+        path: ~/.npm
+        key: node-cache-${{ runner.os }}-${{ runner.arch }}-npm-${{ hashFiles('package-lock.json') }}
 
     - name: Install dependencies
       run: npm ci --workspace=hindsight-clients/typescript
@@ -473,8 +482,15 @@ jobs:
       uses: actions/setup-node@v6
       with:
         node-version: '22'
-        cache: 'npm'
+        cache: ''
+        package-manager-cache: false
         cache-dependency-path: package-lock.json
+
+    - name: Restore Node cache
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      with:
+        path: ~/.npm
+        key: node-cache-${{ runner.os }}-${{ runner.arch }}-npm-${{ hashFiles('package-lock.json') }}
 
     - name: Install dependencies
       run: npm ci --workspace=hindsight-all-npm
@@ -505,8 +521,15 @@ jobs:
       uses: actions/setup-node@v6
       with:
         node-version: '22'
-        cache: 'npm'
+        cache: ''
+        package-manager-cache: false
         cache-dependency-path: package-lock.json
+
+    - name: Restore Node cache
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      with:
+        path: ~/.npm
+        key: node-cache-${{ runner.os }}-${{ runner.arch }}-npm-${{ hashFiles('package-lock.json') }}
 
     # openclaw depends on two monorepo workspaces via `file:` deps:
     # @vectorize-io/hindsight-client and @vectorize-io/hindsight-all. Their
@@ -559,8 +582,15 @@ jobs:
       uses: actions/setup-node@v6
       with:
         node-version: '22'
-        cache: 'npm'
+        cache: ''
+        package-manager-cache: false
         cache-dependency-path: package-lock.json
+
+    - name: Restore Node cache
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      with:
+        path: ~/.npm
+        key: node-cache-${{ runner.os }}-${{ runner.arch }}-npm-${{ hashFiles('package-lock.json') }}
 
     # Install the openclaw CLI globally. The smoke test exercises the real
     # `openclaw plugins install` / `openclaw config set` / `openclaw plugins
@@ -618,8 +648,15 @@ jobs:
     - uses: actions/setup-node@v6
       with:
         node-version: '22'
-        cache: npm
+        cache: ''
+        package-manager-cache: false
         cache-dependency-path: hindsight-integrations/coding-agents/package-lock.json
+
+    - name: Restore Node cache
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      with:
+        path: ~/.npm
+        key: node-cache-${{ runner.os }}-${{ runner.arch }}-npm-${{ hashFiles('package-lock.json') }}
 
     - name: Install dependencies
       working-directory: ./hindsight-integrations/coding-agents
@@ -732,9 +769,10 @@ jobs:
         ref: ${{ github.event.pull_request.head.sha || '' }}
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -1074,9 +1112,10 @@ jobs:
         ref: ${{ github.event.pull_request.head.sha || '' }}
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -1111,9 +1150,10 @@ jobs:
         ref: ${{ github.event.pull_request.head.sha || '' }}
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -1148,9 +1188,10 @@ jobs:
         ref: ${{ github.event.pull_request.head.sha || '' }}
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -1181,9 +1222,10 @@ jobs:
         ref: ${{ github.event.pull_request.head.sha || '' }}
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -1242,9 +1284,10 @@ jobs:
         ref: ${{ github.event.pull_request.head.sha || '' }}
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -1283,8 +1326,15 @@ jobs:
       uses: actions/setup-node@v6
       with:
         node-version: '24'
-        cache: 'npm'
+        cache: ''
+        package-manager-cache: false
         cache-dependency-path: package-lock.json
+
+    - name: Restore Node cache
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      with:
+        path: ~/.npm
+        key: node-cache-${{ runner.os }}-${{ runner.arch }}-npm-${{ hashFiles('package-lock.json') }}
 
     - name: Install SDK dependencies
       run: npm ci --workspace=hindsight-clients/typescript
@@ -1386,8 +1436,15 @@ jobs:
       uses: actions/setup-node@v6
       with:
         node-version: '20'
-        cache: 'npm'
+        cache: ''
+        package-manager-cache: false
         cache-dependency-path: package-lock.json
+
+    - name: Restore Node cache
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      with:
+        path: ~/.npm
+        key: node-cache-${{ runner.os }}-${{ runner.arch }}-npm-${{ hashFiles('package-lock.json') }}
 
     # Fail fast before the (slow) build: every integrations.json entry must have a
     # doc page, and every released integration tag must be in integrations.json.
@@ -1437,7 +1494,7 @@ jobs:
       uses: dtolnay/rust-toolchain@stable
 
     - name: Cache cargo
-      uses: actions/cache@v5
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
       with:
         path: |
           ~/.cargo/registry
@@ -1485,9 +1542,10 @@ jobs:
         retention-days: 1
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -1504,7 +1562,7 @@ jobs:
       run: uv sync --frozen --all-extras --index-strategy unsafe-best-match
 
     - name: Cache HuggingFace models
-      uses: actions/cache@v5
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
       with:
         path: ~/.cache/huggingface
         key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
@@ -1802,9 +1860,10 @@ jobs:
         echo "HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$PROJECT_ID" >> $GITHUB_ENV
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -1821,7 +1880,7 @@ jobs:
       # pinned Python version — the only inputs that change the resolved env.
       # `uv sync --frozen` still runs after restore but is a near-instant link
       # check when the venv already matches the lock.
-      uses: actions/cache@v5
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
       with:
         path: hindsight-api-slim/.venv
         key: ${{ runner.os }}-venv-test-api-${{ hashFiles('uv.lock', 'hindsight-api-slim/pyproject.toml', '.python-version') }}
@@ -1833,7 +1892,7 @@ jobs:
       run: uv sync --frozen --all-extras --index-strategy unsafe-best-match
 
     - name: Cache HuggingFace models
-      uses: actions/cache@v5
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
       with:
         path: ~/.cache/huggingface
         key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
@@ -1929,9 +1988,10 @@ jobs:
         echo "HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$PROJECT_ID" >> $GITHUB_ENV
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -1944,7 +2004,7 @@ jobs:
       run: uv sync --frozen --all-extras --index-strategy unsafe-best-match
 
     - name: Cache HuggingFace models
-      uses: actions/cache@v5
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
       with:
         path: ~/.cache/huggingface
         key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
@@ -2032,9 +2092,10 @@ jobs:
         echo "HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$PROJECT_ID" >> $GITHUB_ENV
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -2047,7 +2108,7 @@ jobs:
       run: uv sync --frozen --all-extras --index-strategy unsafe-best-match
 
     - name: Cache HuggingFace models
-      uses: actions/cache@v5
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
       with:
         path: ~/.cache/huggingface
         key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
@@ -2179,9 +2240,10 @@ jobs:
         echo "HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$PROJECT_ID" >> $GITHUB_ENV
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -2198,7 +2260,7 @@ jobs:
       run: uv sync --frozen --all-extras --index-strategy unsafe-best-match
 
     - name: Cache HuggingFace models
-      uses: actions/cache@v5
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
       with:
         path: ~/.cache/huggingface
         key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
@@ -2253,9 +2315,10 @@ jobs:
         echo "HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$PROJECT_ID" >> $GITHUB_ENV
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -2280,7 +2343,7 @@ jobs:
       run: uv sync --frozen --all-extras --index-strategy unsafe-best-match
 
     - name: Cache HuggingFace models
-      uses: actions/cache@v5
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
       with:
         path: ~/.cache/huggingface
         key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
@@ -2365,9 +2428,10 @@ jobs:
         echo "HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$PROJECT_ID" >> $GITHUB_ENV
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -2397,7 +2461,7 @@ jobs:
       run: npm run build
 
     - name: Cache HuggingFace models
-      uses: actions/cache@v5
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
       with:
         path: ~/.cache/huggingface
         key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
@@ -2557,9 +2621,10 @@ jobs:
         echo "HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$PROJECT_ID" >> $GITHUB_ENV
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -2584,7 +2649,7 @@ jobs:
       run: uv sync --frozen --all-extras --index-strategy unsafe-best-match
 
     - name: Cache HuggingFace models
-      uses: actions/cache@v5
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
       with:
         path: ~/.cache/huggingface
         key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
@@ -2738,9 +2803,10 @@ jobs:
         echo "HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$PROJECT_ID" >> $GITHUB_ENV
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -2770,7 +2836,7 @@ jobs:
       run: npm run build
 
     - name: Cache HuggingFace models
-      uses: actions/cache@v5
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
       with:
         path: ~/.cache/huggingface
         key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
@@ -2856,9 +2922,10 @@ jobs:
         echo "HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$PROJECT_ID" >> $GITHUB_ENV
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -2870,8 +2937,15 @@ jobs:
       uses: actions/setup-node@v6
       with:
         node-version: '20'
-        cache: 'npm'
+        cache: ''
+        package-manager-cache: false
         cache-dependency-path: package-lock.json
+
+    - name: Restore Node cache
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      with:
+        path: ~/.npm
+        key: node-cache-${{ runner.os }}-${{ runner.arch }}-npm-${{ hashFiles('package-lock.json') }}
 
     - name: Set up Deno
       uses: denoland/setup-deno@v2
@@ -2895,7 +2969,7 @@ jobs:
       run: npm run build
 
     - name: Cache HuggingFace models
-      uses: actions/cache@v5
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
       with:
         path: ~/.cache/huggingface
         key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
@@ -2973,7 +3047,7 @@ jobs:
         targets: aarch64-unknown-linux-gnu
 
     - name: Cache cargo
-      uses: actions/cache@v5
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
       with:
         path: |
           ~/.cargo/registry
@@ -3015,9 +3089,10 @@ jobs:
         echo "HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$PROJECT_ID" >> $GITHUB_ENV
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -3029,7 +3104,7 @@ jobs:
       uses: dtolnay/rust-toolchain@stable
 
     - name: Cache cargo
-      uses: actions/cache@v5
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
       with:
         path: |
           ~/.cargo/registry
@@ -3046,7 +3121,7 @@ jobs:
       run: uv sync --frozen --all-extras --index-strategy unsafe-best-match
 
     - name: Cache HuggingFace models
-      uses: actions/cache@v5
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
       with:
         path: ~/.cache/huggingface
         key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
@@ -3131,9 +3206,10 @@ jobs:
         echo "HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$PROJECT_ID" >> $GITHUB_ENV
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -3156,7 +3232,7 @@ jobs:
       run: uv sync --frozen --all-extras --index-strategy unsafe-best-match
 
     - name: Cache HuggingFace models
-      uses: actions/cache@v5
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
       with:
         path: ~/.cache/huggingface
         key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
@@ -3246,9 +3322,10 @@ jobs:
         echo "HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$PROJECT_ID" >> $GITHUB_ENV
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -3274,7 +3351,7 @@ jobs:
       run: uv sync --frozen --all-extras --index-strategy unsafe-best-match
 
     - name: Cache HuggingFace models
-      uses: actions/cache@v5
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
       with:
         path: ~/.cache/huggingface
         key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
@@ -3375,9 +3452,10 @@ jobs:
         echo "HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$PROJECT_ID" >> $GITHUB_ENV
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -3398,7 +3476,7 @@ jobs:
       run: uv sync --frozen --all-extras --index-strategy unsafe-best-match
 
     - name: Cache HuggingFace models
-      uses: actions/cache@v5
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
       with:
         path: ~/.cache/huggingface
         key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
@@ -3479,9 +3557,10 @@ jobs:
         ref: ${{ github.event.pull_request.head.sha || '' }}
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -3519,9 +3598,10 @@ jobs:
         ref: ${{ github.event.pull_request.head.sha || '' }}
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -3556,9 +3636,10 @@ jobs:
         ref: ${{ github.event.pull_request.head.sha || '' }}
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -3595,9 +3676,10 @@ jobs:
         ref: ${{ github.event.pull_request.head.sha || '' }}
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -3634,9 +3716,10 @@ jobs:
         ref: ${{ github.event.pull_request.head.sha || '' }}
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -3677,9 +3760,10 @@ jobs:
         ref: ${{ github.event.pull_request.head.sha || '' }}
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -3716,9 +3800,10 @@ jobs:
         ref: ${{ github.event.pull_request.head.sha || '' }}
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -3754,9 +3839,10 @@ jobs:
         ref: ${{ github.event.pull_request.head.sha || '' }}
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -3856,9 +3942,10 @@ jobs:
         ref: ${{ github.event.pull_request.head.sha || '' }}
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -3900,9 +3987,10 @@ jobs:
         ref: ${{ github.event.pull_request.head.sha || '' }}
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -3947,9 +4035,10 @@ jobs:
         ref: ${{ github.event.pull_request.head.sha || '' }}
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -3994,9 +4083,10 @@ jobs:
         ref: ${{ github.event.pull_request.head.sha || '' }}
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -4034,9 +4124,10 @@ jobs:
         ref: ${{ github.event.pull_request.head.sha || '' }}
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -4072,9 +4163,10 @@ jobs:
         ref: ${{ github.event.pull_request.head.sha || '' }}
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -4110,9 +4202,10 @@ jobs:
         ref: ${{ github.event.pull_request.head.sha || '' }}
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -4149,9 +4242,10 @@ jobs:
         ref: ${{ github.event.pull_request.head.sha || '' }}
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -4188,9 +4282,10 @@ jobs:
         ref: ${{ github.event.pull_request.head.sha || '' }}
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -4225,9 +4320,10 @@ jobs:
         ref: ${{ github.event.pull_request.head.sha || '' }}
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -4258,9 +4354,10 @@ jobs:
         ref: ${{ github.event.pull_request.head.sha || '' }}
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -4297,9 +4394,10 @@ jobs:
         ref: ${{ github.event.pull_request.head.sha || '' }}
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -4337,9 +4435,10 @@ jobs:
         ref: ${{ github.event.pull_request.head.sha || '' }}
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -4376,9 +4475,10 @@ jobs:
         ref: ${{ github.event.pull_request.head.sha || '' }}
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -4415,9 +4515,10 @@ jobs:
         ref: ${{ github.event.pull_request.head.sha || '' }}
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -4454,9 +4555,10 @@ jobs:
         ref: ${{ github.event.pull_request.head.sha || '' }}
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -4493,9 +4595,10 @@ jobs:
         ref: ${{ github.event.pull_request.head.sha || '' }}
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -4532,9 +4635,10 @@ jobs:
         ref: ${{ github.event.pull_request.head.sha || '' }}
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -4583,9 +4687,10 @@ jobs:
         echo "HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$PROJECT_ID" >> $GITHUB_ENV
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -4694,9 +4799,10 @@ jobs:
         echo "HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$PROJECT_ID" >> $GITHUB_ENV
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -4713,7 +4819,7 @@ jobs:
       run: uv sync --frozen --all-extras --index-strategy unsafe-best-match
 
     - name: Cache HuggingFace models
-      uses: actions/cache@v5
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
       with:
         path: ~/.cache/huggingface
         key: ${{ runner.os }}-huggingface-embed-${{ hashFiles('hindsight-embed/pyproject.toml') }}
@@ -4774,9 +4880,10 @@ jobs:
         echo "HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$PROJECT_ID" >> "$GITHUB_ENV"
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -4793,7 +4900,7 @@ jobs:
       run: uv sync --frozen --all-extras --index-strategy unsafe-best-match
 
     - name: Cache HuggingFace models
-      uses: actions/cache@v5
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
       with:
         path: ~/.cache/huggingface
         key: ${{ runner.os }}-huggingface-embed-${{ hashFiles('hindsight-embed/pyproject.toml') }}
@@ -4814,7 +4921,7 @@ jobs:
       uses: dtolnay/rust-toolchain@stable
 
     - name: Cache cargo build
-      uses: actions/cache@v5
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
       with:
         path: |
           ~/.cargo/registry
@@ -4957,16 +5064,17 @@ jobs:
         ref: ${{ github.event.pull_request.head.sha || '' }}
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     # The embedded daemon (uvx hindsight-api) loads local sentence-transformers
     # models. Keyed on the plugin's pyproject: its hindsight-embed range decides
     # which hindsight-api release runs. Cache them like the test-embed job does.
     - name: Cache HuggingFace models
-      uses: actions/cache@v5
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
       with:
         path: ~/.cache/huggingface
         key: ${{ runner.os }}-huggingface-hermes-compat-${{ hashFiles('hindsight-integrations/hermes/pyproject.toml') }}
@@ -5024,9 +5132,10 @@ jobs:
         echo "HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$PROJECT_ID" >> $GITHUB_ENV
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -5038,8 +5147,15 @@ jobs:
       uses: actions/setup-node@v6
       with:
         node-version: '20'
-        cache: 'npm'
+        cache: ''
+        package-manager-cache: false
         cache-dependency-path: package-lock.json
+
+    - name: Restore Node cache
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      with:
+        path: ~/.npm
+        key: node-cache-${{ runner.os }}-${{ runner.arch }}-npm-${{ hashFiles('package-lock.json') }}
 
     - name: Install SDK dependencies
       run: npm ci --workspace=hindsight-clients/typescript
@@ -5071,7 +5187,7 @@ jobs:
       run: uv sync --frozen --extra test --index-strategy unsafe-best-match
 
     - name: Cache HuggingFace models
-      uses: actions/cache@v5
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
       with:
         path: ~/.cache/huggingface
         key: ${{ runner.os }}-huggingface-all-${{ hashFiles('hindsight-all/pyproject.toml') }}
@@ -5126,7 +5242,7 @@ jobs:
 
     - name: Cache cargo
       if: matrix.language == 'cli'
-      uses: actions/cache@v5
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
       with:
         path: |
           ~/.cargo/registry
@@ -5142,9 +5258,10 @@ jobs:
         cp target/release/hindsight /usr/local/bin/hindsight
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -5157,8 +5274,16 @@ jobs:
       uses: actions/setup-node@v6
       with:
         node-version: '20'
-        cache: 'npm'
+        cache: ''
+        package-manager-cache: false
         cache-dependency-path: package-lock.json
+
+    - name: Restore Node cache
+      if: matrix.language == 'node'
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      with:
+        path: ~/.npm
+        key: node-cache-${{ runner.os }}-${{ runner.arch }}-npm-${{ hashFiles('package-lock.json') }}
 
     - name: Install Python client dependencies
       if: matrix.language == 'python'
@@ -5178,7 +5303,7 @@ jobs:
         npm run build --workspace=hindsight-clients/typescript
 
     - name: Cache HuggingFace models
-      uses: actions/cache@v5
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
       with:
         path: ~/.cache/huggingface
         key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
@@ -5268,9 +5393,10 @@ jobs:
       run: git fetch --tags
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
         prune-cache: false
 
     - name: Set up Python
@@ -5279,7 +5405,7 @@ jobs:
         python-version-file: ".python-version"
 
     - name: Cache HuggingFace models
-      uses: actions/cache@v5
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
       with:
         path: ~/.cache/huggingface
         key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
@@ -5347,16 +5473,24 @@ jobs:
         ref: ${{ github.event.pull_request.head.sha || '' }}
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
 
     - name: Set up Node.js
       uses: actions/setup-node@v6
       with:
         node-version: '20'
-        cache: 'npm'
+        cache: ''
+        package-manager-cache: false
         cache-dependency-path: package-lock.json
+
+    - name: Restore Node cache
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      with:
+        path: ~/.npm
+        key: node-cache-${{ runner.os }}-${{ runner.arch }}-npm-${{ hashFiles('package-lock.json') }}
 
     - name: Install Control Plane dependencies
       run: npm install --workspace=hindsight-control-plane
@@ -5394,9 +5528,10 @@ jobs:
         ref: ${{ github.event.pull_request.head.sha || '' }}
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
 
     - name: Set up Python
       uses: actions/setup-python@v6
@@ -5407,14 +5542,21 @@ jobs:
       uses: actions/setup-node@v6
       with:
         node-version: '20'
-        cache: 'npm'
+        cache: ''
+        package-manager-cache: false
         cache-dependency-path: package-lock.json
+
+    - name: Restore Node cache
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      with:
+        path: ~/.npm
+        key: node-cache-${{ runner.os }}-${{ runner.arch }}-npm-${{ hashFiles('package-lock.json') }}
 
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
 
     - name: Cache cargo
-      uses: actions/cache@v5
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
       with:
         path: |
           ~/.cargo/registry
@@ -5481,9 +5623,10 @@ jobs:
         fetch-depth: 0  # Fetch full git history to access base branch
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
 
     - name: Set up Python
       uses: actions/setup-python@v6
@@ -5547,9 +5690,10 @@ jobs:
         ref: ${{ github.event.pull_request.head.sha || '' }}
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
 
     - name: Set up Python
       uses: actions/setup-python@v6
@@ -5588,9 +5732,10 @@ jobs:
         ref: ${{ github.event.pull_request.head.sha || '' }}
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
 
     - name: Set up Python
       uses: actions/setup-python@v6
@@ -5625,9 +5770,10 @@ jobs:
         ref: ${{ github.event.pull_request.head.sha || '' }}
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: false
 
     - name: Set up Python
       uses: actions/setup-python@v6
