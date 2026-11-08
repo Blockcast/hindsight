@@ -66,7 +66,7 @@ paperclip::{companyId}::{agentId}::user::{userId}  ← user granularity (per-use
 
 Agents can call these tools directly during a run:
 
-**`hindsight_recall(query)`** — search memory for relevant context. Called automatically at run start; agents can also call it mid-run for targeted queries. The run-start result is reused only when the agent asks the same query; any other query triggers a live recall.
+**`hindsight_recall(query)`** — search memory for relevant context. Called automatically at run start; agents can also call it mid-run for targeted queries. The run-start result is reused only when the agent asks the same query; any other query triggers a live recall. The run-start recall runs at most once per run, even when Paperclip claims a deferred run again.
 
 **`hindsight_retain(content)`** — store a fact or decision immediately, without waiting for run end.
 

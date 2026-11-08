@@ -129,6 +129,13 @@ const DISABLED_FOR_AGENT =
 const RECALL_DEDUPE_TTL_MS = 10 * 60_000;
 const RECALL_DEDUPE_MAX = 500;
 
+// Paperclip emits agent.run.started every time it claims a run, and a run
+// deferred behind a K8s isolation writer or a branch claim goes back to
+// `queued` and is claimed again, so one run can "start" many times. Recall
+// once per run: a retry asks the same query, and after a timeout each retry
+// adds another slow request to an already overloaded server.
+const RUN_RECALL_TTL_MS = 60 * 60_000;
+
 function isAgentEnabled(config: PluginConfig, agentId: string | undefined | null): boolean {
   const allowlist = config.enabledAgentIds;
   if (!allowlist || allowlist.length === 0) return true;
@@ -144,6 +151,7 @@ const plugin = definePlugin({
     // ceiling bites. Entries hold the recall promise, so concurrent run starts
     // share one request; a rejected promise is dropped, so failures never stick.
     const recallDedupe = new Map<string, { ts: number; results: Promise<Memory[]> }>();
+    const recalledRuns = new Map<string, number>();
 
     // ---------------------------------------------------------------------------
     // agent.run.started — recall memories using the issue's title + description
@@ -159,6 +167,14 @@ const plugin = definePlugin({
       const companyId = event.companyId;
       if (!isAgentEnabled(config, agentId)) return;
       if (!issueId || !companyId) return;
+
+      const startedAt = recalledRuns.get(runId);
+      if (startedAt !== undefined && Date.now() - startedAt < RUN_RECALL_TTL_MS) return;
+      recalledRuns.delete(runId);
+      recalledRuns.set(runId, Date.now());
+      if (recalledRuns.size > RECALL_DEDUPE_MAX) {
+        recalledRuns.delete(recalledRuns.keys().next().value as string);
+      }
 
       let issue;
       try {
