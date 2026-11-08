@@ -19,7 +19,7 @@
 
 import { definePlugin, runWorker } from "@paperclipai/plugin-sdk";
 import type { EnvSecretRefBinding, PluginContext, ToolRunContext } from "@paperclipai/plugin-sdk";
-import { HindsightClient, formatMemories } from "./client.js";
+import { HindsightClient, formatMemories, type Memory } from "./client.js";
 import { deriveBankId, extractUserFromIssue } from "./bank.js";
 
 interface PluginConfig {
@@ -34,6 +34,8 @@ interface PluginConfig {
   bankGranularity?: Array<"company" | "agent" | "user">;
   recallBudget?: "low" | "mid" | "high";
   requestTimeoutMs?: number;
+  recallTimeoutMs?: number;
+  retainTimeoutMs?: number;
   autoRetain?: boolean;
   enabledAgentIds?: string[];
 }
@@ -80,6 +82,11 @@ async function resolveApiKey(
 const DISABLED_FOR_AGENT =
   "Hindsight memory is not enabled for this agent (see the plugin's enabledAgentIds setting).";
 
+// Run-start recall dedupe: wakeups of the same agent on the same issue
+// within the TTL reuse one recall instead of each paying a slow round trip.
+const RECALL_DEDUPE_TTL_MS = 10 * 60_000;
+const RECALL_DEDUPE_MAX = 500;
+
 function isAgentEnabled(config: PluginConfig, agentId: string | undefined | null): boolean {
   const allowlist = config.enabledAgentIds;
   if (!allowlist || allowlist.length === 0) return true;
@@ -89,6 +96,13 @@ function isAgentEnabled(config: PluginConfig, agentId: string | undefined | null
 const plugin = definePlugin({
   async setup(ctx) {
     ctx.logger.info("Hindsight memory plugin starting");
+
+    // ponytail: in-process Map, so it only dedupes on the replica holding the
+    // plugin-worker lease, is lost on restart, and does not coalesce recalls
+    // that are in flight at once. Move to shared state if that ceiling bites.
+    // Keyed by company too: two companies can share a static bankId while
+    // pointing at different Hindsight servers.
+    const recallDedupe = new Map<string, { ts: number; results: Memory[] }>();
 
     // ---------------------------------------------------------------------------
     // agent.run.started — recall memories using the issue's title + description
@@ -134,13 +148,27 @@ const plugin = definePlugin({
       }
 
       try {
-        const apiKey = await resolveApiKey(ctx, config, companyId);
-        const client = new HindsightClient(config.hindsightApiUrl, apiKey, config.requestTimeoutMs);
         const bankId = deriveBankId({ companyId, agentId, userId }, config);
+        const dedupeKey = JSON.stringify([companyId, bankId, query]);
+        const hit = recallDedupe.get(dedupeKey);
+        const cached = !!hit && Date.now() - hit.ts < RECALL_DEDUPE_TTL_MS;
 
-        const response = await client.recall(bankId, query, config.recallBudget ?? "mid");
+        let results: Memory[];
+        if (cached) {
+          results = hit.results;
+        } else {
+          const apiKey = await resolveApiKey(ctx, config, companyId);
+          const client = new HindsightClient(config.hindsightApiUrl, apiKey, config);
+          results = (await client.recall(bankId, query, config.recallBudget ?? "mid")).results;
+          // Only successful recalls get here; errors and timeouts throw past it.
+          recallDedupe.delete(dedupeKey);
+          recallDedupe.set(dedupeKey, { ts: Date.now(), results });
+          if (recallDedupe.size > RECALL_DEDUPE_MAX) {
+            recallDedupe.delete(recallDedupe.keys().next().value as string);
+          }
+        }
 
-        const memories = formatMemories(response.results);
+        const memories = formatMemories(results);
         if (memories) {
           await ctx.state.set(
             { scopeKind: "run", scopeId: runId, stateKey: "recalled-memories" },
@@ -155,7 +183,8 @@ const plugin = definePlugin({
           ctx.logger.info("Recalled memories for run", {
             runId,
             bankId,
-            count: response.results.length,
+            count: results.length,
+            cached,
           });
         }
       } catch (err) {
@@ -241,7 +270,7 @@ const plugin = definePlugin({
 
       try {
         const apiKey = await resolveApiKey(ctx, config, companyId);
-        const client = new HindsightClient(config.hindsightApiUrl, apiKey, config.requestTimeoutMs);
+        const client = new HindsightClient(config.hindsightApiUrl, apiKey, config);
         const bankId = deriveBankId({ companyId, agentId: bankAgentId, userId }, config);
         await client.retain(bankId, body, commentId, {
           agentId: bankAgentId,
@@ -345,11 +374,7 @@ const plugin = definePlugin({
         // Live recall fallback
         try {
           const apiKey = await resolveApiKey(ctx, config, runCtx.companyId);
-          const client = new HindsightClient(
-            config.hindsightApiUrl,
-            apiKey,
-            config.requestTimeoutMs
-          );
+          const client = new HindsightClient(config.hindsightApiUrl, apiKey, config);
           const response = await client.recall(bankId, query, config.recallBudget ?? "mid");
           const memories = formatMemories(response.results);
           return { content: memories || "No relevant memories found." };
@@ -407,11 +432,7 @@ const plugin = definePlugin({
 
         try {
           const apiKey = await resolveApiKey(ctx, config, runCtx.companyId);
-          const client = new HindsightClient(
-            config.hindsightApiUrl,
-            apiKey,
-            config.requestTimeoutMs
-          );
+          const client = new HindsightClient(config.hindsightApiUrl, apiKey, config);
           await client.retain(bankId, content, undefined, {
             agentId: runCtx.agentId,
             companyId: runCtx.companyId,
@@ -438,7 +459,7 @@ const plugin = definePlugin({
     }
 
     try {
-      const client = new HindsightClient(c.hindsightApiUrl, undefined, c.requestTimeoutMs);
+      const client = new HindsightClient(c.hindsightApiUrl, undefined, c);
       const healthy = await client.health();
       if (!healthy) {
         return {

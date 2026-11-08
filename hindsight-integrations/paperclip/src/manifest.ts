@@ -3,7 +3,7 @@ import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
 const manifest: PaperclipPluginManifestV1 = {
   id: "paperclip-plugin-hindsight",
   apiVersion: 1,
-  version: "0.4.2",
+  version: "0.4.3",
   displayName: "Hindsight Memory",
   author: "Vectorize <support@vectorize.io>",
   description:
@@ -88,9 +88,22 @@ const manifest: PaperclipPluginManifestV1 = {
         type: "number",
         title: "Request Timeout (ms)",
         description:
-          "Timeout for each request to Hindsight. Raise it for self-hosted instances where recall on long issue descriptions takes longer than the default.",
+          "Legacy single timeout. When set it replaces both defaults below; recallTimeoutMs and retainTimeoutMs still win over it.",
         minimum: 1000,
-        default: 15000,
+      },
+      recallTimeoutMs: {
+        type: "number",
+        title: "Recall Timeout (ms)",
+        description: "Timeout for recall (run start and the hindsight_recall tool).",
+        minimum: 1000,
+        default: 45000,
+      },
+      retainTimeoutMs: {
+        type: "number",
+        title: "Retain Timeout (ms)",
+        description: "Timeout for retain (auto-retained comments and the hindsight_retain tool).",
+        minimum: 1000,
+        default: 30000,
       },
       autoRetain: {
         type: "boolean",

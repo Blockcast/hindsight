@@ -69,7 +69,9 @@ Memory is keyed to `companyId` + `agentId` — never to the run ID — so it acc
 | `bankId` | — | Static bank ID used when `dynamicBankId` is `false`. All agents sharing this value read/write the same memory bank |
 | `bankGranularity` | `["company", "agent"]` | Memory isolation when `dynamicBankId` is `true`: per company+agent, per company, or per agent. Add `"user"` for per-user memory isolation (useful for GDPR compliance) |
 | `recallBudget` | `mid` | `low` = fastest, `mid` = balanced, `high` = most thorough |
-| `requestTimeoutMs` | `15000` | Timeout for each request to Hindsight. Raise it for self-hosted instances where recall on long issue descriptions is slower |
+| `recallTimeoutMs` | `45000` | Timeout for recall (run start and the `hindsight_recall` tool) |
+| `retainTimeoutMs` | `30000` | Timeout for retain (auto-retained comments and the `hindsight_retain` tool) |
+| `requestTimeoutMs` | — | Legacy single timeout. When set it replaces both defaults above; `recallTimeoutMs` and `retainTimeoutMs` still win over it |
 | `autoRetain` | `true` | Automatically retain run output after every run |
 
 ## Bank ID Format

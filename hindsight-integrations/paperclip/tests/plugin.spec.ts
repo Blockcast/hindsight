@@ -12,7 +12,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createTestHarness } from "@paperclipai/plugin-sdk";
 import manifest from "../src/manifest.js";
 import plugin from "../src/worker.js";
-import { DEFAULT_REQUEST_TIMEOUT_MS, HindsightClient } from "../src/client.js";
+import {
+  DEFAULT_RECALL_TIMEOUT_MS,
+  DEFAULT_RETAIN_TIMEOUT_MS,
+  HindsightClient,
+  type TimeoutConfig,
+} from "../src/client.js";
 
 // ---------------------------------------------------------------------------
 // Fetch mock helpers
@@ -347,6 +352,79 @@ describe("agent.run.started", () => {
       )
     ).resolves.not.toThrow();
   });
+
+  describe("recall dedupe", () => {
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    const recallCalls = () =>
+      fetchMock.mock.calls.filter(([url]: [string]) => url.includes("recall")).length;
+
+    async function startRun(
+      harness: ReturnType<typeof buildHarness>,
+      runId: string,
+      issueId: string
+    ) {
+      await harness.emit(
+        "agent.run.started",
+        { agentId: "ag-1", runId, issueId },
+        { companyId: "co-1" }
+      );
+      return {
+        memories: harness.getState({
+          scopeKind: "run",
+          scopeId: runId,
+          stateKey: "recalled-memories",
+        }),
+        query: harness.getState({ scopeKind: "run", scopeId: runId, stateKey: "recalled-query" }),
+      };
+    }
+
+    it("reuses a recall for the same bank and query within the TTL", async () => {
+      const harness = buildHarness();
+      await setupPlugin(harness);
+      const issue = await seedIssue(harness, { companyId: "co-1", title: "Dedupe me" });
+
+      const first = await startRun(harness, "run-d1", issue.id);
+      const second = await startRun(harness, "run-d2", issue.id);
+
+      expect(recallCalls()).toBe(1);
+      expect(second.memories).toBe(first.memories);
+      expect(second.memories).toContain("TypeScript");
+      expect(second.query).toBe("Dedupe me");
+    });
+
+    it("recalls again once the TTL has passed", async () => {
+      const now = vi.spyOn(Date, "now").mockReturnValue(1_000_000);
+      const harness = buildHarness();
+      await setupPlugin(harness);
+      const issue = await seedIssue(harness, { companyId: "co-1", title: "Dedupe me" });
+
+      await startRun(harness, "run-t1", issue.id);
+      now.mockReturnValue(1_000_000 + 10 * 60_000 - 1);
+      await startRun(harness, "run-t2", issue.id);
+      expect(recallCalls()).toBe(1);
+
+      now.mockReturnValue(1_000_000 + 10 * 60_000);
+      await startRun(harness, "run-t3", issue.id);
+      expect(recallCalls()).toBe(2);
+    });
+
+    it("does not cache a failed recall", async () => {
+      fetchMock.mockResolvedValueOnce(new Response("", { status: 503 }));
+      const harness = buildHarness();
+      await setupPlugin(harness);
+      const issue = await seedIssue(harness, { companyId: "co-1", title: "Dedupe me" });
+
+      const failed = await startRun(harness, "run-f1", issue.id);
+      expect(failed.memories).toBeUndefined();
+
+      const retried = await startRun(harness, "run-f2", issue.id);
+      expect(recallCalls()).toBe(2);
+      expect(retried.memories).toContain("TypeScript");
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -582,6 +660,9 @@ describe("hindsight_recall tool", () => {
     );
 
     expect((result as { content: string }).content).toContain("Memory recall failed");
+    expect((result as { content: string }).content).toMatch(
+      /POST \/v1\/default\/banks\/[^ ]+\/memories\/recall timed out after 50ms/
+    );
   });
 });
 
@@ -591,25 +672,77 @@ describe("HindsightClient timeout", () => {
     vi.unstubAllGlobals();
   });
 
-  async function timeoutUsed(timeoutMs?: number): Promise<number | undefined> {
-    vi.stubGlobal("fetch", mockFetch([{ url: /recall/, body: { results: [] } }]));
+  async function timeoutUsed(op: "recall" | "retain", t?: TimeoutConfig): Promise<unknown> {
+    vi.stubGlobal("fetch", mockFetch([{ url: /./, body: { results: [] } }]));
     const spy = vi.spyOn(globalThis, "setTimeout");
-    await new HindsightClient("http://localhost:8888", undefined, timeoutMs).recall("b", "q");
+    spy.mockClear();
+    const client = new HindsightClient("http://localhost:8888", undefined, t);
+    await (op === "recall" ? client.recall("b", "q") : client.retain("b", "c"));
     return spy.mock.calls[0]?.[1];
   }
 
-  it("defaults to 15s", async () => {
-    expect(await timeoutUsed()).toBe(DEFAULT_REQUEST_TIMEOUT_MS);
-    expect(DEFAULT_REQUEST_TIMEOUT_MS).toBe(15_000);
+  it("defaults to 45s for recall and 30s for retain", async () => {
+    expect(DEFAULT_RECALL_TIMEOUT_MS).toBe(45_000);
+    expect(DEFAULT_RETAIN_TIMEOUT_MS).toBe(30_000);
+    expect(await timeoutUsed("recall")).toBe(45_000);
+    expect(await timeoutUsed("retain")).toBe(30_000);
   });
 
-  it("uses a custom timeout", async () => {
-    expect(await timeoutUsed(45_000)).toBe(45_000);
+  it("per-op keys beat requestTimeoutMs, which beats the defaults", async () => {
+    expect(await timeoutUsed("recall", { requestTimeoutMs: 20_000 })).toBe(20_000);
+    expect(await timeoutUsed("retain", { requestTimeoutMs: 20_000 })).toBe(20_000);
+    expect(await timeoutUsed("recall", { requestTimeoutMs: 20_000, recallTimeoutMs: 60_000 })).toBe(
+      60_000
+    );
+    expect(await timeoutUsed("retain", { retainTimeoutMs: 5_000 })).toBe(5_000);
   });
 
   it("ignores invalid timeouts", async () => {
-    expect(await timeoutUsed(0)).toBe(DEFAULT_REQUEST_TIMEOUT_MS);
-    expect(await timeoutUsed(Number.NaN)).toBe(DEFAULT_REQUEST_TIMEOUT_MS);
+    expect(await timeoutUsed("recall", { recallTimeoutMs: 0 })).toBe(45_000);
+    expect(await timeoutUsed("retain", { retainTimeoutMs: Number.NaN })).toBe(30_000);
+  });
+
+  function hangingFetch() {
+    return vi.fn(
+      (_url: string, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () =>
+            reject(new DOMException("aborted", "AbortError"))
+          );
+        })
+    );
+  }
+
+  it("worker config: recallTimeoutMs and retainTimeoutMs each bound their own call", async () => {
+    vi.stubGlobal("fetch", hangingFetch());
+    const harness = buildHarness({
+      ...DEFAULT_CONFIG,
+      requestTimeoutMs: 60_000,
+      recallTimeoutMs: 50,
+      retainTimeoutMs: 70,
+    });
+    await setupPlugin(harness);
+    const runCtx = { agentId: "ag-1", runId: "run-to", companyId: "co-1", projectId: "proj-1" };
+
+    const recall = await harness.executeTool("hindsight_recall", { query: "q" }, runCtx);
+    expect((recall as { content: string }).content).toMatch(
+      /POST \/v1\/default\/banks\/[^ ]+\/memories\/recall timed out after 50ms/
+    );
+
+    const retain = await harness.executeTool("hindsight_retain", { content: "c" }, runCtx);
+    expect((retain as { content: string }).content).toMatch(
+      /Failed to save memory: .*POST \/v1\/default\/banks\/[^ ]+\/memories timed out after 70ms/
+    );
+  });
+
+  it("rethrows non-timeout errors unchanged", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("down", { status: 503 }))
+    );
+    await expect(new HindsightClient("http://localhost:8888").recall("b", "q")).rejects.toThrow(
+      "HTTP 503 from /v1/default/banks/b/memories/recall: down"
+    );
   });
 });
 
