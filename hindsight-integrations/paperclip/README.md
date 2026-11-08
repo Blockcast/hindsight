@@ -44,9 +44,13 @@ hindsight-api
 | `bankId`             | —                                    | Static bank ID used when `dynamicBankId` is `false`. All agents sharing this value read/write the same memory bank                                                     |
 | `bankGranularity`    | `["company", "agent"]`               | Memory isolation when `dynamicBankId` is `true`: per company+agent, per company, or per agent. Add `"user"` for per-user memory isolation (useful for GDPR compliance) |
 | `recallBudget`       | `mid`                                | `low` = fastest, `mid` = balanced, `high` = most thorough                                                                                                              |
-| `requestTimeoutMs`   | `15000`                              | Timeout for each request to Hindsight. Raise it for self-hosted instances where recall on long issue descriptions is slower                                            |
+| `recallTimeoutMs`    | `45000`                              | Timeout for recall (run start and the `hindsight_recall` tool)                                                                                                         |
+| `retainTimeoutMs`    | `30000`                              | Timeout for retain (auto-retained comments and the `hindsight_retain` tool)                                                                                            |
+| `requestTimeoutMs`   | —                                    | Legacy single timeout. When set it replaces both defaults above; `recallTimeoutMs` and `retainTimeoutMs` still win over it                                             |
 | `autoRetain`         | `true`                               | Automatically retain the full body of every issue comment. Set `false` to turn comment retention off                                                                   |
 | `enabledAgentIds`    | —                                    | Restrict recall/retain to these agent IDs only. Leave empty to enable for all agents (default)                                                                         |
+
+If `requestTimeoutMs` is already set, recall keeps that value until `recallTimeoutMs` is set, and retain keeps it until `retainTimeoutMs` is set. Each timeout accepts 1000 to 120000 ms. Saving the plugin settings form fills `recallTimeoutMs` and `retainTimeoutMs` with their defaults, which then override `requestTimeoutMs`. The `hindsight_recall` tool also runs inside the host's plugin RPC timeout (120 s on current Paperclip), so keep `recallTimeoutMs` below it.
 
 ## Bank ID Format
 
@@ -72,6 +76,7 @@ Agents can call these tools directly during a run:
 agent.run.started
   └─ fetch issue via ctx.issues.get
        └─ recall(issueTitle + description) → cached in plugin state for the run
+            (the same company + server + bank + budget + query within 10 min shares one recall)
 
 agent running…
   ├─ hindsight_recall(query) → cached context if query matches run start, otherwise live recall
@@ -84,6 +89,8 @@ issue.comment.created
 agent.run.finished
   └─ no-op (subscription kept for future use when payload carries output)
 ```
+
+Because of that reuse, the memories cached at run start can lag what was retained by up to 10 minutes. The run-start query is the issue title and description, whitespace-collapsed and cut to 1200 bytes.
 
 `autoRetain` gates the `issue.comment.created` handler above. It does not make
 `agent.run.finished` retain run output: Paperclip's run-finished payload does not

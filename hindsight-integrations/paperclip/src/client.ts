@@ -26,22 +26,38 @@ export interface RecallResponse {
   results: Memory[];
 }
 
-export const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
+export const DEFAULT_RECALL_TIMEOUT_MS = 45_000;
+export const DEFAULT_RETAIN_TIMEOUT_MS = 30_000;
+
+/** Plugin config keys; requestTimeoutMs (legacy single knob) backs both ops. */
+export interface TimeoutConfig {
+  requestTimeoutMs?: number;
+  recallTimeoutMs?: number;
+  retainTimeoutMs?: number;
+}
+
+// setTimeout fires immediately for delays above 2^31-1 ms, so those count as invalid too.
+const MAX_TIMER_MS = 2_147_483_647;
+
+const validMs = (v: unknown): number | undefined =>
+  typeof v === "number" && Number.isFinite(v) && v > 0 && v <= MAX_TIMER_MS ? v : undefined;
 
 export class HindsightClient {
   private readonly baseUrl: string;
   private readonly token: string | undefined;
-  private readonly timeoutMs: number;
+  private readonly recallTimeoutMs: number;
+  private readonly retainTimeoutMs: number;
 
-  constructor(baseUrl: string, token?: string, timeoutMs?: number) {
+  constructor(baseUrl: string, token?: string, timeouts: TimeoutConfig = {}) {
     const url = baseUrl.trim();
     if (!url) throw new Error("hindsightApiUrl is required");
     this.baseUrl = url.replace(/\/$/, "");
     this.token = token;
-    this.timeoutMs =
-      typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0
-        ? timeoutMs
-        : DEFAULT_REQUEST_TIMEOUT_MS;
+    const fallback = validMs(timeouts.requestTimeoutMs);
+    this.recallTimeoutMs =
+      validMs(timeouts.recallTimeoutMs) ?? fallback ?? DEFAULT_RECALL_TIMEOUT_MS;
+    this.retainTimeoutMs =
+      validMs(timeouts.retainTimeoutMs) ?? fallback ?? DEFAULT_RETAIN_TIMEOUT_MS;
   }
 
   private headers(): Record<string, string> {
@@ -53,9 +69,14 @@ export class HindsightClient {
     return h;
   }
 
-  private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
+  private async request<T>(
+    method: string,
+    path: string,
+    body: unknown,
+    timeoutMs: number
+  ): Promise<T> {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
 
     try {
       const resp = await fetch(`${this.baseUrl}${path}`, {
@@ -71,6 +92,12 @@ export class HindsightClient {
       }
 
       return (await resp.json()) as T;
+    } catch (err) {
+      // A bare "AbortError: This operation was aborted" names neither the call nor the limit.
+      if (controller.signal.aborted) {
+        throw new Error(`${method} ${path} timed out after ${timeoutMs}ms`, { cause: err });
+      }
+      throw err;
     } finally {
       clearTimeout(timer);
     }
@@ -78,11 +105,20 @@ export class HindsightClient {
 
   async recall(bankId: string, query: string, budget = "mid"): Promise<RecallResponse> {
     const path = `/v1/default/banks/${encodeURIComponent(bankId)}/memories/recall`;
-    return this.request<RecallResponse>("POST", path, {
-      query,
-      budget,
-      max_tokens: 1024,
-    });
+    const resp = await this.request<RecallResponse>(
+      "POST",
+      path,
+      { query, budget, max_tokens: 1024 },
+      this.recallTimeoutMs
+    );
+    // Reject a malformed 2xx here, so no caller caches or formats it.
+    if (!Array.isArray(resp?.results)) {
+      throw new Error(`Malformed recall response from ${path}: no results array`);
+    }
+    if (!resp.results.every((m) => typeof m?.text === "string")) {
+      throw new Error(`Malformed recall response from ${path}: result without text`);
+    }
+    return resp;
   }
 
   async retain(
@@ -98,7 +134,7 @@ export class HindsightClient {
     };
     if (documentId) item["document_id"] = documentId;
     if (metadata) item["metadata"] = metadata;
-    await this.request("POST", path, { items: [item], async: true });
+    await this.request("POST", path, { items: [item], async: true }, this.retainTimeoutMs);
   }
 
   async health(): Promise<boolean> {
