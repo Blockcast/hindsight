@@ -3468,7 +3468,9 @@ jobs:
     # ML-stack install + docs/image build exceeds arc-light's 4Gi `work` emptyDir
     # (kubelet eviction, BLO-52009); arc-dind's `work` is a 56Gi emptyDir.
     runs-on: {group: default-tools, labels: arc-dind}
-    timeout-minutes: 20
+    # Upstream's 20 is sized for GitHub-hosted runners. On arc-dind the suite was
+    # still at ~88% when 20 minutes cut it off, on every PR from #44 to #47.
+    timeout-minutes: 35
     name: test-system (blackbox)
 
     steps:
