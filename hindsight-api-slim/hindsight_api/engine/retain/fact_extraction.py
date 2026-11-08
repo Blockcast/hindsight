@@ -1845,7 +1845,7 @@ def _build_user_message(
     from .orchestrator import parse_datetime_flexible
 
     sanitized_chunk = _sanitize_text(chunk)
-    sanitized_context = _sanitize_text(context) if context else "none"
+    sanitized_context = (_sanitize_text(context) if context else None) or "none"
     if len(sanitized_context) > MAX_RETAIN_CONTEXT_CHARS:
         omitted = len(sanitized_context) - MAX_RETAIN_CONTEXT_CHARS
         sanitized_context = (
