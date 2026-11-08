@@ -90,12 +90,14 @@ const manifest: PaperclipPluginManifestV1 = {
         description:
           "Legacy single timeout. When set it replaces both defaults below; recallTimeoutMs and retainTimeoutMs still win over it.",
         minimum: 1000,
+        maximum: 120000,
       },
       recallTimeoutMs: {
         type: "number",
         title: "Recall Timeout (ms)",
         description: "Timeout for recall (run start and the hindsight_recall tool).",
         minimum: 1000,
+        maximum: 120000,
         default: 45000,
       },
       retainTimeoutMs: {
@@ -103,6 +105,7 @@ const manifest: PaperclipPluginManifestV1 = {
         title: "Retain Timeout (ms)",
         description: "Timeout for retain (auto-retained comments and the hindsight_retain tool).",
         minimum: 1000,
+        maximum: 120000,
         default: 30000,
       },
       autoRetain: {

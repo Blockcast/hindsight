@@ -58,6 +58,47 @@ interface CommentCreatedPayload {
   runId?: string | null;
 }
 
+export const DEFAULT_MAX_RECALL_QUERY_BYTES = 1200;
+
+function normalizeRecallQueryPart(value: unknown): string {
+  return typeof value === "string" ? value.replace(/\s+/g, " ").trim() : "";
+}
+
+function truncateUtf8(input: string, maxBytes: number): string {
+  if (maxBytes <= 0) return "";
+  if (Buffer.byteLength(input, "utf8") <= maxBytes) return input;
+
+  let out = "";
+  let used = 0;
+  for (const char of input) {
+    const bytes = Buffer.byteLength(char, "utf8");
+    if (used + bytes > maxBytes) break;
+    out += char;
+    used += bytes;
+  }
+  return out.trimEnd();
+}
+
+export function buildRecallQuery(
+  issue: { title?: string | null; description?: string | null },
+  maxBytes = DEFAULT_MAX_RECALL_QUERY_BYTES
+): string {
+  const title = normalizeRecallQueryPart(issue.title);
+  const description = normalizeRecallQueryPart(issue.description);
+  if (!title && !description) return "";
+
+  const full = [title, description].filter(Boolean).join("\n");
+  if (Buffer.byteLength(full, "utf8") <= maxBytes) return full;
+
+  if (!title) return truncateUtf8(description, maxBytes);
+  const titleBytes = Buffer.byteLength(title, "utf8");
+  if (titleBytes >= maxBytes) return truncateUtf8(title, maxBytes);
+
+  const remainingDescriptionBytes = maxBytes - titleBytes - 1; // newline
+  const clippedDescription = truncateUtf8(description, remainingDescriptionBytes);
+  return [title, clippedDescription].filter(Boolean).join("\n").trim();
+}
+
 async function getConfig(ctx: {
   config: { get(): Promise<Record<string, unknown>> };
 }): Promise<PluginConfig> {
@@ -98,11 +139,10 @@ const plugin = definePlugin({
     ctx.logger.info("Hindsight memory plugin starting");
 
     // ponytail: in-process Map, so it only dedupes on the replica holding the
-    // plugin-worker lease, is lost on restart, and does not coalesce recalls
-    // that are in flight at once. Move to shared state if that ceiling bites.
-    // Keyed by company too: two companies can share a static bankId while
-    // pointing at different Hindsight servers.
-    const recallDedupe = new Map<string, { ts: number; results: Memory[] }>();
+    // plugin-worker lease and is lost on restart. Move to shared state if that
+    // ceiling bites. Entries hold the recall promise, so concurrent run starts
+    // share one request; a rejected promise is dropped, so failures never stick.
+    const recallDedupe = new Map<string, { ts: number; results: Promise<Memory[]> }>();
 
     // ---------------------------------------------------------------------------
     // agent.run.started — recall memories using the issue's title + description
@@ -132,8 +172,8 @@ const plugin = definePlugin({
       }
       if (!issue) return;
 
-      const query = [issue.title, issue.description].filter(Boolean).join("\n");
-      if (!query.trim()) return;
+      const query = buildRecallQuery(issue);
+      if (!query) return;
 
       // Extract userId from the specific issue being worked on (not an
       // arbitrary one from list). This is only used when bankGranularity
@@ -149,24 +189,40 @@ const plugin = definePlugin({
 
       try {
         const bankId = deriveBankId({ companyId, agentId, userId }, config);
-        const dedupeKey = JSON.stringify([companyId, bankId, query]);
+        const budget = config.recallBudget ?? "mid";
+        // Company is in the key because two companies can share a static
+        // bankId; the URL and budget because they change the answer.
+        const dedupeKey = JSON.stringify([
+          companyId,
+          config.hindsightApiUrl,
+          bankId,
+          budget,
+          query,
+        ]);
         const hit = recallDedupe.get(dedupeKey);
         const cached = !!hit && Date.now() - hit.ts < RECALL_DEDUPE_TTL_MS;
 
-        let results: Memory[];
+        let pending: Promise<Memory[]>;
         if (cached) {
-          results = hit.results;
+          pending = hit.results;
         } else {
-          const apiKey = await resolveApiKey(ctx, config, companyId);
-          const client = new HindsightClient(config.hindsightApiUrl, apiKey, config);
-          results = (await client.recall(bankId, query, config.recallBudget ?? "mid")).results;
-          // Only successful recalls get here; errors and timeouts throw past it.
+          pending = (async () => {
+            const apiKey = await resolveApiKey(ctx, config, companyId);
+            const client = new HindsightClient(config.hindsightApiUrl, apiKey, config);
+            return (await client.recall(bankId, query, budget)).results;
+          })();
+          const entry = { ts: Date.now(), results: pending };
           recallDedupe.delete(dedupeKey);
-          recallDedupe.set(dedupeKey, { ts: Date.now(), results });
+          recallDedupe.set(dedupeKey, entry);
           if (recallDedupe.size > RECALL_DEDUPE_MAX) {
             recallDedupe.delete(recallDedupe.keys().next().value as string);
           }
+          // Errors, timeouts and malformed responses must not be served again.
+          pending.catch(() => {
+            if (recallDedupe.get(dedupeKey) === entry) recallDedupe.delete(dedupeKey);
+          });
         }
+        const results = await pending;
 
         const memories = formatMemories(results);
         if (memories) {

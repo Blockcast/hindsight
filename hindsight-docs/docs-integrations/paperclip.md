@@ -55,6 +55,8 @@ agent.run.finished
   └─ no-op (subscription kept for future use when payload carries output)
 ```
 
+A run start with the same company, server, bank, budget and query as one in the last 10 minutes reuses that recall, so the memories cached at run start can lag what was retained by up to 10 minutes.
+
 The bundled plugin manifest declares the `issues.read` and `issue.comments.read` capabilities needed by the new SDK calls, so Paperclip may prompt for these on first install or upgrade.
 
 Memory is keyed to `companyId` + `agentId` — never to the run ID — so it accumulates across every run.
@@ -73,6 +75,8 @@ Memory is keyed to `companyId` + `agentId` — never to the run ID — so it acc
 | `retainTimeoutMs` | `30000` | Timeout for retain (auto-retained comments and the `hindsight_retain` tool) |
 | `requestTimeoutMs` | — | Legacy single timeout. When set it replaces both defaults above; `recallTimeoutMs` and `retainTimeoutMs` still win over it |
 | `autoRetain` | `true` | Automatically retain run output after every run |
+
+If `requestTimeoutMs` is already set, recall keeps that value until `recallTimeoutMs` is set, and retain keeps it until `retainTimeoutMs` is set. Each timeout accepts 1000 to 120000 ms.
 
 ## Bank ID Format
 

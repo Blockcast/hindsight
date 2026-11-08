@@ -36,8 +36,11 @@ export interface TimeoutConfig {
   retainTimeoutMs?: number;
 }
 
+// setTimeout fires immediately for delays above 2^31-1 ms, so those count as invalid too.
+const MAX_TIMER_MS = 2_147_483_647;
+
 const validMs = (v: unknown): number | undefined =>
-  typeof v === "number" && Number.isFinite(v) && v > 0 ? v : undefined;
+  typeof v === "number" && Number.isFinite(v) && v > 0 && v <= MAX_TIMER_MS ? v : undefined;
 
 export class HindsightClient {
   private readonly baseUrl: string;
@@ -102,12 +105,17 @@ export class HindsightClient {
 
   async recall(bankId: string, query: string, budget = "mid"): Promise<RecallResponse> {
     const path = `/v1/default/banks/${encodeURIComponent(bankId)}/memories/recall`;
-    return this.request<RecallResponse>(
+    const resp = await this.request<RecallResponse>(
       "POST",
       path,
       { query, budget, max_tokens: 1024 },
       this.recallTimeoutMs
     );
+    // Reject a 2xx without results here, so no caller caches or formats it.
+    if (!Array.isArray(resp?.results)) {
+      throw new Error(`Malformed recall response from ${path}: no results array`);
+    }
+    return resp;
   }
 
   async retain(

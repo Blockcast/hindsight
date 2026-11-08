@@ -50,6 +50,8 @@ hindsight-api
 | `autoRetain`         | `true`                               | Automatically retain the full body of every issue comment. Set `false` to turn comment retention off                                                                   |
 | `enabledAgentIds`    | —                                    | Restrict recall/retain to these agent IDs only. Leave empty to enable for all agents (default)                                                                         |
 
+If `requestTimeoutMs` is already set, recall keeps that value until `recallTimeoutMs` is set, and retain keeps it until `retainTimeoutMs` is set. Each timeout accepts 1000 to 120000 ms.
+
 ## Bank ID Format
 
 ```
@@ -74,7 +76,7 @@ Agents can call these tools directly during a run:
 agent.run.started
   └─ fetch issue via ctx.issues.get
        └─ recall(issueTitle + description) → cached in plugin state for the run
-            (an identical company + bank + query within 10 min reuses the last successful recall)
+            (the same company + server + bank + budget + query within 10 min shares one recall)
 
 agent running…
   ├─ hindsight_recall(query) → cached context if query matches run start, otherwise live recall
@@ -87,6 +89,8 @@ issue.comment.created
 agent.run.finished
   └─ no-op (subscription kept for future use when payload carries output)
 ```
+
+Because of that reuse, the memories cached at run start can lag what was retained by up to 10 minutes. The run-start query is the issue title and description, whitespace-collapsed and cut to 1200 bytes.
 
 `autoRetain` gates the `issue.comment.created` handler above. It does not make
 `agent.run.finished` retain run output: Paperclip's run-finished payload does not
