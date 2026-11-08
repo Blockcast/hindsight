@@ -111,9 +111,12 @@ export class HindsightClient {
       { query, budget, max_tokens: 1024 },
       this.recallTimeoutMs
     );
-    // Reject a 2xx without results here, so no caller caches or formats it.
+    // Reject a malformed 2xx here, so no caller caches or formats it.
     if (!Array.isArray(resp?.results)) {
       throw new Error(`Malformed recall response from ${path}: no results array`);
+    }
+    if (!resp.results.every((m) => typeof m?.text === "string")) {
+      throw new Error(`Malformed recall response from ${path}: result without text`);
     }
     return resp;
   }

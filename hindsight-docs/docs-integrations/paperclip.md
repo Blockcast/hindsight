@@ -76,7 +76,7 @@ Memory is keyed to `companyId` + `agentId` — never to the run ID — so it acc
 | `requestTimeoutMs` | — | Legacy single timeout. When set it replaces both defaults above; `recallTimeoutMs` and `retainTimeoutMs` still win over it |
 | `autoRetain` | `true` | Automatically retain run output after every run |
 
-If `requestTimeoutMs` is already set, recall keeps that value until `recallTimeoutMs` is set, and retain keeps it until `retainTimeoutMs` is set. Each timeout accepts 1000 to 120000 ms.
+If `requestTimeoutMs` is already set, recall keeps that value until `recallTimeoutMs` is set, and retain keeps it until `retainTimeoutMs` is set. Each timeout accepts 1000 to 120000 ms. Saving the plugin settings form fills `recallTimeoutMs` and `retainTimeoutMs` with their defaults, which then override `requestTimeoutMs`. The `hindsight_recall` tool also runs inside the host's plugin RPC timeout (120 s on current Paperclip), so keep `recallTimeoutMs` below it.
 
 ## Bank ID Format
 

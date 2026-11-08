@@ -50,7 +50,7 @@ hindsight-api
 | `autoRetain`         | `true`                               | Automatically retain the full body of every issue comment. Set `false` to turn comment retention off                                                                   |
 | `enabledAgentIds`    | —                                    | Restrict recall/retain to these agent IDs only. Leave empty to enable for all agents (default)                                                                         |
 
-If `requestTimeoutMs` is already set, recall keeps that value until `recallTimeoutMs` is set, and retain keeps it until `retainTimeoutMs` is set. Each timeout accepts 1000 to 120000 ms.
+If `requestTimeoutMs` is already set, recall keeps that value until `recallTimeoutMs` is set, and retain keeps it until `retainTimeoutMs` is set. Each timeout accepts 1000 to 120000 ms. Saving the plugin settings form fills `recallTimeoutMs` and `retainTimeoutMs` with their defaults, which then override `requestTimeoutMs`. The `hindsight_recall` tool also runs inside the host's plugin RPC timeout (120 s on current Paperclip), so keep `recallTimeoutMs` below it.
 
 ## Bank ID Format
 

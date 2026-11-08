@@ -354,6 +354,16 @@ describe("agent.run.started", () => {
     expect(query).toContain("Fix stuck reviewer runs");
   });
 
+  it("bounds multibyte issue text by UTF-8 bytes without splitting characters", () => {
+    for (const unit of ["€", "😀", "漢字", "e\u0301"]) {
+      const query = buildRecallQuery({ title: "T", description: unit.repeat(2000) });
+      expect(Buffer.byteLength(query, "utf8")).toBeLessThanOrEqual(DEFAULT_MAX_RECALL_QUERY_BYTES);
+      expect(query).not.toMatch(
+        /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/
+      );
+    }
+  });
+
   it("honors recallTimeoutMs on the run-start path and does not cache the timeout", async () => {
     const hanging = hangingFetch();
     vi.stubGlobal("fetch", hanging);
@@ -940,6 +950,13 @@ describe("HindsightClient timeout", () => {
     vi.stubGlobal("fetch", mockFetch([{ url: /./, body: { memories: [] } }]));
     await expect(new HindsightClient("http://localhost:8888").recall("b", "q")).rejects.toThrow(
       "Malformed recall response from /v1/default/banks/b/memories/recall: no results array"
+    );
+  });
+
+  it("rejects a 2xx recall response whose results lack text", async () => {
+    vi.stubGlobal("fetch", mockFetch([{ url: /./, body: { results: [null] } }]));
+    await expect(new HindsightClient("http://localhost:8888").recall("b", "q")).rejects.toThrow(
+      "Malformed recall response from /v1/default/banks/b/memories/recall: result without text"
     );
   });
 

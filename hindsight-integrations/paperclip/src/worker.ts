@@ -123,8 +123,9 @@ async function resolveApiKey(
 const DISABLED_FOR_AGENT =
   "Hindsight memory is not enabled for this agent (see the plugin's enabledAgentIds setting).";
 
-// Run-start recall dedupe: wakeups of the same agent on the same issue
-// within the TTL reuse one recall instead of each paying a slow round trip.
+// Run-start recall dedupe: run starts with the same company, server, bank,
+// budget and bounded query within the TTL share one recall instead of each
+// paying a slow round trip.
 const RECALL_DEDUPE_TTL_MS = 10 * 60_000;
 const RECALL_DEDUPE_MAX = 500;
 
