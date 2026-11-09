@@ -485,6 +485,22 @@ Fields must be categorized as either **hierarchical** (can be overridden per-ten
 - Global limits (max concurrent operations)
 - System-wide feature flags
 
+## Blockcast Fork Notes
+
+This is Blockcast's fork of `vectorize-io/hindsight`; these rules are fork-only and must be
+re-applied after every upstream sync.
+
+- **CI runs on on-prem ARC, not GitHub-hosted runners** (#37). Use
+  `runs-on: {group: default-tools, labels: arc-light}` for ordinary Linux jobs and
+  `labels: arc-dind` for Docker/buildx, image scan/sign, and disk-heavy jobs. `arc-light`'s 4Gi
+  `work` volume is deliberate; jobs that outgrow it move to `arc-dind` rather than raising the cap (#39).
+  `ubuntu-latest` remains only for trusted npm publishing.
+- **Every self-hosted job needs a job-level `timeout-minutes`**, including jobs gated to upstream
+  only — onprem-k8s's `check-unbounded-self-hosted-jobs` ratchet checks statically (#40, #45).
+- On ARC, `HOSTNAME` is the pod name, so servers started in CI must bind `0.0.0.0` explicitly (#41).
+- `test-hermes-compat` runs only upstream or via `workflow_dispatch` (#42).
+- Postgres `plan_cache_mode=force_custom_plan` is set as a role GUC in onprem-k8s, not in code (#44).
+
 ## Environment Setup
 
 ### Recommended: One-Shot Bootstrap
