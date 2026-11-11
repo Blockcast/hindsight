@@ -494,7 +494,9 @@ re-applied after every upstream sync.
   `runs-on: {group: default-tools, labels: arc-light}` for ordinary Linux jobs and
   `labels: arc-dind` for Docker/buildx, image scan/sign, and disk-heavy jobs. `arc-light`'s 4Gi
   `work` volume is deliberate; jobs that outgrow it move to `arc-dind` rather than raising the cap (#39).
-  `ubuntu-latest` remains only for trusted npm publishing.
+  `ubuntu-latest` remains only for trusted publishing: npm in `release.yml` (`environment: npm`)
+  and PyPI/integrations + build-provenance attestations in `release-integration.yml` (`publish`).
+  Do not move either onto ARC.
 - **Every self-hosted job needs a job-level `timeout-minutes`**, including jobs gated to upstream
   only — onprem-k8s's `check-unbounded-self-hosted-jobs` ratchet checks statically (#40, #45).
 - On ARC, `HOSTNAME` is the pod name, so servers started in CI must bind `0.0.0.0` explicitly (#41).
