@@ -17,7 +17,7 @@ from ...search.tags import TagGroup, build_tag_groups_where_clause
 
 
 async def consolidation_freshness(*, conn, fq_table: Callable[[str], str], bank_id: str) -> dict[str, Any]:
-    """Last consolidation time, the pending / failed fact counts, and the write watermark, in one scan.
+    """Last consolidation time, the pending / failed fact counts, and the write watermark.
 
     ``pending`` and ``failed`` are disjoint: pending carries the consolidator's
     own candidate predicate (``consolidated_at IS NULL AND consolidation_failed_at
@@ -26,36 +26,52 @@ async def consolidation_freshness(*, conn, fq_table: Callable[[str], str], bank_
     handle is counted once, under ``failed``, and only leaves that bucket via the
     consolidation-recovery endpoint.
 
-    All four come from a single pass so keeping ``failed`` — part of the
-    published contract — costs nothing over reflect()'s ``pending`` read, and
-    ``last_memory_write_at`` (the newest ``updated_at`` anywhere in the bank)
-    rides along for free. That watermark is what lets a caller decide a mental
-    model is up to date without running its own scoped scan: nothing in the bank
-    changed since the refresh, so nothing in the model's scope did either.
+    ``last_memory_write_at`` is the newest ``updated_at`` anywhere in the bank.
+    That watermark is what lets a caller decide a mental model is up to date
+    without running its own scoped scan: nothing in the bank changed since the
+    refresh, so nothing in the model's scope did either.
+
+    Each value is its own index-backed statement, so the cost tracks the
+    consolidation backlog, not the bank size.
     """
-    row = await conn.fetchrow(
+    # One statement per value, each answered from its own index, instead of one
+    # aggregate over every row in the bank (BLO-55989: 471k rows, 14-20 s per call on
+    # production, paid by every reflect()/mental-model refresh). The predicates must
+    # stay word-for-word those of the partial indexes or the planner cannot use them.
+    mu = fq_table("memory_units")
+    # idx_memory_units_consolidated_at: one backward probe.
+    last_consolidated_at = await conn.fetchval(
+        f"SELECT MAX(consolidated_at) FROM {mu} WHERE bank_id = $1 AND consolidated_at IS NOT NULL",
+        bank_id,
+    )
+    # idx_memory_units_bank_updated_at: one backward probe.
+    last_memory_write_at = await conn.fetchval(f"SELECT MAX(updated_at) FROM {mu} WHERE bank_id = $1", bank_id)
+    # idx_memory_units_unconsolidated: reads only the backlog.
+    pending = await conn.fetchval(
         f"""
-        SELECT
-            MAX(consolidated_at) AS last_consolidated_at,
-            MAX(updated_at) AS last_memory_write_at,
-            COUNT(*) FILTER (
-                WHERE consolidated_at IS NULL
-                  AND consolidation_failed_at IS NULL
-                  AND fact_type IN ('experience', 'world')
-            ) AS pending,
-            COUNT(*) FILTER (WHERE consolidation_failed_at IS NOT NULL AND fact_type IN ('experience', 'world')) AS failed
-        FROM {fq_table("memory_units")}
+        SELECT COUNT(*) FROM {mu}
         WHERE bank_id = $1
+          AND consolidated_at IS NULL
+          AND fact_type IN ('experience', 'world')
+          AND consolidation_failed_at IS NULL
         """,
         bank_id,
     )
-    if row is None:
-        return {"last_consolidated_at": None, "last_memory_write_at": None, "pending": 0, "failed": 0}
+    # idx_memory_units_consolidation_failed: reads only the failed facts.
+    failed = await conn.fetchval(
+        f"""
+        SELECT COUNT(*) FROM {mu}
+        WHERE bank_id = $1
+          AND consolidation_failed_at IS NOT NULL
+          AND fact_type IN ('experience', 'world')
+        """,
+        bank_id,
+    )
     return {
-        "last_consolidated_at": row["last_consolidated_at"],
-        "last_memory_write_at": row["last_memory_write_at"],
-        "pending": row["pending"] or 0,
-        "failed": row["failed"] or 0,
+        "last_consolidated_at": last_consolidated_at,
+        "last_memory_write_at": last_memory_write_at,
+        "pending": pending or 0,
+        "failed": failed or 0,
     }
 
 
