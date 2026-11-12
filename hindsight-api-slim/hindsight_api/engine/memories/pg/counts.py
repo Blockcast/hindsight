@@ -32,7 +32,9 @@ async def consolidation_freshness(*, conn, fq_table: Callable[[str], str], bank_
     refresh, so nothing in the model's scope did either.
 
     Each value is its own index-backed statement, so the cost tracks the
-    consolidation backlog, not the bank size.
+    consolidation backlog, not the bank size. The values are therefore each
+    current but not one snapshot: a consolidation committing between reads can
+    pair an older ``last_consolidated_at`` with an already-lower ``pending``.
     """
     # One statement per value, each answered from its own index, instead of one
     # aggregate over every row in the bank (BLO-55989: 471k rows, 14-20 s per call on

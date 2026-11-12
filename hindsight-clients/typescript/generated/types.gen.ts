@@ -3731,6 +3731,12 @@ export type ListMemoryUnitsResponse = {
    * Offset
    */
   offset: number;
+  /**
+   * Total Is Estimate
+   *
+   * True when the count stopped at its cap (10,000, or past the requested page if larger), so `total` is a lower bound rather than an exact count.
+   */
+  total_is_estimate?: boolean;
 };
 
 /**

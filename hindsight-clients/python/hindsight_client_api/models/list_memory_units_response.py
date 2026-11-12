@@ -17,8 +17,8 @@ import pprint
 import re  # noqa: F401
 import json
 
-from pydantic import BaseModel, ConfigDict, StrictInt
-from typing import Any, ClassVar, Dict, List
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt
+from typing import Any, ClassVar, Dict, List, Optional
 from hindsight_client_api.models.memory_unit_list_item import MemoryUnitListItem
 from typing import Optional, Set
 from typing_extensions import Self
@@ -31,7 +31,8 @@ class ListMemoryUnitsResponse(BaseModel):
     total: StrictInt
     limit: StrictInt
     offset: StrictInt
-    __properties: ClassVar[List[str]] = ["items", "total", "limit", "offset"]
+    total_is_estimate: Optional[StrictBool] = Field(default=False, description="True when the count stopped at its cap (10,000, or past the requested page if larger), so `total` is a lower bound rather than an exact count.")
+    __properties: ClassVar[List[str]] = ["items", "total", "limit", "offset", "total_is_estimate"]
 
     model_config = ConfigDict(
         populate_by_name=True,
@@ -94,7 +95,8 @@ class ListMemoryUnitsResponse(BaseModel):
             "items": [MemoryUnitListItem.from_dict(_item) for _item in obj["items"]] if obj.get("items") is not None else None,
             "total": obj.get("total"),
             "limit": obj.get("limit"),
-            "offset": obj.get("offset")
+            "offset": obj.get("offset"),
+            "total_is_estimate": obj.get("total_is_estimate") if obj.get("total_is_estimate") is not None else False
         })
         return _obj
 

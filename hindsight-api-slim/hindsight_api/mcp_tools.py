@@ -3565,7 +3565,8 @@ def _register_list_memories(mcp: FastMCP, memory: MemoryEngine, config: MCPTools
                 type: Filter by fact type: 'world', 'experience', or 'observation'
                 q: Optional text search query to filter memories
                 limit: Maximum number of results (default: 100)
-                offset: Pagination offset (default: 0)
+                offset: Pagination offset (default: 0). When 'total_is_estimate' is true, 'total'
+                    is a lower bound (the count stops at 10,000); keep paging while pages are full.
                 bank_id: Optional bank (defaults to session bank). Use for cross-bank operations.
                 tags: Optional list of tag names to filter by.
                 tags_match: How to combine tags: 'any' (OR, default) or 'all' (AND)
@@ -3601,7 +3602,8 @@ def _register_list_memories(mcp: FastMCP, memory: MemoryEngine, config: MCPTools
                 type: Filter by fact type: 'world', 'experience', or 'observation'
                 q: Optional text search query to filter memories
                 limit: Maximum number of results (default: 100)
-                offset: Pagination offset (default: 0)
+                offset: Pagination offset (default: 0). When 'total_is_estimate' is true, 'total'
+                    is a lower bound (the count stops at 10,000); keep paging while pages are full.
                 tags: Optional list of tag names to filter by.
                 tags_match: How to combine tags: 'any' (OR, default) or 'all' (AND)
                     both also include untagged memories; 'any_strict'/'all_strict'

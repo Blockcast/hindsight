@@ -25,6 +25,8 @@ type ListMemoryUnitsResponse struct {
 	Total int32 `json:"total"`
 	Limit int32 `json:"limit"`
 	Offset int32 `json:"offset"`
+	// True when the count stopped at its cap (10,000, or past the requested page if larger), so `total` is a lower bound rather than an exact count.
+	TotalIsEstimate *bool `json:"total_is_estimate,omitempty"`
 }
 
 type _ListMemoryUnitsResponse ListMemoryUnitsResponse
@@ -39,6 +41,8 @@ func NewListMemoryUnitsResponse(items []MemoryUnitListItem, total int32, limit i
 	this.Total = total
 	this.Limit = limit
 	this.Offset = offset
+	var totalIsEstimate bool = false
+	this.TotalIsEstimate = &totalIsEstimate
 	return &this
 }
 
@@ -47,6 +51,8 @@ func NewListMemoryUnitsResponse(items []MemoryUnitListItem, total int32, limit i
 // but it doesn't guarantee that properties required by API are set
 func NewListMemoryUnitsResponseWithDefaults() *ListMemoryUnitsResponse {
 	this := ListMemoryUnitsResponse{}
+	var totalIsEstimate bool = false
+	this.TotalIsEstimate = &totalIsEstimate
 	return &this
 }
 
@@ -146,6 +152,38 @@ func (o *ListMemoryUnitsResponse) SetOffset(v int32) {
 	o.Offset = v
 }
 
+// GetTotalIsEstimate returns the TotalIsEstimate field value if set, zero value otherwise.
+func (o *ListMemoryUnitsResponse) GetTotalIsEstimate() bool {
+	if o == nil || IsNil(o.TotalIsEstimate) {
+		var ret bool
+		return ret
+	}
+	return *o.TotalIsEstimate
+}
+
+// GetTotalIsEstimateOk returns a tuple with the TotalIsEstimate field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+func (o *ListMemoryUnitsResponse) GetTotalIsEstimateOk() (*bool, bool) {
+	if o == nil || IsNil(o.TotalIsEstimate) {
+		return nil, false
+	}
+	return o.TotalIsEstimate, true
+}
+
+// HasTotalIsEstimate returns a boolean if a field has been set.
+func (o *ListMemoryUnitsResponse) HasTotalIsEstimate() bool {
+	if o != nil && !IsNil(o.TotalIsEstimate) {
+		return true
+	}
+
+	return false
+}
+
+// SetTotalIsEstimate gets a reference to the given bool and assigns it to the TotalIsEstimate field.
+func (o *ListMemoryUnitsResponse) SetTotalIsEstimate(v bool) {
+	o.TotalIsEstimate = &v
+}
+
 func (o ListMemoryUnitsResponse) MarshalJSON() ([]byte, error) {
 	toSerialize,err := o.ToMap()
 	if err != nil {
@@ -160,6 +198,9 @@ func (o ListMemoryUnitsResponse) ToMap() (map[string]interface{}, error) {
 	toSerialize["total"] = o.Total
 	toSerialize["limit"] = o.Limit
 	toSerialize["offset"] = o.Offset
+	if !IsNil(o.TotalIsEstimate) {
+		toSerialize["total_is_estimate"] = o.TotalIsEstimate
+	}
 	return toSerialize, nil
 }
 

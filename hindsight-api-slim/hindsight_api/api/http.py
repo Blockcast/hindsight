@@ -2481,6 +2481,13 @@ class ListMemoryUnitsResponse(BaseModel):
     total: int
     limit: int
     offset: int
+    total_is_estimate: bool = Field(
+        default=False,
+        description=(
+            "True when the count stopped at its cap (10,000, or past the requested page if larger), so "
+            "`total` is a lower bound rather than an exact count."
+        ),
+    )
 
 
 class PromptPreviewRequest(BaseModel):
