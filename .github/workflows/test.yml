@@ -1,6 +1,8 @@
 name: CI
 
 on:
+  push:
+    branches: [ main ]
   pull_request:
     branches: [ main ]
   workflow_dispatch:
@@ -453,7 +455,7 @@ jobs:
         cache-dependency-path: package-lock.json
 
     - name: Restore Node cache
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
       with:
         path: ~/.npm
         key: node-cache-${{ runner.os }}-${{ runner.arch }}-npm-${{ hashFiles('package-lock.json') }}
@@ -487,7 +489,7 @@ jobs:
         cache-dependency-path: package-lock.json
 
     - name: Restore Node cache
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
       with:
         path: ~/.npm
         key: node-cache-${{ runner.os }}-${{ runner.arch }}-npm-${{ hashFiles('package-lock.json') }}
@@ -526,7 +528,7 @@ jobs:
         cache-dependency-path: package-lock.json
 
     - name: Restore Node cache
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
       with:
         path: ~/.npm
         key: node-cache-${{ runner.os }}-${{ runner.arch }}-npm-${{ hashFiles('package-lock.json') }}
@@ -587,7 +589,7 @@ jobs:
         cache-dependency-path: package-lock.json
 
     - name: Restore Node cache
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
       with:
         path: ~/.npm
         key: node-cache-${{ runner.os }}-${{ runner.arch }}-npm-${{ hashFiles('package-lock.json') }}
@@ -653,7 +655,7 @@ jobs:
         cache-dependency-path: hindsight-integrations/coding-agents/package-lock.json
 
     - name: Restore Node cache
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
       with:
         path: ~/.npm
         key: node-cache-${{ runner.os }}-${{ runner.arch }}-npm-${{ hashFiles('package-lock.json') }}
@@ -1331,7 +1333,7 @@ jobs:
         cache-dependency-path: package-lock.json
 
     - name: Restore Node cache
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
       with:
         path: ~/.npm
         key: node-cache-${{ runner.os }}-${{ runner.arch }}-npm-${{ hashFiles('package-lock.json') }}
@@ -1441,7 +1443,7 @@ jobs:
         cache-dependency-path: package-lock.json
 
     - name: Restore Node cache
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
       with:
         path: ~/.npm
         key: node-cache-${{ runner.os }}-${{ runner.arch }}-npm-${{ hashFiles('package-lock.json') }}
@@ -1494,7 +1496,8 @@ jobs:
       uses: dtolnay/rust-toolchain@stable
 
     - name: Cache cargo
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      id: rust-cli-cargo-cache
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
       with:
         path: |
           ~/.cargo/registry
@@ -1541,6 +1544,16 @@ jobs:
         path: hindsight-cli/target/release/hindsight
         retention-days: 1
 
+    - name: Save cargo cache
+      if: ${{ success() && (github.event_name == 'push' || github.event_name == 'schedule') && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && steps.rust-cli-cargo-cache.outputs.cache-hit != 'true' }}
+      uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          hindsight-cli/target
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
     - name: Install uv
       uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
@@ -1562,7 +1575,7 @@ jobs:
       run: uv sync --frozen --all-extras --index-strategy unsafe-best-match
 
     - name: Cache HuggingFace models
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
       with:
         path: ~/.cache/huggingface
         key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
@@ -1880,7 +1893,8 @@ jobs:
       # pinned Python version — the only inputs that change the resolved env.
       # `uv sync --frozen` still runs after restore but is a near-instant link
       # check when the venv already matches the lock.
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      id: test-api-venv-cache
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
       with:
         path: hindsight-api-slim/.venv
         key: ${{ runner.os }}-venv-test-api-${{ hashFiles('uv.lock', 'hindsight-api-slim/pyproject.toml', '.python-version') }}
@@ -1891,8 +1905,15 @@ jobs:
       working-directory: ./hindsight-api-slim
       run: uv sync --frozen --all-extras --index-strategy unsafe-best-match
 
+    - name: Save API virtualenv cache
+      if: ${{ matrix.shard == 1 && success() && (github.event_name == 'push' || github.event_name == 'schedule') && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && steps.test-api-venv-cache.outputs.cache-hit != 'true' }}
+      uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+      with:
+        path: hindsight-api-slim/.venv
+        key: ${{ runner.os }}-venv-test-api-${{ hashFiles('uv.lock', 'hindsight-api-slim/pyproject.toml', '.python-version') }}
+
     - name: Cache HuggingFace models
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
       with:
         path: ~/.cache/huggingface
         key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
@@ -2004,7 +2025,7 @@ jobs:
       run: uv sync --frozen --all-extras --index-strategy unsafe-best-match
 
     - name: Cache HuggingFace models
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
       with:
         path: ~/.cache/huggingface
         key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
@@ -2108,7 +2129,7 @@ jobs:
       run: uv sync --frozen --all-extras --index-strategy unsafe-best-match
 
     - name: Cache HuggingFace models
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
       with:
         path: ~/.cache/huggingface
         key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
@@ -2260,7 +2281,7 @@ jobs:
       run: uv sync --frozen --all-extras --index-strategy unsafe-best-match
 
     - name: Cache HuggingFace models
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
       with:
         path: ~/.cache/huggingface
         key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
@@ -2343,7 +2364,7 @@ jobs:
       run: uv sync --frozen --all-extras --index-strategy unsafe-best-match
 
     - name: Cache HuggingFace models
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
       with:
         path: ~/.cache/huggingface
         key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
@@ -2461,7 +2482,7 @@ jobs:
       run: npm run build
 
     - name: Cache HuggingFace models
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
       with:
         path: ~/.cache/huggingface
         key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
@@ -2649,7 +2670,7 @@ jobs:
       run: uv sync --frozen --all-extras --index-strategy unsafe-best-match
 
     - name: Cache HuggingFace models
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
       with:
         path: ~/.cache/huggingface
         key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
@@ -2836,7 +2857,7 @@ jobs:
       run: npm run build
 
     - name: Cache HuggingFace models
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
       with:
         path: ~/.cache/huggingface
         key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
@@ -2942,7 +2963,7 @@ jobs:
         cache-dependency-path: package-lock.json
 
     - name: Restore Node cache
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
       with:
         path: ~/.npm
         key: node-cache-${{ runner.os }}-${{ runner.arch }}-npm-${{ hashFiles('package-lock.json') }}
@@ -2969,7 +2990,7 @@ jobs:
       run: npm run build
 
     - name: Cache HuggingFace models
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
       with:
         path: ~/.cache/huggingface
         key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
@@ -3047,7 +3068,8 @@ jobs:
         targets: aarch64-unknown-linux-gnu
 
     - name: Cache cargo
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      id: arm64-cargo-cache
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
       with:
         path: |
           ~/.cargo/registry
@@ -3058,6 +3080,16 @@ jobs:
     - name: Build CLI
       working-directory: hindsight-cli
       run: cargo build --release --target aarch64-unknown-linux-gnu
+
+    - name: Save ARM64 cargo cache
+      if: ${{ success() && (github.event_name == 'push' || github.event_name == 'schedule') && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && steps.arm64-cargo-cache.outputs.cache-hit != 'true' }}
+      uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          hindsight-cli/target
+        key: linux-arm64-cargo-${{ hashFiles('**/Cargo.lock') }}
 
   test-rust-client:
     needs: [detect-changes]
@@ -3104,7 +3136,8 @@ jobs:
       uses: dtolnay/rust-toolchain@stable
 
     - name: Cache cargo
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      id: rust-client-cargo-cache
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
       with:
         path: |
           ~/.cargo/registry
@@ -3121,7 +3154,7 @@ jobs:
       run: uv sync --frozen --all-extras --index-strategy unsafe-best-match
 
     - name: Cache HuggingFace models
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
       with:
         path: ~/.cache/huggingface
         key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
@@ -3169,6 +3202,16 @@ jobs:
     - name: Run Rust client tests
       working-directory: ./hindsight-clients/rust
       run: cargo test --lib
+
+    - name: Save Rust client cargo cache
+      if: ${{ success() && (github.event_name == 'push' || github.event_name == 'schedule') && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && steps.rust-client-cargo-cache.outputs.cache-hit != 'true' }}
+      uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          hindsight-clients/rust/target
+        key: ${{ runner.os }}-cargo-client-${{ hashFiles('hindsight-clients/rust/Cargo.lock') }}
 
     - name: Show API server logs
       if: always()
@@ -3233,7 +3276,7 @@ jobs:
       run: uv sync --frozen --all-extras --index-strategy unsafe-best-match
 
     - name: Cache HuggingFace models
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
       with:
         path: ~/.cache/huggingface
         key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
@@ -3352,7 +3395,7 @@ jobs:
       run: uv sync --frozen --all-extras --index-strategy unsafe-best-match
 
     - name: Cache HuggingFace models
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
       with:
         path: ~/.cache/huggingface
         key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
@@ -3477,7 +3520,7 @@ jobs:
       run: uv sync --frozen --all-extras --index-strategy unsafe-best-match
 
     - name: Cache HuggingFace models
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
       with:
         path: ~/.cache/huggingface
         key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
@@ -4820,7 +4863,8 @@ jobs:
       run: uv sync --frozen --all-extras --index-strategy unsafe-best-match
 
     - name: Cache HuggingFace models
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      id: embed-model-cache
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
       with:
         path: ~/.cache/huggingface
         key: ${{ runner.os }}-huggingface-embed-${{ hashFiles('hindsight-embed/pyproject.toml') }}
@@ -4835,6 +4879,13 @@ jobs:
     - name: Run smoke test
       working-directory: ./hindsight-embed
       run: ./test.sh
+
+    - name: Save HuggingFace embed cache
+      if: ${{ success() && (github.event_name == 'push' || github.event_name == 'schedule') && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && steps.embed-model-cache.outputs.cache-hit != 'true' }}
+      uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+      with:
+        path: ~/.cache/huggingface
+        key: ${{ runner.os }}-huggingface-embed-${{ hashFiles('hindsight-embed/pyproject.toml') }}
 
   test-embed-windows:
     # Windows coverage for hindsight-embed. Runs the same unit tests + smoke
@@ -4901,7 +4952,8 @@ jobs:
       run: uv sync --frozen --all-extras --index-strategy unsafe-best-match
 
     - name: Cache HuggingFace models
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      id: windows-embed-model-cache
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
       with:
         path: ~/.cache/huggingface
         key: ${{ runner.os }}-huggingface-embed-${{ hashFiles('hindsight-embed/pyproject.toml') }}
@@ -4922,7 +4974,8 @@ jobs:
       uses: dtolnay/rust-toolchain@stable
 
     - name: Cache cargo build
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      id: windows-cargo-cache
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
       with:
         path: |
           ~/.cargo/registry
@@ -5013,6 +5066,23 @@ jobs:
           "$target/bin/hindsight-embed.exe" --help
         fi
 
+    - name: Save Windows HuggingFace embed cache
+      if: ${{ success() && (github.event_name == 'push' || github.event_name == 'schedule') && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && steps.windows-embed-model-cache.outputs.cache-hit != 'true' }}
+      uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+      with:
+        path: ~/.cache/huggingface
+        key: ${{ runner.os }}-huggingface-embed-${{ hashFiles('hindsight-embed/pyproject.toml') }}
+
+    - name: Save Windows cargo cache
+      if: ${{ success() && (github.event_name == 'push' || github.event_name == 'schedule') && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && steps.windows-cargo-cache.outputs.cache-hit != 'true' }}
+      uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          hindsight-cli/target
+        key: ${{ runner.os }}-cargo-embed-smoke-${{ hashFiles('**/Cargo.lock') }}
+
     - name: Collect daemon logs on failure
       if: failure()
       shell: bash
@@ -5075,7 +5145,8 @@ jobs:
     # models. Keyed on the plugin's pyproject: its hindsight-embed range decides
     # which hindsight-api release runs. Cache them like the test-embed job does.
     - name: Cache HuggingFace models
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      id: hermes-model-cache
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
       with:
         path: ~/.cache/huggingface
         key: ${{ runner.os }}-huggingface-hermes-compat-${{ hashFiles('hindsight-integrations/hermes/pyproject.toml') }}
@@ -5090,6 +5161,13 @@ jobs:
         # every structural check and skips only the LLM-backed round-trips.
         HERMES_COMPAT_LLM_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       run: ./scripts/test-hermes-compat.sh
+
+    - name: Save Hermes HuggingFace cache
+      if: ${{ success() && (github.event_name == 'push' || github.event_name == 'schedule') && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && steps.hermes-model-cache.outputs.cache-hit != 'true' }}
+      uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+      with:
+        path: ~/.cache/huggingface
+        key: ${{ runner.os }}-huggingface-hermes-compat-${{ hashFiles('hindsight-integrations/hermes/pyproject.toml') }}
 
     - name: Collect embedded daemon logs on failure
       if: failure()
@@ -5153,7 +5231,7 @@ jobs:
         cache-dependency-path: package-lock.json
 
     - name: Restore Node cache
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
       with:
         path: ~/.npm
         key: node-cache-${{ runner.os }}-${{ runner.arch }}-npm-${{ hashFiles('package-lock.json') }}
@@ -5188,7 +5266,8 @@ jobs:
       run: uv sync --frozen --extra test --index-strategy unsafe-best-match
 
     - name: Cache HuggingFace models
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      id: all-model-cache
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
       with:
         path: ~/.cache/huggingface
         key: ${{ runner.os }}-huggingface-all-${{ hashFiles('hindsight-all/pyproject.toml') }}
@@ -5199,6 +5278,13 @@ jobs:
     - name: Run unit tests
       working-directory: ./hindsight-all
       run: uv run pytest tests/ -v
+
+    - name: Save hindsight-all HuggingFace cache
+      if: ${{ success() && (github.event_name == 'push' || github.event_name == 'schedule') && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && steps.all-model-cache.outputs.cache-hit != 'true' }}
+      uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+      with:
+        path: ~/.cache/huggingface
+        key: ${{ runner.os }}-huggingface-all-${{ hashFiles('hindsight-all/pyproject.toml') }}
 
   test-doc-examples:
     needs: [detect-changes]
@@ -5243,7 +5329,8 @@ jobs:
 
     - name: Cache cargo
       if: matrix.language == 'cli'
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      id: doc-cli-cargo-cache
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
       with:
         path: |
           ~/.cargo/registry
@@ -5257,6 +5344,16 @@ jobs:
       run: |
         cargo build --release
         cp target/release/hindsight /usr/local/bin/hindsight
+
+    - name: Save docs CLI cargo cache
+      if: ${{ matrix.language == 'cli' && success() && (github.event_name == 'push' || github.event_name == 'schedule') && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && steps.doc-cli-cargo-cache.outputs.cache-hit != 'true' }}
+      uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          hindsight-cli/target
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Install uv
       uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
@@ -5281,7 +5378,7 @@ jobs:
 
     - name: Restore Node cache
       if: matrix.language == 'node'
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
       with:
         path: ~/.npm
         key: node-cache-${{ runner.os }}-${{ runner.arch }}-npm-${{ hashFiles('package-lock.json') }}
@@ -5304,7 +5401,7 @@ jobs:
         npm run build --workspace=hindsight-clients/typescript
 
     - name: Cache HuggingFace models
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
       with:
         path: ~/.cache/huggingface
         key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
@@ -5406,7 +5503,7 @@ jobs:
         python-version-file: ".python-version"
 
     - name: Cache HuggingFace models
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
       with:
         path: ~/.cache/huggingface
         key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
@@ -5488,7 +5585,7 @@ jobs:
         cache-dependency-path: package-lock.json
 
     - name: Restore Node cache
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
       with:
         path: ~/.npm
         key: node-cache-${{ runner.os }}-${{ runner.arch }}-npm-${{ hashFiles('package-lock.json') }}
@@ -5548,7 +5645,7 @@ jobs:
         cache-dependency-path: package-lock.json
 
     - name: Restore Node cache
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
       with:
         path: ~/.npm
         key: node-cache-${{ runner.os }}-${{ runner.arch }}-npm-${{ hashFiles('package-lock.json') }}
@@ -5557,7 +5654,8 @@ jobs:
       uses: dtolnay/rust-toolchain@stable
 
     - name: Cache cargo
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      id: generated-cargo-cache
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
       with:
         path: |
           ~/.cargo/registry
@@ -5608,6 +5706,15 @@ jobs:
           exit 1
         fi
         echo "✓ All generated files are up to date"
+
+    - name: Save generated-files cargo cache
+      if: ${{ success() && (github.event_name == 'push' || github.event_name == 'schedule') && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && steps.generated-cargo-cache.outputs.cache-hit != 'true' }}
+      uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+        key: ${{ runner.os }}-cargo-gen-${{ hashFiles('**/Cargo.lock') }}
 
   check-openapi-compatibility:
     needs: [detect-changes]
