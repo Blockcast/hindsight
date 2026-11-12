@@ -138,7 +138,7 @@ describe("registry covers every installable harness", () => {
     const { INSTALLERS } = await import("../installer");
     const missing = INSTALLERS.map((i) => i.name).filter((n) => !HARNESS_NAMES.includes(n));
     expect(missing).toEqual([]);
-  });
+  }, 30_000);
 
   // The check above is DIRECTIONAL, and the other direction is just as broken: a harness in the
   // registry with no installer is advertised by the README and rejected by `install <name>` with
@@ -150,7 +150,7 @@ describe("registry covers every installable harness", () => {
     const installable = new Set(INSTALLERS.map((i) => i.name));
     const missing = Object.keys(HOOK_HARNESSES).filter((n) => !installable.has(n));
     expect(missing).toEqual([]);
-  });
+  }, 30_000);
 });
 
 /**

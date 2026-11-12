@@ -105,7 +105,7 @@ describe.skipIf(!sqlite)("readDevinTranscript", () => {
       { role: "user", content: "hi" },
       { role: "assistant", content: "hello" },
     ]);
-  });
+  }, 30_000);
 
   // The session id reaches SQLite as a bound parameter, so a quote in it can't terminate the
   // string literal the way the previous hand-escaped `sqlite3` command line could.

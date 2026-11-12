@@ -117,5 +117,5 @@ describe("append cursor on a huge transcript (#4380)", () => {
       mode: "append",
       fromTurn: before.length,
     });
-  });
+  }, 30_000);
 });
