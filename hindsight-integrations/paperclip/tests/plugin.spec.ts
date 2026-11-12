@@ -505,6 +505,46 @@ describe("agent.run.started", () => {
       expect(retried.memories).toContain("TypeScript");
     });
 
+    it("recalls once per run when a deferred run starts again", async () => {
+      const harness = buildHarness();
+      await setupPlugin(harness);
+      const issue = await seedIssue(harness, { companyId: "co-1", title: "Dedupe me" });
+
+      const first = await startRun(harness, "run-r1", issue.id);
+      const again = await startRun(harness, "run-r1", issue.id);
+
+      expect(recallCalls()).toBe(1);
+      expect(again.memories).toBe(first.memories);
+    });
+
+    it("does not retry a failed recall when the same run starts again", async () => {
+      fetchMock.mockResolvedValueOnce(new Response("", { status: 503 }));
+      const harness = buildHarness();
+      await setupPlugin(harness);
+      const issue = await seedIssue(harness, { companyId: "co-1", title: "Dedupe me" });
+
+      await startRun(harness, "run-rf", issue.id);
+      const again = await startRun(harness, "run-rf", issue.id);
+
+      expect(recallCalls()).toBe(1);
+      expect(again.memories).toBeUndefined();
+    });
+
+    it("recalls again for a run once the per-run window has passed", async () => {
+      const now = vi.spyOn(Date, "now").mockReturnValue(1_000_000);
+      fetchMock.mockResolvedValueOnce(new Response("", { status: 503 }));
+      const harness = buildHarness();
+      await setupPlugin(harness);
+      const issue = await seedIssue(harness, { companyId: "co-1", title: "Dedupe me" });
+
+      await startRun(harness, "run-rw", issue.id);
+      now.mockReturnValue(1_000_000 + 60 * 60_000);
+      const later = await startRun(harness, "run-rw", issue.id);
+
+      expect(recallCalls()).toBe(2);
+      expect(later.memories).toContain("TypeScript");
+    });
+
     it("does not cache a malformed 2xx recall response", async () => {
       fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({}), { status: 200 }));
       const harness = buildHarness();
