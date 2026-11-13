@@ -1455,10 +1455,12 @@ DEFAULT_BM25_MAX_QUERY_TERMS = 16
 # Whether the cap above selects terms by pg_stats document frequency (keep the
 # most selective) rather than by position (keep the first N). True is strictly
 # better for recall at no extra cost when stats exist; set False to opt out of
-# the catalog read and cap by position instead. Ignored when the cap is 0.
+# the catalog read and cap by position instead. Also gates bm25_max_term_df,
+# which runs the lookup even when the cap is 0 or not exceeded.
 DEFAULT_BM25_SELECTIVE_TERMS = True
 # Drop native BM25 query terms whose tenant-wide document frequency (pg_stats
-# fraction of rows) exceeds this, even under the term cap: a single common term
+# fraction of rows) exceeds this and whose estimated match count (df * reltuples)
+# exceeds MIN_COMMON_TERM_ROWS, even under the term cap: a single common term
 # in the OR gate matches a large share of the bank and ts_rank_cd then reads every
 # matched heap row (BLO-56780). If all terms are that common, the rarest one is
 # kept. Needs bm25_selective_terms. 0 disables.

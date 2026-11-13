@@ -85,6 +85,7 @@ def search(monkeypatch):
         query: str = "some query",
         ext: str = "native",
         bm25_selective_terms: bool = False,
+        bm25_max_term_df: float = 0.0,
     ):
         async def fake_embed(embeddings, texts, *, input_type=None):
             return [embedding]
@@ -102,7 +103,7 @@ def search(monkeypatch):
                 text_search_extension_pg_search_tokenizer="",
                 bm25_max_query_terms=20,
                 bm25_selective_terms=bm25_selective_terms,
-                bm25_max_term_df=0.0,
+                bm25_max_term_df=bm25_max_term_df,
             ),
         )
         resolved.clear()
@@ -201,7 +202,14 @@ async def test_native_selective_terms_pruning(search, monkeypatch):
 
     async def fake_select(conn, tokens, *, schema, table, language, max_terms, max_df):
         received_args.update(
-            {"tokens": tokens, "schema": schema, "table": table, "language": language, "max_terms": max_terms}
+            {
+                "tokens": tokens,
+                "schema": schema,
+                "table": table,
+                "language": language,
+                "max_terms": max_terms,
+                "max_df": max_df,
+            }
         )
         return ["selected", "tokens"]
 
@@ -215,5 +223,32 @@ async def test_native_selective_terms_pruning(search, monkeypatch):
     assert received_args["table"] == "mental_models"
     assert received_args["language"] == "english"
     assert received_args["max_terms"] == 20
+    assert received_args["max_df"] == 0.0
     assert len(received_args["tokens"]) == 25
     assert search.conn.params[0] == ("[0.1, 0.2]", "bank-1", "selected | tokens")
+
+
+@pytest.mark.asyncio
+async def test_native_df_ceiling_runs_lookup_under_cap(search, monkeypatch):
+    """Under the term cap, a df ceiling > 0 must still route through selection."""
+    from hindsight_api.engine.search import bm25_term_selection
+
+    received_args = {}
+
+    async def fake_select(conn, tokens, *, schema, table, language, max_terms, max_df):
+        received_args.update({"tokens": tokens, "max_df": max_df})
+        return ["rare"]
+
+    monkeypatch.setattr(bm25_term_selection, "select_selective_bm25_tokens", fake_select)
+    monkeypatch.setattr(bm25_term_selection, "get_current_schema", lambda: "public")
+
+    await search.run(
+        enable_text_search=True,
+        embedding=[0.1, 0.2],
+        query="pull request rare",
+        bm25_selective_terms=True,
+        bm25_max_term_df=0.005,
+    )
+
+    assert received_args == {"tokens": ["pull", "request", "rare"], "max_df": 0.005}
+    assert search.conn.params[0] == ("[0.1, 0.2]", "bank-1", "rare")

@@ -38,8 +38,8 @@ class _StubConn:
         return self._rows
 
 
-def _row(ord_: int, df: float, has_lexeme: bool = True) -> dict:
-    return {"ord": ord_, "df": df, "has_lexeme": has_lexeme}
+def _row(ord_: int, df: float, has_lexeme: bool = True, reltuples: float = 2_000_000) -> dict:
+    return {"ord": ord_, "df": df, "has_lexeme": has_lexeme, "reltuples": reltuples}
 
 
 # --------------------------------------------------------------------------
@@ -210,5 +210,16 @@ async def test_df_ceiling_with_zero_cap_and_lookup_error_keeps_all():
         language="english",
         max_terms=0,
         max_df=0.005,
+    )
+    assert result == tokens
+
+
+@pytest.mark.asyncio
+async def test_df_ceiling_ignored_on_small_table():
+    # 400-row table: a df 0.2 term matches ~80 rows, nowhere near a fan-out.
+    tokens = ["pull", "request", "13"]
+    rows = [_row(1, 0.0075, reltuples=400), _row(2, 0.05, reltuples=400), _row(3, 0.2, reltuples=400)]
+    result = await select_selective_bm25_tokens(
+        _StubConn(rows), tokens, schema="public", table="mental_models", language="english", max_terms=16, max_df=0.005
     )
     assert result == tokens

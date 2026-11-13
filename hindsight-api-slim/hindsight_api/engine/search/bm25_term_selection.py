@@ -41,6 +41,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# A term is "common" only if it is above ``max_df`` AND its estimated match count
+# (df * reltuples) is above this floor: on a small table (mental_models, a small
+# tenant schema) a high-df term matches a handful of rows and never fans out.
+MIN_COMMON_TERM_ROWS = 5000
+
 # Map each query token to the maximum document frequency among its lexemes (as
 # produced by the same text-search config that built ``search_vector``), reading
 # the per-lexeme frequencies ANALYZE stored in ``pg_stats.most_common_elems``.
@@ -52,7 +57,8 @@ logger = logging.getLogger(__name__)
 #
 # Tokens whose text yields no lexeme (stopwords) come back with
 # ``has_lexeme = false`` and are dropped by the caller; tokens whose lexemes are
-# absent from the stats get df 0 (rare → kept first).
+# absent from the stats get df 0 (rare → kept first). ``reltuples`` (planner row
+# estimate, -1 when never analyzed) turns df into an absolute matched-row estimate.
 _TOKEN_DF_SQL = """
 WITH toks AS (
     SELECT ord, tok
@@ -71,7 +77,9 @@ stats AS (
 )
 SELECT lex.ord AS ord,
        bool_or(lex.lexeme IS NOT NULL) AS has_lexeme,
-       COALESCE(MAX(s.freq), 0)::float8 AS df
+       COALESCE(MAX(s.freq), 0)::float8 AS df,
+       COALESCE((SELECT c.reltuples FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE n.nspname = $2 AND c.relname = $3), 0)::float8 AS reltuples
 FROM lex
 LEFT JOIN stats s ON s.lexeme = lex.lexeme
 GROUP BY lex.ord
@@ -91,8 +99,9 @@ async def select_selective_bm25_tokens(
 ) -> list[str]:
     """Return at most ``max_terms`` tokens, preferring the lowest-df (most selective).
 
-    When ``max_df`` > 0, terms whose document frequency exceeds it are dropped
-    even if the query is under the cap: one common term in the OR gate is enough
+    When ``max_df`` > 0, terms whose document frequency exceeds it — and whose
+    estimated match count exceeds ``MIN_COMMON_TERM_ROWS`` — are dropped even if
+    the query is under the cap: one common term in the OR gate is enough
     to match a large share of the bank, and ``ts_rank_cd`` then reads every matched
     heap row (BLO-56780: 22–40k heap blocks per recall). If every term is that
     common, only the single most selective one is kept. ``max_terms`` <= 0 means
@@ -125,7 +134,17 @@ async def select_selective_bm25_tokens(
 
     scored.sort(key=lambda df_ord: df_ord)
     if max_df > 0:
-        scored = [s for s in scored if s[0] <= max_df] or scored[:1]
+        reltuples = rows[0]["reltuples"]
+        rare = [s for s in scored if s[0] <= max_df or s[0] * reltuples <= MIN_COMMON_TERM_ROWS]
+        kept = rare or scored[:1]
+        if len(kept) < len(scored):
+            logger.debug(
+                "BM25 df ceiling dropped terms %s (reltuples=%.0f, max_df=%s)",
+                [(tokens[o - 1], round(df, 5)) for df, o in scored if (df, o) not in kept],
+                reltuples,
+                max_df,
+            )
+        scored = kept
     if max_terms > 0:
         scored = scored[:max_terms]
     kept_ords = sorted(ord_ for _, ord_ in scored)
