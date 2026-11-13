@@ -150,7 +150,7 @@ class TestRowsAreTypedWithoutChangingTheWire:
         assert _dump(ListDocumentsResponse.model_validate(payload)) == payload
 
     def test_memory_rows_round_trip_unchanged(self):
-        payload = {"items": [_MEMORY_ROW], "total": 1, "limit": 100, "offset": 0}
+        payload = {"items": [_MEMORY_ROW], "total": 1, "limit": 100, "offset": 0, "total_is_estimate": False}
         assert _dump(ListMemoryUnitsResponse.model_validate(payload)) == payload
 
     def test_graph_payload_round_trips_unchanged(self):

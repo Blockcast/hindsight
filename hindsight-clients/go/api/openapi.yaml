@@ -10156,6 +10156,13 @@ components:
         offset:
           title: Offset
           type: integer
+        total_is_estimate:
+          default: false
+          description: "True when the count stopped at its cap (10,000, or past the\
+            \ requested page if larger), so `total` is a lower bound rather than an\
+            \ exact count."
+          title: Total Is Estimate
+          type: boolean
       required:
       - items
       - limit

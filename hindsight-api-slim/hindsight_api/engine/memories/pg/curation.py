@@ -32,6 +32,9 @@ from ...search.tags import (
 from ...time_filter import MEMORY_TIME_FIELDS, build_time_clause
 from .graph import _entity_rows_for_units_sql, _ops_for
 
+# list_memory_units counts its total only this far; see the call site.
+_LIST_TOTAL_CAP = 10_000
+
 
 async def list_memory_units(
     *,
@@ -92,7 +95,9 @@ async def list_memory_units(
         offset: Offset for pagination
 
     Returns:
-        Dict with items (list of memory units) and total count
+        Dict with items, total, limit, offset and ``total_is_estimate``. The total
+        is counted only up to ``max(_LIST_TOTAL_CAP, offset + limit + 1)``; past
+        that, ``total`` is the cap (a lower bound) and ``total_is_estimate`` is true.
     """
     if state is not None and state not in ("valid", "invalidated"):
         raise ValueError(f"Invalid state '{state}': expected 'valid' or 'invalidated'.")
@@ -207,14 +212,21 @@ async def list_memory_units(
 
     where_clause = "WHERE " + " AND ".join(query_conditions) if query_conditions else ""
 
-    # Get total count
+    # Total, counted only up to a cap: an exact COUNT read the whole bank on every
+    # page (280k index entries, 5.5 s in production, BLO-55989). One row past the cap
+    # says there are more (same contract as list_documents' `q` search). The cap always
+    # reaches past this page, so "is there a next page" stays exact.
+    count_cap = max(_LIST_TOTAL_CAP, int(offset) + int(limit) + 1)
     count_query = f"""
-        SELECT COUNT(*) as total
-        FROM {source_table}
-        {where_clause}
+        SELECT COUNT(*) as total FROM (
+            SELECT 1 FROM {source_table}
+            {where_clause}
+            LIMIT {count_cap + 1}
+        ) capped
     """
     count_result = await conn.fetchrow(count_query, *query_params)
-    total = count_result["total"]
+    total_is_estimate = count_result["total"] > count_cap
+    total = min(count_result["total"], count_cap)
 
     # Get units with limit and offset
     param_count += 1
@@ -312,7 +324,7 @@ async def list_memory_units(
             }
         )
 
-    return {"items": items, "total": total, "limit": limit, "offset": offset}
+    return {"items": items, "total": total, "limit": limit, "offset": offset, "total_is_estimate": total_is_estimate}
 
 
 async def get_memory_unit(*, conn, ops, fq_table, bank_id: str, unit_id: str) -> dict[str, Any] | None:
