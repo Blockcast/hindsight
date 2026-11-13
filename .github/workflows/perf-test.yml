@@ -77,9 +77,10 @@ jobs:
         ref: ${{ inputs.ref || github.ref }}
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') }}
         prune-cache: false
 
     - name: Set up Python
@@ -88,7 +89,8 @@ jobs:
         python-version-file: ".python-version"
 
     - name: Cache HuggingFace models
-      uses: actions/cache@v5
+      id: perf-model-cache
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
       with:
         path: ~/.cache/huggingface
         key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
@@ -119,6 +121,13 @@ jobs:
           --scale ${{ inputs.scale || 'large' }} \
           $SUITE_ARG \
           --output perf-results.json
+
+    - name: Save HuggingFace model cache
+      if: ${{ success() && (github.event_name == 'push' || github.event_name == 'schedule') && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && steps.perf-model-cache.outputs.cache-hit != 'true' }}
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+      with:
+        path: ~/.cache/huggingface
+        key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
 
     - name: Upload perf results
       if: always()
@@ -181,9 +190,10 @@ jobs:
         echo "HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$PROJECT_ID" >> $GITHUB_ENV
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') }}
         prune-cache: false
 
     - name: Set up Python
@@ -192,7 +202,8 @@ jobs:
         python-version-file: ".python-version"
 
     - name: Cache HuggingFace models
-      uses: actions/cache@v5
+      id: amb-model-cache
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
       with:
         path: ~/.cache/huggingface
         key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
@@ -210,7 +221,8 @@ jobs:
         "
 
     - name: Cache the AMB checkout
-      uses: actions/cache@v5
+      id: amb-checkout-cache
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
       with:
         path: ${{ github.workspace }}/.amb
         key: amb-${{ hashFiles('hindsight-system-evals/AMB_REF') }}
@@ -230,6 +242,20 @@ jobs:
         fi
         cd hindsight-system-evals
         uv run run-amb --dataset ${{ matrix.dataset }} --split ${{ matrix.split }} -- ${{ inputs.amb_args }}
+
+    - name: Save HuggingFace model cache
+      if: ${{ success() && (github.event_name == 'push' || github.event_name == 'schedule') && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && steps.amb-model-cache.outputs.cache-hit != 'true' }}
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+      with:
+        path: ~/.cache/huggingface
+        key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
+
+    - name: Save AMB checkout cache
+      if: ${{ success() && (github.event_name == 'push' || github.event_name == 'schedule') && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && steps.amb-checkout-cache.outputs.cache-hit != 'true' }}
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+      with:
+        path: ${{ github.workspace }}/.amb
+        key: amb-${{ hashFiles('hindsight-system-evals/AMB_REF') }}
 
     - name: Upload AMB results
       if: always()
@@ -275,9 +301,10 @@ jobs:
         echo "HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$PROJECT_ID" >> $GITHUB_ENV
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') }}
         prune-cache: false
 
     - name: Set up Python
@@ -286,7 +313,8 @@ jobs:
         python-version-file: ".python-version"
 
     - name: Cache HuggingFace models
-      uses: actions/cache@v5
+      id: obs-model-cache
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
       with:
         path: ~/.cache/huggingface
         key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
@@ -319,6 +347,13 @@ jobs:
         cd hindsight-dev
         uv run python -m benchmarks.obs.obs_benchmark \
           --dataset "$DATASET" --fraction "$FRACTION" --wipe-bank --output obs-results.json
+
+    - name: Save HuggingFace model cache
+      if: ${{ success() && (github.event_name == 'push' || github.event_name == 'schedule') && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && steps.obs-model-cache.outputs.cache-hit != 'true' }}
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+      with:
+        path: ~/.cache/huggingface
+        key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
 
     - name: Upload obs results
       if: always()
@@ -366,9 +401,10 @@ jobs:
         echo "HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$PROJECT_ID" >> $GITHUB_ENV
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v7
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       with:
         enable-cache: true
+        save-cache: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') }}
         prune-cache: false
 
     - name: Set up Python
@@ -377,7 +413,8 @@ jobs:
         python-version-file: ".python-version"
 
     - name: Cache HuggingFace models
-      uses: actions/cache@v5
+      id: system-model-cache
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
       with:
         path: ~/.cache/huggingface
         key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
@@ -400,6 +437,13 @@ jobs:
         # `tests` first: fast, model-free unit tests of the harness itself (target
         # resolution). They cost seconds and a break there invalidates the evals.
         uv run pytest tests evals $FLAG --output system-evals-results.json
+
+    - name: Save HuggingFace model cache
+      if: ${{ success() && (github.event_name == 'push' || github.event_name == 'schedule') && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') && steps.system-model-cache.outputs.cache-hit != 'true' }}
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+      with:
+        path: ~/.cache/huggingface
+        key: ${{ runner.os }}-huggingface-hs-rerank-1-${{ hashFiles('hindsight-api-slim/pyproject.toml') }}
 
     - name: Upload system-evals results
       if: always()
