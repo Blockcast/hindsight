@@ -489,6 +489,7 @@ async def test_selective_terms_flag_gates_the_pg_stats_lookup(monkeypatch, selec
         text_search_extension_pg_search_tokenizer="",
         bm25_max_query_terms=16,
         bm25_selective_terms=selective,
+        bm25_max_term_df=0.0,
     )
     monkeypatch.setattr(recall_mod, "get_config", lambda: config)
     monkeypatch.setattr(recall_mod, "create_sql_dialect", lambda backend: fake_dialect)
