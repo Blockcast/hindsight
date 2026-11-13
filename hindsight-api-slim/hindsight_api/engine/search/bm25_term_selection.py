@@ -87,34 +87,48 @@ async def select_selective_bm25_tokens(
     table: str,
     language: str,
     max_terms: int,
+    max_df: float = 0.0,
 ) -> list[str]:
     """Return at most ``max_terms`` tokens, preferring the lowest-df (most selective).
+
+    When ``max_df`` > 0, terms whose document frequency exceeds it are dropped
+    even if the query is under the cap: one common term in the OR gate is enough
+    to match a large share of the bank, and ``ts_rank_cd`` then reads every matched
+    heap row (BLO-56780: 22–40k heap blocks per recall). If every term is that
+    common, only the single most selective one is kept. ``max_terms`` <= 0 means
+    no count cap.
 
     The returned tokens keep their original relative order (the OR ``tsquery`` is
     order-insensitive; preserving order keeps traces and logs readable). Falls
     back to the first ``max_terms`` tokens whenever document-frequency stats
     cannot be read, so recall is never blocked by a stats problem.
     """
-    if max_terms <= 0 or len(tokens) <= max_terms:
+    over_cap = 0 < max_terms < len(tokens)
+    if not over_cap and max_df <= 0:
         return tokens
+    first_n = tokens[:max_terms] if over_cap else tokens
 
     try:
         rows = await conn.fetch(_TOKEN_DF_SQL, tokens, schema, table, language)
     except Exception:
         logger.debug("BM25 term-df lookup failed; falling back to first-N cap", exc_info=True)
-        return tokens[:max_terms]
+        return first_n
 
     if not rows:
-        return tokens[:max_terms]
+        return first_n
 
     # ``ord`` is 1-based into ``tokens``. Keep only real search terms (drop
     # stopwords), then take the ``max_terms`` lowest-df, ties broken by position.
     scored = [(row["df"], row["ord"]) for row in rows if row["has_lexeme"]]
     if not scored:
-        return tokens[:max_terms]
+        return first_n
 
     scored.sort(key=lambda df_ord: df_ord)
-    kept_ords = sorted(ord_ for _, ord_ in scored[:max_terms])
+    if max_df > 0:
+        scored = [s for s in scored if s[0] <= max_df] or scored[:1]
+    if max_terms > 0:
+        scored = scored[:max_terms]
+    kept_ords = sorted(ord_ for _, ord_ in scored)
     return [tokens[ord_ - 1] for ord_ in kept_ords]
 
 
@@ -142,6 +156,7 @@ async def build_bm25_query_text(
     """
     text_search_extension = config.text_search_extension
     max_query_terms = config.bm25_max_query_terms
+    max_term_df = config.bm25_max_term_df
     bm25_tokens = tokens
     # Native tsvector has no IDF and ranks every `@@` match, so a long OR query over
     # common terms scans and ranks a large fraction of the corpus (the +60s prod
@@ -152,8 +167,7 @@ async def build_bm25_query_text(
     # Opt out via bm25_selective_terms to cap by position instead.
     if (
         text_search_extension == "native"
-        and max_query_terms > 0
-        and len(tokens) > max_query_terms
+        and (max_term_df > 0 or 0 < max_query_terms < len(tokens))
         and config.bm25_selective_terms
         and getattr(conn, "backend_type", "postgresql") == "postgresql"
     ):
@@ -164,6 +178,7 @@ async def build_bm25_query_text(
             table=table,
             language=language,
             max_terms=max_query_terms,
+            max_df=max_term_df,
         )
     return dialect.prepare_bm25_text(
         bm25_tokens,

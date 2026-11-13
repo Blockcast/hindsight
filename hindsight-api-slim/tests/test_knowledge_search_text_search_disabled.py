@@ -102,6 +102,7 @@ def search(monkeypatch):
                 text_search_extension_pg_search_tokenizer="",
                 bm25_max_query_terms=20,
                 bm25_selective_terms=bm25_selective_terms,
+                bm25_max_term_df=0.0,
             ),
         )
         resolved.clear()
@@ -198,7 +199,7 @@ async def test_native_selective_terms_pruning(search, monkeypatch):
 
     received_args = {}
 
-    async def fake_select(conn, tokens, *, schema, table, language, max_terms):
+    async def fake_select(conn, tokens, *, schema, table, language, max_terms, max_df):
         received_args.update(
             {"tokens": tokens, "schema": schema, "table": table, "language": language, "max_terms": max_terms}
         )
