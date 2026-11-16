@@ -499,6 +499,12 @@ re-applied after every upstream sync.
   Do not move either onto ARC.
 - **Every self-hosted job needs a job-level `timeout-minutes`**, including jobs gated to upstream
   only — onprem-k8s's `check-unbounded-self-hosted-jobs` ratchet checks statically (#40, #45).
+  Size it from ARC run history, not GitHub-hosted history: 2× the longest recent run, capped at
+  240 (#40's rule, re-applied to ARC durations in #52 and #56).
+- **CI caches are restore-only except on the default branch** (#49). Use
+  `actions/cache/restore` (SHA-pinned) in jobs and pass `save-cache: false` to setup actions;
+  only a separate `actions/cache/save` step guarded by
+  `success() && (push || schedule) && ref is main/master && cache-hit != 'true'` may write.
 - On ARC, `HOSTNAME` is the pod name, so servers started in CI must bind `0.0.0.0` explicitly (#41).
 - `test-hermes-compat` runs only upstream or via `workflow_dispatch` (#42).
 - Postgres `plan_cache_mode=force_custom_plan` is set as a role GUC in onprem-k8s, not in code (#44).
