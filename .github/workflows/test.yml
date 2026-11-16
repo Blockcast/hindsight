@@ -3608,7 +3608,9 @@ jobs:
     runs-on: {group: default-tools, labels: arc-dind}
     # Upstream's 20 is sized for GitHub-hosted runners. On arc-dind the suite was
     # still at ~88% when 20 minutes cut it off, on every PR from #44 to #47.
-    timeout-minutes: 35
+    # 35 then proved too tight as the suite grew: #55 (run 43671315806) was cut
+    # off at 98% with every test passing, twice, while main runs took 21-32m (BLO-57277).
+    timeout-minutes: 50
     name: test-system (blackbox)
 
     steps:
